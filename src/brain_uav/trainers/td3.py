@@ -1,7 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import json
+import math
+import statistics
+import time
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -17,6 +22,22 @@ class TD3Metrics:
     critic_loss: float = 0.0
     steps: int = 0
     episodes: int = 0
+    episode_returns: list[float] = field(default_factory=list)
+    episode_lengths: list[int] = field(default_factory=list)
+    outcomes: dict[str, int] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            'actor_loss': self.actor_loss,
+            'critic_loss': self.critic_loss,
+            'steps': self.steps,
+            'episodes': self.episodes,
+            'episode_returns': self.episode_returns,
+            'episode_lengths': self.episode_lengths,
+            'outcomes': self.outcomes,
+            'avg_return': statistics.mean(self.episode_returns) if self.episode_returns else 0.0,
+            'avg_length': statistics.mean(self.episode_lengths) if self.episode_lengths else 0.0,
+        }
 
 
 class TD3Trainer:
@@ -37,7 +58,7 @@ class TD3Trainer:
         batch_size: int,
         warmup_steps: int,
         exploration_noise: float,
-        device: str = "cpu",
+        device: str = 'cpu',
     ) -> None:
         self.env = env
         self.actor = actor.to(device)
@@ -67,25 +88,35 @@ class TD3Trainer:
 
     def train(self, total_timesteps: int) -> TD3Metrics:
         obs, _ = self.env.reset()
+        episode_return = 0.0
+        episode_length = 0
         for _ in range(total_timesteps):
             self.total_steps += 1
             if self.total_steps <= self.warmup_steps:
                 action = self.env.action_space.sample()
             else:
                 action = self.select_action(obs, with_noise=True)
-            next_obs, reward, terminated, truncated, _ = self.env.step(action)
+            next_obs, reward, terminated, truncated, info = self.env.step(action)
             done = terminated or truncated
             self.replay.add(obs, action, reward, next_obs, done)
+            episode_return += reward
+            episode_length += 1
             obs = next_obs
             if len(self.replay) >= self.batch_size:
                 self._update()
             if done:
                 self.metrics.episodes += 1
+                self.metrics.episode_returns.append(float(episode_return))
+                self.metrics.episode_lengths.append(int(episode_length))
+                outcome = info.get('outcome', 'unknown')
+                self.metrics.outcomes[outcome] = self.metrics.outcomes.get(outcome, 0) + 1
                 obs, _ = self.env.reset()
+                episode_return = 0.0
+                episode_length = 0
         self.metrics.steps = self.total_steps
-        self.actor.to("cpu")
-        self.critic1.to("cpu")
-        self.critic2.to("cpu")
+        self.actor.to('cpu')
+        self.critic1.to('cpu')
+        self.critic2.to('cpu')
         return self.metrics
 
     def select_action(self, obs: np.ndarray, with_noise: bool = False) -> np.ndarray:
@@ -98,11 +129,11 @@ class TD3Trainer:
 
     def _update(self) -> None:
         batch = self.replay.sample(self.batch_size)
-        obs = batch["obs"].to(self.device)
-        actions = batch["action"].to(self.device)
-        rewards = batch["reward"].to(self.device)
-        next_obs = batch["next_obs"].to(self.device)
-        done = batch["done"].to(self.device)
+        obs = batch['obs'].to(self.device)
+        actions = batch['action'].to(self.device)
+        rewards = batch['reward'].to(self.device)
+        next_obs = batch['next_obs'].to(self.device)
+        done = batch['done'].to(self.device)
 
         with torch.no_grad():
             noise = (torch.randn_like(actions) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
@@ -133,4 +164,3 @@ class TD3Trainer:
     def _soft_update(self, model: nn.Module, target: nn.Module) -> None:
         for param, target_param in zip(model.parameters(), target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
-

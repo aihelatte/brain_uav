@@ -1,6 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
@@ -51,6 +51,7 @@ class TrainingConfig:
     bc_epochs: int = 10
     snn_time_window: int = 4
     hidden_dim: int = 128
+    device: str = 'cpu'
 
 
 @dataclass(slots=True)
@@ -58,6 +59,11 @@ class ExperimentConfig:
     scenario: ScenarioConfig = field(default_factory=ScenarioConfig)
     rewards: RewardConfig = field(default_factory=RewardConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
-    output_dir: Path = Path("outputs")
-    data_dir: Path = Path("data")
+    output_dir: Path = Path('outputs')
+    data_dir: Path = Path('data')
 
+    def to_dict(self) -> dict:
+        payload = asdict(self)
+        payload['output_dir'] = str(self.output_dir)
+        payload['data_dir'] = str(self.data_dir)
+        return payload

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import torch
 
@@ -18,4 +19,10 @@ def save_checkpoint(path: str | Path, payload: dict) -> Path:
 
 
 def load_checkpoint(path: str | Path) -> dict:
-    return torch.load(path, map_location="cpu", weights_only=False)
+    return torch.load(path, map_location='cpu', weights_only=False)
+
+
+def save_json(path: str | Path, payload: dict | list) -> Path:
+    target = ensure_parent(path)
+    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    return target

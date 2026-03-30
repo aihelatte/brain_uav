@@ -3,23 +3,17 @@
 import torch
 from torch import nn
 
-
-class SurrogateSpike(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, membrane: torch.Tensor, threshold: float) -> torch.Tensor:
-        ctx.save_for_backward(membrane)
-        ctx.threshold = threshold
-        return (membrane >= threshold).to(membrane.dtype)
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        (membrane,) = ctx.saved_tensors
-        threshold = ctx.threshold
-        scale = torch.clamp(1.0 - (membrane - threshold).abs(), min=0.0)
-        return grad_output * scale, None
+try:
+    from spikingjelly.activation_based import functional, neuron, surrogate
+    HAS_SPIKINGJELLY = True
+except ImportError:
+    HAS_SPIKINGJELLY = False
+    functional = None
+    neuron = None
+    surrogate = None
 
 
-class LIFLayer(nn.Module):
+class FallbackLIFLayer(nn.Module):
     def __init__(self, decay: float = 0.5, threshold: float = 1.0) -> None:
         super().__init__()
         self.decay = decay
@@ -31,9 +25,11 @@ class LIFLayer(nn.Module):
         last_membrane = torch.zeros_like(current)
         for _ in range(steps):
             membrane = self.decay * membrane + current
-            spikes = SurrogateSpike.apply(membrane, self.threshold)
-            membrane = membrane * (1.0 - spikes)
-            spike_sum += spikes
+            spikes = torch.sigmoid(5.0 * (membrane - self.threshold))
+            hard = (membrane >= self.threshold).to(membrane.dtype)
+            spikes = spikes + (hard - spikes).detach()
+            membrane = membrane * (1.0 - hard)
+            spike_sum += hard
             last_membrane = membrane
         return spike_sum / steps, last_membrane, spike_sum
 
@@ -49,37 +45,63 @@ class SNNPolicyActor(nn.Module):
     ) -> None:
         super().__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
-        self.lif1 = LIFLayer()
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.lif2 = LIFLayer()
         self.fc3 = nn.Linear(hidden_dim, action_dim)
         self.time_window = time_window
         self.hidden_dim = hidden_dim
         self.action_dim = action_dim
         self.state_dim = state_dim
-        self.register_buffer("action_limit", action_limit)
+        if HAS_SPIKINGJELLY:
+            self.lif1 = neuron.LIFNode(tau=2.0, surrogate_function=surrogate.ATan())
+            self.lif2 = neuron.LIFNode(tau=2.0, surrogate_function=surrogate.ATan())
+        else:
+            self.lif1 = FallbackLIFLayer()
+            self.lif2 = FallbackLIFLayer()
+        self.register_buffer('action_limit', action_limit)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         action, _ = self.forward_with_diagnostics(obs)
         return action
 
     def forward_with_diagnostics(self, obs: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
-        encoded = self.fc1(obs)
-        spikes1, _, spike_sum1 = self.lif1(encoded, self.time_window)
-        hidden = self.fc2(spikes1)
-        spikes2, membrane, spike_sum2 = self.lif2(hidden, self.time_window)
-        out = self.fc3(0.5 * (spikes2 + membrane))
+        if HAS_SPIKINGJELLY:
+            functional.reset_net(self)
+            encoded = self.fc1(obs)
+            spike_trace_1 = []
+            for _ in range(self.time_window):
+                spike_trace_1.append(self.lif1(encoded))
+            spikes1 = torch.stack(spike_trace_1, dim=0).mean(0)
+            hidden = self.fc2(spikes1)
+            spike_trace_2 = []
+            mem_trace_2 = []
+            for _ in range(self.time_window):
+                spk = self.lif2(hidden)
+                spike_trace_2.append(spk)
+                mem_trace_2.append(self.lif2.v.clone())
+            spikes2 = torch.stack(spike_trace_2, dim=0).mean(0)
+            membrane = torch.stack(mem_trace_2, dim=0).mean(0)
+            spike_sum1 = torch.stack(spike_trace_1, dim=0).sum(0)
+            spike_sum2 = torch.stack(spike_trace_2, dim=0).sum(0)
+            out = self.fc3(0.5 * (spikes2 + membrane))
+            functional.reset_net(self)
+        else:
+            encoded = self.fc1(obs)
+            spikes1, _, spike_sum1 = self.lif1(encoded, self.time_window)
+            hidden = self.fc2(spikes1)
+            spikes2, membrane, spike_sum2 = self.lif2(hidden, self.time_window)
+            out = self.fc3(0.5 * (spikes2 + membrane))
         action = torch.tanh(out) * self.action_limit
         diagnostics = {
-            "spike_rate_l1": float((spike_sum1 / self.time_window).mean().detach().cpu()),
-            "spike_rate_l2": float((spike_sum2 / self.time_window).mean().detach().cpu()),
-            "dense_macs_estimate": float(
+            'backend': 'spikingjelly' if HAS_SPIKINGJELLY else 'fallback',
+            'spike_rate_l1': float((spike_sum1 / self.time_window).mean().detach().cpu()),
+            'spike_rate_l2': float((spike_sum2 / self.time_window).mean().detach().cpu()),
+            'dense_macs_estimate': float(
                 self.state_dim * self.hidden_dim + self.hidden_dim * self.hidden_dim + self.hidden_dim * self.action_dim
             ),
         }
-        diagnostics["effective_macs_estimate"] = float(
+        diagnostics['effective_macs_estimate'] = float(
             self.state_dim * self.hidden_dim
-            + self.hidden_dim * self.hidden_dim * diagnostics["spike_rate_l1"]
-            + self.hidden_dim * self.action_dim * diagnostics["spike_rate_l2"]
+            + self.hidden_dim * self.hidden_dim * diagnostics['spike_rate_l1']
+            + self.hidden_dim * self.action_dim * diagnostics['spike_rate_l2']
         )
         return action, diagnostics
