@@ -66,6 +66,9 @@ class TrainingConfig:
     - batch size
     - TD3 噪声参数
     - SNN 时间窗口 T
+
+    这里的 TD3 噪声已经按当前动作空间量级调小，避免无人机在训练早期
+    因探索抖动过大而疯狂撞地/越界，破坏 BC 初始化。
     """
 
     seed: int = 7
@@ -74,10 +77,10 @@ class TrainingConfig:
     batch_size: int = 64
     gamma: float = 0.99
     tau: float = 0.005
-    policy_noise: float = 0.08
-    noise_clip: float = 0.15
+    policy_noise: float = 0.01
+    noise_clip: float = 0.02
     policy_delay: int = 2
-    exploration_noise: float = 0.1
+    exploration_noise: float = 0.01
     replay_size: int = 100_000
     warmup_steps: int = 256
     bc_epochs: int = 10
