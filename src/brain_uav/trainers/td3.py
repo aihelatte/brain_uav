@@ -67,6 +67,7 @@ class TD3Trainer:
         batch_size: int,
         warmup_steps: int,
         exploration_noise: float,
+        warmup_strategy: str = 'random',
         device: str = 'cpu',
     ) -> None:
         self.env = env
@@ -88,6 +89,7 @@ class TD3Trainer:
         self.batch_size = batch_size
         self.warmup_steps = warmup_steps
         self.exploration_noise = exploration_noise
+        self.warmup_strategy = warmup_strategy
         self.device = device
         self.replay = ReplayBuffer(replay_size)
         self.total_steps = 0
@@ -104,13 +106,14 @@ class TD3Trainer:
         if verbose:
             print(
                 f"[TD3] start total_timesteps={total_timesteps} warmup_steps={self.warmup_steps} "
-                f"batch_size={self.batch_size} replay_size={self.replay.buffer.maxlen}"
+                f"batch_size={self.batch_size} replay_size={self.replay.buffer.maxlen} "
+                f"warmup_strategy={self.warmup_strategy}"
             )
         for step_idx in range(total_timesteps):
             self.total_steps += 1
             if self.total_steps <= self.warmup_steps:
-                # 训练初期先随机探索，帮 replay buffer 攒够多样经验。
-                action = self.env.action_space.sample()
+                # 有 BC 预训练时，默认不要再用纯随机动作污染前期经验。
+                action = self._warmup_action(obs)
             else:
                 action = self.select_action(obs, with_noise=True)
             next_obs, reward, terminated, truncated, info = self.env.step(action)
@@ -157,6 +160,19 @@ class TD3Trainer:
         if with_noise:
             action = action + np.random.normal(0.0, self.exploration_noise, size=action.shape)
         return np.clip(action, self.env.action_space.low, self.env.action_space.high).astype(np.float32)
+
+    def _warmup_action(self, obs: np.ndarray) -> np.ndarray:
+        """Choose initial exploration behavior before normal TD3 updates stabilize.
+
+        random:
+            标准 TD3 做法，适合 actor 从零开始时使用。
+        policy:
+            使用当前 actor + 探索噪声，适合 BC 预训练后的热启动。
+        """
+
+        if self.warmup_strategy == 'policy':
+            return self.select_action(obs, with_noise=True)
+        return self.env.action_space.sample()
 
     def _update(self) -> None:
         """One TD3 gradient update."""

@@ -27,9 +27,11 @@ def main() -> None:
     env = make_env(cfg, seed=args.seed)
     obs, _ = env.reset(seed=args.seed)
     actor = make_actor(cfg, args.model, obs.shape[0], env.action_space.shape[0])
+    warmup_strategy = 'random'
     if args.bc_checkpoint:
         # TD3 从 BC 的结果出发，而不是从纯随机权重开始。
         actor.load_state_dict(load_checkpoint(args.bc_checkpoint)['state_dict'])
+        warmup_strategy = 'policy'
     critic1, critic2 = make_critics(cfg, obs.shape[0], env.action_space.shape[0])
     trainer = TD3Trainer(
         env=env,
@@ -47,9 +49,10 @@ def main() -> None:
         batch_size=cfg.training.batch_size,
         warmup_steps=cfg.training.warmup_steps,
         exploration_noise=cfg.training.exploration_noise,
+        warmup_strategy=warmup_strategy,
         device=cfg.training.device,
     )
-    metrics = trainer.train(args.timesteps)
+    metrics = trainer.train(args.timesteps, log_interval=max(100, args.timesteps // 10), verbose=True)
     output = args.output or Path(f'outputs/td3_{args.model}.pt')
     metrics_out = args.metrics_out or Path(f'outputs/td3_{args.model}_metrics.json')
     save_checkpoint(

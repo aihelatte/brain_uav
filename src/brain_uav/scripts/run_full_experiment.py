@@ -107,6 +107,7 @@ def train_td3_model(model: str, bc_checkpoint: Path, timesteps: int, seed: int, 
         batch_size=cfg.training.batch_size,
         warmup_steps=cfg.training.warmup_steps,
         exploration_noise=cfg.training.exploration_noise,
+        warmup_strategy='policy',
         device=cfg.training.device,
     )
     metrics = trainer.train(timesteps, log_interval=max(100, timesteps // 10), verbose=True).to_dict()
