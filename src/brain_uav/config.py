@@ -1,4 +1,10 @@
-﻿from __future__ import annotations
+﻿"""Central configuration definitions for the whole project.
+
+读项目时建议先看这个文件，因为环境、模型、训练脚本都会从这里拿参数。
+如果你后面要调实验，大多数时候改这里就够了。
+"""
+
+from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -6,6 +12,15 @@ from pathlib import Path
 
 @dataclass(slots=True)
 class ScenarioConfig:
+    """Environment-side parameters.
+
+    这一组参数决定“飞行任务长什么样”：
+    - 飞机飞多快
+    - 世界范围多大
+    - 禁飞区有多大
+    - 每一步动作允许转多少
+    """
+
     dt: float = 1.0
     speed: float = 25.0
     gamma_max: float = 0.6
@@ -25,6 +40,14 @@ class ScenarioConfig:
 
 @dataclass(slots=True)
 class RewardConfig:
+    """Reward weights used by reinforcement learning.
+
+    这组参数控制策略会“偏好什么行为”：
+    - 更快接近目标
+    - 不要撞禁飞区
+    - 不要动作抖动太大
+    """
+
     progress_weight: float = 1.0
     goal_reward: float = 500.0
     zone_penalty_weight: float = 2.5
@@ -36,6 +59,15 @@ class RewardConfig:
 
 @dataclass(slots=True)
 class TrainingConfig:
+    """Model and optimizer settings.
+
+    这一组参数主要影响训练过程：
+    - 学习率
+    - batch size
+    - TD3 噪声参数
+    - SNN 时间窗口 T
+    """
+
     seed: int = 7
     actor_lr: float = 1e-3
     critic_lr: float = 1e-3
@@ -56,6 +88,12 @@ class TrainingConfig:
 
 @dataclass(slots=True)
 class ExperimentConfig:
+    """Top-level config container.
+
+    这个对象会把环境配置、奖励配置、训练配置统一打包，
+    方便在脚本里一次性传来传去。
+    """
+
     scenario: ScenarioConfig = field(default_factory=ScenarioConfig)
     rewards: RewardConfig = field(default_factory=RewardConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -63,6 +101,8 @@ class ExperimentConfig:
     data_dir: Path = Path('data')
 
     def to_dict(self) -> dict:
+        """Convert config to a plain dict so it can be saved into checkpoints/JSON."""
+
         payload = asdict(self)
         payload['output_dir'] = str(self.output_dir)
         payload['data_dir'] = str(self.data_dir)

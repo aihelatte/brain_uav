@@ -1,4 +1,10 @@
-﻿from __future__ import annotations
+﻿"""Predefined benchmark scenarios.
+
+这个文件保存“固定测试场景”，方便你每次都在同样的场景上比较 SNN 和 ANN，
+这样结果才公平。
+"""
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
@@ -6,12 +12,16 @@ from typing import Any
 
 @dataclass(slots=True)
 class NamedScenario:
+    """A benchmark scenario plus its human-readable name and description."""
+
     name: str
     description: str
     scenario: dict[str, Any]
 
 
 def build_benchmark_scenarios() -> list[NamedScenario]:
+    """Return the standard benchmark suite used by evaluation scripts."""
+
     return [
         NamedScenario(
             name='single_detour',

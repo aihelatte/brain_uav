@@ -1,4 +1,11 @@
-﻿from __future__ import annotations
+﻿"""Profile ANN and SNN actor complexity.
+
+这里会同时输出：
+- 普通稠密 MACs
+- SNN 按脉冲活动率折算后的有效 MACs
+"""
+
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
@@ -12,6 +19,8 @@ from ..utils.io import load_checkpoint, save_json
 
 
 def describe_ann(checkpoint: Path) -> tuple[float, float]:
+    """Profile ANN actor with thop."""
+
     cfg = ExperimentConfig()
     env = make_env(cfg, seed=cfg.training.seed)
     obs, _ = env.reset(seed=cfg.training.seed)
@@ -23,6 +32,8 @@ def describe_ann(checkpoint: Path) -> tuple[float, float]:
 
 
 def describe_snn(checkpoint: Path, sample_count: int = 32) -> tuple[float, float, float, float, float, str]:
+    """Profile SNN actor and estimate event-driven effective MACs."""
+
     cfg = ExperimentConfig()
     env = make_env(cfg, seed=cfg.training.seed)
     obs, _ = env.reset(seed=cfg.training.seed)

@@ -1,3 +1,5 @@
+﻿"""Small tests for environment API contract."""
+
 import unittest
 
 import numpy as np
@@ -7,6 +9,8 @@ from brain_uav.envs import StaticNoFlyTrajectoryEnv
 
 
 class TestStaticNoFlyEnv(unittest.TestCase):
+    """Ensure reset/step follow the expected interface."""
+
     def setUp(self) -> None:
         self.env = StaticNoFlyTrajectoryEnv(ScenarioConfig(), RewardConfig(), seed=7)
 
@@ -27,4 +31,3 @@ class TestStaticNoFlyEnv(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

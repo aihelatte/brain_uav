@@ -1,4 +1,6 @@
-﻿from __future__ import annotations
+﻿"""Light-weight A* baseline on a coarse 3D grid."""
+
+from __future__ import annotations
 
 import heapq
 
@@ -9,6 +11,8 @@ from .common import heading_to_action
 
 
 class AStarPlanner:
+    """Search for a coarse feasible path, then convert the next waypoint to an action."""
+
     def __init__(self, env: StaticNoFlyTrajectoryEnv, grid_size: float = 40.0):
         self.env = env
         self.grid_size = grid_size
@@ -50,6 +54,7 @@ class AStarPlanner:
                     heapq.heappush(frontier, (new_cost + self._heuristic(nxt, goal), nxt))
                     came_from[nxt] = current
         if goal not in came_from:
+            # 如果搜索失败，就退回“直接朝目标飞”。
             return self.env.goal
         path = [goal]
         while came_from[path[-1]] is not None:

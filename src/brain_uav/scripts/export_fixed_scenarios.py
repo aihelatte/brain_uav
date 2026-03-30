@@ -1,3 +1,8 @@
+﻿"""Export random fixed scenarios to a JSON file.
+
+这个脚本适合你想保存一批随机测试场景，后面重复使用时运行。
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -39,4 +44,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

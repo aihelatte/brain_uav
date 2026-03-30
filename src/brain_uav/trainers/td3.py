@@ -1,12 +1,17 @@
-﻿from __future__ import annotations
+﻿"""TD3 trainer.
 
-import json
-import math
+这是强化学习的主循环。
+你可以把它理解成：
+- Actor 负责出动作
+- 两个 Critic 负责打分
+- 回放缓存负责反复学习过去经验
+"""
+
+from __future__ import annotations
+
 import statistics
-import time
 from copy import deepcopy
 from dataclasses import dataclass, field
-from pathlib import Path
 
 import numpy as np
 import torch
@@ -18,6 +23,8 @@ from .replay_buffer import ReplayBuffer
 
 @dataclass(slots=True)
 class TD3Metrics:
+    """Training summary saved after TD3 finishes."""
+
     actor_loss: float = 0.0
     critic_loss: float = 0.0
     steps: int = 0
@@ -41,6 +48,8 @@ class TD3Metrics:
 
 
 class TD3Trainer:
+    """Twin Delayed DDPG trainer for continuous control."""
+
     def __init__(
         self,
         env,
@@ -86,13 +95,21 @@ class TD3Trainer:
         self.action_low = torch.tensor(env.action_space.low, dtype=torch.float32, device=device)
         self.action_high = torch.tensor(env.action_space.high, dtype=torch.float32, device=device)
 
-    def train(self, total_timesteps: int) -> TD3Metrics:
+    def train(self, total_timesteps: int, log_interval: int = 500, verbose: bool = True) -> TD3Metrics:
+        """Run the whole TD3 training loop."""
+
         obs, _ = self.env.reset()
         episode_return = 0.0
         episode_length = 0
-        for _ in range(total_timesteps):
+        if verbose:
+            print(
+                f"[TD3] start total_timesteps={total_timesteps} warmup_steps={self.warmup_steps} "
+                f"batch_size={self.batch_size} replay_size={self.replay.buffer.maxlen}"
+            )
+        for step_idx in range(total_timesteps):
             self.total_steps += 1
             if self.total_steps <= self.warmup_steps:
+                # 训练初期先随机探索，帮 replay buffer 攒够多样经验。
                 action = self.env.action_space.sample()
             else:
                 action = self.select_action(obs, with_noise=True)
@@ -110,9 +127,21 @@ class TD3Trainer:
                 self.metrics.episode_lengths.append(int(episode_length))
                 outcome = info.get('outcome', 'unknown')
                 self.metrics.outcomes[outcome] = self.metrics.outcomes.get(outcome, 0) + 1
+                if verbose:
+                    print(
+                        f"[TD3] episode={self.metrics.episodes} step={self.total_steps}/{total_timesteps} "
+                        f"return={episode_return:.2f} length={episode_length} outcome={outcome}"
+                    )
                 obs, _ = self.env.reset()
                 episode_return = 0.0
                 episode_length = 0
+            if verbose and ((step_idx + 1) % log_interval == 0 or (step_idx + 1) == total_timesteps):
+                avg_return = statistics.mean(self.metrics.episode_returns[-5:]) if self.metrics.episode_returns else 0.0
+                print(
+                    f"[TD3] progress={step_idx + 1}/{total_timesteps} episodes={self.metrics.episodes} "
+                    f"buffer={len(self.replay)} actor_loss={self.metrics.actor_loss:.4f} "
+                    f"critic_loss={self.metrics.critic_loss:.4f} recent_avg_return={avg_return:.2f}"
+                )
         self.metrics.steps = self.total_steps
         self.actor.to('cpu')
         self.critic1.to('cpu')
@@ -120,6 +149,8 @@ class TD3Trainer:
         return self.metrics
 
     def select_action(self, obs: np.ndarray, with_noise: bool = False) -> np.ndarray:
+        """Run actor inference and optionally add exploration noise."""
+
         obs_tensor = torch.tensor(obs[None, :], dtype=torch.float32, device=self.device)
         with torch.no_grad():
             action = self.actor(obs_tensor).cpu().numpy()[0]
@@ -128,6 +159,8 @@ class TD3Trainer:
         return np.clip(action, self.env.action_space.low, self.env.action_space.high).astype(np.float32)
 
     def _update(self) -> None:
+        """One TD3 gradient update."""
+
         batch = self.replay.sample(self.batch_size)
         obs = batch['obs'].to(self.device)
         actions = batch['action'].to(self.device)
@@ -162,5 +195,7 @@ class TD3Trainer:
             self.metrics.actor_loss = float(actor_loss.item())
 
     def _soft_update(self, model: nn.Module, target: nn.Module) -> None:
+        """Move target parameters slightly toward online parameters."""
+
         for param, target_param in zip(model.parameters(), target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)

@@ -1,3 +1,10 @@
+﻿"""Simple hand-crafted baseline.
+
+思路很直接：
+- 先朝目标飞
+- 如果靠近禁飞区，就加入一个排斥方向
+"""
+
 from __future__ import annotations
 
 import numpy as np
@@ -7,6 +14,8 @@ from .common import heading_to_action
 
 
 class HeuristicPlanner:
+    """Rule-based planner used for generating easy demonstration trajectories."""
+
     def __init__(self, env: StaticNoFlyTrajectoryEnv) -> None:
         self.env = env
 
@@ -20,6 +29,7 @@ class HeuristicPlanner:
             distance = max(float(np.linalg.norm(vector)), 1e-6)
             influence = zone.radius + self.env.scenario.warning_distance + 40.0
             if distance < influence:
+                # 越靠近禁飞区，排斥效果越强。
                 repulsion += vector / distance * (influence - distance) * 3.0
         limits = np.array(
             [self.env.scenario.delta_gamma_max, self.env.scenario.delta_psi_max], dtype=np.float32
@@ -27,6 +37,8 @@ class HeuristicPlanner:
         return heading_to_action(self.env.state[3], self.env.state[4], direction + repulsion, limits)
 
     def rollout(self, max_steps: int | None = None) -> list[tuple[np.ndarray, np.ndarray]]:
+        """Roll out one full trajectory and return (state, action) pairs."""
+
         obs, _ = self.env.reset()
         steps = max_steps or self.env.scenario.max_steps
         samples: list[tuple[np.ndarray, np.ndarray]] = []
@@ -37,4 +49,3 @@ class HeuristicPlanner:
             if terminated or truncated:
                 break
         return samples
-

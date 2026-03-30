@@ -1,12 +1,12 @@
-﻿from __future__ import annotations
+﻿"""Plot the main summary chart from a finished experiment run."""
+
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
-import matplotlib.pyplot as plt
-
-from ..utils.io import save_json
 import json
+import matplotlib.pyplot as plt
 
 
 def main() -> None:

@@ -1,3 +1,5 @@
+﻿"""Replay buffer used by TD3."""
+
 from __future__ import annotations
 
 from collections import deque
@@ -9,6 +11,8 @@ import torch
 
 @dataclass(slots=True)
 class Transition:
+    """One RL transition."""
+
     obs: np.ndarray
     action: np.ndarray
     reward: float
@@ -17,6 +21,8 @@ class Transition:
 
 
 class ReplayBuffer:
+    """Store transitions and sample random mini-batches for off-policy learning."""
+
     def __init__(self, capacity: int) -> None:
         self.buffer: deque[Transition] = deque(maxlen=capacity)
 
@@ -36,4 +42,3 @@ class ReplayBuffer:
             "next_obs": torch.tensor(np.stack([item.next_obs for item in batch]), dtype=torch.float32),
             "done": torch.tensor([[item.done] for item in batch], dtype=torch.float32),
         }
-

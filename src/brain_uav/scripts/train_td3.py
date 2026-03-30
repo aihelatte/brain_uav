@@ -1,4 +1,6 @@
-﻿from __future__ import annotations
+﻿"""Train the TD3 policy after behavior cloning initialization."""
+
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
@@ -26,6 +28,7 @@ def main() -> None:
     obs, _ = env.reset(seed=args.seed)
     actor = make_actor(cfg, args.model, obs.shape[0], env.action_space.shape[0])
     if args.bc_checkpoint:
+        # TD3 从 BC 的结果出发，而不是从纯随机权重开始。
         actor.load_state_dict(load_checkpoint(args.bc_checkpoint)['state_dict'])
     critic1, critic2 = make_critics(cfg, obs.shape[0], env.action_space.shape[0])
     trainer = TD3Trainer(

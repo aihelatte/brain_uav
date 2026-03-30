@@ -1,4 +1,6 @@
-﻿from __future__ import annotations
+﻿"""Evaluate a trained checkpoint on either random or benchmark scenarios."""
+
+from __future__ import annotations
 
 import argparse
 import statistics
@@ -15,6 +17,8 @@ from ..utils.seeding import set_global_seed
 
 
 def evaluate_policy(checkpoint: Path, model: str, episodes: int, seed: int, scenario_suite: str) -> dict:
+    """Run evaluation and return a rich result dict."""
+
     cfg = ExperimentConfig()
     set_global_seed(seed)
     env = make_env(cfg, seed=seed, scenario_suite=scenario_suite if scenario_suite == 'benchmark' else None)

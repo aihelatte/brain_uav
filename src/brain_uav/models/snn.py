@@ -1,4 +1,9 @@
-﻿from __future__ import annotations
+﻿"""Spiking neural network actor.
+
+优先使用 SpikingJelly；如果环境里没有这个库，就回退到一个简化版 LIF 实现。
+"""
+
+from __future__ import annotations
 
 import torch
 from torch import nn
@@ -14,6 +19,8 @@ except ImportError:
 
 
 class FallbackLIFLayer(nn.Module):
+    """A tiny differentiable LIF approximation used only as fallback."""
+
     def __init__(self, decay: float = 0.5, threshold: float = 1.0) -> None:
         super().__init__()
         self.decay = decay
@@ -27,6 +34,7 @@ class FallbackLIFLayer(nn.Module):
             membrane = self.decay * membrane + current
             spikes = torch.sigmoid(5.0 * (membrane - self.threshold))
             hard = (membrane >= self.threshold).to(membrane.dtype)
+            # 这里用 straight-through 的方式，让前向是硬脉冲，反向仍可求梯度。
             spikes = spikes + (hard - spikes).detach()
             membrane = membrane * (1.0 - hard)
             spike_sum += hard
@@ -35,6 +43,8 @@ class FallbackLIFLayer(nn.Module):
 
 
 class SNNPolicyActor(nn.Module):
+    """Actor network for the proposed SNN-based method."""
+
     def __init__(
         self,
         state_dim: int,
@@ -64,6 +74,14 @@ class SNNPolicyActor(nn.Module):
         return action
 
     def forward_with_diagnostics(self, obs: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
+        """Forward pass plus some extra statistics for profiling.
+
+        这些统计包括：
+        - 每层平均脉冲发放率
+        - 稠密 MACs 估计
+        - 根据脉冲活动率折算后的有效 MACs
+        """
+
         if HAS_SPIKINGJELLY:
             functional.reset_net(self)
             encoded = self.fc1(obs)
@@ -71,6 +89,7 @@ class SNNPolicyActor(nn.Module):
             for _ in range(self.time_window):
                 spike_trace_1.append(self.lif1(encoded))
             spikes1 = torch.stack(spike_trace_1, dim=0).mean(0)
+
             hidden = self.fc2(spikes1)
             spike_trace_2 = []
             mem_trace_2 = []
@@ -90,6 +109,7 @@ class SNNPolicyActor(nn.Module):
             hidden = self.fc2(spikes1)
             spikes2, membrane, spike_sum2 = self.lif2(hidden, self.time_window)
             out = self.fc3(0.5 * (spikes2 + membrane))
+
         action = torch.tanh(out) * self.action_limit
         diagnostics = {
             'backend': 'spikingjelly' if HAS_SPIKINGJELLY else 'fallback',

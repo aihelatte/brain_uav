@@ -1,3 +1,5 @@
+﻿"""Small tests for baseline planner outputs."""
+
 import unittest
 
 from brain_uav.baselines import AStarPlanner, ArtificialPotentialFieldPlanner, HeuristicPlanner
@@ -6,6 +8,8 @@ from brain_uav.envs import StaticNoFlyTrajectoryEnv
 
 
 class TestBaselines(unittest.TestCase):
+    """Baseline planners should all produce a 2D action."""
+
     def setUp(self) -> None:
         self.env = StaticNoFlyTrajectoryEnv(ScenarioConfig(), RewardConfig(), seed=11)
         self.obs, _ = self.env.reset(seed=11)
@@ -22,4 +26,3 @@ class TestBaselines(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

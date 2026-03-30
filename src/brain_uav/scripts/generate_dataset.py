@@ -1,4 +1,12 @@
-﻿from __future__ import annotations
+﻿"""Generate behavior cloning dataset from baseline planners.
+
+运行这个脚本后，会在 `data/` 目录下生成 `.npz` 数据集：
+- observations: 状态
+- actions: 基线动作
+- planner_tags: 这条样本来自哪种基线
+"""
+
+from __future__ import annotations
 
 import argparse
 from pathlib import Path

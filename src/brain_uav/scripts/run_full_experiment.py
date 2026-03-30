@@ -1,28 +1,36 @@
-﻿from __future__ import annotations
+﻿"""Run the full experiment pipeline end to end.
+
+如果你什么都不想分步操作，直接跑这个脚本就行。
+它会依次完成：
+1. 生成 BC 数据集
+2. 训练 BC 初始化模型
+3. 训练 TD3 主模型
+4. 做 benchmark 评估
+5. 汇总 profile 和最终指标
+"""
+
+from __future__ import annotations
 
 import argparse
 from pathlib import Path
 
+import numpy as np
+
+from ..baselines import AStarPlanner, ArtificialPotentialFieldPlanner, HeuristicPlanner
 from ..config import ExperimentConfig
+from ..envs import StaticNoFlyTrajectoryEnv
 from ..scenarios import build_benchmark_scenarios
+from ..scripts.common import make_actor, make_critics, make_env
 from ..scripts.evaluate import evaluate_policy
-from ..scripts.generate_dataset import main as _unused
-from ..scripts.common import make_actor
-from ..scripts.profile_models import main as _unused2
-from ..scripts.train_bc import main as _unused3
-from ..scripts.train_td3 import main as _unused4
+from ..scripts.profile_models import describe_ann, describe_snn
+from ..trainers import TD3Trainer, train_behavior_cloning
 from ..utils.io import load_checkpoint, save_checkpoint, save_json
 from ..utils.seeding import set_global_seed
-from ..trainers import train_behavior_cloning
-from ..scripts.common import make_actor, make_critics, make_env
-from ..trainers import TD3Trainer
-from .profile_models import describe_ann, describe_snn
-import numpy as np
-from ..baselines import AStarPlanner, ArtificialPotentialFieldPlanner, HeuristicPlanner
-from ..envs import StaticNoFlyTrajectoryEnv
 
 
 def generate_dataset(dataset_path: Path, episodes: int, seed: int) -> dict:
+    """Generate one BC dataset inside the full pipeline."""
+
     cfg = ExperimentConfig()
     set_global_seed(seed)
     env = StaticNoFlyTrajectoryEnv(cfg.scenario, cfg.rewards, seed=seed)
@@ -30,12 +38,14 @@ def generate_dataset(dataset_path: Path, episodes: int, seed: int) -> dict:
     observations = []
     actions = []
     planner_tags = []
+    print(f"[Stage 1/5] Generating BC dataset -> {dataset_path}")
     for episode in range(episodes):
         planner = planners[episode % len(planners)]
         rollout = planner.rollout()
         observations.extend(obs for obs, _ in rollout)
         actions.extend(action for _, action in rollout)
         planner_tags.extend([planner.__class__.__name__] * len(rollout))
+        print(f"[Dataset] episode {episode + 1}/{episodes} planner={planner.__class__.__name__} samples={len(observations)}")
     dataset_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         dataset_path,
@@ -47,20 +57,33 @@ def generate_dataset(dataset_path: Path, episodes: int, seed: int) -> dict:
 
 
 def train_bc_model(model: str, dataset: Path, epochs: int, output_dir: Path) -> tuple[Path, dict]:
+    """Train and save one BC initialization model."""
+
+    print(f"[Stage 2/5] Training BC model={model}")
     cfg = ExperimentConfig()
     data = np.load(dataset)
     actor = make_actor(cfg, model, data['observations'].shape[1], data['actions'].shape[1])
     history = train_behavior_cloning(
-        actor, dataset, epochs=epochs, batch_size=cfg.training.batch_size, lr=cfg.training.actor_lr, device=cfg.training.device
+        actor,
+        dataset,
+        epochs=epochs,
+        batch_size=cfg.training.batch_size,
+        lr=cfg.training.actor_lr,
+        device=cfg.training.device,
+        verbose=True,
     )
     ckpt = output_dir / f'bc_{model}.pt'
     save_checkpoint(ckpt, {'model_type': model, 'state_dict': actor.state_dict(), 'loss_history': history, 'config': cfg.to_dict()})
     metrics = {'model': model, 'final_loss': history[-1], 'loss_history': history}
     save_json(output_dir / f'bc_{model}_metrics.json', metrics)
+    print(f"[BC] saved checkpoint={ckpt}")
     return ckpt, metrics
 
 
 def train_td3_model(model: str, bc_checkpoint: Path, timesteps: int, seed: int, output_dir: Path) -> tuple[Path, dict]:
+    """Train and save one TD3 model."""
+
+    print(f"[Stage 3/5] Training TD3 model={model}")
     cfg = ExperimentConfig()
     set_global_seed(seed)
     env = make_env(cfg, seed=seed)
@@ -86,10 +109,11 @@ def train_td3_model(model: str, bc_checkpoint: Path, timesteps: int, seed: int, 
         exploration_noise=cfg.training.exploration_noise,
         device=cfg.training.device,
     )
-    metrics = trainer.train(timesteps).to_dict()
+    metrics = trainer.train(timesteps, log_interval=max(100, timesteps // 10), verbose=True).to_dict()
     ckpt = output_dir / f'td3_{model}.pt'
     save_checkpoint(ckpt, {'model_type': model, 'state_dict': actor.state_dict(), 'metrics': metrics, 'config': cfg.to_dict()})
     save_json(output_dir / f'td3_{model}_metrics.json', metrics)
+    print(f"[TD3] saved checkpoint={ckpt}")
     return ckpt, metrics
 
 
@@ -107,14 +131,18 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_path = Path('data') / 'bc_dataset_full.npz'
 
+    print('[Run] Full experiment started')
     dataset_info = generate_dataset(dataset_path, args.dataset_episodes, args.seed)
     bc_snn_ckpt, bc_snn = train_bc_model('snn', dataset_path, args.bc_epochs, output_dir)
     bc_ann_ckpt, bc_ann = train_bc_model('ann', dataset_path, args.bc_epochs, output_dir)
     td3_snn_ckpt, td3_snn = train_td3_model('snn', bc_snn_ckpt, args.td3_timesteps, args.seed, output_dir)
     td3_ann_ckpt, td3_ann = train_td3_model('ann', bc_ann_ckpt, args.td3_timesteps, args.seed, output_dir)
 
+    print('[Stage 4/5] Evaluating trained models on benchmark scenarios')
     eval_snn = evaluate_policy(td3_snn_ckpt, 'snn', args.eval_episodes, args.seed, 'benchmark')
     eval_ann = evaluate_policy(td3_ann_ckpt, 'ann', args.eval_episodes, args.seed, 'benchmark')
+
+    print('[Stage 5/5] Profiling model complexity and writing summary')
     snn_dense_macs, snn_params, snn_effective_macs, spike_rate_l1, spike_rate_l2, backend = describe_snn(td3_snn_ckpt)
     ann_macs, ann_params = describe_ann(td3_ann_ckpt)
 
@@ -141,6 +169,7 @@ def main() -> None:
         },
     }
     save_json(output_dir / 'summary.json', summary)
+    print(f"[Run] Summary written to {output_dir / 'summary.json'}")
     print(summary)
 
 

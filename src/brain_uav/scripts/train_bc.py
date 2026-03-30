@@ -1,4 +1,6 @@
-﻿from __future__ import annotations
+﻿"""Train the behavior cloning initialization model."""
+
+from __future__ import annotations
 
 import argparse
 from pathlib import Path

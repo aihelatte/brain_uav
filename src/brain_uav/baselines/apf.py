@@ -1,4 +1,6 @@
-﻿from __future__ import annotations
+﻿"""Artificial potential field baseline."""
+
+from __future__ import annotations
 
 import numpy as np
 
@@ -7,6 +9,8 @@ from .common import heading_to_action
 
 
 class ArtificialPotentialFieldPlanner:
+    """Use attraction to goal and repulsion from no-fly zones."""
+
     def __init__(self, env: StaticNoFlyTrajectoryEnv, attractive_gain: float = 1.0, repulsive_gain: float = 5000.0):
         self.env = env
         self.attractive_gain = attractive_gain
@@ -21,6 +25,7 @@ class ArtificialPotentialFieldPlanner:
             distance = max(float(np.linalg.norm(delta)), 1e-6)
             threshold = zone.radius + self.env.scenario.warning_distance + 60.0
             if distance < threshold:
+                # APF 的核心：进入作用范围后，障碍物会产生斥力。
                 strength = self.repulsive_gain * ((1.0 / distance) - (1.0 / threshold)) / (distance**2)
                 force += strength * (delta / distance)
         limits = np.array(

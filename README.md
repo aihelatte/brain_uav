@@ -17,7 +17,23 @@ python -m brain_uav.scripts.run_full_experiment --dataset-episodes 64 --bc-epoch
 python -m brain_uav.scripts.plot_results --summary outputs\full_run\summary.json
 ```
 
-运行结束后，重点看这些文件：
+## 训练时你会看到什么
+
+在 VS Code 终端里，运行时会按阶段打印进度：
+
+- `[Stage 1/5]`：正在生成 BC 数据集
+- `[BC] epoch x/y`：行为克隆预训练的 epoch 进度和 loss
+- `[Stage 3/5]`：开始 TD3 训练
+- `[TD3] episode=...`：每个 episode 结束时的回报、长度、结局
+- `[TD3] progress=...`：每隔一段步数打印一次总体训练进度、buffer 大小、actor/critic loss、最近平均回报
+- `[Stage 4/5]`：开始 benchmark 评估
+- `[Stage 5/5]`：开始 MACs/参数量统计并写 summary
+
+所以你训练时不用担心“程序卡住了”，只要终端还在刷新这些信息，训练就是正常在跑。
+
+## 运行结束后看哪里
+
+重点看这些文件：
 
 - `outputs/full_run/summary.json`：完整实验汇总
 - `outputs/full_run/bc_snn_metrics.json`、`outputs/full_run/bc_ann_metrics.json`
