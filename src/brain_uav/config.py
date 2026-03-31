@@ -44,17 +44,20 @@ class RewardConfig:
 
     这组参数控制策略会“偏好什么行为”：
     - 更快接近目标
+    - 更愿意冲向终点
     - 不要撞禁飞区
+    - 不要用 timeout 的方式苟活
     - 不要动作抖动太大
     """
 
-    progress_weight: float = 1.0
-    goal_reward: float = 500.0
+    progress_weight: float = 2.0
+    goal_reward: float = 1200.0
     zone_penalty_weight: float = 2.5
     collision_penalty: float = 1000.0
-    step_penalty: float = 1.0
+    step_penalty: float = 2.0
     smoothness_weight: float = 2.0
     boundary_penalty: float = 800.0
+    timeout_penalty: float = 300.0
 
 
 @dataclass(slots=True)
@@ -67,8 +70,8 @@ class TrainingConfig:
     - TD3 噪声参数
     - SNN 时间窗口 T
 
-    这里的 TD3 噪声已经按当前动作空间量级调小，避免无人机在训练早期
-    因探索抖动过大而疯狂撞地/越界，破坏 BC 初始化。
+    这里把探索噪声从极小值稍微放大一点，让策略在不严重破坏 BC 底子的前提下，
+    有机会跳出“保守耗时直到 timeout”的局部最优。
     """
 
     seed: int = 7
@@ -77,10 +80,10 @@ class TrainingConfig:
     batch_size: int = 64
     gamma: float = 0.99
     tau: float = 0.005
-    policy_noise: float = 0.01
-    noise_clip: float = 0.02
+    policy_noise: float = 0.015
+    noise_clip: float = 0.03
     policy_delay: int = 2
-    exploration_noise: float = 0.01
+    exploration_noise: float = 0.02
     replay_size: int = 100_000
     warmup_steps: int = 256
     bc_epochs: int = 10

@@ -50,10 +50,6 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self._fixed_idx = 0
         self.rng = np.random.default_rng(seed)
 
-        # 观测由三部分组成：
-        # 1. 飞行器自身状态
-        # 2. 相对目标位置
-        # 3. 最近若干禁飞区的相对信息
         obs_dim = 5 + 3 + 3 * self.scenario.nearest_zone_count
         self.action_space = spaces.Box(
             low=np.array(
@@ -78,18 +74,9 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.trajectory: list[np.ndarray] = []
 
     def seed(self, seed: int | None = None) -> None:
-        """Reset the random generator."""
-
         self.rng = np.random.default_rng(seed)
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
-        """Start a new episode.
-
-        可选地接收：
-        - 固定随机种子
-        - 外部指定场景
-        """
-
         if seed is not None:
             self.seed(seed)
         if options and "scenario" in options:
@@ -105,8 +92,6 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         return self._get_obs(), self._info(progress=0.0)
 
     def step(self, action: np.ndarray):
-        """Advance one control step and return Gymnasium-style outputs."""
-
         action = np.asarray(action, dtype=np.float32).clip(self.action_space.low, self.action_space.high)
         prev_distance = self._goal_distance(self.state[:3])
         self._apply_action(action)
@@ -121,8 +106,6 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         )
 
     def render(self):
-        """Draw the 3D trajectory and hemisphere zones."""
-
         import matplotlib.pyplot as plt
 
         fig = plt.figure(figsize=(6, 5))
@@ -140,8 +123,6 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         return fig
 
     def export_scenario(self) -> dict[str, Any]:
-        """Export current scenario into a JSON-friendly dict."""
-
         return {
             "state": self.state.copy(),
             "goal": self.goal.copy(),
@@ -151,8 +132,6 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         }
 
     def _sample_scenario(self) -> None:
-        """Randomly generate one training scenario."""
-
         cfg = self.scenario
         self.state = np.array(
             [
@@ -189,8 +168,6 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             )
 
     def _load_scenario(self, payload: dict[str, Any]) -> None:
-        """Load a fixed externally supplied scenario."""
-
         self.state = np.asarray(payload["state"], dtype=np.float32).copy()
         self.goal = np.asarray(payload["goal"], dtype=np.float32).copy()
         self.zones = [
@@ -199,8 +176,6 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         ]
 
     def _apply_action(self, action: np.ndarray) -> None:
-        """Update kinematic state using the discrete motion equations."""
-
         x, y, z, gamma, psi = self.state
         cfg = self.scenario
         gamma = float(np.clip(gamma + action[0], -cfg.gamma_max, cfg.gamma_max))
@@ -211,8 +186,6 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.state = np.array([x, y, z, gamma, psi], dtype=np.float32)
 
     def _get_obs(self) -> np.ndarray:
-        """Pack the observation vector fed into the policy network."""
-
         own_state = self.state
         rel_goal = self.goal - self.state[:3]
         zone_features: list[float] = []
@@ -227,8 +200,6 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         ).astype(np.float32)
 
     def _termination(self) -> tuple[bool, bool, str]:
-        """Check whether the episode has reached a terminal condition."""
-
         cfg = self.scenario
         pos = self.state[:3]
         if self._goal_distance(pos) <= cfg.goal_radius:
@@ -244,8 +215,6 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         return False, False, "running"
 
     def _compute_reward(self, prev_distance: float, new_distance: float, action: np.ndarray, outcome: str) -> float:
-        """Compute dense reward plus terminal penalties/rewards."""
-
         rew = self.rewards.progress_weight * (prev_distance - new_distance)
         rew -= self.rewards.step_penalty
         rew -= self.rewards.smoothness_weight * float(np.square(action).sum())
@@ -256,11 +225,11 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             rew -= self.rewards.collision_penalty
         elif outcome == "boundary":
             rew -= self.rewards.boundary_penalty
+        elif outcome == "timeout":
+            rew -= self.rewards.timeout_penalty
         return rew
 
     def _zone_warning_penalty(self, pos: np.ndarray) -> float:
-        """Soft penalty used to discourage flying too close to zone boundaries."""
-
         penalty = 0.0
         for zone in self.zones:
             center_distance = float(
@@ -274,8 +243,6 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
 
     @staticmethod
     def _inside_zone(pos: np.ndarray, zone: Zone) -> bool:
-        """Check whether the UAV is inside the hemisphere volume."""
-
         distance = (pos[0] - zone.center_xy[0]) ** 2 + (pos[1] - zone.center_xy[1]) ** 2 + pos[2] ** 2
         return bool(distance <= zone.radius**2)
 
@@ -284,8 +251,6 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         return ((value + math.pi) % (2 * math.pi)) - math.pi
 
     def _info(self, *, progress: float, outcome: str = "running") -> dict[str, Any]:
-        """Extra diagnostic info returned by the environment."""
-
         return {
             "goal_distance": self._goal_distance(self.state[:3]),
             "progress": progress,
