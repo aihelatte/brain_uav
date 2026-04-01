@@ -154,18 +154,32 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.zones = []
         zone_count = int(self.rng.integers(cfg.min_no_fly_zones, cfg.max_no_fly_zones + 1))
         for _ in range(zone_count):
-            self.zones.append(
-                Zone(
-                    center_xy=np.array(
-                        [
-                            self.rng.uniform(-0.2 * cfg.world_xy, 0.5 * cfg.world_xy),
-                            self.rng.uniform(-0.5 * cfg.world_xy, 0.5 * cfg.world_xy),
-                        ],
-                        dtype=np.float32,
-                    ),
-                    radius=float(self.rng.uniform(*cfg.no_fly_radius_range)),
+            for _attempt in range(50):
+                center_xy = np.array(
+                    [
+                        self.rng.uniform(-0.2 * cfg.world_xy, 0.5 * cfg.world_xy),
+                        self.rng.uniform(-0.5 * cfg.world_xy, 0.5 * cfg.world_xy),
+                    ],
+                    dtype=np.float32,
                 )
-            )
+                radius = float(self.rng.uniform(*cfg.no_fly_radius_range))
+                dist_to_goal = float(
+                    np.linalg.norm(
+                        np.array(
+                            [
+                                self.goal[0] - center_xy[0],
+                                self.goal[1] - center_xy[1],
+                                self.goal[2],
+                            ],
+                            dtype=np.float32,
+                        )
+                    )
+                )
+                # 保证目标判定球和禁飞区警戒区之间留出少量净空，避免“到达目标却仍被软惩罚”。
+                safe_margin = radius + cfg.warning_distance + cfg.goal_radius + 10.0
+                if dist_to_goal > safe_margin:
+                    self.zones.append(Zone(center_xy=center_xy, radius=radius))
+                    break
 
     def _load_scenario(self, payload: dict[str, Any]) -> None:
         self.state = np.asarray(payload["state"], dtype=np.float32).copy()
@@ -281,3 +295,4 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             "outcome": outcome,
             "steps": self.steps,
         }
+
