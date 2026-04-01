@@ -23,8 +23,6 @@ from .replay_buffer import ReplayBuffer
 
 @dataclass(slots=True)
 class TD3Metrics:
-    """Training summary saved after TD3 finishes."""
-
     actor_loss: float = 0.0
     critic_loss: float = 0.0
     steps: int = 0
@@ -32,6 +30,7 @@ class TD3Metrics:
     episode_returns: list[float] = field(default_factory=list)
     episode_lengths: list[int] = field(default_factory=list)
     outcomes: dict[str, int] = field(default_factory=dict)
+    episode_window_stats: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -42,14 +41,13 @@ class TD3Metrics:
             'episode_returns': self.episode_returns,
             'episode_lengths': self.episode_lengths,
             'outcomes': self.outcomes,
+            'episode_window_stats': self.episode_window_stats,
             'avg_return': statistics.mean(self.episode_returns) if self.episode_returns else 0.0,
             'avg_length': statistics.mean(self.episode_lengths) if self.episode_lengths else 0.0,
         }
 
 
 class TD3Trainer:
-    """Twin Delayed DDPG trainer for continuous control."""
-
     def __init__(
         self,
         env,
@@ -96,10 +94,15 @@ class TD3Trainer:
         self.metrics = TD3Metrics()
         self.action_low = torch.tensor(env.action_space.low, dtype=torch.float32, device=device)
         self.action_high = torch.tensor(env.action_space.high, dtype=torch.float32, device=device)
+        self._current_window: list[dict] = []
 
-    def train(self, total_timesteps: int, log_interval: int = 500, verbose: bool = True) -> TD3Metrics:
-        """Run the whole TD3 training loop."""
-
+    def train(
+        self,
+        total_timesteps: int,
+        log_interval: int = 500,
+        verbose: bool = True,
+        summary_every_episodes: int = 50,
+    ) -> TD3Metrics:
         obs, _ = self.env.reset()
         episode_return = 0.0
         episode_length = 0
@@ -107,18 +110,18 @@ class TD3Trainer:
             print(
                 f"[TD3] start total_timesteps={total_timesteps} warmup_steps={self.warmup_steps} "
                 f"batch_size={self.batch_size} replay_size={self.replay.buffer.maxlen} "
-                f"warmup_strategy={self.warmup_strategy}"
+                f"warmup_strategy={self.warmup_strategy} summary_every_episodes={summary_every_episodes}"
             )
         for step_idx in range(total_timesteps):
             self.total_steps += 1
             if self.total_steps <= self.warmup_steps:
-                # 有 BC 预训练时，默认不要再用纯随机动作污染前期经验。
                 action = self._warmup_action(obs)
             else:
                 action = self.select_action(obs, with_noise=True)
             next_obs, reward, terminated, truncated, info = self.env.step(action)
             done = terminated or truncated
-            self.replay.add(obs, action, reward, next_obs, done)
+            # 注意：只把 terminated 当成 TD target 的“真实结束”掩码。
+            self.replay.add(obs, action, reward, next_obs, terminated)
             episode_return += reward
             episode_length += 1
             obs = next_obs
@@ -130,6 +133,18 @@ class TD3Trainer:
                 self.metrics.episode_lengths.append(int(episode_length))
                 outcome = info.get('outcome', 'unknown')
                 self.metrics.outcomes[outcome] = self.metrics.outcomes.get(outcome, 0) + 1
+                self._current_window.append(
+                    {
+                        'episode': self.metrics.episodes,
+                        'return': float(episode_return),
+                        'length': int(episode_length),
+                        'outcome': outcome,
+                        'actor_loss': float(self.metrics.actor_loss),
+                        'critic_loss': float(self.metrics.critic_loss),
+                    }
+                )
+                if summary_every_episodes > 0 and len(self._current_window) >= summary_every_episodes:
+                    self._flush_window_stats()
                 if verbose:
                     print(
                         f"[TD3] episode={self.metrics.episodes} step={self.total_steps}/{total_timesteps} "
@@ -145,6 +160,8 @@ class TD3Trainer:
                     f"buffer={len(self.replay)} actor_loss={self.metrics.actor_loss:.4f} "
                     f"critic_loss={self.metrics.critic_loss:.4f} recent_avg_return={avg_return:.2f}"
                 )
+        if self._current_window:
+            self._flush_window_stats()
         self.metrics.steps = self.total_steps
         self.actor.to('cpu')
         self.critic1.to('cpu')
@@ -152,8 +169,6 @@ class TD3Trainer:
         return self.metrics
 
     def select_action(self, obs: np.ndarray, with_noise: bool = False) -> np.ndarray:
-        """Run actor inference and optionally add exploration noise."""
-
         obs_tensor = torch.tensor(obs[None, :], dtype=torch.float32, device=self.device)
         with torch.no_grad():
             action = self.actor(obs_tensor).cpu().numpy()[0]
@@ -162,21 +177,38 @@ class TD3Trainer:
         return np.clip(action, self.env.action_space.low, self.env.action_space.high).astype(np.float32)
 
     def _warmup_action(self, obs: np.ndarray) -> np.ndarray:
-        """Choose initial exploration behavior before normal TD3 updates stabilize.
-
-        random:
-            标准 TD3 做法，适合 actor 从零开始时使用。
-        policy:
-            使用当前 actor + 探索噪声，适合 BC 预训练后的热启动。
-        """
-
         if self.warmup_strategy == 'policy':
             return self.select_action(obs, with_noise=True)
         return self.env.action_space.sample()
 
-    def _update(self) -> None:
-        """One TD3 gradient update."""
+    def _flush_window_stats(self) -> None:
+        """Aggregate recent episodes into one AI-friendly summary block."""
 
+        window = self._current_window
+        outcome_counts: dict[str, int] = {}
+        for item in window:
+            outcome_counts[item['outcome']] = outcome_counts.get(item['outcome'], 0) + 1
+        row = {
+            'episode_start': window[0]['episode'],
+            'episode_end': window[-1]['episode'],
+            'episode_count': len(window),
+            'avg_return': round(statistics.mean(item['return'] for item in window), 6),
+            'avg_length': round(statistics.mean(item['length'] for item in window), 6),
+            'avg_actor_loss': round(statistics.mean(item['actor_loss'] for item in window), 6),
+            'avg_critic_loss': round(statistics.mean(item['critic_loss'] for item in window), 6),
+            'goal_count': outcome_counts.get('goal', 0),
+            'timeout_count': outcome_counts.get('timeout', 0),
+            'boundary_count': outcome_counts.get('boundary', 0),
+            'ground_count': outcome_counts.get('ground', 0),
+            'collision_count': outcome_counts.get('collision', 0),
+            'other_count': sum(
+                v for k, v in outcome_counts.items() if k not in {'goal', 'timeout', 'boundary', 'ground', 'collision'}
+            ),
+        }
+        self.metrics.episode_window_stats.append(row)
+        self._current_window = []
+
+    def _update(self) -> None:
         batch = self.replay.sample(self.batch_size)
         obs = batch['obs'].to(self.device)
         actions = batch['action'].to(self.device)
@@ -211,7 +243,5 @@ class TD3Trainer:
             self.metrics.actor_loss = float(actor_loss.item())
 
     def _soft_update(self, model: nn.Module, target: nn.Module) -> None:
-        """Move target parameters slightly toward online parameters."""
-
         for param, target_param in zip(model.parameters(), target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)

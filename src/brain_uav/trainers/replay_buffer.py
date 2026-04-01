@@ -11,7 +11,14 @@ import torch
 
 @dataclass(slots=True)
 class Transition:
-    """One RL transition."""
+    """One RL transition.
+
+    done 这里专门表示“真实终止”掩码：
+    - goal / collision / ground / boundary -> 1
+    - timeout(truncated) -> 0
+
+    这样 TD3 在 timeout 时仍然可以保留 bootstrap，避免价值被错误清零。
+    """
 
     obs: np.ndarray
     action: np.ndarray

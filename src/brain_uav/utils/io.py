@@ -1,8 +1,10 @@
-﻿"""File helpers for checkpoints and JSON results."""
+﻿"""File helpers for checkpoints and structured result files."""
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
+import csv
 import json
 
 import torch
@@ -40,3 +42,34 @@ def save_json(path: str | Path, payload: dict | list) -> Path:
     target = ensure_parent(path)
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
     return target
+
+
+def save_csv_rows(path: str | Path, rows: list[dict]) -> Path:
+    """Save a list of dict rows as CSV.
+
+    适合把按 episode 分段的统计结果导出成表格，方便 Excel 和 AI 一起读。
+    """
+
+    target = ensure_parent(path)
+    if not rows:
+        target.write_text('', encoding='utf-8')
+        return target
+    fieldnames = list(rows[0].keys())
+    with target.open('w', encoding='utf-8', newline='') as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    return target
+
+
+def now_timestamp() -> str:
+    """Return a compact local timestamp for output file names."""
+
+    return datetime.now().strftime('%Y%m%d_%H%M%S')
+
+
+def with_timestamp_suffix(path: str | Path, timestamp: str) -> Path:
+    """Append a timestamp to a file name before its extension."""
+
+    src = Path(path)
+    return src.with_name(f'{src.stem}_{timestamp}{src.suffix}')

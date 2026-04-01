@@ -28,9 +28,22 @@ from ..utils.io import load_checkpoint, save_checkpoint, save_json
 from ..utils.seeding import set_global_seed
 
 
-def generate_dataset(dataset_path: Path, episodes: int, seed: int) -> dict:
-    """Generate one BC dataset inside the full pipeline."""
+def collect_rollout(planner, env: StaticNoFlyTrajectoryEnv, max_steps: int | None = None):
+    obs, _ = env.reset()
+    steps = max_steps or env.scenario.max_steps
+    samples = []
+    outcome = 'timeout'
+    for _ in range(steps):
+        action = planner.act(obs)
+        samples.append((obs.copy(), action.copy()))
+        obs, _, terminated, truncated, info = env.step(action)
+        if terminated or truncated:
+            outcome = info['outcome']
+            break
+    return samples, outcome
 
+
+def generate_dataset(dataset_path: Path, episodes: int, seed: int) -> dict:
     cfg = ExperimentConfig()
     set_global_seed(seed)
     env = StaticNoFlyTrajectoryEnv(cfg.scenario, cfg.rewards, seed=seed)
@@ -38,14 +51,30 @@ def generate_dataset(dataset_path: Path, episodes: int, seed: int) -> dict:
     observations = []
     actions = []
     planner_tags = []
+    success_count = 0
+    fallback_samples: list[tuple[np.ndarray, np.ndarray, str]] = []
     print(f"[Stage 1/5] Generating BC dataset -> {dataset_path}")
     for episode in range(episodes):
         planner = planners[episode % len(planners)]
-        rollout = planner.rollout()
-        observations.extend(obs for obs, _ in rollout)
-        actions.extend(action for _, action in rollout)
-        planner_tags.extend([planner.__class__.__name__] * len(rollout))
-        print(f"[Dataset] episode {episode + 1}/{episodes} planner={planner.__class__.__name__} samples={len(observations)}")
+        rollout, outcome = collect_rollout(planner, env)
+        if outcome == 'goal':
+            observations.extend(obs for obs, _ in rollout)
+            actions.extend(action for _, action in rollout)
+            planner_tags.extend([planner.__class__.__name__] * len(rollout))
+            success_count += 1
+        elif not fallback_samples:
+            fallback_samples = [(obs, action, planner.__class__.__name__) for obs, action in rollout]
+        print(
+            f"[Dataset] episode {episode + 1}/{episodes} planner={planner.__class__.__name__} "
+            f"outcome={outcome} kept_samples={len(observations)}"
+        )
+    if not observations and fallback_samples:
+        observations = [item[0] for item in fallback_samples]
+        actions = [item[1] for item in fallback_samples]
+        planner_tags = [item[2] for item in fallback_samples]
+        print('[Dataset] warning: no successful trajectories found, using one fallback rollout to avoid empty dataset')
+    if not observations:
+        raise RuntimeError('Dataset generation produced zero samples. Please increase episodes or improve baselines.')
     dataset_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         dataset_path,
@@ -53,12 +82,15 @@ def generate_dataset(dataset_path: Path, episodes: int, seed: int) -> dict:
         actions=np.stack(actions).astype(np.float32),
         planner_tags=np.array(planner_tags),
     )
-    return {'samples': len(observations), 'episodes': episodes, 'dataset': str(dataset_path)}
+    return {
+        'samples': len(observations),
+        'episodes': episodes,
+        'successful_episodes': success_count,
+        'dataset': str(dataset_path),
+    }
 
 
 def train_bc_model(model: str, dataset: Path, epochs: int, output_dir: Path) -> tuple[Path, dict]:
-    """Train and save one BC initialization model."""
-
     print(f"[Stage 2/5] Training BC model={model}")
     cfg = ExperimentConfig()
     data = np.load(dataset)
@@ -81,8 +113,6 @@ def train_bc_model(model: str, dataset: Path, epochs: int, output_dir: Path) -> 
 
 
 def train_td3_model(model: str, bc_checkpoint: Path, timesteps: int, seed: int, output_dir: Path) -> tuple[Path, dict]:
-    """Train and save one TD3 model."""
-
     print(f"[Stage 3/5] Training TD3 model={model}")
     cfg = ExperimentConfig()
     set_global_seed(seed)
