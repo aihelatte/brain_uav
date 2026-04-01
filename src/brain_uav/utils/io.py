@@ -18,6 +18,14 @@ def ensure_parent(path: str | Path) -> Path:
     return target
 
 
+def ensure_dir(path: str | Path) -> Path:
+    """Create a directory if needed and return it as Path."""
+
+    target = Path(path)
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
 def save_checkpoint(path: str | Path, payload: dict) -> Path:
     """Save a PyTorch checkpoint."""
 
@@ -73,3 +81,15 @@ def with_timestamp_suffix(path: str | Path, timestamp: str) -> Path:
 
     src = Path(path)
     return src.with_name(f'{src.stem}_{timestamp}{src.suffix}')
+
+
+def build_timestamped_run_paths(base_output: str | Path, base_metrics: str | Path, timestamp: str) -> tuple[Path, Path, Path]:
+    """Create one timestamp-named run folder and place output files inside it."""
+
+    base_output = Path(base_output)
+    base_metrics = Path(base_metrics)
+    root_dir = base_output.parent
+    run_dir = ensure_dir(root_dir / timestamp)
+    output = run_dir / base_output.name
+    metrics = run_dir / base_metrics.name
+    return run_dir, output, metrics

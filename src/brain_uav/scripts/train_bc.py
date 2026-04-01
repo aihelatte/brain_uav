@@ -10,7 +10,7 @@ import numpy as np
 from ..config import ExperimentConfig
 from ..scripts.common import make_actor
 from ..trainers import train_behavior_cloning
-from ..utils.io import save_checkpoint, save_json
+from ..utils.io import build_timestamped_run_paths, now_timestamp, save_checkpoint, save_json
 
 
 def main() -> None:
@@ -34,8 +34,12 @@ def main() -> None:
         lr=cfg.training.actor_lr,
         device=cfg.training.device,
     )
-    output = args.output or Path(f'outputs/bc_{args.model}.pt')
-    metrics_out = args.metrics_out or Path(f'outputs/bc_{args.model}_metrics.json')
+
+    finished_at = now_timestamp()
+    base_output = args.output or Path(f'outputs/bc_{args.model}.pt')
+    base_metrics = args.metrics_out or Path(f'outputs/bc_{args.model}_metrics.json')
+    run_dir, output, metrics_out = build_timestamped_run_paths(base_output, base_metrics, finished_at)
+
     save_checkpoint(
         output,
         {
@@ -43,10 +47,22 @@ def main() -> None:
             'state_dict': actor.state_dict(),
             'loss_history': history,
             'config': cfg.to_dict(),
+            'finished_at': finished_at,
+            'run_dir': str(run_dir),
         },
     )
-    save_json(metrics_out, {'model': args.model, 'loss_history': history, 'final_loss': history[-1]})
+    save_json(
+        metrics_out,
+        {
+            'model': args.model,
+            'loss_history': history,
+            'final_loss': history[-1],
+            'finished_at': finished_at,
+            'run_dir': str(run_dir),
+        },
+    )
     print(f'Saved BC checkpoint to {output}')
+    print(f'Saved BC metrics to {metrics_out}')
     print(f'Final BC loss: {history[-1]:.6f}')
 
 

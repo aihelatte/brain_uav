@@ -53,10 +53,10 @@ class RewardConfig:
     progress_weight: float = 2.0
     goal_reward: float = 1200.0
     zone_penalty_weight: float = 2.5
-    collision_penalty: float = 1000.0
+    collision_penalty: float = 3000.0
     step_penalty: float = 2.0
     smoothness_weight: float = 2.0
-    boundary_penalty: float = 800.0
+    boundary_penalty: float = 3000.0
     timeout_penalty: float = 300.0
 
 
