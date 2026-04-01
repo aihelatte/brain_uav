@@ -76,20 +76,19 @@ def now_timestamp() -> str:
     return datetime.now().strftime('%Y%m%d_%H%M%S')
 
 
-def with_timestamp_suffix(path: str | Path, timestamp: str) -> Path:
-    """Append a timestamp to a file name before its extension."""
+def build_log_paths(base_output: str | Path, base_metrics: str | Path, timestamp: str) -> tuple[Path, Path, Path]:
+    """Keep model path fixed, but place logs under logs/<timestamp>/.
 
-    src = Path(path)
-    return src.with_name(f'{src.stem}_{timestamp}{src.suffix}')
-
-
-def build_timestamped_run_paths(base_output: str | Path, base_metrics: str | Path, timestamp: str) -> tuple[Path, Path, Path]:
-    """Create one timestamp-named run folder and place output files inside it."""
+    返回：
+    - log_dir
+    - fixed model output path
+    - timestamped metrics path inside log_dir
+    """
 
     base_output = Path(base_output)
     base_metrics = Path(base_metrics)
     root_dir = base_output.parent
-    run_dir = ensure_dir(root_dir / timestamp)
-    output = run_dir / base_output.name
-    metrics = run_dir / base_metrics.name
-    return run_dir, output, metrics
+    log_dir = ensure_dir(root_dir / 'logs' / timestamp)
+    output = base_output
+    metrics = log_dir / base_metrics.name
+    return log_dir, output, metrics

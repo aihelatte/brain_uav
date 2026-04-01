@@ -218,7 +218,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         rew = self.rewards.progress_weight * (prev_distance - new_distance)
         rew -= self.rewards.step_penalty
         rew -= self.rewards.smoothness_weight * float(np.square(action).sum())
-        rew -= self.rewards.zone_penalty_weight * self._zone_warning_penalty(self.state[:3])
+        rew -= self._zone_warning_penalty(self.state[:3])
+        rew -= self._boundary_warning_penalty(self.state[:3])
         if outcome == "goal":
             rew += self.rewards.goal_reward
         elif outcome in {"collision", "ground"}:
@@ -230,13 +231,36 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         return rew
 
     def _zone_warning_penalty(self, pos: np.ndarray) -> float:
-        penalty = 0.0
+        """Quadratic soft penalty around no-fly zones with a hard cap."""
+
+        warning_distance = max(self.scenario.warning_distance, 1e-6)
+        total_penalty = 0.0
         for zone in self.zones:
             center_distance = float(
                 np.linalg.norm(np.array([pos[0] - zone.center_xy[0], pos[1] - zone.center_xy[1], pos[2]]))
             )
-            penalty += max(0.0, zone.radius + self.scenario.warning_distance - center_distance)
-        return penalty
+            intrusion = zone.radius + warning_distance - center_distance
+            if intrusion <= 0.0:
+                continue
+            ratio = float(np.clip(intrusion / warning_distance, 0.0, 1.0))
+            total_penalty += self.rewards.zone_penalty_weight * (ratio**2)
+        return min(total_penalty, self.rewards.zone_penalty_cap)
+
+    def _boundary_warning_penalty(self, pos: np.ndarray) -> float:
+        """Quadratic soft penalty when approaching x/y/ceiling boundaries."""
+
+        warning_distance = max(self.scenario.boundary_warning_distance, 1e-6)
+        distances = [
+            self.scenario.world_xy - abs(float(pos[0])),
+            self.scenario.world_xy - abs(float(pos[1])),
+            self.scenario.world_z_max - float(pos[2]),
+        ]
+        min_distance = min(distances)
+        if min_distance >= warning_distance:
+            return 0.0
+        ratio = float(np.clip((warning_distance - min_distance) / warning_distance, 0.0, 1.0))
+        penalty = self.rewards.boundary_soft_penalty_weight * (ratio**2)
+        return min(penalty, self.rewards.boundary_soft_penalty_cap)
 
     def _goal_distance(self, pos: np.ndarray) -> float:
         return float(np.linalg.norm(pos - self.goal))

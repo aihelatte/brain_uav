@@ -10,7 +10,7 @@ import numpy as np
 from ..config import ExperimentConfig
 from ..scripts.common import make_actor
 from ..trainers import train_behavior_cloning
-from ..utils.io import build_timestamped_run_paths, now_timestamp, save_checkpoint, save_json
+from ..utils.io import build_log_paths, now_timestamp, save_checkpoint, save_json
 
 
 def main() -> None:
@@ -38,7 +38,7 @@ def main() -> None:
     finished_at = now_timestamp()
     base_output = args.output or Path(f'outputs/bc_{args.model}.pt')
     base_metrics = args.metrics_out or Path(f'outputs/bc_{args.model}_metrics.json')
-    run_dir, output, metrics_out = build_timestamped_run_paths(base_output, base_metrics, finished_at)
+    log_dir, output, metrics_out = build_log_paths(base_output, base_metrics, finished_at)
 
     save_checkpoint(
         output,
@@ -48,7 +48,7 @@ def main() -> None:
             'loss_history': history,
             'config': cfg.to_dict(),
             'finished_at': finished_at,
-            'run_dir': str(run_dir),
+            'log_dir': str(log_dir),
         },
     )
     save_json(
@@ -58,7 +58,7 @@ def main() -> None:
             'loss_history': history,
             'final_loss': history[-1],
             'finished_at': finished_at,
-            'run_dir': str(run_dir),
+            'log_dir': str(log_dir),
         },
     )
     print(f'Saved BC checkpoint to {output}')

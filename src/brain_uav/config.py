@@ -26,7 +26,7 @@ class ScenarioConfig:
     gamma_max: float = 0.6
     delta_gamma_max: float = 0.12
     delta_psi_max: float = 0.2
-    goal_radius: float = 25.0
+    goal_radius: float = 45.0
     world_xy: float = 800.0
     world_z_min: float = 1.0
     world_z_max: float = 400.0
@@ -34,7 +34,8 @@ class ScenarioConfig:
     min_no_fly_zones: int = 1
     max_no_fly_zones: int = 3
     no_fly_radius_range: tuple[float, float] = (60.0, 140.0)
-    warning_distance: float = 20.0
+    warning_distance: float = 100.0
+    boundary_warning_distance: float = 100.0
     nearest_zone_count: int = 3
 
 
@@ -46,18 +47,22 @@ class RewardConfig:
     - 更快接近目标
     - 更愿意冲向终点
     - 不要撞禁飞区
+    - 不要提前贴近边界
     - 不要用 timeout 的方式苟活
     - 不要动作抖动太大
     """
 
-    progress_weight: float = 2.0
-    goal_reward: float = 1200.0
-    zone_penalty_weight: float = 2.5
+    progress_weight: float = 2.2
+    goal_reward: float = 2500.0
+    zone_penalty_weight: float = 450.0
+    zone_penalty_cap: float = 1200.0
+    boundary_soft_penalty_weight: float = 450.0
+    boundary_soft_penalty_cap: float = 450.0
     collision_penalty: float = 3000.0
-    step_penalty: float = 2.0
+    step_penalty: float = 3.0
     smoothness_weight: float = 2.0
     boundary_penalty: float = 3000.0
-    timeout_penalty: float = 300.0
+    timeout_penalty: float = 1000.0
 
 
 @dataclass(slots=True)

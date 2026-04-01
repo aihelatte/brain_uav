@@ -9,7 +9,7 @@ from ..config import ExperimentConfig
 from ..scripts.common import make_actor, make_critics, make_env
 from ..trainers import TD3Trainer
 from ..utils.io import (
-    build_timestamped_run_paths,
+    build_log_paths,
     load_checkpoint,
     now_timestamp,
     save_checkpoint,
@@ -119,7 +119,6 @@ def main() -> None:
     actor = make_actor(cfg, args.model, obs.shape[0], env.action_space.shape[0])
     warmup_strategy = 'random'
     if args.bc_checkpoint:
-        # TD3 从 BC 的结果出发，而不是从纯随机权重开始。
         actor.load_state_dict(load_checkpoint(args.bc_checkpoint)['state_dict'])
         warmup_strategy = 'policy'
     critic1, critic2 = make_critics(cfg, obs.shape[0], env.action_space.shape[0])
@@ -153,12 +152,12 @@ def main() -> None:
     finished_at = now_timestamp()
     base_output = args.output or Path(f'outputs/td3_{args.model}.pt')
     base_metrics = args.metrics_out or Path(f'outputs/td3_{args.model}_metrics.json')
-    run_dir, output, metrics_out = build_timestamped_run_paths(base_output, base_metrics, finished_at)
+    log_dir, output, metrics_out = build_log_paths(base_output, base_metrics, finished_at)
 
     metrics_dict = metrics.to_dict()
     metrics_dict['finished_at'] = finished_at
     metrics_dict['summary_every_episodes'] = args.summary_every_episodes
-    metrics_dict['run_dir'] = str(run_dir)
+    metrics_dict['log_dir'] = str(log_dir)
     metrics_dict['actor_freeze_steps'] = cfg.training.actor_freeze_steps
 
     save_checkpoint(
@@ -169,7 +168,7 @@ def main() -> None:
             'metrics': metrics_dict,
             'config': cfg.to_dict(),
             'finished_at': finished_at,
-            'run_dir': str(run_dir),
+            'log_dir': str(log_dir),
         },
     )
     report_outputs = export_training_report(metrics_out, metrics_dict)
