@@ -107,9 +107,12 @@ def main() -> None:
     parser.add_argument('--output', type=Path, default=None)
     parser.add_argument('--metrics-out', type=Path, default=None)
     parser.add_argument('--summary-every-episodes', type=int, default=50)
+    parser.add_argument('--actor-freeze-steps', type=int, default=None)
     args = parser.parse_args()
 
     cfg = ExperimentConfig()
+    if args.actor_freeze_steps is not None:
+        cfg.training.actor_freeze_steps = args.actor_freeze_steps
     set_global_seed(args.seed)
     env = make_env(cfg, seed=args.seed)
     obs, _ = env.reset(seed=args.seed)
@@ -136,6 +139,7 @@ def main() -> None:
         batch_size=cfg.training.batch_size,
         warmup_steps=cfg.training.warmup_steps,
         exploration_noise=cfg.training.exploration_noise,
+        actor_freeze_steps=cfg.training.actor_freeze_steps,
         warmup_strategy=warmup_strategy,
         device=cfg.training.device,
     )
@@ -155,6 +159,7 @@ def main() -> None:
     metrics_dict['finished_at'] = finished_at
     metrics_dict['summary_every_episodes'] = args.summary_every_episodes
     metrics_dict['run_dir'] = str(run_dir)
+    metrics_dict['actor_freeze_steps'] = cfg.training.actor_freeze_steps
 
     save_checkpoint(
         output,

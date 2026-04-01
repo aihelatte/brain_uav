@@ -69,6 +69,7 @@ class TrainingConfig:
     - batch size
     - TD3 噪声参数
     - SNN 时间窗口 T
+    - Actor 冻结保护期
 
     这里把探索噪声从极小值稍微放大一点，让策略在不严重破坏 BC 底子的前提下，
     有机会跳出“保守耗时直到 timeout”的局部最优。
@@ -86,6 +87,7 @@ class TrainingConfig:
     exploration_noise: float = 0.02
     replay_size: int = 100_000
     warmup_steps: int = 256
+    actor_freeze_steps: int = 5_000
     bc_epochs: int = 10
     snn_time_window: int = 4
     hidden_dim: int = 128

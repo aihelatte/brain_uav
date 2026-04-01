@@ -65,6 +65,7 @@ class TD3Trainer:
         batch_size: int,
         warmup_steps: int,
         exploration_noise: float,
+        actor_freeze_steps: int = 0,
         warmup_strategy: str = 'random',
         device: str = 'cpu',
     ) -> None:
@@ -87,6 +88,7 @@ class TD3Trainer:
         self.batch_size = batch_size
         self.warmup_steps = warmup_steps
         self.exploration_noise = exploration_noise
+        self.actor_freeze_steps = actor_freeze_steps
         self.warmup_strategy = warmup_strategy
         self.device = device
         self.replay = ReplayBuffer(replay_size)
@@ -109,8 +111,9 @@ class TD3Trainer:
         if verbose:
             print(
                 f"[TD3] start total_timesteps={total_timesteps} warmup_steps={self.warmup_steps} "
-                f"batch_size={self.batch_size} replay_size={self.replay.buffer.maxlen} "
-                f"warmup_strategy={self.warmup_strategy} summary_every_episodes={summary_every_episodes}"
+                f"actor_freeze_steps={self.actor_freeze_steps} batch_size={self.batch_size} "
+                f"replay_size={self.replay.buffer.maxlen} warmup_strategy={self.warmup_strategy} "
+                f"summary_every_episodes={summary_every_episodes}"
             )
         for step_idx in range(total_timesteps):
             self.total_steps += 1
@@ -155,9 +158,10 @@ class TD3Trainer:
                 episode_length = 0
             if verbose and ((step_idx + 1) % log_interval == 0 or (step_idx + 1) == total_timesteps):
                 avg_return = statistics.mean(self.metrics.episode_returns[-5:]) if self.metrics.episode_returns else 0.0
+                actor_phase = 'frozen' if self.total_steps <= self.actor_freeze_steps else 'active'
                 print(
                     f"[TD3] progress={step_idx + 1}/{total_timesteps} episodes={self.metrics.episodes} "
-                    f"buffer={len(self.replay)} actor_loss={self.metrics.actor_loss:.4f} "
+                    f"buffer={len(self.replay)} actor_phase={actor_phase} actor_loss={self.metrics.actor_loss:.4f} "
                     f"critic_loss={self.metrics.critic_loss:.4f} recent_avg_return={avg_return:.2f}"
                 )
         if self._current_window:
@@ -232,15 +236,16 @@ class TD3Trainer:
         self.metrics.critic_loss = float(critic_loss.item())
 
         if self.total_steps % self.policy_delay == 0:
-            actor_actions = self.actor(obs)
-            actor_loss = -self.critic1(obs, actor_actions).mean()
-            self.actor_optimizer.zero_grad()
-            actor_loss.backward()
-            self.actor_optimizer.step()
-            self._soft_update(self.actor, self.actor_target)
             self._soft_update(self.critic1, self.critic1_target)
             self._soft_update(self.critic2, self.critic2_target)
-            self.metrics.actor_loss = float(actor_loss.item())
+            if self.total_steps > self.actor_freeze_steps:
+                actor_actions = self.actor(obs)
+                actor_loss = -self.critic1(obs, actor_actions).mean()
+                self.actor_optimizer.zero_grad()
+                actor_loss.backward()
+                self.actor_optimizer.step()
+                self._soft_update(self.actor, self.actor_target)
+                self.metrics.actor_loss = float(actor_loss.item())
 
     def _soft_update(self, model: nn.Module, target: nn.Module) -> None:
         for param, target_param in zip(model.parameters(), target.parameters()):

@@ -137,6 +137,7 @@ def train_td3_model(model: str, bc_checkpoint: Path, timesteps: int, seed: int, 
         batch_size=cfg.training.batch_size,
         warmup_steps=cfg.training.warmup_steps,
         exploration_noise=cfg.training.exploration_noise,
+        actor_freeze_steps=cfg.training.actor_freeze_steps,
         warmup_strategy='policy',
         device=cfg.training.device,
     )
@@ -206,3 +207,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
