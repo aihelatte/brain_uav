@@ -12,6 +12,7 @@ from __future__ import annotations
 import statistics
 from copy import deepcopy
 from dataclasses import dataclass, field
+from typing import Any, Callable
 
 import numpy as np
 import torch
@@ -104,6 +105,7 @@ class TD3Trainer:
         log_interval: int = 500,
         verbose: bool = True,
         summary_every_episodes: int = 50,
+        episode_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> TD3Metrics:
         obs, _ = self.env.reset()
         episode_return = 0.0
@@ -123,7 +125,6 @@ class TD3Trainer:
                 action = self.select_action(obs, with_noise=True)
             next_obs, reward, terminated, truncated, info = self.env.step(action)
             done = terminated or truncated
-            # 注意：只把 terminated 当成 TD target 的“真实结束”掩码。
             self.replay.add(obs, action, reward, next_obs, terminated)
             episode_return += reward
             episode_length += 1
@@ -136,16 +137,34 @@ class TD3Trainer:
                 self.metrics.episode_lengths.append(int(episode_length))
                 outcome = info.get('outcome', 'unknown')
                 self.metrics.outcomes[outcome] = self.metrics.outcomes.get(outcome, 0) + 1
+                episode_record = {
+                    'episode': self.metrics.episodes,
+                    'return': float(episode_return),
+                    'length': int(episode_length),
+                    'outcome': outcome,
+                    'actor_loss': float(self.metrics.actor_loss),
+                    'critic_loss': float(self.metrics.critic_loss),
+                    'scenario': self.env.export_scenario(),
+                    'trajectory': [point.tolist() for point in self.env.trajectory],
+                    'final_state': self.env.state.copy().tolist(),
+                    'info': {
+                        'goal_distance': float(info.get('goal_distance', 0.0)),
+                        'progress': float(info.get('progress', 0.0)),
+                        'steps': int(info.get('steps', episode_length)),
+                    },
+                }
                 self._current_window.append(
                     {
-                        'episode': self.metrics.episodes,
-                        'return': float(episode_return),
-                        'length': int(episode_length),
-                        'outcome': outcome,
-                        'actor_loss': float(self.metrics.actor_loss),
-                        'critic_loss': float(self.metrics.critic_loss),
+                        'episode': episode_record['episode'],
+                        'return': episode_record['return'],
+                        'length': episode_record['length'],
+                        'outcome': episode_record['outcome'],
+                        'actor_loss': episode_record['actor_loss'],
+                        'critic_loss': episode_record['critic_loss'],
                     }
                 )
+                if episode_callback is not None:
+                    episode_callback(episode_record)
                 if summary_every_episodes > 0 and len(self._current_window) >= summary_every_episodes:
                     self._flush_window_stats()
                 if verbose:

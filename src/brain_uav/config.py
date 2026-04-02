@@ -36,6 +36,7 @@ class ScenarioConfig:
     no_fly_radius_range: tuple[float, float] = (60.0, 140.0)
     warning_distance: float = 100.0
     boundary_warning_distance: float = 100.0
+    ground_warning_height: float = 60.0
     nearest_zone_count: int = 3
 
 
@@ -58,6 +59,8 @@ class RewardConfig:
     zone_penalty_cap: float = 1200.0
     boundary_soft_penalty_weight: float = 450.0
     boundary_soft_penalty_cap: float = 450.0
+    ground_soft_penalty_weight: float = 180.0
+    ground_soft_penalty_cap: float = 180.0
     collision_penalty: float = 3000.0
     step_penalty: float = 3.0
     smoothness_weight: float = 2.0

@@ -68,6 +68,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             dtype=np.float32,
         )
         self.state = np.zeros(5, dtype=np.float32)
+        self.initial_state = np.zeros(5, dtype=np.float32)
         self.goal = np.zeros(3, dtype=np.float32)
         self.zones: list[Zone] = []
         self.steps = 0
@@ -87,6 +88,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             self._load_scenario(scenario)
         else:
             self._sample_scenario()
+        self.initial_state = self.state.copy()
         self.steps = 0
         self.trajectory = [self.state[:3].copy()]
         return self._get_obs(), self._info(progress=0.0)
@@ -124,10 +126,11 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
 
     def export_scenario(self) -> dict[str, Any]:
         return {
-            "state": self.state.copy(),
-            "goal": self.goal.copy(),
+            "state": self.initial_state.copy().tolist(),
+            "goal": self.goal.copy().tolist(),
             "zones": [
-                {"center_xy": zone.center_xy.copy(), "radius": float(zone.radius)} for zone in self.zones
+                {"center_xy": zone.center_xy.copy().tolist(), "radius": float(zone.radius)}
+                for zone in self.zones
             ],
         }
 
@@ -175,7 +178,6 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                         )
                     )
                 )
-                # 保证目标判定球和禁飞区警戒区之间留出少量净空，避免“到达目标却仍被软惩罚”。
                 safe_margin = radius + cfg.warning_distance + cfg.goal_radius + 10.0
                 if dist_to_goal > safe_margin:
                     self.zones.append(Zone(center_xy=center_xy, radius=radius))
@@ -234,6 +236,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         rew -= self.rewards.smoothness_weight * float(np.square(action).sum())
         rew -= self._zone_warning_penalty(self.state[:3])
         rew -= self._boundary_warning_penalty(self.state[:3])
+        rew -= self._ground_warning_penalty(self.state[:3])
         if outcome == "goal":
             rew += self.rewards.goal_reward
         elif outcome in {"collision", "ground"}:
@@ -275,6 +278,17 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         ratio = float(np.clip((warning_distance - min_distance) / warning_distance, 0.0, 1.0))
         penalty = self.rewards.boundary_soft_penalty_weight * (ratio**2)
         return min(penalty, self.rewards.boundary_soft_penalty_cap)
+
+    def _ground_warning_penalty(self, pos: np.ndarray) -> float:
+        """Apply a mild quadratic soft penalty when descending too close to the ground."""
+
+        warning_height = min(self.scenario.ground_warning_height, 80.0)
+        effective_span = max(warning_height - self.scenario.world_z_min, 1e-6)
+        if float(pos[2]) >= warning_height:
+            return 0.0
+        ratio = float(np.clip((warning_height - float(pos[2])) / effective_span, 0.0, 1.0))
+        penalty = self.rewards.ground_soft_penalty_weight * (ratio**2)
+        return min(penalty, self.rewards.ground_soft_penalty_cap)
 
     def _goal_distance(self, pos: np.ndarray) -> float:
         return float(np.linalg.norm(pos - self.goal))
