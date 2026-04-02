@@ -104,10 +104,10 @@ def train_bc_model(model: str, dataset: Path, epochs: int, output_dir: Path) -> 
         device=cfg.training.device,
         verbose=True,
     )
-    ckpt = output_dir / f'bc_{model}.pt'
+    ckpt = output_dir / f'bc_{model}_v5.pt'
     save_checkpoint(ckpt, {'model_type': model, 'state_dict': actor.state_dict(), 'loss_history': history, 'config': cfg.to_dict()})
     metrics = {'model': model, 'final_loss': history[-1], 'loss_history': history}
-    save_json(output_dir / f'bc_{model}_metrics.json', metrics)
+    save_json(output_dir / f'bc_{model}_v5_metrics.json', metrics)
     print(f"[BC] saved checkpoint={ckpt}")
     return ckpt, metrics
 
@@ -161,7 +161,7 @@ def main() -> None:
 
     output_dir = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
-    dataset_path = Path('data') / 'bc_dataset_full.npz'
+    dataset_path = Path('data') / 'bc_dataset_full_v5.npz'
 
     print('[Run] Full experiment started')
     dataset_info = generate_dataset(dataset_path, args.dataset_episodes, args.seed)
@@ -207,4 +207,5 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
 

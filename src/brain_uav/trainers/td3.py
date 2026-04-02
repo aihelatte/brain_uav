@@ -1,10 +1,10 @@
-﻿"""TD3 trainer.
+"""TD3 trainer.
 
-这是强化学习的主循环。
-你可以把它理解成：
-- Actor 负责出动作
-- 两个 Critic 负责打分
-- 回放缓存负责反复学习过去经验
+����ǿ��ѧϰ����ѭ����
+����԰������ɣ�
+- Actor ���������
+- ���� Critic ������
+- �طŻ��渺�𷴸�ѧϰ��ȥ����
 """
 
 from __future__ import annotations
@@ -66,6 +66,7 @@ class TD3Trainer:
         batch_size: int,
         warmup_steps: int,
         exploration_noise: float,
+        success_sample_bias: float,
         actor_freeze_steps: int = 0,
         warmup_strategy: str = 'random',
         device: str = 'cpu',
@@ -92,7 +93,7 @@ class TD3Trainer:
         self.actor_freeze_steps = actor_freeze_steps
         self.warmup_strategy = warmup_strategy
         self.device = device
-        self.replay = ReplayBuffer(replay_size)
+        self.replay = ReplayBuffer(replay_size, success_sample_bias=success_sample_bias)
         self.total_steps = 0
         self.metrics = TD3Metrics()
         self.action_low = torch.tensor(env.action_space.low, dtype=torch.float32, device=device)
@@ -125,7 +126,7 @@ class TD3Trainer:
                 action = self.select_action(obs, with_noise=True)
             next_obs, reward, terminated, truncated, info = self.env.step(action)
             done = terminated or truncated
-            self.replay.add(obs, action, reward, next_obs, terminated)
+            self.replay.add(obs, action, reward, next_obs, terminated, success=bool(terminated and reward > 0.0))
             episode_return += reward
             episode_length += 1
             obs = next_obs
@@ -139,6 +140,7 @@ class TD3Trainer:
                 self.metrics.outcomes[outcome] = self.metrics.outcomes.get(outcome, 0) + 1
                 episode_record = {
                     'episode': self.metrics.episodes,
+                    'total_steps': self.total_steps,
                     'return': float(episode_return),
                     'length': int(episode_length),
                     'outcome': outcome,
@@ -180,7 +182,8 @@ class TD3Trainer:
                 actor_phase = 'frozen' if self.total_steps <= self.actor_freeze_steps else 'active'
                 print(
                     f"[TD3] progress={step_idx + 1}/{total_timesteps} episodes={self.metrics.episodes} "
-                    f"buffer={len(self.replay)} actor_phase={actor_phase} actor_loss={self.metrics.actor_loss:.4f} "
+                    f"buffer={len(self.replay)} success_frac={self.replay.success_fraction():.3f} "
+                    f"actor_phase={actor_phase} actor_loss={self.metrics.actor_loss:.4f} "
                     f"critic_loss={self.metrics.critic_loss:.4f} recent_avg_return={avg_return:.2f}"
                 )
         if self._current_window:
@@ -205,8 +208,6 @@ class TD3Trainer:
         return self.env.action_space.sample()
 
     def _flush_window_stats(self) -> None:
-        """Aggregate recent episodes into one AI-friendly summary block."""
-
         window = self._current_window
         outcome_counts: dict[str, int] = {}
         for item in window:

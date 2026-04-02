@@ -1,4 +1,4 @@
-﻿"""Train the TD3 policy after behavior cloning initialization."""
+"""Train the TD3 policy after behavior cloning initialization."""
 
 from __future__ import annotations
 
@@ -142,6 +142,7 @@ def export_episode_result(
 
     payload = {
         'episode': record['episode'],
+        'total_steps': record['total_steps'],
         'return': record['return'],
         'length': record['length'],
         'outcome': record['outcome'],
@@ -219,6 +220,7 @@ def export_episode_result(
     ]
     summary = [
         f"episode: {record['episode']}",
+        f"steps consumed: {record['total_steps']}",
         f"outcome: {record['outcome']}",
         f"return: {record['return']:.2f}",
         f"length: {record['length']}",
@@ -246,25 +248,37 @@ def export_episode_result(
 def make_episode_capture_callback(
     result_root: Path,
     summary_every_episodes: int,
+    total_timesteps: int,
     config_payload: dict[str, Any],
-    max_goal_examples: int = 10,
 ) -> Callable[[dict[str, Any]], None]:
-    """Create a callback that stores window samples and first goal examples."""
+    """Create a callback that stores step snapshots and sparse goal examples."""
 
-    window_dir = ensure_dir(result_root / 'window_samples')
+    snapshot_dir = ensure_dir(result_root / 'step_snapshots')
     goal_dir = ensure_dir(result_root / 'goal_examples')
-    goal_saved = 0
+
+    snapshot_interval = max(1, total_timesteps // 10)
+    next_snapshot_step = snapshot_interval
+    saved_goal_groups: set[int] = set()
 
     def callback(record: dict[str, Any]) -> None:
-        nonlocal goal_saved
-        if summary_every_episodes > 0 and record['episode'] % summary_every_episodes == 0:
-            window_idx = record['episode'] // summary_every_episodes
-            stem = f'window_{window_idx:04d}_ep{record["episode"]:05d}_{record["outcome"]}'
-            export_episode_result(window_dir, stem, record, config_payload)
-        if record['outcome'] == 'goal' and goal_saved < max_goal_examples:
-            goal_saved += 1
-            stem = f'goal_{goal_saved:02d}_ep{record["episode"]:05d}'
-            export_episode_result(goal_dir, stem, record, config_payload)
+        nonlocal next_snapshot_step
+
+        while record['total_steps'] >= next_snapshot_step and next_snapshot_step <= total_timesteps:
+            snapshot_idx = max(1, next_snapshot_step // snapshot_interval)
+            stem = (
+                f"step_{snapshot_idx:02d}_s{next_snapshot_step:06d}_"
+                f"ep{record['episode']:05d}_{record['outcome']}"
+            )
+            export_episode_result(snapshot_dir, stem, record, config_payload)
+            next_snapshot_step += snapshot_interval
+
+        if summary_every_episodes > 0 and record['outcome'] == 'goal':
+            window_idx = (record['episode'] - 1) // summary_every_episodes
+            goal_group_idx = window_idx // 2
+            if goal_group_idx not in saved_goal_groups:
+                saved_goal_groups.add(goal_group_idx)
+                stem = f'goal_group_{goal_group_idx + 1:02d}_ep{record["episode"]:05d}'
+                export_episode_result(goal_dir, stem, record, config_payload)
 
     return callback
 
@@ -316,6 +330,7 @@ def main() -> None:
         batch_size=cfg.training.batch_size,
         warmup_steps=cfg.training.warmup_steps,
         exploration_noise=cfg.training.exploration_noise,
+        success_sample_bias=cfg.training.success_sample_bias,
         actor_freeze_steps=cfg.training.actor_freeze_steps,
         warmup_strategy=warmup_strategy,
         device=cfg.training.device,
@@ -323,8 +338,8 @@ def main() -> None:
     episode_callback = make_episode_capture_callback(
         result_root=results_dir,
         summary_every_episodes=args.summary_every_episodes,
+        total_timesteps=args.timesteps,
         config_payload=cfg.to_dict(),
-        max_goal_examples=10,
     )
     metrics = trainer.train(
         args.timesteps,
@@ -340,6 +355,7 @@ def main() -> None:
     metrics_dict['log_dir'] = str(log_dir)
     metrics_dict['results_dir'] = str(results_dir)
     metrics_dict['actor_freeze_steps'] = cfg.training.actor_freeze_steps
+    metrics_dict['success_sample_bias'] = cfg.training.success_sample_bias
 
     save_checkpoint(
         output,

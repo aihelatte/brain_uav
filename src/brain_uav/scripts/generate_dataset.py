@@ -4,6 +4,7 @@
 - observations: 状态
 - actions: 基线动作
 - planner_tags: 这条样本来自哪种基线
+- dataset_version/config_json: 用来确认 BC 是否和当前环境版本一致
 
 这里会优先只保留成功到达 goal 的轨迹，避免把撞墙/超时的坏轨迹教给 BC。
 """
@@ -11,6 +12,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +22,9 @@ from ..config import ExperimentConfig
 from ..envs import StaticNoFlyTrajectoryEnv
 from ..utils.io import ensure_parent
 from ..utils.seeding import set_global_seed
+
+
+DATASET_VERSION = 'v5'
 
 
 def collect_rollout(planner, env: StaticNoFlyTrajectoryEnv, max_steps: int | None = None):
@@ -41,7 +46,7 @@ def collect_rollout(planner, env: StaticNoFlyTrajectoryEnv, max_steps: int | Non
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Generate behavior cloning dataset.')
-    parser.add_argument('--output', type=Path, default=Path('data/bc_dataset.npz'))
+    parser.add_argument('--output', type=Path, default=Path('data/bc_dataset_v5.npz'))
     parser.add_argument('--episodes', type=int, default=64)
     parser.add_argument('--seed', type=int, default=7)
     args = parser.parse_args()
@@ -64,10 +69,9 @@ def main() -> None:
             planner_tags.extend([planner.__class__.__name__] * len(rollout))
             success_count += 1
         elif not fallback_samples:
-            # 兜底：如果全都失败，保留第一条失败轨迹，避免数据集为空导致脚本崩溃。
             fallback_samples = [(obs, action, planner.__class__.__name__) for obs, action in rollout]
         print(
-            f"[Dataset] episode {episode + 1}/{args.episodes} planner={planner.__class__.__name__} "
+            f"[Dataset:{DATASET_VERSION}] episode {episode + 1}/{args.episodes} planner={planner.__class__.__name__} "
             f"outcome={outcome} kept_samples={len(observations)}"
         )
     if not observations and fallback_samples:
@@ -83,8 +87,13 @@ def main() -> None:
         observations=np.stack(observations).astype(np.float32),
         actions=np.stack(actions).astype(np.float32),
         planner_tags=np.array(planner_tags),
+        dataset_version=np.array(DATASET_VERSION),
+        config_json=np.array(json.dumps(cfg.to_dict(), ensure_ascii=False)),
     )
-    print(f'Saved dataset with {len(observations)} samples from {success_count} successful episodes to {target}')
+    print(
+        f'Saved dataset {DATASET_VERSION} with {len(observations)} samples from '
+        f'{success_count} successful episodes to {target}'
+    )
 
 
 if __name__ == '__main__':
