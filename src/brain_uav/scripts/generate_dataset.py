@@ -1,12 +1,7 @@
 ﻿"""Generate behavior cloning dataset from baseline planners.
 
-运行这个脚本后，会在 `data/` 目录下生成 `.npz` 数据集：
-- observations: 状态
-- actions: 基线动作
-- planner_tags: 这条样本来自哪种基线
-- dataset_version/config_json: 用来确认 BC 是否和当前环境版本一致
-
 这里会优先只保留成功到达 goal 的轨迹，避免把撞墙/超时的坏轨迹教给 BC。
+默认面向课程学习的第一层 easy 生成 BC 数据。
 """
 
 from __future__ import annotations
@@ -19,7 +14,8 @@ import numpy as np
 
 from ..baselines import AStarPlanner, ArtificialPotentialFieldPlanner, HeuristicPlanner
 from ..config import ExperimentConfig
-from ..envs import StaticNoFlyTrajectoryEnv
+from ..curriculum import describe_curriculum_mix, parse_curriculum_mix
+from ..scripts.common import make_env
 from ..utils.io import ensure_parent
 from ..utils.seeding import set_global_seed
 
@@ -27,7 +23,7 @@ from ..utils.seeding import set_global_seed
 DATASET_VERSION = 'v5'
 
 
-def collect_rollout(planner, env: StaticNoFlyTrajectoryEnv, max_steps: int | None = None):
+def collect_rollout(planner, env, max_steps: int | None = None):
     """Run one planner episode and return samples plus final outcome."""
 
     obs, _ = env.reset()
@@ -46,14 +42,17 @@ def collect_rollout(planner, env: StaticNoFlyTrajectoryEnv, max_steps: int | Non
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Generate behavior cloning dataset.')
-    parser.add_argument('--output', type=Path, default=Path('data/bc_dataset_v5.npz'))
-    parser.add_argument('--episodes', type=int, default=64)
+    parser.add_argument('--output', type=Path, default=Path('data/bc_dataset_easy_v5.npz'))
+    parser.add_argument('--episodes', type=int, default=180)
     parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--curriculum-level', choices=['easy', 'medium', 'hard'], default='easy')
+    parser.add_argument('--curriculum-mix', type=str, default=None)
     args = parser.parse_args()
 
     cfg = ExperimentConfig()
+    curriculum_mix = parse_curriculum_mix(args.curriculum_mix, fallback_level=args.curriculum_level)
     set_global_seed(args.seed)
-    env = StaticNoFlyTrajectoryEnv(cfg.scenario, cfg.rewards, seed=args.seed)
+    env = make_env(cfg, seed=args.seed, curriculum_level=args.curriculum_level, curriculum_mix=curriculum_mix)
     planners = [HeuristicPlanner(env), ArtificialPotentialFieldPlanner(env), AStarPlanner(env)]
     observations: list[np.ndarray] = []
     actions: list[np.ndarray] = []
@@ -72,7 +71,8 @@ def main() -> None:
             fallback_samples = [(obs, action, planner.__class__.__name__) for obs, action in rollout]
         print(
             f"[Dataset:{DATASET_VERSION}] episode {episode + 1}/{args.episodes} planner={planner.__class__.__name__} "
-            f"outcome={outcome} kept_samples={len(observations)}"
+            f"outcome={outcome} level={args.curriculum_level} mix={describe_curriculum_mix(curriculum_mix)} "
+            f"kept_samples={len(observations)}"
         )
     if not observations and fallback_samples:
         observations = [item[0] for item in fallback_samples]
@@ -88,6 +88,8 @@ def main() -> None:
         actions=np.stack(actions).astype(np.float32),
         planner_tags=np.array(planner_tags),
         dataset_version=np.array(DATASET_VERSION),
+        curriculum_level=np.array(args.curriculum_level),
+        curriculum_mix=np.array(json.dumps(curriculum_mix, ensure_ascii=False)),
         config_json=np.array(json.dumps(cfg.to_dict(), ensure_ascii=False)),
     )
     print(

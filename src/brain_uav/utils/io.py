@@ -76,8 +76,14 @@ def now_timestamp() -> str:
     return datetime.now().strftime('%Y%m%d_%H%M%S')
 
 
-def build_log_paths(base_output: str | Path, base_metrics: str | Path, timestamp: str) -> tuple[Path, Path, Path]:
-    """Keep model path fixed, but place logs under logs/<timestamp>/.
+def build_log_paths(
+    base_output: str | Path,
+    base_metrics: str | Path,
+    timestamp: str,
+    *,
+    log_root: str | Path | None = None,
+) -> tuple[Path, Path, Path]:
+    """Keep model path fixed, but place logs under a timestamped directory.
 
     返回：
     - log_dir
@@ -87,8 +93,40 @@ def build_log_paths(base_output: str | Path, base_metrics: str | Path, timestamp
 
     base_output = Path(base_output)
     base_metrics = Path(base_metrics)
-    root_dir = base_output.parent
-    log_dir = ensure_dir(root_dir / 'logs' / timestamp)
-    output = base_output
+    if log_root is None:
+        log_dir = ensure_dir(base_output.parent / 'logs' / timestamp)
+    else:
+        log_dir = ensure_dir(Path(log_root) / timestamp)
+    output = ensure_parent(base_output)
     metrics = log_dir / base_metrics.name
     return log_dir, output, metrics
+
+
+def model_output_path(stage: str, *, model: str, level: str | None = None) -> Path:
+    """Return the default reusable model path under outputs/models/."""
+
+    root = Path('outputs/models')
+    if stage == 'bc':
+        return root / 'bc' / f'bc_{model}_latest.pt'
+    if stage == 'td3':
+        if level is None:
+            raise ValueError('level is required for TD3 model outputs')
+        return root / level / f'td3_{model}_{level}_latest.pt'
+    if stage == 'bootstrap':
+        return root / 'bootstrap' / f'{model}_bootstrap_latest.pt'
+    raise ValueError(f'Unsupported stage: {stage}')
+
+
+def log_root_path(stage: str, *, level: str | None = None) -> Path:
+    """Return the default log root under outputs/logs/."""
+
+    root = Path('outputs/logs')
+    if stage == 'bc':
+        return root / 'bc'
+    if stage == 'td3':
+        if level is None:
+            raise ValueError('level is required for TD3 log roots')
+        return root / level
+    if stage == 'benchmark':
+        return root / 'benchmark'
+    raise ValueError(f'Unsupported stage: {stage}')

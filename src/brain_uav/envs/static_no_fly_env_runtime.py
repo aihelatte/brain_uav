@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 
 from ..config import RewardConfig, ScenarioConfig
+from ..curriculum import CURRICULUM_LEVELS, normalize_curriculum_mix
 from ..utils.gym_compat import gym, spaces
 
 
@@ -39,11 +40,13 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         rewards: RewardConfig | None = None,
         seed: int | None = None,
         fixed_scenarios: list[dict[str, Any]] | None = None,
+        curriculum_mix: dict[str, float] | None = None,
     ) -> None:
         super().__init__()
         self.scenario = scenario or ScenarioConfig()
         self.rewards = rewards or RewardConfig()
         self.fixed_scenarios = fixed_scenarios or []
+        self.curriculum_mix = normalize_curriculum_mix(curriculum_mix, fallback_level='hard') if curriculum_mix else None
         self._fixed_idx = 0
         self.rng = np.random.default_rng(seed)
 
@@ -73,6 +76,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.prev_action = np.zeros(2, dtype=np.float32)
         self.recent_progress: list[float] = []
         self.trajectory: list[np.ndarray] = []
+        self.last_curriculum_level = 'random'
 
     def seed(self, seed: int | None = None) -> None:
         self.rng = np.random.default_rng(seed)
@@ -141,9 +145,170 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 {'center_xy': zone.center_xy.copy().tolist(), 'radius': float(zone.radius)}
                 for zone in self.zones
             ],
+            'curriculum_level': self.last_curriculum_level,
         }
 
     def _sample_scenario(self) -> None:
+        if self.curriculum_mix:
+            for _ in range(self.scenario.scenario_max_sampling_attempts):
+                level = self._sample_curriculum_level()
+                scenario = self._sample_curriculum_scenario(level)
+                if scenario is not None:
+                    self._load_scenario(scenario)
+                    self.last_curriculum_level = level
+                    return
+            raise RuntimeError('Failed to sample a curriculum scenario under current constraints.')
+
+        scenario = self._sample_curriculum_scenario('hard')
+        if scenario is None:
+            raise RuntimeError('Failed to sample a random hard scenario under current constraints.')
+        self._load_scenario(scenario)
+        self.last_curriculum_level = 'hard'
+
+    def _sample_curriculum_level(self) -> str:
+        levels = list(self.curriculum_mix.keys())
+        weights = np.array([self.curriculum_mix[level] for level in levels], dtype=np.float64)
+        weights = weights / weights.sum()
+        return str(self.rng.choice(levels, p=weights))
+
+    def _sample_curriculum_scenario(self, level: str) -> dict[str, Any] | None:
+        if level == 'easy':
+            return self._sample_easy_scenario()
+        if level == 'medium':
+            return self._sample_medium_scenario()
+        if level == 'hard':
+            return self._sample_hard_scenario()
+        raise ValueError(f'Unsupported curriculum level: {level}')
+
+    def _sample_easy_scenario(self) -> dict[str, Any] | None:
+        cfg = self.scenario
+        for _ in range(40):
+            state = np.array(
+                [
+                    self.rng.uniform(-0.8 * cfg.world_xy, -0.58 * cfg.world_xy),
+                    self.rng.uniform(-0.10 * cfg.world_xy, 0.10 * cfg.world_xy),
+                    self.rng.uniform(110.0, 155.0),
+                    0.0,
+                    self.rng.uniform(-0.10, 0.10),
+                ],
+                dtype=np.float32,
+            )
+            goal = np.array(
+                [
+                    self.rng.uniform(0.52 * cfg.world_xy, 0.80 * cfg.world_xy),
+                    self.rng.uniform(-0.12 * cfg.world_xy, 0.12 * cfg.world_xy),
+                    self.rng.uniform(105.0, 165.0),
+                ],
+                dtype=np.float32,
+            )
+            if abs(float(goal[2] - state[2])) > 55.0:
+                continue
+            radius = float(self.rng.uniform(70.0, 105.0))
+            line_y = float((state[1] + goal[1]) * 0.5)
+            zone = Zone(
+                center_xy=np.array(
+                    [
+                        self.rng.uniform(-0.05 * cfg.world_xy, 0.35 * cfg.world_xy),
+                        line_y + self.rng.choice([-1.0, 1.0]) * self.rng.uniform(170.0, 280.0),
+                    ],
+                    dtype=np.float32,
+                ),
+                radius=radius,
+            )
+            if not self._zone_candidate_is_valid(state, goal, [], zone.center_xy, zone.radius):
+                continue
+            blockers = self._count_corridor_blockers(state, goal, [zone], margin=20.0)
+            if blockers != 0:
+                continue
+            return {
+                'state': state.tolist(),
+                'goal': goal.tolist(),
+                'zones': [{'center_xy': zone.center_xy.tolist(), 'radius': zone.radius}],
+                'curriculum_level': 'easy',
+            }
+        return None
+
+    def _sample_medium_scenario(self) -> dict[str, Any] | None:
+        cfg = self.scenario
+        for _ in range(60):
+            state = np.array(
+                [
+                    self.rng.uniform(-0.82 * cfg.world_xy, -0.60 * cfg.world_xy),
+                    self.rng.uniform(-0.16 * cfg.world_xy, 0.16 * cfg.world_xy),
+                    self.rng.uniform(105.0, 165.0),
+                    0.0,
+                    self.rng.uniform(-0.15, 0.15),
+                ],
+                dtype=np.float32,
+            )
+            goal = np.array(
+                [
+                    self.rng.uniform(0.50 * cfg.world_xy, 0.82 * cfg.world_xy),
+                    self.rng.uniform(-0.20 * cfg.world_xy, 0.20 * cfg.world_xy),
+                    self.rng.uniform(95.0, 185.0),
+                ],
+                dtype=np.float32,
+            )
+            if abs(float(goal[2] - state[2])) > 75.0:
+                continue
+            mode = str(self.rng.choice(['single_block', 'double_detour']))
+            if mode == 'single_block':
+                zones = self._sample_medium_single_block(state, goal)
+            else:
+                zones = self._sample_medium_double_detour(state, goal)
+            if not zones:
+                continue
+            blockers = self._count_corridor_blockers(state, goal, zones, margin=cfg.corridor_blocking_margin)
+            if blockers < 1 or blockers > 2:
+                continue
+            return {
+                'state': state.tolist(),
+                'goal': goal.tolist(),
+                'zones': [
+                    {'center_xy': zone.center_xy.tolist(), 'radius': zone.radius}
+                    for zone in zones
+                ],
+                'curriculum_level': 'medium',
+            }
+        return None
+
+    def _sample_medium_single_block(self, state: np.ndarray, goal: np.ndarray) -> list[Zone] | None:
+        cfg = self.scenario
+        zones: list[Zone] = []
+        center_xy = np.array(
+            [
+                self.rng.uniform(0.00 * cfg.world_xy, 0.30 * cfg.world_xy),
+                self.rng.uniform(-60.0, 60.0) + 0.5 * (state[1] + goal[1]),
+            ],
+            dtype=np.float32,
+        )
+        radius = float(self.rng.uniform(105.0, 145.0))
+        if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
+            return None
+        zones.append(Zone(center_xy=center_xy, radius=radius))
+        return zones
+
+    def _sample_medium_double_detour(self, state: np.ndarray, goal: np.ndarray) -> list[Zone] | None:
+        cfg = self.scenario
+        zones: list[Zone] = []
+        base_x = self.rng.uniform(-0.05 * cfg.world_xy, 0.20 * cfg.world_xy)
+        offsets = [self.rng.uniform(120.0, 190.0), -self.rng.uniform(120.0, 190.0)]
+        self.rng.shuffle(offsets)
+        for idx, offset in enumerate(offsets):
+            center_xy = np.array(
+                [
+                    base_x + idx * self.rng.uniform(120.0, 190.0),
+                    0.5 * (state[1] + goal[1]) + offset,
+                ],
+                dtype=np.float32,
+            )
+            radius = float(self.rng.uniform(85.0, 120.0))
+            if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
+                return None
+            zones.append(Zone(center_xy=center_xy, radius=radius))
+        return zones
+
+    def _sample_hard_scenario(self) -> dict[str, Any] | None:
         cfg = self.scenario
         for _attempt in range(cfg.scenario_max_sampling_attempts):
             state = np.array(
@@ -171,16 +336,21 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 continue
             if not self._corridor_is_reasonable(state, goal, zones):
                 continue
-            self.state = state
-            self.goal = goal
-            self.zones = zones
-            return
-        raise RuntimeError('Failed to sample a learnable scenario under current constraints.')
+            return {
+                'state': state.tolist(),
+                'goal': goal.tolist(),
+                'zones': [
+                    {'center_xy': zone.center_xy.tolist(), 'radius': zone.radius}
+                    for zone in zones
+                ],
+                'curriculum_level': 'hard',
+            }
+        return None
 
     def _sample_zones_for_pair(self, state: np.ndarray, goal: np.ndarray) -> list[Zone] | None:
         cfg = self.scenario
         zones: list[Zone] = []
-        zone_count = int(self.rng.integers(cfg.min_no_fly_zones, cfg.max_no_fly_zones + 1))
+        zone_count = int(self.rng.integers(max(2, cfg.min_no_fly_zones), cfg.max_no_fly_zones + 1))
         for _ in range(zone_count):
             accepted = False
             for _attempt in range(50):
@@ -235,23 +405,26 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         return True
 
     def _corridor_is_reasonable(self, state: np.ndarray, goal: np.ndarray, zones: list[Zone]) -> bool:
-        cfg = self.scenario
-        blockers = 0
+        blockers = self._count_corridor_blockers(state, goal, zones, margin=self.scenario.corridor_blocking_margin)
+        return blockers <= self.scenario.max_corridor_blockers
+
+    def _count_corridor_blockers(self, state: np.ndarray, goal: np.ndarray, zones: list[Zone], margin: float) -> int:
         start_xy = state[:2]
         goal_xy = goal[:2]
         segment = goal_xy - start_xy
         segment_norm_sq = float(np.dot(segment, segment))
         if segment_norm_sq <= 1e-6:
-            return True
+            return 0
+        blockers = 0
         for zone in zones:
             t = float(np.dot(zone.center_xy - start_xy, segment) / segment_norm_sq)
-            if t <= 0.1 or t >= 0.9:
+            if t <= 0.08 or t >= 0.92:
                 continue
             projection = start_xy + t * segment
             distance_to_segment = float(np.linalg.norm(zone.center_xy - projection))
-            if distance_to_segment <= zone.radius + cfg.corridor_blocking_margin:
+            if distance_to_segment <= zone.radius + margin:
                 blockers += 1
-        return blockers <= cfg.max_corridor_blockers
+        return blockers
 
     def _load_scenario(self, payload: dict[str, Any]) -> None:
         self.state = np.asarray(payload['state'], dtype=np.float32).copy()
@@ -260,6 +433,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             Zone(center_xy=np.asarray(zone['center_xy'], dtype=np.float32), radius=float(zone['radius']))
             for zone in payload['zones']
         ]
+        self.last_curriculum_level = str(payload.get('curriculum_level', 'custom'))
 
     def _apply_action(self, action: np.ndarray) -> None:
         x, y, z, gamma, psi = self.state
@@ -451,4 +625,5 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             'progress': progress,
             'outcome': outcome,
             'steps': self.steps,
+            'curriculum_level': self.last_curriculum_level,
         }

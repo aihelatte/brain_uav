@@ -17,7 +17,7 @@ class ScenarioConfig:
     dt: float = 1.0
     speed: float = 25.0
     gamma_max: float = 0.6
-    delta_gamma_max: float = 0.10
+    delta_gamma_max: float = 0.14
     delta_psi_max: float = 0.2
     goal_radius: float = 45.0
     world_xy: float = 800.0
@@ -46,25 +46,25 @@ class RewardConfig:
     """Reward weights used by reinforcement learning."""
 
     progress_weight: float = 2.4
-    goal_reward: float = 2500.0
-    zone_penalty_weight: float = 450.0
-    zone_penalty_cap: float = 1200.0
-    boundary_soft_penalty_weight: float = 450.0
-    boundary_soft_penalty_cap: float = 450.0
-    ground_soft_penalty_weight: float = 180.0
-    ground_soft_penalty_cap: float = 180.0
-    descent_trend_penalty_weight: float = 180.0
-    descent_trend_penalty_cap: float = 220.0
-    inefficiency_penalty_weight: float = 55.0
-    inefficiency_penalty_cap: float = 80.0
+    goal_reward: float = 3500.0
+    zone_penalty_weight: float = 180.0
+    zone_penalty_cap: float = 300.0
+    boundary_soft_penalty_weight: float = 120.0
+    boundary_soft_penalty_cap: float = 160.0
+    ground_soft_penalty_weight: float = 60.0
+    ground_soft_penalty_cap: float = 80.0
+    descent_trend_penalty_weight: float = 35.0
+    descent_trend_penalty_cap: float = 60.0
+    inefficiency_penalty_weight: float = 8.0
+    inefficiency_penalty_cap: float = 15.0
     progress_window_size: int = 8
     min_progress_per_window: float = 18.0
-    action_delta_gamma_weight: float = 14.0
-    action_delta_psi_weight: float = 5.0
-    smoothness_weight: float = 0.2
-    collision_penalty: float = 3000.0
+    action_delta_gamma_weight: float = 8.0
+    action_delta_psi_weight: float = 3.0
+    smoothness_weight: float = 0.1
+    collision_penalty: float = 6000.0
     step_penalty: float = 3.0
-    boundary_penalty: float = 3000.0
+    boundary_penalty: float = 6000.0
     timeout_penalty: float = 1000.0
 
 

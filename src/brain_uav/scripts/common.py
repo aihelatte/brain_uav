@@ -8,22 +8,41 @@ from __future__ import annotations
 import torch
 
 from ..config import ExperimentConfig
+from ..curriculum import normalize_curriculum_mix, parse_curriculum_mix
 from ..envs import StaticNoFlyTrajectoryEnv
 from ..models import ANNCritic, ANNPolicyActor, SNNPolicyActor
 from ..scenarios import build_benchmark_scenarios
 
 
-def make_env(cfg: ExperimentConfig, seed: int | None = None, scenario_suite: str | None = None) -> StaticNoFlyTrajectoryEnv:
+def make_env(
+    cfg: ExperimentConfig,
+    seed: int | None = None,
+    scenario_suite: str | None = None,
+    curriculum_level: str | None = None,
+    curriculum_mix: dict[str, float] | str | None = None,
+) -> StaticNoFlyTrajectoryEnv:
     """Build one environment instance.
 
-    如果 scenario_suite='benchmark'，就会加载固定基准场景；
-    否则默认使用随机采样场景。
+    - `scenario_suite='benchmark'` 会加载固定测试场景。
+    - 否则默认使用课程场景或随机场景。
     """
 
     fixed_scenarios = None
+    mix_payload = None
     if scenario_suite == 'benchmark':
         fixed_scenarios = [item.scenario for item in build_benchmark_scenarios()]
-    return StaticNoFlyTrajectoryEnv(cfg.scenario, cfg.rewards, seed=seed, fixed_scenarios=fixed_scenarios)
+    elif curriculum_level is not None:
+        if isinstance(curriculum_mix, str) or curriculum_mix is None:
+            mix_payload = parse_curriculum_mix(curriculum_mix, fallback_level=curriculum_level)
+        else:
+            mix_payload = normalize_curriculum_mix(curriculum_mix, fallback_level=curriculum_level)
+    return StaticNoFlyTrajectoryEnv(
+        cfg.scenario,
+        cfg.rewards,
+        seed=seed,
+        fixed_scenarios=fixed_scenarios,
+        curriculum_mix=mix_payload,
+    )
 
 
 def make_actor(cfg: ExperimentConfig, model_type: str, state_dim: int, action_dim: int):

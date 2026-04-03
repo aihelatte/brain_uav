@@ -1,4 +1,4 @@
-"""Train the TD3 policy after behavior cloning initialization."""
+﻿"""Train the TD3 policy after behavior cloning initialization."""
 
 from __future__ import annotations
 
@@ -7,12 +7,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ..config import ExperimentConfig
+from ..curriculum import describe_curriculum_mix, parse_curriculum_mix
 from ..scripts.common import make_actor, make_critics, make_env
 from ..trainers import TD3Trainer
 from ..utils.io import (
     build_log_paths,
     ensure_dir,
     load_checkpoint,
+    log_root_path,
+    model_output_path,
     now_timestamp,
     save_checkpoint,
     save_csv_rows,
@@ -224,6 +227,7 @@ def export_episode_result(
         f"outcome: {record['outcome']}",
         f"return: {record['return']:.2f}",
         f"length: {record['length']}",
+        f"curriculum_level: {record['info'].get('curriculum_level', 'unknown')}",
         f"goal distance: {record['info']['goal_distance']:.2f}",
         f"start: ({start[0]:.1f}, {start[1]:.1f}, {start[2]:.1f})",
         f"goal: ({goal[0]:.1f}, {goal[1]:.1f}, {goal[2]:.1f})",
@@ -284,10 +288,13 @@ def make_episode_capture_callback(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description='Train TD3 on the static no-fly-zone task.')
+    parser = argparse.ArgumentParser(description='Train the TD3 curriculum policy stage by stage.')
     parser.add_argument('--model', choices=['snn', 'ann'], default='snn')
-    parser.add_argument('--timesteps', type=int, default=5000)
+    parser.add_argument('--timesteps', type=int, default=200000)
     parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--curriculum-level', choices=['easy', 'medium', 'hard'], required=True)
+    parser.add_argument('--curriculum-mix', type=str, default=None)
+    parser.add_argument('--init-checkpoint', type=Path, default=None)
     parser.add_argument('--bc-checkpoint', type=Path, default=None)
     parser.add_argument('--output', type=Path, default=None)
     parser.add_argument('--metrics-out', type=Path, default=None)
@@ -300,18 +307,30 @@ def main() -> None:
         cfg.training.actor_freeze_steps = args.actor_freeze_steps
     set_global_seed(args.seed)
 
+    curriculum_mix = parse_curriculum_mix(args.curriculum_mix, fallback_level=args.curriculum_level)
     finished_at = now_timestamp()
-    base_output = args.output or Path(f'outputs/td3_{args.model}.pt')
-    base_metrics = args.metrics_out or Path(f'outputs/td3_{args.model}_metrics.json')
-    log_dir, output, metrics_out = build_log_paths(base_output, base_metrics, finished_at)
+    base_output = args.output or model_output_path('td3', model=args.model, level=args.curriculum_level)
+    base_metrics = args.metrics_out or Path(f'td3_{args.model}_{args.curriculum_level}_metrics.json')
+    log_dir, output, metrics_out = build_log_paths(
+        base_output,
+        base_metrics,
+        finished_at,
+        log_root=log_root_path('td3', level=args.curriculum_level),
+    )
     results_dir = ensure_dir(log_dir / 'results')
 
-    env = make_env(cfg, seed=args.seed)
+    env = make_env(
+        cfg,
+        seed=args.seed,
+        curriculum_level=args.curriculum_level,
+        curriculum_mix=curriculum_mix,
+    )
     obs, _ = env.reset(seed=args.seed)
     actor = make_actor(cfg, args.model, obs.shape[0], env.action_space.shape[0])
     warmup_strategy = 'random'
-    if args.bc_checkpoint:
-        actor.load_state_dict(load_checkpoint(args.bc_checkpoint)['state_dict'])
+    init_checkpoint = args.init_checkpoint or args.bc_checkpoint
+    if init_checkpoint:
+        actor.load_state_dict(load_checkpoint(init_checkpoint)['state_dict'])
         warmup_strategy = 'policy'
     critic1, critic2 = make_critics(cfg, obs.shape[0], env.action_space.shape[0])
     trainer = TD3Trainer(
@@ -335,11 +354,14 @@ def main() -> None:
         warmup_strategy=warmup_strategy,
         device=cfg.training.device,
     )
+    config_payload = cfg.to_dict()
+    config_payload['curriculum_level'] = args.curriculum_level
+    config_payload['curriculum_mix'] = curriculum_mix
     episode_callback = make_episode_capture_callback(
         result_root=results_dir,
         summary_every_episodes=args.summary_every_episodes,
         total_timesteps=args.timesteps,
-        config_payload=cfg.to_dict(),
+        config_payload=config_payload,
     )
     metrics = trainer.train(
         args.timesteps,
@@ -356,6 +378,9 @@ def main() -> None:
     metrics_dict['results_dir'] = str(results_dir)
     metrics_dict['actor_freeze_steps'] = cfg.training.actor_freeze_steps
     metrics_dict['success_sample_bias'] = cfg.training.success_sample_bias
+    metrics_dict['curriculum_level'] = args.curriculum_level
+    metrics_dict['curriculum_mix'] = curriculum_mix
+    metrics_dict['init_checkpoint'] = str(init_checkpoint) if init_checkpoint else None
 
     save_checkpoint(
         output,
@@ -363,14 +388,18 @@ def main() -> None:
             'model_type': args.model,
             'state_dict': actor.state_dict(),
             'metrics': metrics_dict,
-            'config': cfg.to_dict(),
+            'config': config_payload,
             'finished_at': finished_at,
             'log_dir': str(log_dir),
             'results_dir': str(results_dir),
+            'curriculum_level': args.curriculum_level,
+            'curriculum_mix': curriculum_mix,
+            'init_checkpoint': str(init_checkpoint) if init_checkpoint else None,
         },
     )
     report_outputs = export_training_report(metrics_out, metrics_dict)
     print(f'Saved TD3 checkpoint to {output}')
+    print(f'Curriculum level={args.curriculum_level}, mix={describe_curriculum_mix(curriculum_mix)}')
     print(f"Episodes: {metrics.episodes}, Steps: {metrics.steps}, Critic loss: {metrics.critic_loss:.4f}")
     print(f'Result directory: {results_dir}')
     print(f"Training reports: {report_outputs}")
