@@ -99,6 +99,7 @@ class TD3Trainer:
         self.action_low = torch.tensor(env.action_space.low, dtype=torch.float32, device=device)
         self.action_high = torch.tensor(env.action_space.high, dtype=torch.float32, device=device)
         self._current_window: list[dict] = []
+        self.stop_reason: str | None = None
 
     def train(
         self,
@@ -107,6 +108,7 @@ class TD3Trainer:
         verbose: bool = True,
         summary_every_episodes: int = 50,
         episode_callback: Callable[[dict[str, Any]], None] | None = None,
+        window_callback: Callable[[dict[str, Any]], str | None] | None = None,
     ) -> TD3Metrics:
         obs, _ = self.env.reset()
         episode_return = 0.0
@@ -153,6 +155,7 @@ class TD3Trainer:
                         'goal_distance': float(info.get('goal_distance', 0.0)),
                         'progress': float(info.get('progress', 0.0)),
                         'steps': int(info.get('steps', episode_length)),
+                        'curriculum_level': info.get('curriculum_level'),
                     },
                 }
                 self._current_window.append(
@@ -168,7 +171,17 @@ class TD3Trainer:
                 if episode_callback is not None:
                     episode_callback(episode_record)
                 if summary_every_episodes > 0 and len(self._current_window) >= summary_every_episodes:
-                    self._flush_window_stats()
+                    window_row = self._flush_window_stats()
+                    if window_callback is not None and window_row is not None:
+                        stop_reason = window_callback(window_row)
+                        if stop_reason:
+                            self.stop_reason = stop_reason
+                            if verbose:
+                                print(f"[TD3] early stop triggered: {stop_reason}")
+                            obs, _ = self.env.reset()
+                            episode_return = 0.0
+                            episode_length = 0
+                            break
                 if verbose:
                     print(
                         f"[TD3] episode={self.metrics.episodes} step={self.total_steps}/{total_timesteps} "
@@ -187,7 +200,13 @@ class TD3Trainer:
                     f"critic_loss={self.metrics.critic_loss:.4f} recent_avg_return={avg_return:.2f}"
                 )
         if self._current_window:
-            self._flush_window_stats()
+            window_row = self._flush_window_stats()
+            if window_callback is not None and window_row is not None and self.stop_reason is None:
+                stop_reason = window_callback(window_row)
+                if stop_reason:
+                    self.stop_reason = stop_reason
+                    if verbose:
+                        print(f"[TD3] early stop triggered: {stop_reason}")
         self.metrics.steps = self.total_steps
         self.actor.to('cpu')
         self.critic1.to('cpu')
@@ -207,8 +226,10 @@ class TD3Trainer:
             return self.select_action(obs, with_noise=True)
         return self.env.action_space.sample()
 
-    def _flush_window_stats(self) -> None:
+    def _flush_window_stats(self) -> dict[str, Any] | None:
         window = self._current_window
+        if not window:
+            return None
         outcome_counts: dict[str, int] = {}
         for item in window:
             outcome_counts[item['outcome']] = outcome_counts.get(item['outcome'], 0) + 1
@@ -231,6 +252,7 @@ class TD3Trainer:
         }
         self.metrics.episode_window_stats.append(row)
         self._current_window = []
+        return row
 
     def _update(self) -> None:
         batch = self.replay.sample(self.batch_size)

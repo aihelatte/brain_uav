@@ -55,17 +55,24 @@ class RewardConfig:
     ground_soft_penalty_cap: float = 80.0
     descent_trend_penalty_weight: float = 35.0
     descent_trend_penalty_cap: float = 60.0
-    inefficiency_penalty_weight: float = 8.0
-    inefficiency_penalty_cap: float = 15.0
+    inefficiency_penalty_weight: float = 12.0
+    inefficiency_penalty_cap: float = 24.0
     progress_window_size: int = 8
     min_progress_per_window: float = 18.0
-    action_delta_gamma_weight: float = 8.0
-    action_delta_psi_weight: float = 3.0
-    smoothness_weight: float = 0.1
+    action_delta_gamma_weight: float = 10.0
+    action_delta_psi_weight: float = 4.5
+    smoothness_weight: float = 0.15
     collision_penalty: float = 6000.0
     step_penalty: float = 3.0
     boundary_penalty: float = 6000.0
     timeout_penalty: float = 1000.0
+    terminal_convergence_distance: float = 140.0
+    terminal_convergence_progress_weight: float = 0.18
+    terminal_convergence_reward_cap: float = 6.0
+    climb_trend_high_altitude_ratio: float = 0.75
+    climb_trend_gamma_threshold: float = 0.08
+    climb_trend_penalty_weight: float = 6.0
+    climb_trend_penalty_cap: float = 6.0
 
 
 @dataclass(slots=True)

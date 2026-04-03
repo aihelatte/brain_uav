@@ -493,6 +493,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         outcome: str,
     ) -> float:
         rew = self.rewards.progress_weight * (prev_distance - new_distance)
+        rew += self._terminal_convergence_reward(prev_distance, new_distance)
         rew -= self.rewards.step_penalty
         rew -= self.rewards.smoothness_weight * float(np.square(action).sum())
         rew -= self._action_change_penalty(prev_action, action)
@@ -500,6 +501,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         rew -= self._boundary_warning_penalty(self.state[:3])
         rew -= self._ground_warning_penalty(self.state[:3])
         rew -= self._descent_trend_penalty(prev_state, self.state)
+        rew -= self._climb_trend_penalty(self.state)
         rew -= self._inefficiency_penalty()
         if outcome == 'goal':
             rew += self.rewards.goal_reward
@@ -532,6 +534,12 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         )
         penalty = self.rewards.inefficiency_penalty_weight * deficit_ratio
         return min(penalty, self.rewards.inefficiency_penalty_cap)
+
+    def _terminal_convergence_reward(self, prev_distance: float, new_distance: float) -> float:
+        if new_distance >= self.rewards.terminal_convergence_distance or new_distance >= prev_distance:
+            return 0.0
+        reward = self.rewards.terminal_convergence_progress_weight * (prev_distance - new_distance)
+        return min(reward, self.rewards.terminal_convergence_reward_cap)
 
     def _action_change_penalty(self, prev_action: np.ndarray, action: np.ndarray) -> float:
         delta = action - prev_action
@@ -606,6 +614,32 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             )
         penalty = self.rewards.descent_trend_penalty_weight * gamma_ratio * descent_ratio * height_factor
         return min(penalty, self.rewards.descent_trend_penalty_cap)
+
+    def _climb_trend_penalty(self, state: np.ndarray) -> float:
+        high_altitude_start = self.rewards.climb_trend_high_altitude_ratio * self.scenario.world_z_max
+        altitude = float(state[2])
+        gamma = float(state[3])
+        if altitude <= high_altitude_start or gamma <= self.rewards.climb_trend_gamma_threshold:
+            return 0.0
+
+        altitude_ratio = float(
+            np.clip(
+                (altitude - high_altitude_start)
+                / max(self.scenario.world_z_max - high_altitude_start, 1e-6),
+                0.0,
+                1.0,
+            )
+        )
+        gamma_ratio = float(
+            np.clip(
+                (gamma - self.rewards.climb_trend_gamma_threshold)
+                / max(self.scenario.gamma_max - self.rewards.climb_trend_gamma_threshold, 1e-6),
+                0.0,
+                1.0,
+            )
+        )
+        penalty = self.rewards.climb_trend_penalty_weight * altitude_ratio * gamma_ratio
+        return min(penalty, self.rewards.climb_trend_penalty_cap)
 
     def _goal_distance(self, pos: np.ndarray) -> float:
         return float(np.linalg.norm(pos - self.goal))

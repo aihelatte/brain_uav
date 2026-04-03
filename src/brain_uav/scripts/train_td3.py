@@ -255,12 +255,16 @@ def make_episode_capture_callback(
     total_timesteps: int,
     config_payload: dict[str, Any],
 ) -> Callable[[dict[str, Any]], None]:
-    """Create a callback that stores step snapshots and sparse goal examples."""
+    """Create a callback that stores sparse step snapshots and goal examples.
+
+    Current policy:
+    - save one step snapshot every 1/20 of total training steps
+    - save at most one goal example per 4 episode windows
+    """
 
     snapshot_dir = ensure_dir(result_root / 'step_snapshots')
     goal_dir = ensure_dir(result_root / 'goal_examples')
-
-    snapshot_interval = max(1, total_timesteps // 10)
+    snapshot_interval = max(1, total_timesteps // 20)
     next_snapshot_step = snapshot_interval
     saved_goal_groups: set[int] = set()
 
@@ -278,11 +282,45 @@ def make_episode_capture_callback(
 
         if summary_every_episodes > 0 and record['outcome'] == 'goal':
             window_idx = (record['episode'] - 1) // summary_every_episodes
-            goal_group_idx = window_idx // 2
+            goal_group_idx = window_idx // 4
             if goal_group_idx not in saved_goal_groups:
                 saved_goal_groups.add(goal_group_idx)
                 stem = f'goal_group_{goal_group_idx + 1:02d}_ep{record["episode"]:05d}'
                 export_episode_result(goal_dir, stem, record, config_payload)
+
+    return callback
+
+
+def default_timesteps_for_level(level: str) -> int:
+    if level == 'easy':
+        return 250000
+    return 200000
+
+
+def make_early_stop_callback(
+    enabled: bool,
+    goal_rate_threshold: float,
+    consecutive_windows: int,
+) -> Callable[[dict[str, Any]], str | None] | None:
+    if not enabled:
+        return None
+
+    recent_goal_rates: list[float] = []
+
+    def callback(window_row: dict[str, Any]) -> str | None:
+        episode_count = max(int(window_row.get('episode_count', 0)), 1)
+        goal_rate = float(window_row.get('goal_count', 0)) / episode_count
+        recent_goal_rates.append(goal_rate)
+        if len(recent_goal_rates) > consecutive_windows:
+            recent_goal_rates.pop(0)
+        if len(recent_goal_rates) < consecutive_windows:
+            return None
+        if all(rate >= goal_rate_threshold for rate in recent_goal_rates):
+            return (
+                f"goal_rate>={goal_rate_threshold:.2f} for {consecutive_windows} consecutive windows "
+                f"(latest={goal_rate:.2f})"
+            )
+        return None
 
     return callback
 
@@ -326,7 +364,7 @@ def load_training_state(init_checkpoint: Path | None, actor, critic1, critic2, t
 def main() -> None:
     parser = argparse.ArgumentParser(description='Train the TD3 curriculum policy stage by stage.')
     parser.add_argument('--model', choices=['snn', 'ann'], default='snn')
-    parser.add_argument('--timesteps', type=int, default=200000)
+    parser.add_argument('--timesteps', type=int, default=None)
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--curriculum-level', choices=['easy', 'medium', 'hard'], required=True)
     parser.add_argument('--curriculum-mix', type=str, default=None)
@@ -336,6 +374,9 @@ def main() -> None:
     parser.add_argument('--metrics-out', type=Path, default=None)
     parser.add_argument('--summary-every-episodes', type=int, default=50)
     parser.add_argument('--actor-freeze-steps', type=int, default=None)
+    parser.add_argument('--early-stop-enabled', action='store_true')
+    parser.add_argument('--early-stop-goal-rate', type=float, default=0.94)
+    parser.add_argument('--early-stop-windows', type=int, default=5)
     args = parser.parse_args()
 
     cfg = ExperimentConfig()
@@ -343,6 +384,7 @@ def main() -> None:
         cfg.training.actor_freeze_steps = args.actor_freeze_steps
     set_global_seed(args.seed)
 
+    total_timesteps = args.timesteps or default_timesteps_for_level(args.curriculum_level)
     curriculum_mix = parse_curriculum_mix(args.curriculum_mix, fallback_level=args.curriculum_level)
     finished_at = now_timestamp()
     base_output = args.output or model_output_path('td3', model=args.model, level=args.curriculum_level)
@@ -394,15 +436,21 @@ def main() -> None:
     episode_callback = make_episode_capture_callback(
         result_root=results_dir,
         summary_every_episodes=args.summary_every_episodes,
-        total_timesteps=args.timesteps,
+        total_timesteps=total_timesteps,
         config_payload=config_payload,
     )
+    early_stop_callback = make_early_stop_callback(
+        enabled=args.early_stop_enabled and args.summary_every_episodes > 0,
+        goal_rate_threshold=args.early_stop_goal_rate,
+        consecutive_windows=args.early_stop_windows,
+    )
     metrics = trainer.train(
-        args.timesteps,
-        log_interval=max(100, args.timesteps // 10),
+        total_timesteps,
+        log_interval=max(100, total_timesteps // 10),
         verbose=True,
         summary_every_episodes=args.summary_every_episodes,
         episode_callback=episode_callback,
+        window_callback=early_stop_callback,
     )
 
     metrics_dict = metrics.to_dict()
@@ -414,6 +462,12 @@ def main() -> None:
     metrics_dict['success_sample_bias'] = cfg.training.success_sample_bias
     metrics_dict['curriculum_level'] = args.curriculum_level
     metrics_dict['curriculum_mix'] = curriculum_mix
+    metrics_dict['timesteps_requested'] = total_timesteps
+    metrics_dict['early_stop_enabled'] = bool(args.early_stop_enabled and args.summary_every_episodes > 0)
+    metrics_dict['early_stop_goal_rate'] = args.early_stop_goal_rate
+    metrics_dict['early_stop_windows'] = args.early_stop_windows
+    metrics_dict['stopped_early'] = trainer.stop_reason is not None
+    metrics_dict['stop_reason'] = trainer.stop_reason
     metrics_dict['init_checkpoint'] = str(init_checkpoint) if init_checkpoint else None
 
     save_checkpoint(
@@ -442,6 +496,8 @@ def main() -> None:
     print(f'Saved TD3 checkpoint to {output}')
     print(f'Curriculum level={args.curriculum_level}, mix={describe_curriculum_mix(curriculum_mix)}')
     print(f"Episodes: {metrics.episodes}, Steps: {metrics.steps}, Critic loss: {metrics.critic_loss:.4f}")
+    if trainer.stop_reason is not None:
+        print(f"Early stop: {trainer.stop_reason}")
     print(f'Result directory: {results_dir}')
     print(f"Training reports: {report_outputs}")
 
