@@ -246,21 +246,21 @@ def export_episode_result(
     fig.savefig(png_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
 
-    return {'json': str(json_path), 'plot': str(png_path)}
-
-
 def make_episode_capture_callback(
     result_root: Path,
     summary_every_episodes: int,
     total_timesteps: int,
     config_payload: dict[str, Any],
 ) -> Callable[[dict[str, Any]], None]:
-    """Create a callback that stores step snapshots and sparse goal examples."""
+    """Create a callback that stores sparse step snapshots and goal examples.
 
+    Current policy:
+    - save one step snapshot every 1/20 of total training steps
+    - save at most one goal example per 4 episode windows
+    """
     snapshot_dir = ensure_dir(result_root / 'step_snapshots')
     goal_dir = ensure_dir(result_root / 'goal_examples')
-
-    snapshot_interval = max(1, total_timesteps // 10)
+    snapshot_interval = max(1, total_timesteps // 20)
     next_snapshot_step = snapshot_interval
     saved_goal_groups: set[int] = set()
 
@@ -278,7 +278,7 @@ def make_episode_capture_callback(
 
         if summary_every_episodes > 0 and record['outcome'] == 'goal':
             window_idx = (record['episode'] - 1) // summary_every_episodes
-            goal_group_idx = window_idx // 2
+            goal_group_idx = window_idx // 4
             if goal_group_idx not in saved_goal_groups:
                 saved_goal_groups.add(goal_group_idx)
                 stem = f'goal_group_{goal_group_idx + 1:02d}_ep{record["episode"]:05d}'
@@ -448,3 +448,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+

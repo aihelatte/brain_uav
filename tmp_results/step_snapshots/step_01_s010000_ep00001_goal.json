@@ -1,0 +1,72 @@
+{
+  "episode": 1,
+  "total_steps": 10000,
+  "return": 1.0,
+  "length": 10,
+  "outcome": "goal",
+  "actor_loss": 0.1,
+  "critic_loss": 0.2,
+  "scenario": {
+    "state": [
+      0,
+      0,
+      100,
+      0,
+      0
+    ],
+    "goal": [
+      100,
+      0,
+      120
+    ],
+    "zones": [
+      {
+        "center_xy": [
+          20,
+          30
+        ],
+        "radius": 50
+      }
+    ]
+  },
+  "trajectory": [
+    [
+      0,
+      0,
+      100
+    ],
+    [
+      10,
+      0,
+      102
+    ],
+    [
+      20,
+      0,
+      104
+    ]
+  ],
+  "final_state": [
+    20,
+    0,
+    104,
+    0,
+    0
+  ],
+  "info": {
+    "goal_distance": 80.0,
+    "progress": 5.0,
+    "steps": 10,
+    "curriculum_level": "easy"
+  },
+  "config": {
+    "scenario": {
+      "warning_distance": 100,
+      "world_xy": 800,
+      "world_z_max": 400,
+      "ground_warning_height": 40,
+      "goal_radius": 45,
+      "boundary_warning_distance": 100
+    }
+  }
+}
