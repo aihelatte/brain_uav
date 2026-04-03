@@ -297,6 +297,7 @@ def load_training_state(init_checkpoint: Path | None, actor, critic1, critic2, t
     actor.load_state_dict(checkpoint['state_dict'])
     has_critics = 'critic1_state_dict' in checkpoint and 'critic2_state_dict' in checkpoint
     if not has_critics:
+        trainer.actor_target.load_state_dict(checkpoint['state_dict'])
         print('Loaded Actor only from BC checkpoint; critics are randomly initialized.')
         return 'policy'
 
