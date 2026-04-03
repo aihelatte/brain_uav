@@ -1,4 +1,4 @@
-﻿"""Evaluate a trained checkpoint on either random or benchmark scenarios."""
+﻿"""Evaluate a trained checkpoint on benchmark, curriculum, or random scenarios."""
 
 from __future__ import annotations
 
@@ -10,18 +10,33 @@ from pathlib import Path
 import torch
 
 from ..config import ExperimentConfig
+from ..curriculum import describe_curriculum_mix, parse_curriculum_mix
 from ..scenarios import build_benchmark_scenarios
 from ..scripts.common import make_actor, make_env
 from ..utils.io import load_checkpoint, save_json
 from ..utils.seeding import set_global_seed
 
 
-def evaluate_policy(checkpoint: Path, model: str, episodes: int, seed: int, scenario_suite: str) -> dict:
+def evaluate_policy(
+    checkpoint: Path,
+    model: str,
+    episodes: int,
+    seed: int,
+    evaluation_mode: str,
+    curriculum_level: str | None = None,
+    curriculum_mix: dict[str, float] | None = None,
+) -> dict:
     """Run evaluation and return a rich result dict."""
 
     cfg = ExperimentConfig()
     set_global_seed(seed)
-    env = make_env(cfg, seed=seed, scenario_suite=scenario_suite if scenario_suite == 'benchmark' else None)
+    env = make_env(
+        cfg,
+        seed=seed,
+        scenario_suite='benchmark' if evaluation_mode == 'benchmark' else None,
+        curriculum_level=curriculum_level if evaluation_mode == 'curriculum' else None,
+        curriculum_mix=curriculum_mix if evaluation_mode == 'curriculum' else None,
+    )
     obs, _ = env.reset(seed=seed)
     actor = make_actor(cfg, model, obs.shape[0], env.action_space.shape[0])
     actor.load_state_dict(load_checkpoint(checkpoint)['state_dict'])
@@ -34,15 +49,18 @@ def evaluate_policy(checkpoint: Path, model: str, episodes: int, seed: int, scen
     per_inference = []
     outcomes = {}
     records = []
-    named_scenarios = build_benchmark_scenarios() if scenario_suite == 'benchmark' else []
+    named_scenarios = build_benchmark_scenarios() if evaluation_mode == 'benchmark' else []
     for ep in range(episodes):
-        if scenario_suite == 'benchmark':
+        if evaluation_mode == 'benchmark':
             scenario = named_scenarios[ep % len(named_scenarios)]
             obs, _ = env.reset(options={'scenario': scenario.scenario})
             scenario_name = scenario.name
         else:
             obs, _ = env.reset(seed=seed + ep)
-            scenario_name = f'random_{ep:03d}'
+            if evaluation_mode == 'curriculum':
+                scenario_name = f"{env.last_curriculum_level}_{ep:03d}"
+            else:
+                scenario_name = f'random_{ep:03d}'
         done = False
         steps = 0
         inference_times = []
@@ -73,6 +91,7 @@ def evaluate_policy(checkpoint: Path, model: str, episodes: int, seed: int, scen
                 'goal_distance': info['goal_distance'],
                 'avg_inference_time_ms': 1000.0 * statistics.mean(inference_times),
                 'max_inference_time_ms': 1000.0 * max(inference_times),
+                'curriculum_level': info.get('curriculum_level'),
             }
         )
     return {
@@ -86,7 +105,9 @@ def evaluate_policy(checkpoint: Path, model: str, episodes: int, seed: int, scen
         'max_inference_time_ms': 1000.0 * max(per_inference),
         'outcomes': outcomes,
         'records': records,
-        'scenario_suite': scenario_suite,
+        'evaluation_mode': evaluation_mode,
+        'curriculum_level': curriculum_level,
+        'curriculum_mix': curriculum_mix,
     }
 
 
@@ -96,13 +117,30 @@ def main() -> None:
     parser.add_argument('--model', choices=['snn', 'ann'], required=True)
     parser.add_argument('--episodes', type=int, default=16)
     parser.add_argument('--seed', type=int, default=7)
-    parser.add_argument('--scenario-suite', choices=['benchmark', 'random'], default='benchmark')
+    parser.add_argument('--evaluation-mode', choices=['benchmark', 'curriculum', 'random'], default='benchmark')
+    parser.add_argument('--curriculum-level', choices=['easy', 'medium', 'hard'], default=None)
+    parser.add_argument('--curriculum-mix', type=str, default=None)
     parser.add_argument('--output', type=Path, default=None)
     args = parser.parse_args()
 
-    results = evaluate_policy(args.checkpoint, args.model, args.episodes, args.seed, args.scenario_suite)
+    curriculum_mix = None
+    if args.evaluation_mode == 'curriculum':
+        if args.curriculum_level is None:
+            raise ValueError('--curriculum-level is required when --evaluation-mode curriculum')
+        curriculum_mix = parse_curriculum_mix(args.curriculum_mix, fallback_level=args.curriculum_level)
+    results = evaluate_policy(
+        args.checkpoint,
+        args.model,
+        args.episodes,
+        args.seed,
+        args.evaluation_mode,
+        curriculum_level=args.curriculum_level,
+        curriculum_mix=curriculum_mix,
+    )
     if args.output:
         save_json(args.output, results)
+    if args.evaluation_mode == 'curriculum':
+        print(f"Curriculum evaluation: level={args.curriculum_level}, mix={describe_curriculum_mix(curriculum_mix)}")
     print(results)
 
 

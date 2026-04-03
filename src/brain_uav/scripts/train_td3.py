@@ -287,6 +287,41 @@ def make_episode_capture_callback(
     return callback
 
 
+def load_training_state(init_checkpoint: Path | None, actor, critic1, critic2, trainer) -> str:
+    """Restore checkpoint according to whether it is BC or TD3."""
+
+    if init_checkpoint is None:
+        return 'random'
+
+    checkpoint = load_checkpoint(init_checkpoint)
+    actor.load_state_dict(checkpoint['state_dict'])
+    has_critics = 'critic1_state_dict' in checkpoint and 'critic2_state_dict' in checkpoint
+    if not has_critics:
+        print('Loaded Actor only from BC checkpoint; critics are randomly initialized.')
+        return 'policy'
+
+    critic1.load_state_dict(checkpoint['critic1_state_dict'])
+    critic2.load_state_dict(checkpoint['critic2_state_dict'])
+    if 'actor_target_state_dict' in checkpoint:
+        trainer.actor_target.load_state_dict(checkpoint['actor_target_state_dict'])
+    else:
+        trainer.actor_target.load_state_dict(checkpoint['state_dict'])
+    if 'critic1_target_state_dict' in checkpoint:
+        trainer.critic1_target.load_state_dict(checkpoint['critic1_target_state_dict'])
+    else:
+        trainer.critic1_target.load_state_dict(checkpoint['critic1_state_dict'])
+    if 'critic2_target_state_dict' in checkpoint:
+        trainer.critic2_target.load_state_dict(checkpoint['critic2_target_state_dict'])
+    else:
+        trainer.critic2_target.load_state_dict(checkpoint['critic2_state_dict'])
+    if 'actor_optimizer_state_dict' in checkpoint:
+        trainer.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+    if 'critic_optimizer_state_dict' in checkpoint:
+        trainer.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+    print('Loaded Actor and Twin Critics from TD3 checkpoint for curriculum continuation.')
+    return 'policy'
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Train the TD3 curriculum policy stage by stage.')
     parser.add_argument('--model', choices=['snn', 'ann'], default='snn')
@@ -327,11 +362,6 @@ def main() -> None:
     )
     obs, _ = env.reset(seed=args.seed)
     actor = make_actor(cfg, args.model, obs.shape[0], env.action_space.shape[0])
-    warmup_strategy = 'random'
-    init_checkpoint = args.init_checkpoint or args.bc_checkpoint
-    if init_checkpoint:
-        actor.load_state_dict(load_checkpoint(init_checkpoint)['state_dict'])
-        warmup_strategy = 'policy'
     critic1, critic2 = make_critics(cfg, obs.shape[0], env.action_space.shape[0])
     trainer = TD3Trainer(
         env=env,
@@ -351,9 +381,12 @@ def main() -> None:
         exploration_noise=cfg.training.exploration_noise,
         success_sample_bias=cfg.training.success_sample_bias,
         actor_freeze_steps=cfg.training.actor_freeze_steps,
-        warmup_strategy=warmup_strategy,
+        warmup_strategy='random',
         device=cfg.training.device,
     )
+    init_checkpoint = args.init_checkpoint or args.bc_checkpoint
+    trainer.warmup_strategy = load_training_state(init_checkpoint, actor, critic1, critic2, trainer)
+
     config_payload = cfg.to_dict()
     config_payload['curriculum_level'] = args.curriculum_level
     config_payload['curriculum_mix'] = curriculum_mix
@@ -387,6 +420,13 @@ def main() -> None:
         {
             'model_type': args.model,
             'state_dict': actor.state_dict(),
+            'critic1_state_dict': critic1.state_dict(),
+            'critic2_state_dict': critic2.state_dict(),
+            'actor_target_state_dict': trainer.actor_target.state_dict(),
+            'critic1_target_state_dict': trainer.critic1_target.state_dict(),
+            'critic2_target_state_dict': trainer.critic2_target.state_dict(),
+            'actor_optimizer_state_dict': trainer.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': trainer.critic_optimizer.state_dict(),
             'metrics': metrics_dict,
             'config': config_payload,
             'finished_at': finished_at,
