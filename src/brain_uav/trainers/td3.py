@@ -237,6 +237,7 @@ class TD3Trainer:
             'episode_start': window[0]['episode'],
             'episode_end': window[-1]['episode'],
             'episode_count': len(window),
+            'total_steps': self.total_steps,
             'avg_return': round(statistics.mean(item['return'] for item in window), 6),
             'avg_length': round(statistics.mean(item['length'] for item in window), 6),
             'avg_actor_loss': round(statistics.mean(item['actor_loss'] for item in window), 6),
@@ -274,6 +275,10 @@ class TD3Trainer:
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            list(self.critic1.parameters()) + list(self.critic2.parameters()),
+            max_norm=1.0,
+        )
         self.critic_optimizer.step()
         self.metrics.critic_loss = float(critic_loss.item())
 

@@ -292,15 +292,16 @@ def make_episode_capture_callback(
 
 
 def default_timesteps_for_level(level: str) -> int:
-    if level == 'easy':
+    if level in {'easy', 'medium', 'hard'}:
         return 250000
-    return 200000
+    raise ValueError(f'Unsupported curriculum level: {level}')
 
 
 def make_early_stop_callback(
     enabled: bool,
     goal_rate_threshold: float,
     consecutive_windows: int,
+    min_steps: int,
 ) -> Callable[[dict[str, Any]], str | None] | None:
     if not enabled:
         return None
@@ -313,12 +314,14 @@ def make_early_stop_callback(
         recent_goal_rates.append(goal_rate)
         if len(recent_goal_rates) > consecutive_windows:
             recent_goal_rates.pop(0)
+        if int(window_row.get('total_steps', 0)) < min_steps:
+            return None
         if len(recent_goal_rates) < consecutive_windows:
             return None
         if all(rate >= goal_rate_threshold for rate in recent_goal_rates):
             return (
-                f"goal_rate>={goal_rate_threshold:.2f} for {consecutive_windows} consecutive windows "
-                f"(latest={goal_rate:.2f})"
+                f"goal_rate>={goal_rate_threshold:.2f} for {consecutive_windows} consecutive windows after "
+                f"min_steps={min_steps} (latest={goal_rate:.2f})"
             )
         return None
 
@@ -377,6 +380,7 @@ def main() -> None:
     parser.add_argument('--early-stop-enabled', action='store_true')
     parser.add_argument('--early-stop-goal-rate', type=float, default=0.94)
     parser.add_argument('--early-stop-windows', type=int, default=5)
+    parser.add_argument('--early-stop-min-steps', type=int, default=120000)
     args = parser.parse_args()
 
     cfg = ExperimentConfig()
@@ -443,6 +447,7 @@ def main() -> None:
         enabled=args.early_stop_enabled and args.summary_every_episodes > 0,
         goal_rate_threshold=args.early_stop_goal_rate,
         consecutive_windows=args.early_stop_windows,
+        min_steps=args.early_stop_min_steps,
     )
     metrics = trainer.train(
         total_timesteps,
@@ -466,6 +471,7 @@ def main() -> None:
     metrics_dict['early_stop_enabled'] = bool(args.early_stop_enabled and args.summary_every_episodes > 0)
     metrics_dict['early_stop_goal_rate'] = args.early_stop_goal_rate
     metrics_dict['early_stop_windows'] = args.early_stop_windows
+    metrics_dict['early_stop_min_steps'] = args.early_stop_min_steps
     metrics_dict['stopped_early'] = trainer.stop_reason is not None
     metrics_dict['stop_reason'] = trainer.stop_reason
     metrics_dict['init_checkpoint'] = str(init_checkpoint) if init_checkpoint else None
