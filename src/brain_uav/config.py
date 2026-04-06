@@ -1,8 +1,4 @@
-﻿"""Central configuration definitions for the whole project.
-
-读项目时建议先看这个文件，因为环境、模型、训练脚本都会从这里拿参数。
-如果你后面要调实验，大多数时候改这里就够了。
-"""
+"""Central configuration definitions for the whole project."""
 
 from __future__ import annotations
 
@@ -39,6 +35,8 @@ class ScenarioConfig:
     corridor_blocking_margin: float = 35.0
     max_corridor_blockers: int = 2
     max_start_goal_height_gap: float = 110.0
+    dual_zone_min_margin: float = 130.0
+    easy_two_zone_blocker_probability: float = 0.5
 
 
 @dataclass(slots=True)
@@ -55,17 +53,21 @@ class RewardConfig:
     ground_soft_penalty_cap: float = 80.0
     descent_trend_penalty_weight: float = 35.0
     descent_trend_penalty_cap: float = 60.0
-    inefficiency_penalty_weight: float = 8.0
-    inefficiency_penalty_cap: float = 15.0
-    progress_window_size: int = 8
-    min_progress_per_window: float = 18.0
+    inefficiency_penalty_weight: float = 14.0
+    inefficiency_penalty_cap: float = 30.0
+    progress_window_size: int = 10
+    min_progress_per_window: float = 20.0
     action_delta_gamma_weight: float = 8.0
     action_delta_psi_weight: float = 3.0
     smoothness_weight: float = 0.1
     collision_penalty: float = 6000.0
     step_penalty: float = 3.0
     boundary_penalty: float = 6000.0
-    timeout_penalty: float = 1000.0
+    timeout_penalty: float = 1500.0
+    breakthrough_reward_distance: float = 220.0
+    breakthrough_progress_threshold: float = 22.0
+    breakthrough_reward_weight: float = 0.35
+    breakthrough_reward_cap: float = 10.0
 
 
 @dataclass(slots=True)
@@ -89,6 +91,7 @@ class TrainingConfig:
     bc_epochs: int = 10
     snn_time_window: int = 4
     hidden_dim: int = 128
+    critic_grad_clip_norm: float | None = None
     device: str = 'cpu'
 
 

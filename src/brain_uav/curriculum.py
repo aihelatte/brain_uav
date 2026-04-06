@@ -1,14 +1,15 @@
-﻿"""Curriculum helpers for explicit easy/medium/hard training stages."""
+"""Curriculum helpers for explicit easy/easy_two_zone/medium/hard training stages."""
 
 from __future__ import annotations
 
 from typing import Iterable
 
-CURRICULUM_LEVELS = ('easy', 'medium', 'hard')
+CURRICULUM_LEVELS = ('easy', 'easy_two_zone', 'medium', 'hard')
 DEFAULT_CURRICULUM_MIXES: dict[str, dict[str, float]] = {
     'easy': {'easy': 1.0},
-    'medium': {'medium': 0.8, 'easy': 0.2},
-    'hard': {'hard': 0.7, 'medium': 0.2, 'easy': 0.1},
+    'easy_two_zone': {'easy_two_zone': 0.8, 'easy': 0.2},
+    'medium': {'medium': 0.8, 'easy_two_zone': 0.2},
+    'hard': {'hard': 0.7, 'medium': 0.2, 'easy_two_zone': 0.1},
 }
 
 
@@ -33,7 +34,7 @@ def normalize_curriculum_mix(mix: dict[str, float] | None, *, fallback_level: st
 
 
 def parse_curriculum_mix(raw: str | None, *, fallback_level: str) -> dict[str, float]:
-    """Parse a CLI curriculum mix string like ``hard:0.7,medium:0.2,easy:0.1``."""
+    """Parse a CLI curriculum mix string like ``hard:0.7,medium:0.2,easy_two_zone:0.1``."""
 
     if raw is None or not raw.strip():
         return default_curriculum_mix(fallback_level)

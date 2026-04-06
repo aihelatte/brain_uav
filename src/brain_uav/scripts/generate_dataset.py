@@ -20,7 +20,7 @@ from ..utils.io import ensure_parent
 from ..utils.seeding import set_global_seed
 
 
-DATASET_VERSION = 'v5'
+DATASET_VERSION = 'v6'
 
 
 def collect_rollout(planner, env, max_steps: int | None = None):
@@ -42,10 +42,10 @@ def collect_rollout(planner, env, max_steps: int | None = None):
 
 def main() -> None:
     parser = argparse.ArgumentParser(description='Generate behavior cloning dataset.')
-    parser.add_argument('--output', type=Path, default=Path('data/bc_dataset_easy_v5.npz'))
+    parser.add_argument('--output', type=Path, default=Path('data/bc_dataset_easy_v6.npz'))
     parser.add_argument('--episodes', type=int, default=180)
     parser.add_argument('--seed', type=int, default=7)
-    parser.add_argument('--curriculum-level', choices=['easy', 'medium', 'hard'], default='easy')
+    parser.add_argument('--curriculum-level', choices=['easy', 'easy_two_zone', 'medium', 'hard'], default='easy')
     parser.add_argument('--curriculum-mix', type=str, default=None)
     args = parser.parse_args()
 

@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 
 from ..config import RewardConfig, ScenarioConfig
-from ..curriculum import CURRICULUM_LEVELS, normalize_curriculum_mix
+from ..curriculum import normalize_curriculum_mix
 from ..utils.gym_compat import gym, spaces
 
 
@@ -50,7 +50,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self._fixed_idx = 0
         self.rng = np.random.default_rng(seed)
 
-        obs_dim = 5 + 3 + 4 + 3 * self.scenario.nearest_zone_count
+        obs_dim = 5 + 3 + 4 + 4 * self.scenario.nearest_zone_count
         self.action_space = spaces.Box(
             low=np.array(
                 [-self.scenario.delta_gamma_max, -self.scenario.delta_psi_max], dtype=np.float32
@@ -77,6 +77,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.recent_progress: list[float] = []
         self.trajectory: list[np.ndarray] = []
         self.last_curriculum_level = 'random'
+        self.best_goal_distance_so_far = 0.0
 
     def seed(self, seed: int | None = None) -> None:
         self.rng = np.random.default_rng(seed)
@@ -98,6 +99,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.prev_action = np.zeros(2, dtype=np.float32)
         self.recent_progress = []
         self.trajectory = [self.state[:3].copy()]
+        self.best_goal_distance_so_far = self._goal_distance(self.state[:3])
         return self._get_obs(), self._info(progress=0.0)
 
     def step(self, action: np.ndarray):
@@ -105,6 +107,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         prev_state = self.state.copy()
         prev_action = self.prev_action.copy()
         prev_distance = self._goal_distance(prev_state[:3])
+        prev_best_goal_distance = self.best_goal_distance_so_far
         self._apply_action(action)
         self.last_delta_z = float(self.state[2] - prev_state[2])
         self.steps += 1
@@ -113,7 +116,17 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         step_progress = prev_distance - new_distance
         self._record_progress(step_progress)
         terminated, truncated, outcome = self._termination()
-        reward = self._compute_reward(prev_state, prev_action, prev_distance, new_distance, action, outcome)
+        reward = self._compute_reward(
+            prev_state,
+            prev_action,
+            prev_distance,
+            new_distance,
+            action,
+            outcome,
+            prev_best_goal_distance,
+        )
+        if new_distance < self.best_goal_distance_so_far:
+            self.best_goal_distance_so_far = new_distance
         self.prev_action = action.copy()
         return self._get_obs(), float(reward), terminated, truncated, self._info(
             progress=step_progress,
@@ -174,6 +187,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     def _sample_curriculum_scenario(self, level: str) -> dict[str, Any] | None:
         if level == 'easy':
             return self._sample_easy_scenario()
+        if level == 'easy_two_zone':
+            return self._sample_easy_two_zone_scenario()
         if level == 'medium':
             return self._sample_medium_scenario()
         if level == 'hard':
@@ -227,6 +242,99 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 'curriculum_level': 'easy',
             }
         return None
+
+    def _sample_easy_two_zone_scenario(self) -> dict[str, Any] | None:
+        cfg = self.scenario
+        for _ in range(70):
+            state = np.array(
+                [
+                    self.rng.uniform(-0.82 * cfg.world_xy, -0.60 * cfg.world_xy),
+                    self.rng.uniform(-0.12 * cfg.world_xy, 0.12 * cfg.world_xy),
+                    self.rng.uniform(105.0, 160.0),
+                    0.0,
+                    self.rng.uniform(-0.12, 0.12),
+                ],
+                dtype=np.float32,
+            )
+            goal = np.array(
+                [
+                    self.rng.uniform(0.50 * cfg.world_xy, 0.82 * cfg.world_xy),
+                    self.rng.uniform(-0.16 * cfg.world_xy, 0.16 * cfg.world_xy),
+                    self.rng.uniform(100.0, 175.0),
+                ],
+                dtype=np.float32,
+            )
+            if abs(float(goal[2] - state[2])) > 65.0:
+                continue
+            force_blocker = bool(self.rng.random() < cfg.easy_two_zone_blocker_probability)
+            zones = self._sample_easy_two_zone_pair(state, goal, force_blocker)
+            if not zones:
+                continue
+            blockers = self._count_corridor_blockers(state, goal, zones, margin=cfg.corridor_blocking_margin)
+            if force_blocker and not (1 <= blockers <= 2):
+                continue
+            if not force_blocker and blockers > 1:
+                continue
+            return {
+                'state': state.tolist(),
+                'goal': goal.tolist(),
+                'zones': [
+                    {'center_xy': zone.center_xy.tolist(), 'radius': zone.radius}
+                    for zone in zones
+                ],
+                'curriculum_level': 'easy_two_zone',
+            }
+        return None
+
+    def _sample_easy_two_zone_pair(self, state: np.ndarray, goal: np.ndarray, force_blocker: bool) -> list[Zone] | None:
+        cfg = self.scenario
+        zones: list[Zone] = []
+        mean_y = 0.5 * (state[1] + goal[1])
+        if force_blocker:
+            center_1 = np.array(
+                [
+                    self.rng.uniform(-0.02 * cfg.world_xy, 0.22 * cfg.world_xy),
+                    mean_y + self.rng.uniform(-45.0, 45.0),
+                ],
+                dtype=np.float32,
+            )
+            radius_1 = float(self.rng.uniform(90.0, 120.0))
+            if not self._zone_candidate_is_valid(state, goal, zones, center_1, radius_1):
+                return None
+            zones.append(Zone(center_xy=center_1, radius=radius_1))
+
+            side = float(self.rng.choice([-1.0, 1.0]))
+            center_2 = np.array(
+                [
+                    center_1[0] + self.rng.uniform(130.0, 220.0),
+                    mean_y + side * self.rng.uniform(170.0, 250.0),
+                ],
+                dtype=np.float32,
+            )
+            radius_2 = float(self.rng.uniform(80.0, 110.0))
+            if not self._zone_candidate_is_valid(state, goal, zones, center_2, radius_2):
+                return None
+            zones.append(Zone(center_xy=center_2, radius=radius_2))
+        else:
+            base_x = self.rng.uniform(-0.05 * cfg.world_xy, 0.20 * cfg.world_xy)
+            offsets = [self.rng.uniform(160.0, 240.0), -self.rng.uniform(160.0, 240.0)]
+            self.rng.shuffle(offsets)
+            for idx, offset in enumerate(offsets):
+                center_xy = np.array(
+                    [
+                        base_x + idx * self.rng.uniform(130.0, 200.0),
+                        mean_y + offset,
+                    ],
+                    dtype=np.float32,
+                )
+                radius = float(self.rng.uniform(80.0, 110.0))
+                if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
+                    return None
+                zones.append(Zone(center_xy=center_xy, radius=radius))
+
+        if not self._double_zone_layout_is_reasonable(state, goal, zones, cfg.dual_zone_min_margin):
+            return None
+        return zones
 
     def _sample_medium_scenario(self) -> dict[str, Any] | None:
         cfg = self.scenario
@@ -306,6 +414,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
                 return None
             zones.append(Zone(center_xy=center_xy, radius=radius))
+        if not self._double_zone_layout_is_reasonable(state, goal, zones, cfg.dual_zone_min_margin):
+            return None
         return zones
 
     def _sample_hard_scenario(self) -> dict[str, Any] | None:
@@ -408,6 +518,25 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         blockers = self._count_corridor_blockers(state, goal, zones, margin=self.scenario.corridor_blocking_margin)
         return blockers <= self.scenario.max_corridor_blockers
 
+    def _double_zone_layout_is_reasonable(
+        self,
+        state: np.ndarray,
+        goal: np.ndarray,
+        zones: list[Zone],
+        min_margin: float,
+    ) -> bool:
+        if len(zones) < 2:
+            return True
+        for idx, zone_a in enumerate(zones):
+            for zone_b in zones[idx + 1 :]:
+                center_distance = float(np.linalg.norm(zone_a.center_xy - zone_b.center_xy))
+                if center_distance <= zone_a.radius + zone_b.radius + min_margin:
+                    return False
+        blockers = self._count_corridor_blockers(state, goal, zones, margin=self.scenario.corridor_blocking_margin)
+        if blockers > 2:
+            return False
+        return True
+
     def _count_corridor_blockers(self, state: np.ndarray, goal: np.ndarray, zones: list[Zone], margin: float) -> int:
         start_xy = state[:2]
         goal_xy = goal[:2]
@@ -461,9 +590,15 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         sorted_zones = sorted(self.zones, key=lambda zone: np.linalg.norm(zone.center_xy - self.state[:2]))
         for zone in sorted_zones[: self.scenario.nearest_zone_count]:
             dx, dy = zone.center_xy - self.state[:2]
-            zone_features.extend([float(dx), float(dy), float(zone.radius)])
-        while len(zone_features) < self.scenario.nearest_zone_count * 3:
-            zone_features.extend([0.0, 0.0, 0.0])
+            r_xy = float(np.linalg.norm([dx, dy]))
+            if r_xy < zone.radius:
+                z_cap = math.sqrt(max(zone.radius ** 2 - r_xy ** 2, 0.0))
+            else:
+                z_cap = 0.0
+            z_margin_to_dome = float(self.state[2] - z_cap)
+            zone_features.extend([float(dx), float(dy), float(zone.radius), z_margin_to_dome])
+        while len(zone_features) < self.scenario.nearest_zone_count * 4:
+            zone_features.extend([0.0, 0.0, 0.0, 0.0])
         return np.concatenate(
             [own_state, rel_goal.astype(np.float32), extra_features, np.array(zone_features, dtype=np.float32)]
         ).astype(np.float32)
@@ -491,8 +626,10 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         new_distance: float,
         action: np.ndarray,
         outcome: str,
+        prev_best_goal_distance: float,
     ) -> float:
         rew = self.rewards.progress_weight * (prev_distance - new_distance)
+        rew += self._breakthrough_reward(new_distance, prev_best_goal_distance, outcome)
         rew -= self.rewards.step_penalty
         rew -= self.rewards.smoothness_weight * float(np.square(action).sum())
         rew -= self._action_change_penalty(prev_action, action)
@@ -532,6 +669,37 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         )
         penalty = self.rewards.inefficiency_penalty_weight * deficit_ratio
         return min(penalty, self.rewards.inefficiency_penalty_cap)
+
+    def _breakthrough_reward(
+        self,
+        new_distance: float,
+        prev_best_goal_distance: float,
+        outcome: str,
+    ) -> float:
+        if outcome in {'collision', 'ground', 'boundary'}:
+            return 0.0
+        if new_distance >= prev_best_goal_distance:
+            return 0.0
+        if len(self.recent_progress) < self.rewards.progress_window_size:
+            return 0.0
+        window_progress = float(sum(self.recent_progress))
+        if window_progress < self.rewards.breakthrough_progress_threshold:
+            return 0.0
+        if self._nearest_zone_surface_clearance(self.state[:3]) > self.rewards.breakthrough_reward_distance:
+            return 0.0
+        reward = self.rewards.breakthrough_reward_weight * window_progress
+        return min(reward, self.rewards.breakthrough_reward_cap)
+
+    def _nearest_zone_surface_clearance(self, pos: np.ndarray) -> float:
+        if not self.zones:
+            return float('inf')
+        clearances = []
+        for zone in self.zones:
+            center_distance = float(
+                np.linalg.norm(np.array([pos[0] - zone.center_xy[0], pos[1] - zone.center_xy[1], pos[2]]))
+            )
+            clearances.append(center_distance - zone.radius)
+        return min(clearances)
 
     def _action_change_penalty(self, prev_action: np.ndarray, action: np.ndarray) -> float:
         delta = action - prev_action

@@ -68,6 +68,7 @@ class TD3Trainer:
         exploration_noise: float,
         success_sample_bias: float,
         actor_freeze_steps: int = 0,
+        critic_grad_clip_norm: float | None = None,
         warmup_strategy: str = 'random',
         device: str = 'cpu',
     ) -> None:
@@ -91,6 +92,7 @@ class TD3Trainer:
         self.warmup_steps = warmup_steps
         self.exploration_noise = exploration_noise
         self.actor_freeze_steps = actor_freeze_steps
+        self.critic_grad_clip_norm = critic_grad_clip_norm
         self.warmup_strategy = warmup_strategy
         self.device = device
         self.replay = ReplayBuffer(replay_size, success_sample_bias=success_sample_bias)
@@ -252,6 +254,11 @@ class TD3Trainer:
         critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        if self.critic_grad_clip_norm is not None and self.critic_grad_clip_norm > 0.0:
+            torch.nn.utils.clip_grad_norm_(
+                list(self.critic1.parameters()) + list(self.critic2.parameters()),
+                max_norm=self.critic_grad_clip_norm,
+            )
         self.critic_optimizer.step()
         self.metrics.critic_loss = float(critic_loss.item())
 

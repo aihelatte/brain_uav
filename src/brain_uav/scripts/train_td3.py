@@ -328,7 +328,7 @@ def main() -> None:
     parser.add_argument('--model', choices=['snn', 'ann'], default='snn')
     parser.add_argument('--timesteps', type=int, default=200000)
     parser.add_argument('--seed', type=int, default=7)
-    parser.add_argument('--curriculum-level', choices=['easy', 'medium', 'hard'], required=True)
+    parser.add_argument('--curriculum-level', choices=['easy', 'easy_two_zone', 'medium', 'hard'], required=True)
     parser.add_argument('--curriculum-mix', type=str, default=None)
     parser.add_argument('--init-checkpoint', type=Path, default=None)
     parser.add_argument('--bc-checkpoint', type=Path, default=None)
@@ -336,11 +336,14 @@ def main() -> None:
     parser.add_argument('--metrics-out', type=Path, default=None)
     parser.add_argument('--summary-every-episodes', type=int, default=50)
     parser.add_argument('--actor-freeze-steps', type=int, default=None)
+    parser.add_argument('--critic-grad-clip-norm', type=float, default=None)
     args = parser.parse_args()
 
     cfg = ExperimentConfig()
     if args.actor_freeze_steps is not None:
         cfg.training.actor_freeze_steps = args.actor_freeze_steps
+    if args.critic_grad_clip_norm is not None:
+        cfg.training.critic_grad_clip_norm = args.critic_grad_clip_norm
     set_global_seed(args.seed)
 
     curriculum_mix = parse_curriculum_mix(args.curriculum_mix, fallback_level=args.curriculum_level)
@@ -382,6 +385,7 @@ def main() -> None:
         exploration_noise=cfg.training.exploration_noise,
         success_sample_bias=cfg.training.success_sample_bias,
         actor_freeze_steps=cfg.training.actor_freeze_steps,
+        critic_grad_clip_norm=cfg.training.critic_grad_clip_norm,
         warmup_strategy='random',
         device=cfg.training.device,
     )
@@ -411,6 +415,7 @@ def main() -> None:
     metrics_dict['log_dir'] = str(log_dir)
     metrics_dict['results_dir'] = str(results_dir)
     metrics_dict['actor_freeze_steps'] = cfg.training.actor_freeze_steps
+    metrics_dict['critic_grad_clip_norm'] = cfg.training.critic_grad_clip_norm
     metrics_dict['success_sample_bias'] = cfg.training.success_sample_bias
     metrics_dict['curriculum_level'] = args.curriculum_level
     metrics_dict['curriculum_mix'] = curriculum_mix
