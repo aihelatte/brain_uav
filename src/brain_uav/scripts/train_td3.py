@@ -287,6 +287,37 @@ def make_episode_capture_callback(
     return callback
 
 
+def make_early_stop_callback(
+    enabled: bool,
+    goal_rate_threshold: float,
+    consecutive_windows: int,
+    min_steps: int,
+) -> Callable[[dict[str, Any]], str | None] | None:
+    if not enabled:
+        return None
+
+    recent_goal_rates: list[float] = []
+
+    def callback(window_row: dict[str, Any]) -> str | None:
+        episode_count = max(int(window_row.get('episode_count', 0)), 1)
+        goal_rate = float(window_row.get('goal_count', 0)) / episode_count
+        recent_goal_rates.append(goal_rate)
+        if len(recent_goal_rates) > consecutive_windows:
+            recent_goal_rates.pop(0)
+        if int(window_row.get('total_steps', 0)) < min_steps:
+            return None
+        if len(recent_goal_rates) < consecutive_windows:
+            return None
+        if all(rate >= goal_rate_threshold for rate in recent_goal_rates):
+            return (
+                f"goal_rate>={goal_rate_threshold:.2f} for {consecutive_windows} consecutive windows after "
+                f"min_steps={min_steps} (latest={goal_rate:.2f})"
+            )
+        return None
+
+    return callback
+
+
 def load_training_state(init_checkpoint: Path | None, actor, critic1, critic2, trainer) -> str:
     """Restore checkpoint according to whether it is BC or TD3."""
 
@@ -337,6 +368,10 @@ def main() -> None:
     parser.add_argument('--summary-every-episodes', type=int, default=50)
     parser.add_argument('--actor-freeze-steps', type=int, default=None)
     parser.add_argument('--critic-grad-clip-norm', type=float, default=None)
+    parser.add_argument('--early-stop-enabled', action='store_true')
+    parser.add_argument('--early-stop-goal-rate', type=float, default=0.94)
+    parser.add_argument('--early-stop-windows', type=int, default=5)
+    parser.add_argument('--early-stop-min-steps', type=int, default=120000)
     args = parser.parse_args()
 
     cfg = ExperimentConfig()
@@ -401,12 +436,19 @@ def main() -> None:
         total_timesteps=args.timesteps,
         config_payload=config_payload,
     )
+    early_stop_callback = make_early_stop_callback(
+        enabled=args.early_stop_enabled and args.summary_every_episodes > 0,
+        goal_rate_threshold=args.early_stop_goal_rate,
+        consecutive_windows=args.early_stop_windows,
+        min_steps=args.early_stop_min_steps,
+    )
     metrics = trainer.train(
         args.timesteps,
         log_interval=max(100, args.timesteps // 10),
         verbose=True,
         summary_every_episodes=args.summary_every_episodes,
         episode_callback=episode_callback,
+        window_callback=early_stop_callback,
     )
 
     metrics_dict = metrics.to_dict()
@@ -416,6 +458,12 @@ def main() -> None:
     metrics_dict['results_dir'] = str(results_dir)
     metrics_dict['actor_freeze_steps'] = cfg.training.actor_freeze_steps
     metrics_dict['critic_grad_clip_norm'] = cfg.training.critic_grad_clip_norm
+    metrics_dict['early_stop_enabled'] = bool(args.early_stop_enabled and args.summary_every_episodes > 0)
+    metrics_dict['early_stop_goal_rate'] = args.early_stop_goal_rate
+    metrics_dict['early_stop_windows'] = args.early_stop_windows
+    metrics_dict['early_stop_min_steps'] = args.early_stop_min_steps
+    metrics_dict['stopped_early'] = trainer.stop_reason is not None
+    metrics_dict['stop_reason'] = trainer.stop_reason
     metrics_dict['success_sample_bias'] = cfg.training.success_sample_bias
     metrics_dict['curriculum_level'] = args.curriculum_level
     metrics_dict['curriculum_mix'] = curriculum_mix
@@ -447,6 +495,8 @@ def main() -> None:
     print(f'Saved TD3 checkpoint to {output}')
     print(f'Curriculum level={args.curriculum_level}, mix={describe_curriculum_mix(curriculum_mix)}')
     print(f"Episodes: {metrics.episodes}, Steps: {metrics.steps}, Critic loss: {metrics.critic_loss:.4f}")
+    if trainer.stop_reason is not None:
+        print(f"Early stop: {trainer.stop_reason}")
     print(f'Result directory: {results_dir}')
     print(f"Training reports: {report_outputs}")
 

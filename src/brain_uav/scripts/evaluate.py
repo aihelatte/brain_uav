@@ -118,7 +118,7 @@ def main() -> None:
     parser.add_argument('--episodes', type=int, default=16)
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--evaluation-mode', choices=['benchmark', 'curriculum', 'random'], default='benchmark')
-    parser.add_argument('--curriculum-level', choices=['easy', 'medium', 'hard'], default=None)
+    parser.add_argument('--curriculum-level', choices=['easy', 'easy_two_zone', 'medium', 'hard'], default=None)
     parser.add_argument('--curriculum-mix', type=str, default=None)
     parser.add_argument('--output', type=Path, default=None)
     args = parser.parse_args()
