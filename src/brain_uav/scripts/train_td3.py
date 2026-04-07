@@ -151,6 +151,7 @@ def export_episode_result(
         'outcome': record['outcome'],
         'actor_loss': record['actor_loss'],
         'critic_loss': record['critic_loss'],
+        'zone_count': len(record['scenario']['zones']),
         'scenario': record['scenario'],
         'trajectory': record['trajectory'],
         'final_state': record['final_state'],
@@ -221,16 +222,27 @@ def export_episode_result(
         f"zone {idx}: center=({zone['center_xy'][0]:.1f}, {zone['center_xy'][1]:.1f}), r={zone['radius']:.1f}"
         for idx, zone in enumerate(zones, start=1)
     ]
+    scenario_label = record['info'].get('scenario_name')
+    scenario_id = record['info'].get('scenario_id')
+    category = record['info'].get('category')
+    corridor_width = record['info'].get('corridor_width')
+    min_clearance = record['info'].get('min_clearance_to_boundary')
     summary = [
         f"episode: {record['episode']}",
         f"steps consumed: {record['total_steps']}",
+        f"steps: {record['length']}",
         f"outcome: {record['outcome']}",
         f"return: {record['return']:.2f}",
-        f"length: {record['length']}",
+        f"scenario: {scenario_label or 'n/a'}",
+        f"scenario_id: {scenario_id or 'n/a'}",
+        f"category: {category or 'n/a'}",
         f"curriculum_level: {record['info'].get('curriculum_level', 'unknown')}",
         f"goal distance: {record['info']['goal_distance']:.2f}",
         f"start: ({start[0]:.1f}, {start[1]:.1f}, {start[2]:.1f})",
         f"goal: ({goal[0]:.1f}, {goal[1]:.1f}, {goal[2]:.1f})",
+        f"zone_count: {len(zones)}",
+        f"corridor_width: {corridor_width if corridor_width is not None else 'n/a'}",
+        f"min_clearance_to_boundary: {min_clearance if min_clearance is not None else 'n/a'}",
         f"goal radius: {scenario_cfg['goal_radius']}",
         f"warning_distance: {scenario_cfg['warning_distance']}",
         f"boundary_warning_distance: {scenario_cfg['boundary_warning_distance']}",
@@ -245,6 +257,8 @@ def export_episode_result(
     fig.tight_layout(rect=[0, 0, 1, 0.97], pad=2.0)
     fig.savefig(png_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
+
+    return {'json': str(json_path), 'png': str(png_path)}
 
 def make_episode_capture_callback(
     result_root: Path,

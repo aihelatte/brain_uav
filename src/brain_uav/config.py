@@ -36,6 +36,7 @@ class ScenarioConfig:
     max_corridor_blockers: int = 2
     max_start_goal_height_gap: float = 110.0
     dual_zone_min_margin: float = 130.0
+    easy_two_zone_min_gap: float = 220.0
     easy_two_zone_blocker_probability: float = 0.5
 
 

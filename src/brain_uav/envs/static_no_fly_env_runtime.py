@@ -332,7 +332,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                     return None
                 zones.append(Zone(center_xy=center_xy, radius=radius))
 
-        if not self._double_zone_layout_is_reasonable(state, goal, zones, cfg.dual_zone_min_margin):
+        if not self._double_zone_layout_is_reasonable(state, goal, zones, cfg.easy_two_zone_min_gap):
             return None
         return zones
 
