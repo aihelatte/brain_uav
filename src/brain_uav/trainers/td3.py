@@ -130,7 +130,15 @@ class TD3Trainer:
                 action = self.select_action(obs, with_noise=True)
             next_obs, reward, terminated, truncated, info = self.env.step(action)
             done = terminated or truncated
-            self.replay.add(obs, action, reward, next_obs, terminated, success=bool(terminated and reward > 0.0))
+            # Include timeouts as terminal transitions in replay.
+            self.replay.add(
+                obs,
+                action,
+                reward,
+                next_obs,
+                done,
+                success=bool(info.get('outcome') == 'goal'),
+            )
             episode_return += reward
             episode_length += 1
             obs = next_obs
