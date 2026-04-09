@@ -1,9 +1,10 @@
-﻿"""Train the TD3 policy after behavior cloning initialization."""
+"""Train the TD3 policy after behavior cloning initialization."""
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from copy import deepcopy
 from typing import Any, Callable
 
 from ..config import ExperimentConfig
@@ -371,7 +372,7 @@ def load_training_state(init_checkpoint: Path | None, actor, critic1, critic2, t
 def main() -> None:
     parser = argparse.ArgumentParser(description='Train the TD3 curriculum policy stage by stage.')
     parser.add_argument('--model', choices=['snn', 'ann'], default='snn')
-    parser.add_argument('--timesteps', type=int, default=200000)
+    parser.add_argument('--timesteps', type=int, default=None)
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--curriculum-level', choices=['easy', 'easy_two_zone', 'medium', 'hard'], required=True)
     parser.add_argument('--curriculum-mix', type=str, default=None)
@@ -388,11 +389,26 @@ def main() -> None:
     parser.add_argument('--early-stop-min-steps', type=int, default=120000)
     args = parser.parse_args()
 
+    if args.timesteps is None:
+        args.timesteps = 300000 if args.curriculum_level == 'hard' else 200000
+
     cfg = ExperimentConfig()
-    if args.actor_freeze_steps is not None:
+    if args.actor_freeze_steps is None:
+        cfg.training.actor_freeze_steps = 10_000
+    else:
         cfg.training.actor_freeze_steps = args.actor_freeze_steps
-    if args.critic_grad_clip_norm is not None:
+    if args.critic_grad_clip_norm is None:
+        cfg.training.critic_grad_clip_norm = 1.0
+    else:
         cfg.training.critic_grad_clip_norm = args.critic_grad_clip_norm
+    if args.model == 'ann':
+        # Use more conservative defaults for ANN to avoid late-training collapse.
+        cfg.training.actor_lr = 1.5e-4
+        cfg.training.critic_lr = 2e-4
+    if args.curriculum_level == 'hard':
+        cfg.training.actor_lr *= 0.75
+        cfg.training.critic_lr *= 0.85
+        cfg.training.success_sample_bias = 5.0
     set_global_seed(args.seed)
 
     curriculum_mix = parse_curriculum_mix(args.curriculum_mix, fallback_level=args.curriculum_level)
@@ -437,9 +453,16 @@ def main() -> None:
         critic_grad_clip_norm=cfg.training.critic_grad_clip_norm,
         warmup_strategy='random',
         device=cfg.training.device,
+        curriculum_level=args.curriculum_level,
     )
     init_checkpoint = args.init_checkpoint or args.bc_checkpoint
     trainer.warmup_strategy = load_training_state(init_checkpoint, actor, critic1, critic2, trainer)
+
+    if init_checkpoint is not None and args.curriculum_level == 'easy':
+        checkpoint = load_checkpoint(init_checkpoint)
+        has_critics = 'critic1_state_dict' in checkpoint and 'critic2_state_dict' in checkpoint
+        if not has_critics:
+            trainer.set_bc_reference_actor(deepcopy(actor))
 
     config_payload = cfg.to_dict()
     config_payload['curriculum_level'] = args.curriculum_level
@@ -472,6 +495,15 @@ def main() -> None:
     metrics_dict['results_dir'] = str(results_dir)
     metrics_dict['actor_freeze_steps'] = cfg.training.actor_freeze_steps
     metrics_dict['critic_grad_clip_norm'] = cfg.training.critic_grad_clip_norm
+    metrics_dict['exploration_noise_current'] = trainer.exploration_noise_current
+    metrics_dict['policy_noise_current'] = trainer.policy_noise_current
+    metrics_dict['noise_clip_current'] = trainer.noise_clip_current
+    metrics_dict['success_sample_bias'] = cfg.training.success_sample_bias
+    metrics_dict['bc_regularization_enabled'] = trainer.metrics.bc_regularization_enabled
+    metrics_dict['bc_lambda'] = trainer.metrics.bc_lambda
+    metrics_dict['bc_loss'] = trainer.metrics.bc_loss
+    metrics_dict['rl_actor_loss'] = trainer.metrics.rl_actor_loss
+    metrics_dict['total_actor_loss'] = trainer.metrics.actor_loss
     metrics_dict['early_stop_enabled'] = bool(args.early_stop_enabled and args.summary_every_episodes > 0)
     metrics_dict['early_stop_goal_rate'] = args.early_stop_goal_rate
     metrics_dict['early_stop_windows'] = args.early_stop_windows
@@ -517,4 +549,5 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+
 

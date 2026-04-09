@@ -26,6 +26,10 @@ from .replay_buffer import ReplayBuffer
 class TD3Metrics:
     actor_loss: float = 0.0
     critic_loss: float = 0.0
+    rl_actor_loss: float = 0.0
+    bc_loss: float = 0.0
+    bc_lambda: float = 0.0
+    bc_regularization_enabled: bool = False
     steps: int = 0
     episodes: int = 0
     episode_returns: list[float] = field(default_factory=list)
@@ -37,6 +41,10 @@ class TD3Metrics:
         return {
             'actor_loss': self.actor_loss,
             'critic_loss': self.critic_loss,
+            'rl_actor_loss': self.rl_actor_loss,
+            'bc_loss': self.bc_loss,
+            'bc_lambda': self.bc_lambda,
+            'bc_regularization_enabled': self.bc_regularization_enabled,
             'steps': self.steps,
             'episodes': self.episodes,
             'episode_returns': self.episode_returns,
@@ -71,6 +79,8 @@ class TD3Trainer:
         critic_grad_clip_norm: float | None = None,
         warmup_strategy: str = 'random',
         device: str = 'cpu',
+        bc_reference_actor: nn.Module | None = None,
+        curriculum_level: str | None = None,
     ) -> None:
         self.env = env
         self.actor = actor.to(device)
@@ -93,6 +103,13 @@ class TD3Trainer:
         self.exploration_noise = exploration_noise
         self.actor_freeze_steps = actor_freeze_steps
         self.critic_grad_clip_norm = critic_grad_clip_norm
+        self.success_sample_bias = success_sample_bias
+        self.exploration_noise_base = exploration_noise
+        self.policy_noise_base = policy_noise
+        self.noise_clip_base = noise_clip
+        self.exploration_noise_current = exploration_noise
+        self.policy_noise_current = policy_noise
+        self.noise_clip_current = noise_clip
         self.warmup_strategy = warmup_strategy
         self.device = device
         self.replay = ReplayBuffer(replay_size, success_sample_bias=success_sample_bias)
@@ -102,6 +119,10 @@ class TD3Trainer:
         self.action_high = torch.tensor(env.action_space.high, dtype=torch.float32, device=device)
         self._current_window: list[dict] = []
         self.stop_reason: str | None = None
+        self.curriculum_level: str | None = curriculum_level
+        self.bc_reference_actor: nn.Module | None = None
+        if bc_reference_actor is not None:
+            self.set_bc_reference_actor(bc_reference_actor)
 
     def train(
         self,
@@ -224,12 +245,50 @@ class TD3Trainer:
         self.critic2.to('cpu')
         return self.metrics
 
+    def set_bc_reference_actor(self, actor: nn.Module) -> None:
+        self.bc_reference_actor = actor.to(self.device)
+        self.bc_reference_actor.eval()
+        for param in self.bc_reference_actor.parameters():
+            param.requires_grad = False
+        self.metrics.bc_regularization_enabled = True
+
+    def _bc_lambda(self) -> float:
+        if self.curriculum_level == 'hard':
+            if self.total_steps <= 50_000:
+                return 600.0
+            if self.total_steps <= 100_000:
+                return 150.0
+            return 20.0
+        if self.total_steps <= 50_000:
+            return 1000.0
+        if self.total_steps <= 100_000:
+            return 300.0
+        return 50.0
+
+    def _current_noise(self) -> tuple[float, float, float]:
+        if self.curriculum_level != 'hard':
+            self.exploration_noise_current = self.exploration_noise_base
+            self.policy_noise_current = self.policy_noise_base
+            self.noise_clip_current = self.noise_clip_base
+            return self.exploration_noise_current, self.policy_noise_current, self.noise_clip_current
+        if self.total_steps <= 100_000:
+            factor = 0.0
+        elif self.total_steps <= 200_000:
+            factor = (self.total_steps - 100_000) / 100_000
+        else:
+            factor = 1.0
+        self.exploration_noise_current = self.exploration_noise_base + (0.01 - self.exploration_noise_base) * factor
+        self.policy_noise_current = self.policy_noise_base + (0.008 - self.policy_noise_base) * factor
+        self.noise_clip_current = self.noise_clip_base + (0.015 - self.noise_clip_base) * factor
+        return self.exploration_noise_current, self.policy_noise_current, self.noise_clip_current
+
     def select_action(self, obs: np.ndarray, with_noise: bool = False) -> np.ndarray:
         obs_tensor = torch.tensor(obs[None, :], dtype=torch.float32, device=self.device)
         with torch.no_grad():
             action = self.actor(obs_tensor).cpu().numpy()[0]
         if with_noise:
-            action = action + np.random.normal(0.0, self.exploration_noise, size=action.shape)
+            exploration_noise, _, _ = self._current_noise()
+            action = action + np.random.normal(0.0, exploration_noise, size=action.shape)
         return np.clip(action, self.env.action_space.low, self.env.action_space.high).astype(np.float32)
 
     def _warmup_action(self, obs: np.ndarray) -> np.ndarray:
@@ -275,7 +334,8 @@ class TD3Trainer:
         done = batch['done'].to(self.device)
 
         with torch.no_grad():
-            noise = (torch.randn_like(actions) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
+            _, policy_noise, noise_clip = self._current_noise()
+            noise = (torch.randn_like(actions) * policy_noise).clamp(-noise_clip, noise_clip)
             next_actions = (self.actor_target(next_obs) + noise).clamp(self.action_low, self.action_high)
             target_q1 = self.critic1_target(next_obs, next_actions)
             target_q2 = self.critic2_target(next_obs, next_actions)
@@ -299,12 +359,23 @@ class TD3Trainer:
             self._soft_update(self.critic2, self.critic2_target)
             if self.total_steps > self.actor_freeze_steps:
                 actor_actions = self.actor(obs)
-                actor_loss = -self.critic1(obs, actor_actions).mean()
+                rl_actor_loss = -self.critic1(obs, actor_actions).mean()
+                bc_lambda = 0.0
+                bc_loss = torch.zeros((), device=self.device)
+                if self.bc_reference_actor is not None:
+                    bc_lambda = self._bc_lambda()
+                    with torch.no_grad():
+                        bc_actions = self.bc_reference_actor(obs)
+                    bc_loss = F.mse_loss(actor_actions, bc_actions)
+                actor_loss = rl_actor_loss + bc_lambda * bc_loss
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 self.actor_optimizer.step()
                 self._soft_update(self.actor, self.actor_target)
                 self.metrics.actor_loss = float(actor_loss.item())
+                self.metrics.rl_actor_loss = float(rl_actor_loss.item())
+                self.metrics.bc_loss = float(bc_loss.item())
+                self.metrics.bc_lambda = float(bc_lambda)
 
     def _soft_update(self, model: nn.Module, target: nn.Module) -> None:
         for param, target_param in zip(model.parameters(), target.parameters()):
