@@ -101,6 +101,164 @@ def _build_category_summary(records: list[dict]) -> dict[str, dict]:
     return result
 
 
+def _percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    values_sorted = sorted(values)
+    k = (len(values_sorted) - 1) * (pct / 100.0)
+    f = int(k)
+    c = min(f + 1, len(values_sorted) - 1)
+    if f == c:
+        return float(values_sorted[int(k)])
+    d0 = values_sorted[f] * (c - k)
+    d1 = values_sorted[c] * (k - f)
+    return float(d0 + d1)
+
+
+def _count_params(model: torch.nn.Module) -> tuple[int, int]:
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return int(total), int(trainable)
+
+
+def _thop_macs(model: torch.nn.Module, example_input: torch.Tensor) -> tuple[float | None, float | None, str]:
+    try:
+        from thop import profile  # type: ignore
+    except Exception:
+        return None, None, 'thop_unavailable'
+    try:
+        macs, params = profile(model, inputs=(example_input,), verbose=False)
+        return float(macs), float(params), 'thop_profile'
+    except Exception:
+        return None, None, 'thop_failed'
+
+
+def _coerce_number(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _json_safe(value: object) -> object:
+    if isinstance(value, (int, float, str, bool)) or value is None:
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(val) for key, val in value.items()}
+    try:
+        import numpy as np  # type: ignore
+
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+    except Exception:
+        pass
+    return str(value)
+
+
+def _parse_syops_payload(payload: object) -> tuple[dict[str, float | None], dict[str, object]]:
+    base: dict[str, float | None] = {
+        'syops_total': None,
+        'snn_acs': None,
+        'snn_macs': None,
+        'syops_energy': None,
+    }
+    extras: dict[str, object] = {}
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            extras[key] = _json_safe(value)
+        for key in ('syops_total', 'syops', 'total_syops', 'ops', 'total_ops'):
+            if base['syops_total'] is None:
+                base['syops_total'] = _coerce_number(payload.get(key))
+        for key in ('acs', 'ac', 'snn_acs', 'total_acs'):
+            if base['snn_acs'] is None:
+                base['snn_acs'] = _coerce_number(payload.get(key))
+        for key in ('macs', 'mac', 'snn_macs', 'total_macs'):
+            if base['snn_macs'] is None:
+                base['snn_macs'] = _coerce_number(payload.get(key))
+        for key in ('energy', 'syops_energy', 'total_energy'):
+            if base['syops_energy'] is None:
+                base['syops_energy'] = _coerce_number(payload.get(key))
+        return base, _json_safe(extras)
+
+    try:
+        import numpy as np  # type: ignore
+        is_array = isinstance(payload, np.ndarray)
+    except Exception:
+        is_array = False
+
+    if isinstance(payload, (list, tuple)) or is_array:
+        extras['raw'] = _json_safe(payload)
+        sequence = payload
+        if len(sequence) == 2:
+            syops_count = sequence[0]
+            extras['params'] = sequence[1]
+        else:
+            syops_count = sequence
+        syops_values = _json_safe(syops_count)
+        if isinstance(syops_values, list) and len(syops_values) >= 3:
+            base['syops_total'] = _coerce_number(syops_values[0])
+            base['snn_acs'] = _coerce_number(syops_values[1])
+            base['snn_macs'] = _coerce_number(syops_values[2])
+            if len(syops_values) > 3:
+                extras['spike_rate'] = _json_safe(syops_values[3])
+        else:
+            base['syops_total'] = _coerce_number(syops_values)
+        return base, _json_safe(extras)
+
+    return base, extras
+
+
+def _syops_profile(model: torch.nn.Module, example_input: torch.Tensor) -> dict[str, object]:
+    try:
+        import syops  # type: ignore
+    except Exception:
+        return {
+            'syops_method': 'syops_unavailable',
+            'syops_assumptions': 'syops package is not available in the environment.',
+        }
+
+    input_shape = tuple(example_input.shape[1:])
+    try:
+        if hasattr(syops, 'profile'):
+            try:
+                payload = syops.profile(model, inputs=(example_input,), verbose=False)
+            except TypeError:
+                payload = syops.profile(model, inputs=(example_input,))
+            base, extras = _parse_syops_payload(payload)
+            return {
+                **base,
+                'syops_method': 'syops.profile',
+                'syops_assumptions': 'Values reported directly by syops.profile.',
+                'syops_raw': extras,
+            }
+        if hasattr(syops, 'get_model_complexity_info'):
+            payload = syops.get_model_complexity_info(
+                model,
+                input_shape,
+                as_strings=False,
+                print_per_layer_stat=False,
+                verbose=False,
+            )
+            base, extras = _parse_syops_payload(payload)
+            return {
+                **base,
+                'syops_method': 'syops.get_model_complexity_info',
+                'syops_assumptions': 'Values reported directly by syops.get_model_complexity_info.',
+                'syops_raw': extras,
+            }
+    except Exception as exc:
+        return {
+            'syops_method': 'syops_failed',
+            'syops_assumptions': f'syops profiling failed: {type(exc).__name__}.',
+        }
+
+    return {
+        'syops_method': 'syops_unrecognized',
+        'syops_assumptions': 'syops package loaded but no supported profiling API found.',
+    }
+
+
 def _make_episode_stem(record: dict) -> str:
     parts = [
         f"ep_{record['episode']:03d}",
@@ -114,6 +272,20 @@ def _make_episode_stem(record: dict) -> str:
         parts.append(_sanitize_token(str(record['scenario_id'])))
     parts.append(f"zones{record['zone_count']}")
     return '_'.join(parts)
+
+
+def _measure_1000s_planning_time(actor: torch.nn.Module, obs_samples: list, device: torch.device) -> float:
+    if not obs_samples:
+        return 0.0
+    steps = 1000
+    start = time.perf_counter()
+    with torch.no_grad():
+        for i in range(steps):
+            obs = obs_samples[i % len(obs_samples)]
+            obs_tensor = torch.tensor(obs[None, :], dtype=torch.float32, device=device)
+            _ = actor(obs_tensor)
+    end = time.perf_counter()
+    return float(end - start)
 
 
 def evaluate_policy(
@@ -143,6 +315,12 @@ def evaluate_policy(
     actor = make_actor(cfg, model, obs.shape[0], env.action_space.shape[0])
     actor.load_state_dict(load_checkpoint(checkpoint)['state_dict'])
     actor.eval()
+
+    device = next(actor.parameters()).device
+    warmup_forward_steps = 10
+    with torch.no_grad():
+        for _ in range(warmup_forward_steps):
+            _ = actor(torch.tensor(obs[None, :], dtype=torch.float32, device=device))
 
     output_root = ensure_dir(output_dir) if output_dir is not None else _default_eval_root(
         evaluation_mode,
@@ -178,6 +356,14 @@ def evaluate_policy(
     per_inference: list[float] = []
     outcomes: dict[str, int] = {}
     records: list[dict] = []
+    obs_samples: list = []
+
+    diag_sample_stride = 10
+    diag_sample_limit = 5000
+    diag_samples = 0
+    sum_spike_rate_l1 = 0.0
+    sum_spike_rate_l2 = 0.0
+    sum_dense_macs = 0.0
 
     for ep in range(episodes):
         scenario_id = None
@@ -212,19 +398,33 @@ def evaluate_policy(
         info: dict = {}
 
         while not done:
+            if len(obs_samples) < 1000:
+                obs_samples.append(obs.copy())
             step_start = time.perf_counter()
             with torch.no_grad():
-                action = actor(torch.tensor(obs[None, :], dtype=torch.float32)).cpu().numpy()[0]
+                obs_tensor = torch.tensor(obs[None, :], dtype=torch.float32, device=device)
+                action_tensor = actor(obs_tensor)
             infer_t = time.perf_counter() - step_start
             inference_times.append(infer_t)
             per_inference.append(infer_t)
+            action = action_tensor.detach().cpu().numpy()[0]
+
+            if hasattr(actor, 'forward_with_diagnostics') and (total_steps % diag_sample_stride == 0):
+                if diag_samples < diag_sample_limit:
+                    with torch.no_grad():
+                        _, diag = actor.forward_with_diagnostics(obs_tensor)
+                    diag_samples += 1
+                    sum_spike_rate_l1 += float(diag.get('spike_rate_l1', 0.0))
+                    sum_spike_rate_l2 += float(diag.get('spike_rate_l2', 0.0))
+                    sum_dense_macs += float(diag.get('dense_macs_estimate', 0.0))
+
             obs, reward, terminated, truncated, info = env.step(action)
             episode_return += float(reward)
             steps += 1
+            total_steps += 1
             done = terminated or truncated
 
         episode_time = sum(inference_times)
-        total_steps += steps
         total_return += float(episode_return)
         return_values.append(float(episode_return))
         episode_times.append(episode_time)
@@ -322,6 +522,95 @@ def evaluate_policy(
     zone_count_summary = _build_zone_count_summary(records)
     outcome_by_zone_count = _build_outcome_by_zone_count(records)
     category_summary = _build_category_summary(records) if evaluation_mode == 'benchmark' else {}
+
+    device_name = str(device)
+    param_count, trainable_param_count = _count_params(actor)
+    example_input = torch.tensor(obs[None, :], dtype=torch.float32, device=device)
+    dense_macs, dense_params, macs_method = _thop_macs(actor, example_input)
+    syops_payload: dict[str, object] = {}
+    if model == 'snn':
+        syops_payload = _syops_profile(actor, example_input)
+
+    avg_spike_rate_l1 = None
+    avg_spike_rate_l2 = None
+    avg_dense_macs = None
+    avg_effective_macs = None
+    if diag_samples > 0:
+        avg_spike_rate_l1 = sum_spike_rate_l1 / diag_samples
+        avg_spike_rate_l2 = sum_spike_rate_l2 / diag_samples
+        avg_dense_macs = sum_dense_macs / diag_samples
+
+    dense_theoretical_macs = dense_macs if dense_macs is not None else avg_dense_macs
+    dense_theoretical_flops = None
+    if dense_theoretical_macs is not None:
+        dense_theoretical_flops = float(dense_theoretical_macs) * 2.0
+
+    if model == 'ann':
+        effective_macs = dense_theoretical_macs
+    else:
+        effective_macs = None
+
+    snn_acs = syops_payload.get('snn_acs')
+    snn_macs = syops_payload.get('snn_macs')
+    snn_spike_aware_ops = None
+    snn_energy_pj = None
+    if isinstance(snn_acs, (int, float)) and isinstance(snn_macs, (int, float)):
+        snn_spike_aware_ops = float(snn_acs) + float(snn_macs)
+        snn_energy_pj = float(snn_acs) * 0.9 + float(snn_macs) * 4.6
+
+    macs_assumptions = None
+    if model == 'ann' and macs_method != 'thop_profile':
+        macs_assumptions = 'dense_theoretical_macs unavailable from thop.'
+
+    decision_dt_s = float(cfg.scenario.dt)
+    estimated_steps_for_1000s = int(round(1000.0 / decision_dt_s))
+    avg_inference_time_ms = 1000.0 * statistics.mean(per_inference) if per_inference else 0.0
+    estimated_1000s_planning_time_s = (avg_inference_time_ms / 1000.0) * estimated_steps_for_1000s
+
+    measured_1000s_planning_time_s = _measure_1000s_planning_time(actor, obs_samples, device)
+
+    p50_inference_time_ms = _percentile([t * 1000.0 for t in per_inference], 50.0)
+    p95_inference_time_ms = _percentile([t * 1000.0 for t in per_inference], 95.0)
+    p99_inference_time_ms = _percentile([t * 1000.0 for t in per_inference], 99.0)
+
+    efficiency_summary = {
+        'device': device_name,
+        'torch_version': torch.__version__,
+        'model_type': model,
+        'param_count': param_count,
+        'trainable_param_count': trainable_param_count,
+        'dense_theoretical_macs': dense_theoretical_macs,
+        'dense_theoretical_flops': dense_theoretical_flops,
+        'effective_macs': effective_macs,
+        'avg_spike_rate_l1': avg_spike_rate_l1,
+        'avg_spike_rate_l2': avg_spike_rate_l2,
+        'macs_counting_method': macs_method if model == 'ann' else syops_payload.get('syops_method'),
+        'assumptions': macs_assumptions,
+        'syops_total': syops_payload.get('syops_total'),
+        'snn_syops': snn_spike_aware_ops,
+        'snn_spike_aware_ops': snn_spike_aware_ops,
+        'snn_acs': snn_acs,
+        'snn_macs': snn_macs,
+        'syops_energy': snn_energy_pj,
+        'snn_energy_pj': snn_energy_pj,
+        'energy_assumptions': 'SNN energy estimate uses AC=0.9 pJ and MAC=4.6 pJ.' if snn_energy_pj is not None else None,
+        'syops_method': syops_payload.get('syops_method'),
+        'syops_assumptions': syops_payload.get('syops_assumptions'),
+        'syops_raw': syops_payload.get('syops_raw'),
+        'dense_macs_method': macs_method,
+        'avg_inference_time_ms': avg_inference_time_ms,
+        'p50_inference_time_ms': p50_inference_time_ms,
+        'p95_inference_time_ms': p95_inference_time_ms,
+        'p99_inference_time_ms': p99_inference_time_ms,
+        'max_inference_time_ms': 1000.0 * max(per_inference) if per_inference else 0.0,
+        'avg_episode_time_s': statistics.mean(episode_times) if episode_times else 0.0,
+        'max_episode_time_s': max(episode_times) if episode_times else 0.0,
+        'decision_dt_s': decision_dt_s,
+        'estimated_steps_for_1000s': estimated_steps_for_1000s,
+        'estimated_1000s_planning_time_s': estimated_1000s_planning_time_s,
+        'measured_1000s_planning_time_s': measured_1000s_planning_time_s,
+    }
+
     summary = {
         'model': model,
         'episodes': episodes,
@@ -335,6 +624,9 @@ def evaluate_policy(
         'avg_return': statistics.mean(return_values),
         'avg_episode_time_s': statistics.mean(episode_times),
         'avg_inference_time_ms': 1000.0 * statistics.mean(per_inference),
+        'p50_inference_time_ms': p50_inference_time_ms,
+        'p95_inference_time_ms': p95_inference_time_ms,
+        'p99_inference_time_ms': p99_inference_time_ms,
         'max_inference_time_ms': 1000.0 * max(per_inference),
         'outcomes': outcomes,
         'records': records,
@@ -348,7 +640,37 @@ def evaluate_policy(
         'benchmark_suite_path': None if benchmark_suite is None else str(Path(benchmark_suite_path)),
         'output_dir': str(output_root),
         'episodes_dir': str(episodes_dir),
+        'param_count': param_count,
+        'trainable_param_count': trainable_param_count,
+        'dense_theoretical_macs': dense_theoretical_macs,
+        'dense_theoretical_flops': dense_theoretical_flops,
+        'effective_macs': effective_macs,
+        'avg_spike_rate_l1': avg_spike_rate_l1,
+        'avg_spike_rate_l2': avg_spike_rate_l2,
+        'macs_counting_method': macs_method if model == 'ann' else syops_payload.get('syops_method'),
+        'assumptions': macs_assumptions,
+        'syops_total': syops_payload.get('syops_total'),
+        'snn_syops': snn_spike_aware_ops,
+        'snn_spike_aware_ops': snn_spike_aware_ops,
+        'snn_acs': snn_acs,
+        'snn_macs': snn_macs,
+        'syops_energy': snn_energy_pj,
+        'snn_energy_pj': snn_energy_pj,
+        'energy_assumptions': 'SNN energy estimate uses AC=0.9 pJ and MAC=4.6 pJ.' if snn_energy_pj is not None else None,
+        'syops_method': syops_payload.get('syops_method'),
+        'syops_assumptions': syops_payload.get('syops_assumptions'),
+        'syops_raw': syops_payload.get('syops_raw'),
+        'dense_macs_method': macs_method,
+        'max_episode_time_s': max(episode_times) if episode_times else 0.0,
+        'decision_dt_s': decision_dt_s,
+        'estimated_steps_for_1000s': estimated_steps_for_1000s,
+        'estimated_1000s_planning_time_s': estimated_1000s_planning_time_s,
+        'measured_1000s_planning_time_s': measured_1000s_planning_time_s,
     }
+
+    efficiency_path = output_root / 'efficiency_summary.json'
+    save_json(efficiency_path, efficiency_summary)
+    summary['efficiency_summary_path'] = str(efficiency_path)
     save_json(output_root / 'summary.json', summary)
     return summary
 
@@ -397,6 +719,8 @@ def main() -> None:
     if args.evaluation_mode == 'benchmark':
         print(f"Benchmark suite: {results['benchmark_suite_name']} @ {results['benchmark_suite_path']}")
     print(f"Saved evaluation summary to {Path(results['output_dir']) / 'summary.json'}")
+    if 'efficiency_summary_path' in results:
+        print(f"Saved efficiency summary to {results['efficiency_summary_path']}")
     print(f"Saved per-episode artifacts to {results['episodes_dir']}")
     print(results)
 

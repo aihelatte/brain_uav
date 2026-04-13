@@ -90,7 +90,7 @@ class TrainingConfig:
     actor_freeze_steps: int = 5_000
     success_sample_bias: float = 2.5
     bc_epochs: int = 10
-    snn_time_window: int = 4
+    snn_time_window: int = 1
     hidden_dim: int = 128
     critic_grad_clip_norm: float | None = None
     device: str = 'cpu'

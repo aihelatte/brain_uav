@@ -111,17 +111,23 @@ class SNNPolicyActor(nn.Module):
             out = self.fc3(0.5 * (spikes2 + membrane))
 
         action = torch.tanh(out) * self.action_limit
+        macs_per_timestep = float(
+            self.state_dim * self.hidden_dim + self.hidden_dim * self.hidden_dim + self.hidden_dim * self.action_dim
+        )
+        dense_macs = macs_per_timestep * float(self.time_window)
+        effective_macs = float(
+            (self.state_dim * self.hidden_dim)
+            + (self.hidden_dim * self.hidden_dim) * float((spike_sum1 / self.time_window).mean().detach().cpu())
+            + (self.hidden_dim * self.action_dim) * float((spike_sum2 / self.time_window).mean().detach().cpu())
+        )
+        effective_macs *= float(self.time_window)
         diagnostics = {
             'backend': 'spikingjelly' if HAS_SPIKINGJELLY else 'fallback',
+            'time_window': float(self.time_window),
             'spike_rate_l1': float((spike_sum1 / self.time_window).mean().detach().cpu()),
             'spike_rate_l2': float((spike_sum2 / self.time_window).mean().detach().cpu()),
-            'dense_macs_estimate': float(
-                self.state_dim * self.hidden_dim + self.hidden_dim * self.hidden_dim + self.hidden_dim * self.action_dim
-            ),
+            'dense_macs_estimate': float(dense_macs),
+            'effective_macs_estimate': float(effective_macs),
+            'dense_macs_per_timestep': float(macs_per_timestep),
         }
-        diagnostics['effective_macs_estimate'] = float(
-            self.state_dim * self.hidden_dim
-            + self.hidden_dim * self.hidden_dim * diagnostics['spike_rate_l1']
-            + self.hidden_dim * self.action_dim * diagnostics['spike_rate_l2']
-        )
         return action, diagnostics

@@ -393,22 +393,29 @@ def main() -> None:
         args.timesteps = 300000 if args.curriculum_level == 'hard' else 200000
 
     cfg = ExperimentConfig()
-    if args.actor_freeze_steps is None:
-        cfg.training.actor_freeze_steps = 10_000
-    else:
-        cfg.training.actor_freeze_steps = args.actor_freeze_steps
-    if args.critic_grad_clip_norm is None:
-        cfg.training.critic_grad_clip_norm = 1.0
-    else:
-        cfg.training.critic_grad_clip_norm = args.critic_grad_clip_norm
+
     if args.model == 'ann':
         # Use more conservative defaults for ANN to avoid late-training collapse.
         cfg.training.actor_lr = 1.5e-4
         cfg.training.critic_lr = 2e-4
-    if args.curriculum_level == 'hard':
-        cfg.training.actor_lr *= 0.75
-        cfg.training.critic_lr *= 0.85
-        cfg.training.success_sample_bias = 5.0
+        if args.actor_freeze_steps is None:
+            cfg.training.actor_freeze_steps = 10_000
+        else:
+            cfg.training.actor_freeze_steps = args.actor_freeze_steps
+        if args.critic_grad_clip_norm is None:
+            cfg.training.critic_grad_clip_norm = 1.0
+        else:
+            cfg.training.critic_grad_clip_norm = args.critic_grad_clip_norm
+        if args.curriculum_level == 'hard':
+            cfg.training.actor_lr *= 0.75
+            cfg.training.critic_lr *= 0.85
+            cfg.training.success_sample_bias = 5.0
+    else:
+        if args.actor_freeze_steps is not None:
+            cfg.training.actor_freeze_steps = args.actor_freeze_steps
+        if args.critic_grad_clip_norm is not None:
+            cfg.training.critic_grad_clip_norm = args.critic_grad_clip_norm
+
     set_global_seed(args.seed)
 
     curriculum_mix = parse_curriculum_mix(args.curriculum_mix, fallback_level=args.curriculum_level)
