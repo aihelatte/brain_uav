@@ -26,7 +26,7 @@ def main() -> None:
 
     ann_params = ann.get('param_count')
     snn_params = snn.get('param_count')
-    ann_macs = ann.get('dense_theoretical_macs')
+    ann_macs = ann.get('ann_macs') or ann.get('dense_theoretical_macs')
     snn_syops_total = snn.get('syops_total')
     snn_acs = snn.get('snn_acs')
     snn_macs = snn.get('snn_macs')

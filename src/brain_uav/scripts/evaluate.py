@@ -21,6 +21,9 @@ from ..scripts.train_td3 import export_episode_result
 from ..utils.io import ensure_dir, load_checkpoint, now_timestamp, save_json
 from ..utils.seeding import set_global_seed
 
+AC_ENERGY_PJ = 0.9
+MAC_ENERGY_PJ = 4.6
+
 
 def _sanitize_token(value: str) -> str:
     token = ''.join(ch.lower() if ch.isalnum() else '_' for ch in value.strip())
@@ -136,6 +139,28 @@ def _thop_macs(model: torch.nn.Module, example_input: torch.Tensor) -> tuple[flo
 def _coerce_number(value: object) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
+    if isinstance(value, str):
+        text = value.strip().replace(',', '')
+        if not text:
+            return None
+        unit_scale = {
+            'k': 1e3,
+            'm': 1e6,
+            'g': 1e9,
+            't': 1e12,
+        }
+        parts = text.split()
+        number_text = parts[0]
+        scale = 1.0
+        if number_text[-1:].lower() in unit_scale:
+            scale = unit_scale[number_text[-1].lower()]
+            number_text = number_text[:-1]
+        elif len(parts) > 1 and parts[1][:1].lower() in unit_scale:
+            scale = unit_scale[parts[1][:1].lower()]
+        try:
+            return float(number_text) * scale
+        except ValueError:
+            return None
     return None
 
 
@@ -154,6 +179,19 @@ def _json_safe(value: object) -> object:
     except Exception:
         pass
     return str(value)
+
+
+def _format_ops(value: float | None) -> str | None:
+    if value is None:
+        return None
+    abs_value = abs(value)
+    if abs_value >= 1e9:
+        return f'{value / 1e9:.2f} G Ops'
+    if abs_value >= 1e6:
+        return f'{value / 1e6:.2f} M Ops'
+    if abs_value >= 1e3:
+        return f'{value / 1e3:.2f} K Ops'
+    return f'{value:.1f} Ops'
 
 
 def _parse_syops_payload(payload: object) -> tuple[dict[str, float | None], dict[str, object]]:
@@ -211,7 +249,7 @@ def _parse_syops_payload(payload: object) -> tuple[dict[str, float | None], dict
 
 def _syops_profile(model: torch.nn.Module, example_input: torch.Tensor) -> dict[str, object]:
     try:
-        import syops  # type: ignore
+        from syops import get_model_complexity_info  # type: ignore
     except Exception:
         return {
             'syops_method': 'syops_unavailable',
@@ -220,43 +258,37 @@ def _syops_profile(model: torch.nn.Module, example_input: torch.Tensor) -> dict[
 
     input_shape = tuple(example_input.shape[1:])
     try:
-        if hasattr(syops, 'profile'):
-            try:
-                payload = syops.profile(model, inputs=(example_input,), verbose=False)
-            except TypeError:
-                payload = syops.profile(model, inputs=(example_input,))
-            base, extras = _parse_syops_payload(payload)
-            return {
-                **base,
-                'syops_method': 'syops.profile',
-                'syops_assumptions': 'Values reported directly by syops.profile.',
-                'syops_raw': extras,
+        ops, params = get_model_complexity_info(
+            model,
+            input_shape,
+            [(example_input.detach(), None)],
+            as_strings=True,
+            print_per_layer_stat=False,
+            verbose=False,
+        )
+        print('  SyOps OPs:', ops)
+        print('  SyOps Params:', params)
+        base, extras = _parse_syops_payload((ops, params))
+        formatted_ops: dict[str, object] = {}
+        safe_ops = _json_safe(ops)
+        if isinstance(safe_ops, list) and len(safe_ops) >= 3:
+            formatted_ops = {
+                'syops_total_ops': safe_ops[0],
+                'snn_ac_ops': safe_ops[1],
+                'snn_mac_ops': safe_ops[2],
             }
-        if hasattr(syops, 'get_model_complexity_info'):
-            payload = syops.get_model_complexity_info(
-                model,
-                input_shape,
-                as_strings=False,
-                print_per_layer_stat=False,
-                verbose=False,
-            )
-            base, extras = _parse_syops_payload(payload)
-            return {
-                **base,
-                'syops_method': 'syops.get_model_complexity_info',
-                'syops_assumptions': 'Values reported directly by syops.get_model_complexity_info.',
-                'syops_raw': extras,
-            }
+        return {
+            **base,
+            **formatted_ops,
+            'syops_method': 'syops.get_model_complexity_info',
+            'syops_assumptions': 'Values reported directly by syops.get_model_complexity_info.',
+            'syops_raw': extras,
+        }
     except Exception as exc:
         return {
             'syops_method': 'syops_failed',
             'syops_assumptions': f'syops profiling failed: {type(exc).__name__}.',
         }
-
-    return {
-        'syops_method': 'syops_unrecognized',
-        'syops_assumptions': 'syops package loaded but no supported profiling API found.',
-    }
 
 
 def _make_episode_stem(record: dict) -> str:
@@ -288,6 +320,20 @@ def _measure_1000s_planning_time(actor: torch.nn.Module, obs_samples: list, devi
     return float(end - start)
 
 
+def _apply_checkpoint_config(cfg: ExperimentConfig, payload: dict) -> None:
+    saved_config = payload.get('config')
+    if not isinstance(saved_config, dict):
+        return
+    for section_name in ('scenario', 'rewards', 'training'):
+        section_payload = saved_config.get(section_name)
+        section = getattr(cfg, section_name)
+        if not isinstance(section_payload, dict):
+            continue
+        for key, value in section_payload.items():
+            if hasattr(section, key):
+                setattr(section, key, value)
+
+
 def evaluate_policy(
     checkpoint: Path,
     model: str,
@@ -303,6 +349,8 @@ def evaluate_policy(
     """Run evaluation and export a three-view result for every episode."""
 
     cfg = ExperimentConfig()
+    checkpoint_payload = load_checkpoint(checkpoint)
+    _apply_checkpoint_config(cfg, checkpoint_payload)
     set_global_seed(seed)
     env = make_env(
         cfg,
@@ -313,7 +361,7 @@ def evaluate_policy(
     )
     obs, _ = env.reset(seed=seed)
     actor = make_actor(cfg, model, obs.shape[0], env.action_space.shape[0])
-    actor.load_state_dict(load_checkpoint(checkpoint)['state_dict'])
+    actor.load_state_dict(checkpoint_payload['state_dict'])
     actor.eval()
 
     device = next(actor.parameters()).device
@@ -552,11 +600,19 @@ def evaluate_policy(
 
     snn_acs = syops_payload.get('snn_acs')
     snn_macs = syops_payload.get('snn_macs')
+    syops_total_ops = syops_payload.get('syops_total_ops')
+    snn_ac_ops = syops_payload.get('snn_ac_ops')
+    snn_mac_ops = syops_payload.get('snn_mac_ops')
     snn_spike_aware_ops = None
     snn_energy_pj = None
     if isinstance(snn_acs, (int, float)) and isinstance(snn_macs, (int, float)):
         snn_spike_aware_ops = float(snn_acs) + float(snn_macs)
-        snn_energy_pj = float(snn_acs) * 0.9 + float(snn_macs) * 4.6
+        snn_energy_pj = float(snn_acs) * AC_ENERGY_PJ + float(snn_macs) * MAC_ENERGY_PJ
+
+    ann_macs = dense_theoretical_macs if model == 'ann' else None
+    ann_energy_pj = None
+    if ann_macs is not None:
+        ann_energy_pj = float(ann_macs) * MAC_ENERGY_PJ
 
     macs_assumptions = None
     if model == 'ann' and macs_method != 'thop_profile':
@@ -582,18 +638,26 @@ def evaluate_policy(
         'dense_theoretical_macs': dense_theoretical_macs,
         'dense_theoretical_flops': dense_theoretical_flops,
         'effective_macs': effective_macs,
+        'ann_macs': ann_macs,
+        'ann_macs_ops': _format_ops(ann_macs),
+        'ann_energy_pj': ann_energy_pj,
+        'ann_energy_assumptions': f'ANN energy estimate uses MAC={MAC_ENERGY_PJ} pJ.' if ann_energy_pj is not None else None,
+        'ann_macs_method': macs_method if model == 'ann' else None,
         'avg_spike_rate_l1': avg_spike_rate_l1,
         'avg_spike_rate_l2': avg_spike_rate_l2,
         'macs_counting_method': macs_method if model == 'ann' else syops_payload.get('syops_method'),
         'assumptions': macs_assumptions,
         'syops_total': syops_payload.get('syops_total'),
+        'syops_total_ops': syops_total_ops,
         'snn_syops': snn_spike_aware_ops,
         'snn_spike_aware_ops': snn_spike_aware_ops,
         'snn_acs': snn_acs,
         'snn_macs': snn_macs,
+        'snn_ac_ops': snn_ac_ops,
+        'snn_mac_ops': snn_mac_ops,
         'syops_energy': snn_energy_pj,
         'snn_energy_pj': snn_energy_pj,
-        'energy_assumptions': 'SNN energy estimate uses AC=0.9 pJ and MAC=4.6 pJ.' if snn_energy_pj is not None else None,
+        'energy_assumptions': f'SNN energy estimate uses AC={AC_ENERGY_PJ} pJ and MAC={MAC_ENERGY_PJ} pJ.' if snn_energy_pj is not None else None,
         'syops_method': syops_payload.get('syops_method'),
         'syops_assumptions': syops_payload.get('syops_assumptions'),
         'syops_raw': syops_payload.get('syops_raw'),
@@ -645,18 +709,26 @@ def evaluate_policy(
         'dense_theoretical_macs': dense_theoretical_macs,
         'dense_theoretical_flops': dense_theoretical_flops,
         'effective_macs': effective_macs,
+        'ann_macs': ann_macs,
+        'ann_macs_ops': _format_ops(ann_macs),
+        'ann_energy_pj': ann_energy_pj,
+        'ann_energy_assumptions': f'ANN energy estimate uses MAC={MAC_ENERGY_PJ} pJ.' if ann_energy_pj is not None else None,
+        'ann_macs_method': macs_method if model == 'ann' else None,
         'avg_spike_rate_l1': avg_spike_rate_l1,
         'avg_spike_rate_l2': avg_spike_rate_l2,
         'macs_counting_method': macs_method if model == 'ann' else syops_payload.get('syops_method'),
         'assumptions': macs_assumptions,
         'syops_total': syops_payload.get('syops_total'),
+        'syops_total_ops': syops_total_ops,
         'snn_syops': snn_spike_aware_ops,
         'snn_spike_aware_ops': snn_spike_aware_ops,
         'snn_acs': snn_acs,
         'snn_macs': snn_macs,
+        'snn_ac_ops': snn_ac_ops,
+        'snn_mac_ops': snn_mac_ops,
         'syops_energy': snn_energy_pj,
         'snn_energy_pj': snn_energy_pj,
-        'energy_assumptions': 'SNN energy estimate uses AC=0.9 pJ and MAC=4.6 pJ.' if snn_energy_pj is not None else None,
+        'energy_assumptions': f'SNN energy estimate uses AC={AC_ENERGY_PJ} pJ and MAC={MAC_ENERGY_PJ} pJ.' if snn_energy_pj is not None else None,
         'syops_method': syops_payload.get('syops_method'),
         'syops_assumptions': syops_payload.get('syops_assumptions'),
         'syops_raw': syops_payload.get('syops_raw'),
