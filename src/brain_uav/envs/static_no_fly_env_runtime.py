@@ -30,7 +30,11 @@ class Zone:
 
 
 class StaticNoFlyTrajectoryEnv(gym.Env):
-    """Gymnasium-style environment for static no-fly-zone trajectory planning."""
+    """Gymnasium-style environment for static no-fly-zone trajectory planning.
+
+    Distances are interpreted as km, time as s, and speed as km/s. The goal
+    success check intentionally uses the fixed ``scenario.goal_radius`` only.
+    """
 
     metadata = {"render_modes": ["human"]}
 
@@ -44,6 +48,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     ) -> None:
         super().__init__()
         self.scenario = scenario or ScenarioConfig()
+        self._normalize_time_limit()
         self.rewards = rewards or RewardConfig()
         self.fixed_scenarios = fixed_scenarios or []
         self.curriculum_mix = normalize_curriculum_mix(curriculum_mix, fallback_level='hard') if curriculum_mix else None
@@ -78,6 +83,17 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.trajectory: list[np.ndarray] = []
         self.last_curriculum_level = 'random'
         self.best_goal_distance_so_far = 0.0
+
+    def _normalize_time_limit(self) -> None:
+        """Fill missing time-limit fields without overriding explicit max_steps."""
+
+        if self.scenario.dt <= 0.0:
+            raise ValueError('scenario.dt must be positive.')
+        max_time_s = getattr(self.scenario, 'max_time_s', None)
+        if self.scenario.max_steps is None:
+            if max_time_s is None:
+                raise ValueError('scenario.max_steps or scenario.max_time_s must be set.')
+            self.scenario.max_steps = int(float(max_time_s) / float(self.scenario.dt))
 
     def seed(self, seed: int | None = None) -> None:
         self.rng = np.random.default_rng(seed)
@@ -159,6 +175,9 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 for zone in self.zones
             ],
             'curriculum_level': self.last_curriculum_level,
+            'distance_unit': 'km',
+            'time_unit': 's',
+            **self._start_goal_metadata(self.initial_state, self.goal),
         }
 
     def _sample_scenario(self) -> None:
@@ -195,30 +214,152 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             return self._sample_hard_scenario()
         raise ValueError(f'Unsupported curriculum level: {level}')
 
-    def _sample_easy_scenario(self) -> dict[str, Any] | None:
+    def _start_goal_distance_range(self, level: str) -> tuple[float, float]:
+        return getattr(self.scenario, f'{level}_start_goal_distance_range')
+
+    def _no_fly_radius_range(self, level: str) -> tuple[float, float]:
+        return getattr(self.scenario, f'{level}_no_fly_radius_range')
+
+    def _min_zone_surface_gap(self, level: str) -> float:
+        return float(getattr(self.scenario, f'{level}_min_zone_surface_gap'))
+
+    def _sample_zone_radius(self, level: str) -> float:
+        return float(self.rng.uniform(*self._no_fly_radius_range(level)))
+
+    def _sample_start_goal_pair(
+        self,
+        level: str,
+        start_x_fraction: tuple[float, float],
+        goal_x_fraction: tuple[float, float],
+        start_y_fraction: tuple[float, float],
+        goal_y_fraction: tuple[float, float],
+        psi_range: tuple[float, float],
+        attempts: int = 80,
+    ) -> tuple[np.ndarray, np.ndarray] | None:
         cfg = self.scenario
-        for _ in range(40):
+        for _ in range(attempts):
             state = np.array(
                 [
-                    self.rng.uniform(-0.8 * cfg.world_xy, -0.58 * cfg.world_xy),
-                    self.rng.uniform(-0.10 * cfg.world_xy, 0.10 * cfg.world_xy),
-                    self.rng.uniform(110.0, 155.0),
+                    self.rng.uniform(start_x_fraction[0] * cfg.world_xy, start_x_fraction[1] * cfg.world_xy),
+                    self.rng.uniform(start_y_fraction[0] * cfg.world_xy, start_y_fraction[1] * cfg.world_xy),
+                    self.rng.uniform(*cfg.start_z_range),
                     0.0,
-                    self.rng.uniform(-0.10, 0.10),
+                    self.rng.uniform(*psi_range),
                 ],
                 dtype=np.float32,
             )
             goal = np.array(
                 [
-                    self.rng.uniform(0.52 * cfg.world_xy, 0.80 * cfg.world_xy),
-                    self.rng.uniform(-0.12 * cfg.world_xy, 0.12 * cfg.world_xy),
-                    self.rng.uniform(105.0, 165.0),
+                    self.rng.uniform(goal_x_fraction[0] * cfg.world_xy, goal_x_fraction[1] * cfg.world_xy),
+                    self.rng.uniform(goal_y_fraction[0] * cfg.world_xy, goal_y_fraction[1] * cfg.world_xy),
+                    self.rng.uniform(*cfg.goal_z_range),
                 ],
                 dtype=np.float32,
             )
-            if abs(float(goal[2] - state[2])) > 55.0:
+            if self._start_goal_profile_is_valid(state, goal, level):
+                return state, goal
+        return None
+
+    def _start_goal_metadata(self, state: np.ndarray, goal: np.ndarray) -> dict[str, float]:
+        delta = goal.astype(np.float32) - state[:3].astype(np.float32)
+        return {
+            'start_goal_distance_km': float(np.linalg.norm(delta)),
+            'start_goal_horizontal_distance_km': float(np.linalg.norm(delta[:2])),
+        }
+
+    def _start_goal_distance_is_valid(self, state: np.ndarray, goal: np.ndarray, level: str) -> bool:
+        distance = self._start_goal_metadata(state, goal)['start_goal_distance_km']
+        low, high = self._start_goal_distance_range(level)
+        return low <= distance <= high
+
+    def _height_profile_is_valid(self, state: np.ndarray, goal: np.ndarray) -> bool:
+        cfg = self.scenario
+        if not (cfg.world_z_min < float(state[2]) < cfg.world_z_max):
+            return False
+        if not (cfg.world_z_min < float(goal[2]) < cfg.world_z_max):
+            return False
+        return abs(float(goal[2] - state[2])) <= cfg.max_start_goal_height_gap
+
+    def _start_goal_profile_is_valid(self, state: np.ndarray, goal: np.ndarray, level: str) -> bool:
+        return (
+            self._point_is_in_bounds(state[:3])
+            and self._point_is_in_bounds(goal)
+            and self._height_profile_is_valid(state, goal)
+            and self._start_goal_distance_is_valid(state, goal, level)
+        )
+
+    def _build_scenario_payload(
+        self,
+        state: np.ndarray,
+        goal: np.ndarray,
+        zones: list[Zone],
+        level: str,
+    ) -> dict[str, Any]:
+        return {
+            'state': state.tolist(),
+            'goal': goal.tolist(),
+            'zones': [
+                {'center_xy': zone.center_xy.tolist(), 'radius': zone.radius}
+                for zone in zones
+            ],
+            'curriculum_level': level,
+            'distance_unit': 'km',
+            'time_unit': 's',
+            **self._start_goal_metadata(state, goal),
+        }
+
+    def _point_is_in_bounds(self, pos: np.ndarray) -> bool:
+        cfg = self.scenario
+        return bool(
+            abs(float(pos[0])) <= cfg.world_xy
+            and abs(float(pos[1])) <= cfg.world_xy
+            and cfg.world_z_min < float(pos[2]) < cfg.world_z_max
+        )
+
+    def _zone_layout_is_valid(self, zones: list[Zone], level: str) -> bool:
+        min_surface_gap = self._min_zone_surface_gap(level)
+        for idx, zone in enumerate(zones):
+            if not self._zone_boundary_is_valid(zone.center_xy, zone.radius):
+                return False
+            for other in zones[idx + 1 :]:
+                center_distance = float(np.linalg.norm(zone.center_xy - other.center_xy))
+                min_allowed = zone.radius + other.radius + min_surface_gap
+                if center_distance <= min_allowed:
+                    return False
+        return True
+
+    def _scenario_geometry_is_valid(
+        self,
+        state: np.ndarray,
+        goal: np.ndarray,
+        zones: list[Zone],
+        level: str,
+    ) -> bool:
+        if not self._start_goal_profile_is_valid(state, goal, level):
+            return False
+        if not self._zone_layout_is_valid(zones, level):
+            return False
+        if any(self._inside_zone(state[:3], zone) or self._inside_zone(goal, zone) for zone in zones):
+            return False
+        if not self._corridor_is_reasonable(state, goal, zones):
+            return False
+        return True
+
+    def _sample_easy_scenario(self) -> dict[str, Any] | None:
+        cfg = self.scenario
+        for _ in range(40):
+            pair = self._sample_start_goal_pair(
+                'easy',
+                start_x_fraction=(-0.58, -0.42),
+                goal_x_fraction=(0.25, 0.42),
+                start_y_fraction=(-0.10, 0.10),
+                goal_y_fraction=(-0.12, 0.12),
+                psi_range=(-0.10, 0.10),
+            )
+            if pair is None:
                 continue
-            radius = float(self.rng.uniform(70.0, 105.0))
+            state, goal = pair
+            radius = self._sample_zone_radius('easy')
             line_y = float((state[1] + goal[1]) * 0.5)
             zone = Zone(
                 center_xy=np.array(
@@ -230,42 +371,31 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 ),
                 radius=radius,
             )
-            if not self._zone_candidate_is_valid(state, goal, [], zone.center_xy, zone.radius):
+            if not self._zone_candidate_is_valid(state, goal, [], zone.center_xy, zone.radius, 'easy'):
                 continue
             blockers = self._count_corridor_blockers(state, goal, [zone], margin=20.0)
             if blockers != 0:
                 continue
-            return {
-                'state': state.tolist(),
-                'goal': goal.tolist(),
-                'zones': [{'center_xy': zone.center_xy.tolist(), 'radius': zone.radius}],
-                'curriculum_level': 'easy',
-            }
+            zones = [zone]
+            if not self._scenario_geometry_is_valid(state, goal, zones, 'easy'):
+                continue
+            return self._build_scenario_payload(state, goal, zones, 'easy')
         return None
 
     def _sample_easy_two_zone_scenario(self) -> dict[str, Any] | None:
         cfg = self.scenario
         for _ in range(70):
-            state = np.array(
-                [
-                    self.rng.uniform(-0.82 * cfg.world_xy, -0.60 * cfg.world_xy),
-                    self.rng.uniform(-0.12 * cfg.world_xy, 0.12 * cfg.world_xy),
-                    self.rng.uniform(105.0, 160.0),
-                    0.0,
-                    self.rng.uniform(-0.12, 0.12),
-                ],
-                dtype=np.float32,
+            pair = self._sample_start_goal_pair(
+                'easy_two_zone',
+                start_x_fraction=(-0.62, -0.45),
+                goal_x_fraction=(0.35, 0.55),
+                start_y_fraction=(-0.12, 0.12),
+                goal_y_fraction=(-0.16, 0.16),
+                psi_range=(-0.12, 0.12),
             )
-            goal = np.array(
-                [
-                    self.rng.uniform(0.50 * cfg.world_xy, 0.82 * cfg.world_xy),
-                    self.rng.uniform(-0.16 * cfg.world_xy, 0.16 * cfg.world_xy),
-                    self.rng.uniform(100.0, 175.0),
-                ],
-                dtype=np.float32,
-            )
-            if abs(float(goal[2] - state[2])) > 65.0:
+            if pair is None:
                 continue
+            state, goal = pair
             force_blocker = bool(self.rng.random() < cfg.easy_two_zone_blocker_probability)
             zones = self._sample_easy_two_zone_pair(state, goal, force_blocker)
             if not zones:
@@ -275,15 +405,9 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 continue
             if not force_blocker and blockers > 1:
                 continue
-            return {
-                'state': state.tolist(),
-                'goal': goal.tolist(),
-                'zones': [
-                    {'center_xy': zone.center_xy.tolist(), 'radius': zone.radius}
-                    for zone in zones
-                ],
-                'curriculum_level': 'easy_two_zone',
-            }
+            if not self._scenario_geometry_is_valid(state, goal, zones, 'easy_two_zone'):
+                continue
+            return self._build_scenario_payload(state, goal, zones, 'easy_two_zone')
         return None
 
     def _sample_easy_two_zone_pair(self, state: np.ndarray, goal: np.ndarray, force_blocker: bool) -> list[Zone] | None:
@@ -298,37 +422,37 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 ],
                 dtype=np.float32,
             )
-            radius_1 = float(self.rng.uniform(90.0, 120.0))
-            if not self._zone_candidate_is_valid(state, goal, zones, center_1, radius_1):
+            radius_1 = self._sample_zone_radius('easy_two_zone')
+            if not self._zone_candidate_is_valid(state, goal, zones, center_1, radius_1, 'easy_two_zone'):
                 return None
             zones.append(Zone(center_xy=center_1, radius=radius_1))
 
             side = float(self.rng.choice([-1.0, 1.0]))
             center_2 = np.array(
                 [
-                    center_1[0] + self.rng.uniform(130.0, 220.0),
-                    mean_y + side * self.rng.uniform(170.0, 250.0),
+                    center_1[0] + self.rng.uniform(230.0, 360.0),
+                    mean_y + side * self.rng.uniform(230.0, 380.0),
                 ],
                 dtype=np.float32,
             )
-            radius_2 = float(self.rng.uniform(80.0, 110.0))
-            if not self._zone_candidate_is_valid(state, goal, zones, center_2, radius_2):
+            radius_2 = self._sample_zone_radius('easy_two_zone')
+            if not self._zone_candidate_is_valid(state, goal, zones, center_2, radius_2, 'easy_two_zone'):
                 return None
             zones.append(Zone(center_xy=center_2, radius=radius_2))
         else:
             base_x = self.rng.uniform(-0.05 * cfg.world_xy, 0.20 * cfg.world_xy)
-            offsets = [self.rng.uniform(160.0, 240.0), -self.rng.uniform(160.0, 240.0)]
+            offsets = [self.rng.uniform(220.0, 360.0), -self.rng.uniform(220.0, 360.0)]
             self.rng.shuffle(offsets)
             for idx, offset in enumerate(offsets):
                 center_xy = np.array(
                     [
-                        base_x + idx * self.rng.uniform(130.0, 200.0),
+                        base_x + idx * self.rng.uniform(240.0, 380.0),
                         mean_y + offset,
                     ],
                     dtype=np.float32,
                 )
-                radius = float(self.rng.uniform(80.0, 110.0))
-                if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
+                radius = self._sample_zone_radius('easy_two_zone')
+                if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius, 'easy_two_zone'):
                     return None
                 zones.append(Zone(center_xy=center_xy, radius=radius))
 
@@ -339,26 +463,17 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     def _sample_medium_scenario(self) -> dict[str, Any] | None:
         cfg = self.scenario
         for _ in range(60):
-            state = np.array(
-                [
-                    self.rng.uniform(-0.82 * cfg.world_xy, -0.60 * cfg.world_xy),
-                    self.rng.uniform(-0.16 * cfg.world_xy, 0.16 * cfg.world_xy),
-                    self.rng.uniform(105.0, 165.0),
-                    0.0,
-                    self.rng.uniform(-0.15, 0.15),
-                ],
-                dtype=np.float32,
+            pair = self._sample_start_goal_pair(
+                'medium',
+                start_x_fraction=(-0.68, -0.50),
+                goal_x_fraction=(0.45, 0.65),
+                start_y_fraction=(-0.16, 0.16),
+                goal_y_fraction=(-0.20, 0.20),
+                psi_range=(-0.15, 0.15),
             )
-            goal = np.array(
-                [
-                    self.rng.uniform(0.50 * cfg.world_xy, 0.82 * cfg.world_xy),
-                    self.rng.uniform(-0.20 * cfg.world_xy, 0.20 * cfg.world_xy),
-                    self.rng.uniform(95.0, 185.0),
-                ],
-                dtype=np.float32,
-            )
-            if abs(float(goal[2] - state[2])) > 75.0:
+            if pair is None:
                 continue
+            state, goal = pair
             mode = str(self.rng.choice(['single_block', 'double_detour']))
             if mode == 'single_block':
                 zones = self._sample_medium_single_block(state, goal)
@@ -369,15 +484,9 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             blockers = self._count_corridor_blockers(state, goal, zones, margin=cfg.corridor_blocking_margin)
             if blockers < 1 or blockers > 2:
                 continue
-            return {
-                'state': state.tolist(),
-                'goal': goal.tolist(),
-                'zones': [
-                    {'center_xy': zone.center_xy.tolist(), 'radius': zone.radius}
-                    for zone in zones
-                ],
-                'curriculum_level': 'medium',
-            }
+            if not self._scenario_geometry_is_valid(state, goal, zones, 'medium'):
+                continue
+            return self._build_scenario_payload(state, goal, zones, 'medium')
         return None
 
     def _sample_medium_single_block(self, state: np.ndarray, goal: np.ndarray) -> list[Zone] | None:
@@ -390,8 +499,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             ],
             dtype=np.float32,
         )
-        radius = float(self.rng.uniform(105.0, 145.0))
-        if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
+        radius = self._sample_zone_radius('medium')
+        if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius, 'medium'):
             return None
         zones.append(Zone(center_xy=center_xy, radius=radius))
         return zones
@@ -400,18 +509,18 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         cfg = self.scenario
         zones: list[Zone] = []
         base_x = self.rng.uniform(-0.05 * cfg.world_xy, 0.20 * cfg.world_xy)
-        offsets = [self.rng.uniform(120.0, 190.0), -self.rng.uniform(120.0, 190.0)]
+        offsets = [self.rng.uniform(260.0, 420.0), -self.rng.uniform(260.0, 420.0)]
         self.rng.shuffle(offsets)
         for idx, offset in enumerate(offsets):
             center_xy = np.array(
                 [
-                    base_x + idx * self.rng.uniform(120.0, 190.0),
+                    base_x + idx * self.rng.uniform(260.0, 420.0),
                     0.5 * (state[1] + goal[1]) + offset,
                 ],
                 dtype=np.float32,
             )
-            radius = float(self.rng.uniform(85.0, 120.0))
-            if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
+            radius = self._sample_zone_radius('medium')
+            if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius, 'medium'):
                 return None
             zones.append(Zone(center_xy=center_xy, radius=radius))
         if not self._double_zone_layout_is_reasonable(state, goal, zones, cfg.dual_zone_min_margin):
@@ -421,43 +530,26 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     def _sample_hard_scenario(self) -> dict[str, Any] | None:
         cfg = self.scenario
         for _attempt in range(cfg.scenario_max_sampling_attempts):
-            state = np.array(
-                [
-                    self.rng.uniform(-0.8 * cfg.world_xy, -0.5 * cfg.world_xy),
-                    self.rng.uniform(-0.2 * cfg.world_xy, 0.2 * cfg.world_xy),
-                    self.rng.uniform(80.0, 160.0),
-                    0.0,
-                    self.rng.uniform(-0.2, 0.2),
-                ],
-                dtype=np.float32,
+            pair = self._sample_start_goal_pair(
+                'hard',
+                start_x_fraction=(-0.72, -0.55),
+                goal_x_fraction=(0.55, 0.78),
+                start_y_fraction=(-0.20, 0.20),
+                goal_y_fraction=(-0.30, 0.30),
+                psi_range=(-0.20, 0.20),
             )
-            goal = np.array(
-                [
-                    self.rng.uniform(0.45 * cfg.world_xy, 0.8 * cfg.world_xy),
-                    self.rng.uniform(-0.3 * cfg.world_xy, 0.3 * cfg.world_xy),
-                    self.rng.uniform(80.0, 220.0),
-                ],
-                dtype=np.float32,
-            )
-            if abs(float(goal[2] - state[2])) > cfg.max_start_goal_height_gap:
+            if pair is None:
                 continue
-            zones = self._sample_zones_for_pair(state, goal)
+            state, goal = pair
+            zones = self._sample_zones_for_pair(state, goal, 'hard')
             if zones is None:
                 continue
-            if not self._corridor_is_reasonable(state, goal, zones):
+            if not self._scenario_geometry_is_valid(state, goal, zones, 'hard'):
                 continue
-            return {
-                'state': state.tolist(),
-                'goal': goal.tolist(),
-                'zones': [
-                    {'center_xy': zone.center_xy.tolist(), 'radius': zone.radius}
-                    for zone in zones
-                ],
-                'curriculum_level': 'hard',
-            }
+            return self._build_scenario_payload(state, goal, zones, 'hard')
         return None
 
-    def _sample_zones_for_pair(self, state: np.ndarray, goal: np.ndarray) -> list[Zone] | None:
+    def _sample_zones_for_pair(self, state: np.ndarray, goal: np.ndarray, level: str) -> list[Zone] | None:
         cfg = self.scenario
         zones: list[Zone] = []
         zone_count = int(self.rng.integers(max(2, cfg.min_no_fly_zones), cfg.max_no_fly_zones + 1))
@@ -471,8 +563,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                     ],
                     dtype=np.float32,
                 )
-                radius = float(self.rng.uniform(*cfg.no_fly_radius_range))
-                if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
+                radius = self._sample_zone_radius(level)
+                if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius, level):
                     continue
                 zones.append(Zone(center_xy=center_xy, radius=radius))
                 accepted = True
@@ -481,6 +573,15 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 return None
         return zones
 
+    def _zone_boundary_is_valid(self, center_xy: np.ndarray, radius: float) -> bool:
+        cfg = self.scenario
+        lateral_clearance = radius + cfg.warning_distance
+        return bool(
+            abs(float(center_xy[0])) + lateral_clearance <= cfg.world_xy
+            and abs(float(center_xy[1])) + lateral_clearance <= cfg.world_xy
+            and radius < cfg.world_z_max
+        )
+
     def _zone_candidate_is_valid(
         self,
         state: np.ndarray,
@@ -488,8 +589,12 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         existing_zones: list[Zone],
         center_xy: np.ndarray,
         radius: float,
+        level: str,
     ) -> bool:
         cfg = self.scenario
+        if not self._zone_boundary_is_valid(center_xy, radius):
+            return False
+
         dist_to_goal = float(
             np.linalg.norm(
                 np.array([goal[0] - center_xy[0], goal[1] - center_xy[1], goal[2]], dtype=np.float32)
@@ -509,7 +614,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
 
         for zone in existing_zones:
             center_distance = float(np.linalg.norm(center_xy - zone.center_xy))
-            min_allowed = cfg.zone_overlap_ratio_limit * (radius + zone.radius)
+            min_allowed = radius + zone.radius + self._min_zone_surface_gap(level)
             if center_distance <= min_allowed:
                 return False
         return True

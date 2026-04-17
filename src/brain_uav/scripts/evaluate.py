@@ -9,7 +9,7 @@ from pathlib import Path
 
 import torch
 
-from ..config import ExperimentConfig
+from ..config import ExperimentConfig, ScenarioConfig
 from ..curriculum import describe_curriculum_mix, parse_curriculum_mix
 from ..scenarios import (
     DEFAULT_BENCHMARK_SUITE_PATH,
@@ -23,6 +23,8 @@ from ..utils.seeding import set_global_seed
 
 AC_ENERGY_PJ = 0.9
 MAC_ENERGY_PJ = 4.6
+TERMINAL_ERROR_RATIO_THRESHOLD = 0.002
+PLANNING_TIME_REQUIREMENT_S = 1.0
 
 
 def _sanitize_token(value: str) -> str:
@@ -78,16 +80,33 @@ def _build_category_summary(records: list[dict]) -> dict[str, dict]:
                 'goal_count': 0,
                 'step_values': [],
                 'return_values': [],
+                'flight_time_values': [],
+                'planning_time_values': [],
+                'terminal_error_values': [],
+                'terminal_error_ratio_values': [],
                 'outcomes': {},
+                'terminal_error_pass_count': 0,
+                'planning_time_pass_count': 0,
+                'acceptance_pass_count': 0,
             },
         )
         bucket['episodes'] += 1
         bucket['step_values'].append(record['steps'])
         bucket['return_values'].append(record['return'])
+        bucket['flight_time_values'].append(record.get('flight_time_s', 0.0))
+        bucket['planning_time_values'].append(record.get('planning_time_s', 0.0))
+        bucket['terminal_error_values'].append(record.get('terminal_error_km', 0.0))
+        bucket['terminal_error_ratio_values'].append(record.get('terminal_error_ratio', 0.0))
         outcome = record['outcome']
         bucket['outcomes'][outcome] = bucket['outcomes'].get(outcome, 0) + 1
         if outcome == 'goal':
             bucket['goal_count'] += 1
+        if record.get('meets_terminal_error_requirement'):
+            bucket['terminal_error_pass_count'] += 1
+        if record.get('meets_planning_time_requirement'):
+            bucket['planning_time_pass_count'] += 1
+        if record.get('acceptance_pass'):
+            bucket['acceptance_pass_count'] += 1
     result: dict[str, dict] = {}
     for category, bucket in summary.items():
         result[category] = {
@@ -99,9 +118,104 @@ def _build_category_summary(records: list[dict]) -> dict[str, dict]:
             'timeout_rate': bucket['outcomes'].get('timeout', 0) / bucket['episodes'],
             'avg_steps': statistics.mean(bucket['step_values']),
             'avg_return': statistics.mean(bucket['return_values']),
+            'mean_flight_time_s': statistics.mean(bucket['flight_time_values']),
+            'mean_planning_time_s': statistics.mean(bucket['planning_time_values']),
+            'mean_terminal_error_km': statistics.mean(bucket['terminal_error_values']),
+            'mean_terminal_error_ratio': statistics.mean(bucket['terminal_error_ratio_values']),
+            'terminal_error_pass_rate': bucket['terminal_error_pass_count'] / bucket['episodes'],
+            'planning_time_pass_rate': bucket['planning_time_pass_count'] / bucket['episodes'],
+            'acceptance_pass_rate': bucket['acceptance_pass_count'] / bucket['episodes'],
             'outcomes': bucket['outcomes'],
         }
     return result
+
+
+def _cuda_synchronize_if_needed(device: torch.device) -> None:
+    if device.type == 'cuda' and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+
+
+def _scenario_float(
+    scenario_payload: dict,
+    key: str,
+    fallback: float,
+) -> float:
+    value = scenario_payload.get(key)
+    if isinstance(value, (int, float)):
+        return float(value)
+    return float(fallback)
+
+
+def _zone_radius_range(scenario_payload: dict) -> list[float] | None:
+    raw = scenario_payload.get('zone_radius_range_km')
+    if isinstance(raw, (list, tuple)) and len(raw) == 2:
+        return [float(raw[0]), float(raw[1])]
+    zones = scenario_payload.get('zones', [])
+    if not zones:
+        return None
+    radii = [float(zone['radius']) for zone in zones]
+    return [min(radii), max(radii)]
+
+
+def _episode_acceptance_metrics(
+    *,
+    steps: int,
+    planning_time_s: float,
+    final_state: list[float],
+    goal: list[float],
+    scenario_payload: dict,
+    cfg: ExperimentConfig,
+    outcome: str,
+) -> dict[str, object]:
+    dt_s = _scenario_float(scenario_payload, 'dt_s', cfg.scenario.dt)
+    speed_km_s = _scenario_float(scenario_payload, 'speed_km_s', cfg.scenario.speed)
+    max_time_s = _scenario_float(scenario_payload, 'max_time_s', cfg.scenario.max_time_s)
+    goal_radius_km = _scenario_float(scenario_payload, 'goal_radius_km', cfg.scenario.goal_radius)
+    flight_time_s = float(steps) * dt_s
+    actual_path_length_km = flight_time_s * speed_km_s
+    dx = float(final_state[0]) - float(goal[0])
+    dy = float(final_state[1]) - float(goal[1])
+    dz = float(final_state[2]) - float(goal[2])
+    terminal_error_km = float((dx * dx + dy * dy + dz * dz) ** 0.5)
+    terminal_error_ratio = (
+        terminal_error_km / actual_path_length_km if actual_path_length_km > 0.0 else None
+    )
+    meets_terminal_error_requirement = (
+        False if terminal_error_ratio is None else terminal_error_ratio <= TERMINAL_ERROR_RATIO_THRESHOLD
+    )
+    meets_planning_time_requirement = planning_time_s <= PLANNING_TIME_REQUIREMENT_S
+    success = outcome == 'goal'
+    acceptance_pass = success and meets_terminal_error_requirement and meets_planning_time_requirement
+    return {
+        'success': success,
+        'dt_s': dt_s,
+        'speed_km_s': speed_km_s,
+        'flight_time_s': flight_time_s,
+        'max_time_s': max_time_s,
+        'timeout': outcome == 'timeout',
+        'terminal_error_km': terminal_error_km,
+        'actual_path_length_km': actual_path_length_km,
+        'terminal_error_ratio': terminal_error_ratio,
+        'meets_terminal_error_requirement': meets_terminal_error_requirement,
+        'planning_time_s': planning_time_s,
+        'meets_planning_time_requirement': meets_planning_time_requirement,
+        'acceptance_pass': acceptance_pass,
+        'goal_radius_km': goal_radius_km,
+        'start_goal_distance_km': scenario_payload.get('start_goal_distance_km'),
+        'start_goal_horizontal_distance_km': scenario_payload.get('start_goal_horizontal_distance_km'),
+        'zone_radius_range_km': _zone_radius_range(scenario_payload),
+    }
+
+
+def _mean_record_value(records: list[dict], key: str) -> float:
+    values = [float(record[key]) for record in records if record.get(key) is not None]
+    return statistics.mean(values) if values else 0.0
+
+
+def _pass_rate(records: list[dict], key: str) -> float:
+    if not records:
+        return 0.0
+    return sum(1 for record in records if record.get(key)) / len(records)
 
 
 def _percentile(values: list[float], pct: float) -> float:
@@ -334,6 +448,13 @@ def _apply_checkpoint_config(cfg: ExperimentConfig, payload: dict) -> None:
                 setattr(section, key, value)
 
 
+def _use_current_benchmark_physics(cfg: ExperimentConfig) -> None:
+    """Benchmark suites are defined in the current km-scale environment."""
+
+    current = ScenarioConfig()
+    cfg.scenario = current
+
+
 def evaluate_policy(
     checkpoint: Path,
     model: str,
@@ -351,6 +472,8 @@ def evaluate_policy(
     cfg = ExperimentConfig()
     checkpoint_payload = load_checkpoint(checkpoint)
     _apply_checkpoint_config(cfg, checkpoint_payload)
+    if evaluation_mode == 'benchmark':
+        _use_current_benchmark_physics(cfg)
     set_global_seed(seed)
     env = make_env(
         cfg,
@@ -359,7 +482,19 @@ def evaluate_policy(
         curriculum_level=curriculum_level if evaluation_mode == 'curriculum' else None,
         curriculum_mix=curriculum_mix if evaluation_mode == 'curriculum' else None,
     )
-    obs, _ = env.reset(seed=seed)
+    benchmark_suite = None
+    named_scenarios = []
+    if evaluation_mode == 'benchmark':
+        benchmark_suite = load_benchmark_suite(benchmark_suite_path)
+        named_scenarios = build_benchmark_scenarios(benchmark_suite_path)
+        if episodes > len(named_scenarios):
+            raise ValueError(
+                f'--episodes={episodes} exceeds benchmark suite size {len(named_scenarios)} at {benchmark_suite_path}. '
+                'Benchmark evaluation does not loop or repeat scenarios.'
+            )
+        obs, _ = env.reset(options={'scenario': named_scenarios[0].scenario})
+    else:
+        obs, _ = env.reset(seed=seed)
     actor = make_actor(cfg, model, obs.shape[0], env.action_space.shape[0])
     actor.load_state_dict(checkpoint_payload['state_dict'])
     actor.eval()
@@ -382,17 +517,6 @@ def evaluate_policy(
     config_payload['evaluation_mode'] = evaluation_mode
     config_payload['curriculum_level'] = curriculum_level
     config_payload['curriculum_mix'] = curriculum_mix
-
-    benchmark_suite = None
-    named_scenarios = []
-    if evaluation_mode == 'benchmark':
-        benchmark_suite = load_benchmark_suite(benchmark_suite_path)
-        named_scenarios = build_benchmark_scenarios(benchmark_suite_path)
-        if episodes > len(named_scenarios):
-            raise ValueError(
-                f'--episodes={episodes} exceeds benchmark suite size {len(named_scenarios)} at {benchmark_suite_path}. '
-                'Benchmark evaluation does not loop or repeat scenarios.'
-            )
 
     successes = 0
     collisions = 0
@@ -420,8 +544,10 @@ def evaluate_policy(
         min_clearance_to_boundary = None
         difficulty_score = None
         scenario_label = None
+        scenario_metadata: dict = {}
         if evaluation_mode == 'benchmark':
             scenario = named_scenarios[ep]
+            scenario_metadata = scenario.scenario
             obs, _ = env.reset(options={'scenario': scenario.scenario})
             scenario_id = scenario.scenario_id
             category = scenario.category
@@ -448,10 +574,12 @@ def evaluate_policy(
         while not done:
             if len(obs_samples) < 1000:
                 obs_samples.append(obs.copy())
+            obs_tensor = torch.tensor(obs[None, :], dtype=torch.float32, device=device)
+            _cuda_synchronize_if_needed(device)
             step_start = time.perf_counter()
             with torch.no_grad():
-                obs_tensor = torch.tensor(obs[None, :], dtype=torch.float32, device=device)
                 action_tensor = actor(obs_tensor)
+            _cuda_synchronize_if_needed(device)
             infer_t = time.perf_counter() - step_start
             inference_times.append(infer_t)
             per_inference.append(infer_t)
@@ -495,10 +623,37 @@ def evaluate_policy(
                 'difficulty_score': difficulty_score,
             }
         )
+        for key in (
+            'distance_unit',
+            'time_unit',
+            'speed_km_s',
+            'dt_s',
+            'max_time_s',
+            'max_steps',
+            'goal_radius_km',
+            'start_goal_distance_km',
+            'start_goal_horizontal_distance_km',
+            'zone_radius_range_km',
+        ):
+            if key in scenario_metadata:
+                scenario_payload[key] = scenario_metadata[key]
         zone_count = len(scenario_payload['zones'])
         zone_radii = [float(zone['radius']) for zone in scenario_payload['zones']]
         zone_centers = [list(zone['center_xy']) for zone in scenario_payload['zones']]
         curriculum_value = info.get('curriculum_level')
+        planning_time_s = float(sum(inference_times))
+        mean_inference_time_s = statistics.mean(inference_times)
+        max_inference_time_s = max(inference_times)
+        final_state = env.state.copy().tolist()
+        acceptance_metrics = _episode_acceptance_metrics(
+            steps=steps,
+            planning_time_s=planning_time_s,
+            final_state=final_state,
+            goal=scenario_payload['goal'],
+            scenario_payload=scenario_payload,
+            cfg=cfg,
+            outcome=outcome,
+        )
         episode_record = {
             'episode': ep + 1,
             'total_steps': total_steps,
@@ -509,7 +664,7 @@ def evaluate_policy(
             'critic_loss': None,
             'scenario': scenario_payload,
             'trajectory': [point.tolist() for point in env.trajectory],
-            'final_state': env.state.copy().tolist(),
+            'final_state': final_state,
             'info': {
                 'goal_distance': float(info['goal_distance']),
                 'progress': float(info.get('progress', 0.0)),
@@ -524,6 +679,7 @@ def evaluate_policy(
                 'corridor_width': corridor_width,
                 'min_clearance_to_boundary': min_clearance_to_boundary,
                 'difficulty_score': difficulty_score,
+                **acceptance_metrics,
             },
         }
         artifact_paths = export_episode_result(
@@ -545,14 +701,35 @@ def evaluate_policy(
         records.append(
             {
                 'episode': ep + 1,
+                'model': model,
                 'scenario_id': scenario_id,
                 'category': category,
                 'scenario': scenario_name,
                 'scenario_label': scenario_label,
                 'outcome': outcome,
+                'success': acceptance_metrics['success'],
                 'steps': steps,
                 'return': float(episode_return),
+                'collision': outcome == 'collision',
+                'timeout': acceptance_metrics['timeout'],
+                'flight_time_s': acceptance_metrics['flight_time_s'],
+                'planning_time_s': planning_time_s,
+                'mean_inference_time_s': mean_inference_time_s,
+                'max_inference_time_s': max_inference_time_s,
                 'goal_distance': float(info['goal_distance']),
+                'terminal_error_km': acceptance_metrics['terminal_error_km'],
+                'actual_path_length_km': acceptance_metrics['actual_path_length_km'],
+                'terminal_error_ratio': acceptance_metrics['terminal_error_ratio'],
+                'meets_terminal_error_requirement': acceptance_metrics['meets_terminal_error_requirement'],
+                'meets_planning_time_requirement': acceptance_metrics['meets_planning_time_requirement'],
+                'acceptance_pass': acceptance_metrics['acceptance_pass'],
+                'dt_s': acceptance_metrics['dt_s'],
+                'speed_km_s': acceptance_metrics['speed_km_s'],
+                'max_time_s': acceptance_metrics['max_time_s'],
+                'goal_radius_km': acceptance_metrics['goal_radius_km'],
+                'start_goal_distance_km': acceptance_metrics['start_goal_distance_km'],
+                'start_goal_horizontal_distance_km': acceptance_metrics['start_goal_horizontal_distance_km'],
+                'zone_radius_range_km': acceptance_metrics['zone_radius_range_km'],
                 'avg_inference_time_ms': 1000.0 * statistics.mean(inference_times),
                 'max_inference_time_ms': 1000.0 * max(inference_times),
                 'curriculum_level': curriculum_value,
@@ -570,6 +747,16 @@ def evaluate_policy(
     zone_count_summary = _build_zone_count_summary(records)
     outcome_by_zone_count = _build_outcome_by_zone_count(records)
     category_summary = _build_category_summary(records) if evaluation_mode == 'benchmark' else {}
+    mean_steps = statistics.mean(step_counts)
+    mean_flight_time_s = _mean_record_value(records, 'flight_time_s')
+    mean_planning_time_s = _mean_record_value(records, 'planning_time_s')
+    max_planning_time_s = max((float(record['planning_time_s']) for record in records), default=0.0)
+    planning_time_pass_rate = _pass_rate(records, 'meets_planning_time_requirement')
+    mean_terminal_error_km = _mean_record_value(records, 'terminal_error_km')
+    mean_terminal_error_ratio = _mean_record_value(records, 'terminal_error_ratio')
+    terminal_error_pass_rate = _pass_rate(records, 'meets_terminal_error_requirement')
+    acceptance_pass_rate = _pass_rate(records, 'acceptance_pass')
+    all_acceptance_pass = bool(records) and all(bool(record.get('acceptance_pass')) for record in records)
 
     device_name = str(device)
     param_count, trainable_param_count = _count_params(actor)
@@ -677,15 +864,29 @@ def evaluate_policy(
 
     summary = {
         'model': model,
+        'evaluation_mode': evaluation_mode,
         'episodes': episodes,
         'total_steps': total_steps,
         'success_rate': successes / episodes,
+        'outcome_counts': outcomes,
         'collision_rate': outcomes.get('collision', 0) / episodes,
         'boundary_rate': outcomes.get('boundary', 0) / episodes,
         'ground_rate': outcomes.get('ground', 0) / episodes,
         'timeout_rate': outcomes.get('timeout', 0) / episodes,
-        'avg_steps': statistics.mean(step_counts),
+        'mean_steps': mean_steps,
+        'avg_steps': mean_steps,
         'avg_return': statistics.mean(return_values),
+        'mean_flight_time_s': mean_flight_time_s,
+        'mean_planning_time_s': mean_planning_time_s,
+        'max_planning_time_s': max_planning_time_s,
+        'planning_time_pass_rate': planning_time_pass_rate,
+        'mean_terminal_error_km': mean_terminal_error_km,
+        'mean_terminal_error_ratio': mean_terminal_error_ratio,
+        'terminal_error_pass_rate': terminal_error_pass_rate,
+        'acceptance_pass_rate': acceptance_pass_rate,
+        'all_acceptance_pass': all_acceptance_pass,
+        'terminal_error_ratio_threshold': TERMINAL_ERROR_RATIO_THRESHOLD,
+        'planning_time_requirement_s': PLANNING_TIME_REQUIREMENT_S,
         'avg_episode_time_s': statistics.mean(episode_times),
         'avg_inference_time_ms': 1000.0 * statistics.mean(per_inference),
         'p50_inference_time_ms': p50_inference_time_ms,

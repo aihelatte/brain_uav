@@ -8,36 +8,77 @@ from pathlib import Path
 
 @dataclass(slots=True)
 class ScenarioConfig:
-    """Environment-side parameters."""
+    """Environment-side parameters.
 
-    dt: float = 1.0
-    speed: float = 25.0
+    Unit convention inside the environment:
+    - distance: km
+    - time: s
+    - speed: km/s
+    - angles: unchanged from the existing code path
+
+    The XY range is a long-range planning box. The Z upper bound is an
+    independent altitude scale and is not meant to grow with ``world_xy``.
+    """
+
+    dt: float = 1.0  # s per environment step
+    speed: float = 2.72  # km/s, about Mach 8 at the intended mission scale
+    max_time_s: float = 1010.0  # s, maximum episode flight time
     gamma_max: float = 0.6
     delta_gamma_max: float = 0.14
     delta_psi_max: float = 0.2
-    goal_radius: float = 45.0
-    world_xy: float = 800.0
-    world_z_min: float = 1.0
-    world_z_max: float = 400.0
-    max_steps: int = 200
+    goal_radius: float = 5.0  # km, fixed training success radius
+    world_xy: float = 1600.0  # km, boundary is [-world_xy, world_xy] on X/Y
+    world_z_min: float = 0.0  # km, ground boundary
+    world_z_max: float = 400.0  # km, independent altitude ceiling
+    max_steps: int | None = None  # defaults to int(max_time_s / dt); explicit values are preserved
     min_no_fly_zones: int = 1
     max_no_fly_zones: int = 3
-    no_fly_radius_range: tuple[float, float] = (60.0, 140.0)
-    warning_distance: float = 100.0
-    boundary_warning_distance: float = 100.0
-    ground_warning_height: float = 40.0
-    descent_penalty_height: float = 120.0
+    no_fly_radius_range: tuple[float, float] = (60.0, 140.0)  # km
+    easy_start_goal_distance_range: tuple[float, float] = (1200.0, 1700.0)  # km
+    easy_two_zone_start_goal_distance_range: tuple[float, float] = (1400.0, 1900.0)  # km
+    medium_start_goal_distance_range: tuple[float, float] = (1600.0, 2100.0)  # km
+    hard_start_goal_distance_range: tuple[float, float] = (1800.0, 2300.0)  # km
+    easy_no_fly_radius_range: tuple[float, float] = (80.0, 140.0)  # km
+    easy_two_zone_no_fly_radius_range: tuple[float, float] = (100.0, 170.0)  # km
+    medium_no_fly_radius_range: tuple[float, float] = (140.0, 220.0)  # km
+    hard_no_fly_radius_range: tuple[float, float] = (200.0, 250.0)  # km
+    start_z_range: tuple[float, float] = (100.0, 180.0)  # km
+    goal_z_range: tuple[float, float] = (95.0, 205.0)  # km
+    warning_distance: float = 100.0  # km around no-fly zones
+    boundary_warning_distance: float = 100.0  # km to X/Y/Z upper boundary
+    ground_warning_height: float = 40.0  # km
+    descent_penalty_height: float = 120.0  # km
     descent_gamma_threshold: float = 0.08
     nearest_zone_count: int = 3
     scenario_max_sampling_attempts: int = 80
     start_zone_clearance: float = 25.0
     zone_overlap_ratio_limit: float = 0.55
+    easy_min_zone_surface_gap: float = 30.0  # km
+    easy_two_zone_min_zone_surface_gap: float = 40.0  # km
+    medium_min_zone_surface_gap: float = 50.0  # km
+    hard_min_zone_surface_gap: float = 60.0  # km
     corridor_blocking_margin: float = 35.0
     max_corridor_blockers: int = 2
     max_start_goal_height_gap: float = 110.0
-    dual_zone_min_margin: float = 130.0
-    easy_two_zone_min_gap: float = 220.0
+    dual_zone_min_margin: float = 40.0  # km
+    easy_two_zone_min_gap: float = 60.0  # km
     easy_two_zone_blocker_probability: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.dt <= 0.0:
+            raise ValueError('dt must be positive.')
+        if self.max_time_s <= 0.0:
+            raise ValueError('max_time_s must be positive.')
+        if self.max_steps is None:
+            self.max_steps = int(self.max_time_s / self.dt)
+        else:
+            self.max_steps = int(self.max_steps)
+            if self.max_steps <= 0:
+                raise ValueError('max_steps must be positive.')
+            self.max_time_s = float(self.max_steps) * self.dt
+
+
+EnvConfig = ScenarioConfig
 
 
 @dataclass(slots=True)
