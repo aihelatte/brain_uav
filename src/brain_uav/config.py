@@ -54,6 +54,7 @@ class ScenarioConfig:
     start_zone_clearance: float = 25.0
     zone_overlap_ratio_limit: float = 0.55
     easy_min_zone_surface_gap: float = 30.0  # km
+    easy_min_corridor_warning_gap: float = 60.0  # km, warning zone must stay this far from easy corridor
     easy_two_zone_min_zone_surface_gap: float = 40.0  # km
     medium_min_zone_surface_gap: float = 50.0  # km
     hard_min_zone_surface_gap: float = 60.0  # km
@@ -128,12 +129,12 @@ class TrainingConfig:
     exploration_noise: float = 0.02
     replay_size: int = 100_000
     warmup_steps: int = 256
-    actor_freeze_steps: int = 5_000
+    actor_freeze_steps: int = 25_000
     success_sample_bias: float = 2.5
     bc_epochs: int = 10
-    snn_time_window: int = 1
+    snn_time_window: int = 8
     hidden_dim: int = 128
-    critic_grad_clip_norm: float | None = None
+    critic_grad_clip_norm: float | None = 1.0
     device: str = 'cpu'
 
 

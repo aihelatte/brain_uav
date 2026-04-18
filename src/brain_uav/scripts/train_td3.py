@@ -167,11 +167,12 @@ def export_episode_result(
     zones = record['scenario']['zones']
     scenario_cfg = config_payload['scenario']
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    ax_xy = axes[0, 0]
-    ax_xz = axes[0, 1]
-    ax_yz = axes[1, 0]
-    ax_text = axes[1, 1]
+    fig = plt.figure(figsize=(16, 24), constrained_layout=True)
+    grid = fig.add_gridspec(4, 1, height_ratios=[8.0, 1.0, 1.0, 2.2], hspace=0.45)
+    ax_xy = fig.add_subplot(grid[0, 0])
+    ax_xz = fig.add_subplot(grid[1, 0])
+    ax_yz = fig.add_subplot(grid[2, 0])
+    ax_text = fig.add_subplot(grid[3, 0])
 
     ax_xy.plot(traj[:, 0], traj[:, 1], color='tab:blue', linewidth=2.0, label='trajectory')
     ax_xy.scatter(start[0], start[1], color='tab:blue', s=55, marker='o', label='start')
@@ -203,6 +204,7 @@ def export_episode_result(
     ax_xz.set_ylim(0.0, scenario_cfg['world_z_max'])
     ax_xz.grid(alpha=0.3)
     ax_xz.legend(loc='upper left', ncol=2)
+    ax_xz.set_aspect('equal', adjustable='box')
 
     ax_yz.plot(traj[:, 1], traj[:, 2], color='tab:blue', linewidth=2.0, label='trajectory')
     ax_yz.scatter(start[1], start[2], color='tab:blue', s=55, marker='o', label='start')
@@ -217,6 +219,7 @@ def export_episode_result(
     ax_yz.set_ylim(0.0, scenario_cfg['world_z_max'])
     ax_yz.grid(alpha=0.3)
     ax_yz.legend(loc='upper left', ncol=2)
+    ax_yz.set_aspect('equal', adjustable='box')
 
     ax_text.axis('off')
     zone_lines = [
@@ -255,7 +258,6 @@ def export_episode_result(
     ax_text.set_title('Scenario Summary')
 
     fig.suptitle(f"Episode {record['episode']} - {record['outcome']}", fontsize=15)
-    fig.tight_layout(rect=[0, 0, 1, 0.97], pad=2.0)
     fig.savefig(png_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
 
@@ -380,17 +382,33 @@ def main() -> None:
     parser.add_argument('--bc-checkpoint', type=Path, default=None)
     parser.add_argument('--output', type=Path, default=None)
     parser.add_argument('--metrics-out', type=Path, default=None)
-    parser.add_argument('--summary-every-episodes', type=int, default=50)
-    parser.add_argument('--actor-freeze-steps', type=int, default=None)
-    parser.add_argument('--critic-grad-clip-norm', type=float, default=None)
-    parser.add_argument('--early-stop-enabled', action='store_true')
-    parser.add_argument('--early-stop-goal-rate', type=float, default=0.94)
-    parser.add_argument('--early-stop-windows', type=int, default=5)
-    parser.add_argument('--early-stop-min-steps', type=int, default=120000)
+    parser.add_argument('--summary-every-episodes', type=int, default=20, help='Episode count per summary window (default: 20).')
+    parser.add_argument(
+        '--actor-freeze-steps',
+        type=int,
+        default=None,
+        help='Override model default actor freeze steps (SNN default: 25000, ANN default: 50000).',
+    )
+    parser.add_argument(
+        '--critic-grad-clip-norm',
+        type=float,
+        default=None,
+        help='Override model default critic grad clip norm (SNN default: 1.0, ANN default: 1.0; pass 0 to disable).',
+    )
+    parser.add_argument('--early-stop-enabled', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument(
+        '--no-early-stop',
+        action='store_true',
+        help='Disable default early stopping.',
+    )
+    parser.add_argument('--early-stop-goal-rate', type=float, default=0.95, help='Goal-rate threshold for early stopping (default: 0.95).')
+    parser.add_argument('--early-stop-windows', type=int, default=5, help='Consecutive summary windows required for early stopping (default: 5).')
+    parser.add_argument('--early-stop-min-steps', type=int, default=80000, help='Minimum training steps before early stopping can trigger (default: 80000).')
     args = parser.parse_args()
 
     if args.timesteps is None:
         args.timesteps = 300000 if args.curriculum_level == 'hard' else 200000
+    early_stop_enabled = not args.no_early_stop
 
     cfg = ExperimentConfig()
 
@@ -399,7 +417,7 @@ def main() -> None:
         cfg.training.actor_lr = 1.5e-4
         cfg.training.critic_lr = 2e-4
         if args.actor_freeze_steps is None:
-            cfg.training.actor_freeze_steps = 10_000
+            cfg.training.actor_freeze_steps = 50_000
         else:
             cfg.training.actor_freeze_steps = args.actor_freeze_steps
         if args.critic_grad_clip_norm is None:
@@ -481,7 +499,7 @@ def main() -> None:
         config_payload=config_payload,
     )
     early_stop_callback = make_early_stop_callback(
-        enabled=args.early_stop_enabled and args.summary_every_episodes > 0,
+        enabled=early_stop_enabled and args.summary_every_episodes > 0,
         goal_rate_threshold=args.early_stop_goal_rate,
         consecutive_windows=args.early_stop_windows,
         min_steps=args.early_stop_min_steps,
@@ -511,7 +529,7 @@ def main() -> None:
     metrics_dict['bc_loss'] = trainer.metrics.bc_loss
     metrics_dict['rl_actor_loss'] = trainer.metrics.rl_actor_loss
     metrics_dict['total_actor_loss'] = trainer.metrics.actor_loss
-    metrics_dict['early_stop_enabled'] = bool(args.early_stop_enabled and args.summary_every_episodes > 0)
+    metrics_dict['early_stop_enabled'] = bool(early_stop_enabled and args.summary_every_episodes > 0)
     metrics_dict['early_stop_goal_rate'] = args.early_stop_goal_rate
     metrics_dict['early_stop_windows'] = args.early_stop_windows
     metrics_dict['early_stop_min_steps'] = args.early_stop_min_steps

@@ -365,7 +365,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 center_xy=np.array(
                     [
                         self.rng.uniform(-0.05 * cfg.world_xy, 0.35 * cfg.world_xy),
-                        line_y + self.rng.choice([-1.0, 1.0]) * self.rng.uniform(170.0, 280.0),
+                        line_y + self.rng.choice([-1.0, 1.0]) * self.rng.uniform(300.0, 450.0),
                     ],
                     dtype=np.float32,
                 ),
@@ -611,6 +611,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         )
         if dist_to_start <= radius + cfg.warning_distance + cfg.start_zone_clearance:
             return False
+        if level == 'easy' and not self._easy_corridor_clearance_is_valid(state, goal, center_xy, radius):
+            return False
 
         for zone in existing_zones:
             center_distance = float(np.linalg.norm(center_xy - zone.center_xy))
@@ -618,6 +620,34 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             if center_distance <= min_allowed:
                 return False
         return True
+
+    def _distance_to_start_goal_segment_xy(
+        self,
+        state: np.ndarray,
+        goal: np.ndarray,
+        center_xy: np.ndarray,
+    ) -> float:
+        start_xy = state[:2]
+        goal_xy = goal[:2]
+        segment = goal_xy - start_xy
+        segment_norm_sq = float(np.dot(segment, segment))
+        if segment_norm_sq <= 1e-6:
+            return float(np.linalg.norm(center_xy - start_xy))
+        t = float(np.dot(center_xy - start_xy, segment) / segment_norm_sq)
+        t = float(np.clip(t, 0.0, 1.0))
+        projection = start_xy + t * segment
+        return float(np.linalg.norm(center_xy - projection))
+
+    def _easy_corridor_clearance_is_valid(
+        self,
+        state: np.ndarray,
+        goal: np.ndarray,
+        center_xy: np.ndarray,
+        radius: float,
+    ) -> bool:
+        distance_to_segment = self._distance_to_start_goal_segment_xy(state, goal, center_xy)
+        min_distance = radius + self.scenario.warning_distance + self.scenario.easy_min_corridor_warning_gap
+        return distance_to_segment >= min_distance
 
     def _corridor_is_reasonable(self, state: np.ndarray, goal: np.ndarray, zones: list[Zone]) -> bool:
         blockers = self._count_corridor_blockers(state, goal, zones, margin=self.scenario.corridor_blocking_margin)

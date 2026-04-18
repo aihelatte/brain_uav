@@ -20,7 +20,41 @@ from ..utils.io import ensure_parent
 from ..utils.seeding import set_global_seed
 
 
-DATASET_VERSION = 'v6'
+DATASET_VERSION = 'v8_restore'
+TERMINAL_AUG_THRESHOLDS_KM = [100.0, 50.0, 20.0]
+TERMINAL_AUG_EXTRA_REPEATS = {
+    100.0: 2,
+    50.0: 4,
+    20.0: 8,
+}
+TERMINAL_DISTANCE_BIN_LABELS = ['<=5km', '5-10km', '10-20km', '20-50km', '50-100km', '>100km']
+
+
+def build_planners(env, planner_names: str):
+    """Build selected baseline planners for dataset generation."""
+
+    registry = {
+        'heuristic': HeuristicPlanner,
+        'apf': ArtificialPotentialFieldPlanner,
+        'astar': AStarPlanner,
+    }
+    planners = []
+    unknown = []
+    for raw_name in planner_names.split(','):
+        key = raw_name.strip().lower()
+        if not key:
+            continue
+        planner_cls = registry.get(key)
+        if planner_cls is None:
+            unknown.append(key)
+            continue
+        planners.append(planner_cls(env))
+    if unknown:
+        allowed = ', '.join(sorted(registry))
+        raise ValueError(f"Unknown planner(s): {', '.join(unknown)}. Allowed planners: {allowed}.")
+    if not planners:
+        raise ValueError('At least one planner must be selected.')
+    return planners
 
 
 def collect_rollout(planner, env, max_steps: int | None = None):
@@ -32,7 +66,8 @@ def collect_rollout(planner, env, max_steps: int | None = None):
     outcome = 'timeout'
     for _ in range(steps):
         action = planner.act(obs)
-        samples.append((obs.copy(), action.copy()))
+        goal_distance = float(env._goal_distance(env.state[:3]))
+        samples.append((obs.copy(), action.copy(), goal_distance))
         obs, _, terminated, truncated, info = env.step(action)
         if terminated or truncated:
             outcome = info['outcome']
@@ -40,35 +75,108 @@ def collect_rollout(planner, env, max_steps: int | None = None):
     return samples, outcome
 
 
+def terminal_extra_repeats(goal_distance_km: float) -> int:
+    """Return extra terminal-capture repeats for one successful rollout sample."""
+
+    if goal_distance_km <= 20.0:
+        return TERMINAL_AUG_EXTRA_REPEATS[20.0]
+    if goal_distance_km <= 50.0:
+        return TERMINAL_AUG_EXTRA_REPEATS[50.0]
+    if goal_distance_km <= 100.0:
+        return TERMINAL_AUG_EXTRA_REPEATS[100.0]
+    return 0
+
+
+def compute_terminal_diagnostics(
+    observations: np.ndarray,
+    actions: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute terminal distance bin action diagnostics from final dataset samples."""
+
+    rel_goal = observations[:, 5:8]
+    distances = np.linalg.norm(rel_goal, axis=1)
+    abs_actions = np.abs(actions)
+    masks = [
+        distances <= 5.0,
+        (distances > 5.0) & (distances <= 10.0),
+        (distances > 10.0) & (distances <= 20.0),
+        (distances > 20.0) & (distances <= 50.0),
+        (distances > 50.0) & (distances <= 100.0),
+        distances > 100.0,
+    ]
+    counts = np.zeros(len(masks), dtype=np.int64)
+    action_abs_mean = np.full((len(masks), actions.shape[1]), np.nan, dtype=np.float32)
+    action_abs_std = np.full((len(masks), actions.shape[1]), np.nan, dtype=np.float32)
+    for idx, mask in enumerate(masks):
+        counts[idx] = int(mask.sum())
+        if counts[idx] > 0:
+            selected = abs_actions[mask]
+            action_abs_mean[idx] = selected.mean(axis=0).astype(np.float32)
+            action_abs_std[idx] = selected.std(axis=0).astype(np.float32)
+    return counts, action_abs_mean, action_abs_std
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description='Generate behavior cloning dataset.')
-    parser.add_argument('--output', type=Path, default=Path('data/bc_dataset_easy_v6.npz'))
+    parser.add_argument('--output', type=Path, default=Path('data/bc_dataset_easy_v8_restore.npz'))
     parser.add_argument('--episodes', type=int, default=180)
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--curriculum-level', choices=['easy', 'easy_two_zone', 'medium', 'hard'], default='easy')
     parser.add_argument('--curriculum-mix', type=str, default=None)
+    parser.add_argument(
+        '--planners',
+        type=str,
+        default='heuristic,apf',
+        help='Comma-separated planners used for dataset generation: heuristic,apf,astar',
+    )
+    terminal_group = parser.add_mutually_exclusive_group()
+    terminal_group.add_argument(
+        '--terminal-augment',
+        dest='terminal_augment',
+        action='store_true',
+        help='Enable terminal capture sample augmentation for successful rollouts.',
+    )
+    terminal_group.add_argument(
+        '--no-terminal-augment',
+        dest='terminal_augment',
+        action='store_false',
+        help='Disable terminal capture sample augmentation.',
+    )
+    parser.set_defaults(terminal_augment=True)
     args = parser.parse_args()
 
     cfg = ExperimentConfig()
     curriculum_mix = parse_curriculum_mix(args.curriculum_mix, fallback_level=args.curriculum_level)
     set_global_seed(args.seed)
     env = make_env(cfg, seed=args.seed, curriculum_level=args.curriculum_level, curriculum_mix=curriculum_mix)
-    planners = [HeuristicPlanner(env), ArtificialPotentialFieldPlanner(env), AStarPlanner(env)]
+    planners = build_planners(env, args.planners)
+    print(f"[Dataset:{DATASET_VERSION}] enabled planners: {', '.join(p.__class__.__name__ for p in planners)}")
     observations: list[np.ndarray] = []
     actions: list[np.ndarray] = []
     planner_tags: list[str] = []
     success_count = 0
+    raw_success_samples = 0
+    augmented_samples = 0
+    terminal_augmented_sample_count = 0
     fallback_samples: list[tuple[np.ndarray, np.ndarray, str]] = []
     for episode in range(args.episodes):
         planner = planners[episode % len(planners)]
         rollout, outcome = collect_rollout(planner, env)
         if outcome == 'goal':
-            observations.extend(obs for obs, _ in rollout)
-            actions.extend(action for _, action in rollout)
-            planner_tags.extend([planner.__class__.__name__] * len(rollout))
+            raw_success_samples += len(rollout)
+            for obs, action, goal_distance in rollout:
+                repeat_count = 1
+                if args.terminal_augment:
+                    repeat_count += terminal_extra_repeats(goal_distance)
+                for _ in range(repeat_count):
+                    observations.append(obs)
+                    actions.append(action)
+                    planner_tags.append(planner.__class__.__name__)
+                augmented_samples += repeat_count
+                terminal_augmented_sample_count += repeat_count - 1
             success_count += 1
         elif not fallback_samples:
-            fallback_samples = [(obs, action, planner.__class__.__name__) for obs, action in rollout]
+            fallback_samples = [(obs, action, planner.__class__.__name__) for obs, action, _ in rollout]
         print(
             f"[Dataset:{DATASET_VERSION}] episode {episode + 1}/{args.episodes} planner={planner.__class__.__name__} "
             f"outcome={outcome} level={args.curriculum_level} mix={describe_curriculum_mix(curriculum_mix)} "
@@ -82,20 +190,51 @@ def main() -> None:
     if not observations:
         raise RuntimeError('Dataset generation produced zero samples. Please increase episodes or improve baselines.')
     target = ensure_parent(args.output)
+    observations_array = np.stack(observations).astype(np.float32)
+    actions_array = np.stack(actions).astype(np.float32)
+    bin_counts, bin_action_abs_mean, bin_action_abs_std = compute_terminal_diagnostics(
+        observations_array,
+        actions_array,
+    )
     np.savez_compressed(
         target,
-        observations=np.stack(observations).astype(np.float32),
-        actions=np.stack(actions).astype(np.float32),
+        observations=observations_array,
+        actions=actions_array,
         planner_tags=np.array(planner_tags),
         dataset_version=np.array(DATASET_VERSION),
         curriculum_level=np.array(args.curriculum_level),
         curriculum_mix=np.array(json.dumps(curriculum_mix, ensure_ascii=False)),
         config_json=np.array(json.dumps(cfg.to_dict(), ensure_ascii=False)),
+        terminal_augmentation_enabled=np.array(bool(args.terminal_augment)),
+        terminal_aug_thresholds_km=np.array(TERMINAL_AUG_THRESHOLDS_KM, dtype=np.float32),
+        terminal_aug_extra_repeats=np.array(
+            [
+                TERMINAL_AUG_EXTRA_REPEATS[100.0],
+                TERMINAL_AUG_EXTRA_REPEATS[50.0],
+                TERMINAL_AUG_EXTRA_REPEATS[20.0],
+            ],
+            dtype=np.int32,
+        ),
+        raw_success_samples=np.array(raw_success_samples, dtype=np.int64),
+        augmented_samples=np.array(augmented_samples, dtype=np.int64),
+        terminal_augmented_sample_count=np.array(terminal_augmented_sample_count, dtype=np.int64),
+        terminal_distance_bin_labels=np.array(TERMINAL_DISTANCE_BIN_LABELS),
+        terminal_distance_bin_counts=bin_counts,
+        terminal_distance_bin_action_abs_mean=bin_action_abs_mean,
+        terminal_distance_bin_action_abs_std=bin_action_abs_std,
     )
     print(
         f'Saved dataset {DATASET_VERSION} with {len(observations)} samples from '
         f'{success_count} successful episodes to {target}'
     )
+    print(
+        f'[Dataset:{DATASET_VERSION}] raw_success_samples={raw_success_samples} '
+        f'augmented_samples={augmented_samples} terminal_augmented_sample_count={terminal_augmented_sample_count}'
+    )
+    print(f'[Dataset:{DATASET_VERSION}] terminal distance diagnostics:')
+    for label, count, mean in zip(TERMINAL_DISTANCE_BIN_LABELS, bin_counts, bin_action_abs_mean):
+        mean_text = 'nan' if count == 0 else f'[{mean[0]:.6f}, {mean[1]:.6f}]'
+        print(f'  {label}: count={int(count)} action_abs_mean={mean_text}')
 
 
 if __name__ == '__main__':

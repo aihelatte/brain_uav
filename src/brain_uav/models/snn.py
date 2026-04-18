@@ -8,6 +8,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from ..config import ScenarioConfig
+from .scaling import FixedObsScaler
+
 try:
     from spikingjelly.activation_based import functional, neuron, surrogate
     HAS_SPIKINGJELLY = True
@@ -52,8 +55,10 @@ class SNNPolicyActor(nn.Module):
         hidden_dim: int,
         time_window: int,
         action_limit: torch.Tensor,
+        scenario_cfg: ScenarioConfig | None = None,
     ) -> None:
         super().__init__()
+        self.obs_scaler = FixedObsScaler(state_dim, scenario_cfg)
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, action_dim)
@@ -82,6 +87,7 @@ class SNNPolicyActor(nn.Module):
         - 根据脉冲活动率折算后的有效 MACs
         """
 
+        obs = self.obs_scaler(obs)
         if HAS_SPIKINGJELLY:
             functional.reset_net(self)
             encoded = self.fc1(obs)

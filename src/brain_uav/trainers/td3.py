@@ -145,6 +145,8 @@ class TD3Trainer:
             )
         for step_idx in range(total_timesteps):
             self.total_steps += 1
+            if self.bc_reference_actor is not None:
+                self.metrics.bc_lambda = float(self._bc_lambda())
             if self.total_steps <= self.warmup_steps:
                 action = self._warmup_action(obs)
             else:
@@ -259,9 +261,9 @@ class TD3Trainer:
             if self.total_steps <= 100_000:
                 return 150.0
             return 20.0
-        if self.total_steps <= 50_000:
+        if self.total_steps <= 250_000:
             return 1000.0
-        if self.total_steps <= 100_000:
+        if self.total_steps <= 500_000:
             return 300.0
         return 50.0
 

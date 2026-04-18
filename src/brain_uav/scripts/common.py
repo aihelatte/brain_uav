@@ -53,10 +53,10 @@ def make_actor(cfg: ExperimentConfig, model_type: str, state_dim: int, action_di
     )
     if model_type == 'snn':
         return SNNPolicyActor(
-            state_dim, action_dim, cfg.training.hidden_dim, cfg.training.snn_time_window, action_limit
+            state_dim, action_dim, cfg.training.hidden_dim, cfg.training.snn_time_window, action_limit, cfg.scenario
         )
     if model_type == 'ann':
-        return ANNPolicyActor(state_dim, action_dim, cfg.training.hidden_dim, action_limit)
+        return ANNPolicyActor(state_dim, action_dim, cfg.training.hidden_dim, action_limit, cfg.scenario)
     raise ValueError(f'Unsupported model_type: {model_type}')
 
 
@@ -64,6 +64,6 @@ def make_critics(cfg: ExperimentConfig, state_dim: int, action_dim: int):
     """Create the twin critics required by TD3."""
 
     return (
-        ANNCritic(state_dim, action_dim, cfg.training.hidden_dim),
-        ANNCritic(state_dim, action_dim, cfg.training.hidden_dim),
+        ANNCritic(state_dim, action_dim, cfg.training.hidden_dim, cfg.scenario),
+        ANNCritic(state_dim, action_dim, cfg.training.hidden_dim, cfg.scenario),
     )
