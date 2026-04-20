@@ -13,6 +13,7 @@ from ..config import ExperimentConfig
 from ..curriculum import describe_curriculum_mix, parse_curriculum_mix
 from ..scripts.common import make_actor, make_critics, make_env
 from ..trainers import TD3Trainer
+from ..trainers.vector_env import ProcessVectorEnv
 from ..utils.io import (
     build_log_paths,
     ensure_dir,
@@ -497,6 +498,7 @@ def main() -> None:
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
     parser.add_argument('--batch-size', type=int, default=None, help='TD3 mini-batch size (default: 128).')
     parser.add_argument('--num-envs', type=int, default=1, help='Number of rollout environments for optional parallel sampling (default: 1).')
+    parser.add_argument('--env-worker-mode', choices=['inline', 'process'], default='inline')
     parser.add_argument('--render-during-training', action='store_true', help='Render snapshot PNGs during training; default saves JSON only.')
     parser.add_argument('--summary-every-episodes', type=int, default=15, help='Episode count per summary window (default: 15).')
     parser.add_argument(
@@ -539,7 +541,7 @@ def main() -> None:
     if args.batch_size is not None:
         cfg.training.batch_size = args.batch_size
     print(_device_log_line('train_td3', cfg.training.device))
-    print(f'[train_td3] num_envs={args.num_envs}, batch_size={cfg.training.batch_size}')
+    print(f'[train_td3] num_envs={args.num_envs}, env_worker_mode={args.env_worker_mode}, batch_size={cfg.training.batch_size}')
 
     if args.model == 'ann':
         # Use more conservative defaults for ANN to avoid late-training collapse.
@@ -589,17 +591,19 @@ def main() -> None:
         curriculum_mix=curriculum_mix,
         goal_radius_curriculum_enabled=True,
     )
+    process_vector_env = None
     envs = [env]
-    for env_id in range(1, args.num_envs):
-        envs.append(
-            make_env(
-                cfg,
-                seed=args.seed + env_id * 10000,
-                curriculum_level=args.curriculum_level,
-                curriculum_mix=curriculum_mix,
-                goal_radius_curriculum_enabled=True,
+    if args.env_worker_mode == 'inline':
+        for env_id in range(1, args.num_envs):
+            envs.append(
+                make_env(
+                    cfg,
+                    seed=args.seed + env_id * 10000,
+                    curriculum_level=args.curriculum_level,
+                    curriculum_mix=curriculum_mix,
+                    goal_radius_curriculum_enabled=True,
+                )
             )
-        )
     obs, _ = env.reset(seed=args.seed)
     actor = make_actor(cfg, args.model, obs.shape[0], env.action_space.shape[0])
     critic1, critic2 = make_critics(cfg, obs.shape[0], env.action_space.shape[0])
@@ -631,6 +635,8 @@ def main() -> None:
         device=cfg.training.device,
         curriculum_level=args.curriculum_level,
         envs=envs,
+        process_vector_env=process_vector_env,
+        env_worker_mode=args.env_worker_mode,
     )
     init_checkpoint = args.init_checkpoint or args.bc_checkpoint
     trainer.warmup_strategy = load_training_state(init_checkpoint, actor, critic1, critic2, trainer)
@@ -641,10 +647,24 @@ def main() -> None:
         if not has_critics:
             trainer.set_bc_reference_actor(deepcopy(actor))
 
+    if args.env_worker_mode == 'process':
+        process_vector_env = ProcessVectorEnv(
+            cfg=cfg,
+            num_envs=args.num_envs,
+            base_seed=args.seed,
+            curriculum_level=args.curriculum_level,
+            curriculum_mix=curriculum_mix,
+            start_method='spawn' if cfg.training.device == 'cuda' else None,
+        )
+        trainer.process_vector_env = process_vector_env
+        trainer.env_worker_mode = args.env_worker_mode
+
     config_payload = cfg.to_dict()
     config_payload['curriculum_level'] = args.curriculum_level
     config_payload['curriculum_mix'] = curriculum_mix
     config_payload['num_envs'] = args.num_envs
+    config_payload['env_worker_mode'] = args.env_worker_mode
+    config_payload['worker_seed_rule'] = 'base_seed + env_id * 10000'
     config_payload['render_during_training'] = bool(args.render_during_training)
     episode_callback = make_episode_capture_callback(
         result_root=results_dir,
@@ -678,6 +698,9 @@ def main() -> None:
     metrics_dict['device'] = cfg.training.device
     metrics_dict['num_envs'] = args.num_envs
     metrics_dict['parallel_env_sampling_enabled'] = args.num_envs > 1
+    metrics_dict['env_worker_mode'] = args.env_worker_mode
+    metrics_dict['process_env_workers_enabled'] = args.env_worker_mode == 'process'
+    metrics_dict['worker_seed_rule'] = 'base_seed + env_id * 10000'
     metrics_dict['render_during_training'] = bool(args.render_during_training)
     metrics_dict['snapshot_json_only'] = not bool(args.render_during_training)
     metrics_dict['terminal_los_radius'] = cfg.rewards.terminal_los_radius

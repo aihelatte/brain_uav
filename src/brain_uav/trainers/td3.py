@@ -20,6 +20,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from .replay_buffer import ReplayBuffer
+from .vector_env import ProcessVectorEnv
 
 
 @dataclass(slots=True)
@@ -93,9 +94,13 @@ class TD3Trainer:
         bc_reference_actor: nn.Module | None = None,
         curriculum_level: str | None = None,
         envs: list[Any] | None = None,
+        process_vector_env: ProcessVectorEnv | None = None,
+        env_worker_mode: str = 'inline',
     ) -> None:
         self.env = env
         self.envs = envs if envs is not None else [env]
+        self.process_vector_env = process_vector_env
+        self.env_worker_mode = env_worker_mode
         self.actor = actor.to(device)
         self.critic1 = critic1.to(device)
         self.critic2 = critic2.to(device)
@@ -158,6 +163,15 @@ class TD3Trainer:
         episode_callback: Callable[[dict[str, Any]], None] | None = None,
         window_callback: Callable[[dict[str, Any]], str | None] | None = None,
     ) -> TD3Metrics:
+        if self.process_vector_env is not None:
+            return self._train_process_parallel(
+                total_timesteps=total_timesteps,
+                log_interval=log_interval,
+                verbose=verbose,
+                summary_every_episodes=summary_every_episodes,
+                episode_callback=episode_callback,
+                window_callback=window_callback,
+            )
         if len(self.envs) > 1:
             return self._train_parallel(
                 total_timesteps=total_timesteps,
@@ -308,6 +322,127 @@ class TD3Trainer:
         self.critic1.to('cpu')
         self.critic2.to('cpu')
         return self.metrics
+
+    def _train_process_parallel(
+        self,
+        total_timesteps: int,
+        log_interval: int = 500,
+        verbose: bool = True,
+        summary_every_episodes: int = 50,
+        episode_callback: Callable[[dict[str, Any]], None] | None = None,
+        window_callback: Callable[[dict[str, Any]], str | None] | None = None,
+    ) -> TD3Metrics:
+        if self.process_vector_env is None:
+            raise RuntimeError('process_vector_env is required for process parallel training.')
+        self.training_horizon = max(int(total_timesteps), 1)
+        vector_env = self.process_vector_env
+        obs_list = vector_env.reset_all()
+        if verbose:
+            print(
+                f"[TD3] start total_timesteps={total_timesteps} warmup_steps={self.warmup_steps} "
+                f"actor_freeze_steps={self.actor_freeze_steps} batch_size={self.batch_size} "
+                f"replay_size={self.replay.buffer.maxlen} warmup_strategy={self.warmup_strategy} "
+                f"summary_every_episodes={summary_every_episodes} num_envs={len(vector_env)} "
+                f"env_worker_mode=process near_goal_sample_bias={self.near_goal_sample_bias} "
+                f"near_goal_sample_radius={self.near_goal_sample_radius}"
+            )
+
+        stop_training = False
+        try:
+            while self.total_steps < total_timesteps and not stop_training:
+                remaining = total_timesteps - self.total_steps
+                active_indices = list(range(min(len(vector_env), remaining)))
+                if not active_indices:
+                    break
+
+                obs_batch = np.stack([obs_list[idx] for idx in active_indices]).astype(np.float32)
+                if self.total_steps < self.warmup_steps and self.warmup_strategy == 'random':
+                    actions_batch = np.asarray(
+                        [self.env.action_space.sample() for _ in active_indices],
+                        dtype=np.float32,
+                    )
+                else:
+                    actions_batch = self.select_actions(obs_batch, with_noise=True)
+                actions = [actions_batch[item_idx] for item_idx in range(len(active_indices))]
+                results = vector_env.step_at(active_indices, actions)
+
+                for result_idx, result in zip(active_indices, results):
+                    if self.total_steps >= total_timesteps:
+                        break
+                    obs = obs_list[result_idx]
+                    action = actions[active_indices.index(result_idx)]
+                    next_obs = result['next_obs']
+                    reward = float(result['reward'])
+                    done = bool(result['done'])
+                    info = result['info']
+                    self.total_steps += 1
+                    if self.bc_reference_actor is not None:
+                        self.metrics.bc_lambda = float(self._bc_lambda())
+                    near_goal = float(info.get('goal_distance', float('inf'))) <= self.near_goal_sample_radius
+                    self.replay.add(
+                        obs,
+                        action,
+                        reward,
+                        next_obs,
+                        done,
+                        success=bool(info.get('outcome') == 'goal'),
+                        near_goal=bool(near_goal),
+                    )
+                    self.metrics.replay_near_goal_fraction = self.replay.near_goal_fraction()
+                    obs_list[result_idx] = result['reset_obs'] if done else next_obs
+                    if len(self.replay) >= self.batch_size:
+                        self._update()
+                    if done and result.get('episode_record') is not None:
+                        episode_record = self._record_worker_episode(result['episode_record'])
+                        if episode_callback is not None:
+                            episode_callback(episode_record)
+                        if summary_every_episodes > 0 and len(self._current_window) >= summary_every_episodes:
+                            window_row = self._flush_window_stats()
+                            if window_callback is not None and window_row is not None:
+                                stop_reason = window_callback(window_row)
+                                if stop_reason:
+                                    self.stop_reason = stop_reason
+                                    stop_training = True
+                                    if verbose:
+                                        print(f"[TD3] early stop triggered: {stop_reason}")
+                        if verbose:
+                            print(
+                                f"[TD3] episode={self.metrics.episodes} env={episode_record['env_id']} "
+                                f"step={self.total_steps}/{total_timesteps} "
+                                f"return={episode_record['return']:.2f} length={episode_record['length']} "
+                                f"outcome={episode_record['outcome']}"
+                            )
+                        if stop_training:
+                            break
+                    if verbose and (self.total_steps % log_interval == 0 or self.total_steps == total_timesteps):
+                        avg_return = (
+                            statistics.mean(self.metrics.episode_returns[-5:]) if self.metrics.episode_returns else 0.0
+                        )
+                        actor_phase = 'frozen' if self.total_steps <= self.actor_freeze_steps else 'active'
+                        print(
+                            f"[TD3] progress={self.total_steps}/{total_timesteps} episodes={self.metrics.episodes} "
+                            f"buffer={len(self.replay)} success_frac={self.replay.success_fraction():.3f} "
+                            f"near_goal_frac={self.replay.near_goal_fraction():.3f} "
+                            f"actor_phase={actor_phase} actor_loss={self.metrics.actor_loss:.4f} "
+                            f"critic_loss={self.metrics.critic_loss:.4f} recent_avg_return={avg_return:.2f}"
+                        )
+
+            if self._current_window:
+                window_row = self._flush_window_stats()
+                if window_callback is not None and window_row is not None and self.stop_reason is None:
+                    stop_reason = window_callback(window_row)
+                    if stop_reason:
+                        self.stop_reason = stop_reason
+                        if verbose:
+                            print(f"[TD3] early stop triggered: {stop_reason}")
+            self.metrics.steps = self.total_steps
+            self.metrics.replay_near_goal_fraction = self.replay.near_goal_fraction()
+            self.actor.to('cpu')
+            self.critic1.to('cpu')
+            self.critic2.to('cpu')
+            return self.metrics
+        finally:
+            vector_env.close()
 
     def _train_parallel(
         self,
@@ -491,6 +626,44 @@ class TD3Trainer:
                 'steps': int(info.get('steps', episode_length)),
                 'curriculum_level': info.get('curriculum_level'),
             },
+        }
+        self._current_window.append(
+            {
+                'episode': episode_record['episode'],
+                'total_steps': episode_record['total_steps'],
+                'return': episode_record['return'],
+                'length': episode_record['length'],
+                'outcome': episode_record['outcome'],
+                'actor_loss': episode_record['actor_loss'],
+                'critic_loss': episode_record['critic_loss'],
+                'min_goal_distance': episode_record['min_goal_distance'],
+                'min_xy_goal_distance': episode_record['min_xy_goal_distance'],
+                'min_z_goal_error': episode_record['min_z_goal_error'],
+                'final_goal_distance': episode_record['final_goal_distance'],
+                'final_xy_goal_distance': episode_record['final_xy_goal_distance'],
+                'final_z_goal_error': episode_record['final_z_goal_error'],
+                'min_segment_goal_distance': episode_record['min_segment_goal_distance'],
+                'near_goal_step_count': episode_record['near_goal_step_count'],
+                'goal_reached_by_segment_count': episode_record['goal_reached_by_segment_count'],
+                'active_goal_radius': episode_record['active_goal_radius'],
+            }
+        )
+        return episode_record
+
+    def _record_worker_episode(self, worker_record: dict[str, Any]) -> dict[str, Any]:
+        self.metrics.episodes += 1
+        outcome = worker_record.get('outcome', 'unknown')
+        episode_return = float(worker_record['return'])
+        episode_length = int(worker_record['length'])
+        self.metrics.episode_returns.append(episode_return)
+        self.metrics.episode_lengths.append(episode_length)
+        self.metrics.outcomes[outcome] = self.metrics.outcomes.get(outcome, 0) + 1
+        episode_record = {
+            **worker_record,
+            'episode': self.metrics.episodes,
+            'total_steps': self.total_steps,
+            'actor_loss': float(self.metrics.actor_loss),
+            'critic_loss': float(self.metrics.critic_loss),
         }
         self._current_window.append(
             {
