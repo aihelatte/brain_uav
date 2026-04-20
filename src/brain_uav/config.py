@@ -134,7 +134,7 @@ class TrainingConfig:
     seed: int = 7
     actor_lr: float = 1e-3
     critic_lr: float = 1e-3
-    batch_size: int = 64
+    batch_size: int = 128
     gamma: float = 0.99
     tau: float = 0.005
     policy_noise: float = 0.015

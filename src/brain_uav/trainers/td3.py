@@ -92,8 +92,10 @@ class TD3Trainer:
         device: str = 'cpu',
         bc_reference_actor: nn.Module | None = None,
         curriculum_level: str | None = None,
+        envs: list[Any] | None = None,
     ) -> None:
         self.env = env
+        self.envs = envs if envs is not None else [env]
         self.actor = actor.to(device)
         self.critic1 = critic1.to(device)
         self.critic2 = critic2.to(device)
@@ -156,6 +158,16 @@ class TD3Trainer:
         episode_callback: Callable[[dict[str, Any]], None] | None = None,
         window_callback: Callable[[dict[str, Any]], str | None] | None = None,
     ) -> TD3Metrics:
+        if len(self.envs) > 1:
+            return self._train_parallel(
+                total_timesteps=total_timesteps,
+                log_interval=log_interval,
+                verbose=verbose,
+                summary_every_episodes=summary_every_episodes,
+                episode_callback=episode_callback,
+                window_callback=window_callback,
+            )
+
         self.training_horizon = max(int(total_timesteps), 1)
         obs, _ = self.env.reset()
         episode_return = 0.0
@@ -297,6 +309,144 @@ class TD3Trainer:
         self.critic2.to('cpu')
         return self.metrics
 
+    def _train_parallel(
+        self,
+        total_timesteps: int,
+        log_interval: int = 500,
+        verbose: bool = True,
+        summary_every_episodes: int = 50,
+        episode_callback: Callable[[dict[str, Any]], None] | None = None,
+        window_callback: Callable[[dict[str, Any]], str | None] | None = None,
+    ) -> TD3Metrics:
+        self.training_horizon = max(int(total_timesteps), 1)
+        obs_list: list[np.ndarray] = []
+        episode_returns: list[float] = []
+        episode_lengths: list[int] = []
+        episode_diagnostics: list[dict[str, Any]] = []
+        for env in self.envs:
+            obs, _ = env.reset()
+            obs_list.append(obs)
+            episode_returns.append(0.0)
+            episode_lengths.append(0)
+            episode_diagnostics.append(self._new_episode_goal_diagnostics(env))
+
+        if verbose:
+            print(
+                f"[TD3] start total_timesteps={total_timesteps} warmup_steps={self.warmup_steps} "
+                f"actor_freeze_steps={self.actor_freeze_steps} batch_size={self.batch_size} "
+                f"replay_size={self.replay.buffer.maxlen} warmup_strategy={self.warmup_strategy} "
+                f"summary_every_episodes={summary_every_episodes} num_envs={len(self.envs)} "
+                f"near_goal_sample_bias={self.near_goal_sample_bias} "
+                f"near_goal_sample_radius={self.near_goal_sample_radius}"
+            )
+
+        stop_training = False
+        while self.total_steps < total_timesteps and not stop_training:
+            remaining = total_timesteps - self.total_steps
+            active_indices = list(range(min(len(self.envs), remaining)))
+            if not active_indices:
+                break
+
+            if self.total_steps < self.warmup_steps and self.warmup_strategy == 'random':
+                actions = [self.envs[idx].action_space.sample() for idx in active_indices]
+            else:
+                obs_batch = np.stack([obs_list[idx] for idx in active_indices]).astype(np.float32)
+                actions_batch = self.select_actions(obs_batch, with_noise=True)
+                actions = [actions_batch[item_idx] for item_idx in range(len(active_indices))]
+
+            for env_idx, action in zip(active_indices, actions):
+                if self.total_steps >= total_timesteps:
+                    break
+                env = self.envs[env_idx]
+                obs = obs_list[env_idx]
+                self.total_steps += 1
+                if self.bc_reference_actor is not None:
+                    self.metrics.bc_lambda = float(self._bc_lambda())
+                next_obs, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+                near_goal = float(info.get('goal_distance', float('inf'))) <= self.near_goal_sample_radius
+                self.replay.add(
+                    obs,
+                    action,
+                    reward,
+                    next_obs,
+                    done,
+                    success=bool(info.get('outcome') == 'goal'),
+                    near_goal=bool(near_goal),
+                )
+                self.metrics.replay_near_goal_fraction = self.replay.near_goal_fraction()
+                episode_returns[env_idx] += reward
+                episode_lengths[env_idx] += 1
+                self._update_episode_goal_diagnostics(
+                    episode_diagnostics[env_idx],
+                    episode_lengths[env_idx],
+                    env,
+                )
+                obs_list[env_idx] = next_obs
+                if len(self.replay) >= self.batch_size:
+                    self._update()
+                if done:
+                    episode_record = self._record_episode(
+                        env=env,
+                        info=info,
+                        episode_return=episode_returns[env_idx],
+                        episode_length=episode_lengths[env_idx],
+                        diagnostics=episode_diagnostics[env_idx],
+                        env_id=env_idx,
+                    )
+                    if episode_callback is not None:
+                        episode_callback(episode_record)
+                    if summary_every_episodes > 0 and len(self._current_window) >= summary_every_episodes:
+                        window_row = self._flush_window_stats()
+                        if window_callback is not None and window_row is not None:
+                            stop_reason = window_callback(window_row)
+                            if stop_reason:
+                                self.stop_reason = stop_reason
+                                stop_training = True
+                                if verbose:
+                                    print(f"[TD3] early stop triggered: {stop_reason}")
+                    if verbose:
+                        print(
+                            f"[TD3] episode={self.metrics.episodes} env={env_idx} "
+                            f"step={self.total_steps}/{total_timesteps} "
+                            f"return={episode_returns[env_idx]:.2f} length={episode_lengths[env_idx]} "
+                            f"outcome={episode_record['outcome']}"
+                        )
+                    if stop_training:
+                        break
+                    obs_reset, _ = env.reset()
+                    obs_list[env_idx] = obs_reset
+                    episode_returns[env_idx] = 0.0
+                    episode_lengths[env_idx] = 0
+                    episode_diagnostics[env_idx] = self._new_episode_goal_diagnostics(env)
+                if verbose and (self.total_steps % log_interval == 0 or self.total_steps == total_timesteps):
+                    avg_return = (
+                        statistics.mean(self.metrics.episode_returns[-5:]) if self.metrics.episode_returns else 0.0
+                    )
+                    actor_phase = 'frozen' if self.total_steps <= self.actor_freeze_steps else 'active'
+                    print(
+                        f"[TD3] progress={self.total_steps}/{total_timesteps} episodes={self.metrics.episodes} "
+                        f"buffer={len(self.replay)} success_frac={self.replay.success_fraction():.3f} "
+                        f"near_goal_frac={self.replay.near_goal_fraction():.3f} "
+                        f"actor_phase={actor_phase} actor_loss={self.metrics.actor_loss:.4f} "
+                        f"critic_loss={self.metrics.critic_loss:.4f} recent_avg_return={avg_return:.2f}"
+                    )
+
+        if self._current_window:
+            window_row = self._flush_window_stats()
+            if window_callback is not None and window_row is not None and self.stop_reason is None:
+                stop_reason = window_callback(window_row)
+                if stop_reason:
+                    self.stop_reason = stop_reason
+                    if verbose:
+                        print(f"[TD3] early stop triggered: {stop_reason}")
+        self.metrics.steps = self.total_steps
+        self.metrics.replay_near_goal_fraction = self.replay.near_goal_fraction()
+        self.actor.to('cpu')
+        self.critic1.to('cpu')
+        self.critic2.to('cpu')
+        return self.metrics
+
     def set_bc_reference_actor(self, actor: nn.Module) -> None:
         self.bc_reference_actor = actor.to(self.device)
         self.bc_reference_actor.eval()
@@ -304,22 +454,84 @@ class TD3Trainer:
             param.requires_grad = False
         self.metrics.bc_regularization_enabled = True
 
-    def _goal_error_components(self) -> dict[str, float | list[float]]:
-        pos = np.asarray(self.env.state[:3], dtype=float)
-        goal = np.asarray(self.env.goal, dtype=float)
+    def _record_episode(
+        self,
+        env,
+        info: dict[str, Any],
+        episode_return: float,
+        episode_length: int,
+        diagnostics: dict[str, Any],
+        env_id: int = 0,
+    ) -> dict[str, Any]:
+        self.metrics.episodes += 1
+        self.metrics.episode_returns.append(float(episode_return))
+        self.metrics.episode_lengths.append(int(episode_length))
+        outcome = info.get('outcome', 'unknown')
+        self.metrics.outcomes[outcome] = self.metrics.outcomes.get(outcome, 0) + 1
+        episode_record = {
+            'episode': self.metrics.episodes,
+            'env_id': int(env_id),
+            'total_steps': self.total_steps,
+            'return': float(episode_return),
+            'length': int(episode_length),
+            'outcome': outcome,
+            'actor_loss': float(self.metrics.actor_loss),
+            'critic_loss': float(self.metrics.critic_loss),
+            **self._finalize_episode_goal_diagnostics(diagnostics, env),
+            'scenario': env.export_scenario(),
+            'trajectory': [point.tolist() for point in env.trajectory],
+            'final_state': env.state.copy().tolist(),
+            'info': {
+                'goal_distance': float(info.get('goal_distance', 0.0)),
+                'segment_goal_distance': float(info.get('segment_goal_distance', 0.0)),
+                'goal_reached_by_segment': bool(info.get('goal_reached_by_segment', False)),
+                'goal_radius': float(info.get('goal_radius', env.scenario.goal_radius)),
+                'active_goal_radius': float(info.get('active_goal_radius', env.scenario.goal_radius)),
+                'progress': float(info.get('progress', 0.0)),
+                'steps': int(info.get('steps', episode_length)),
+                'curriculum_level': info.get('curriculum_level'),
+            },
+        }
+        self._current_window.append(
+            {
+                'episode': episode_record['episode'],
+                'total_steps': episode_record['total_steps'],
+                'return': episode_record['return'],
+                'length': episode_record['length'],
+                'outcome': episode_record['outcome'],
+                'actor_loss': episode_record['actor_loss'],
+                'critic_loss': episode_record['critic_loss'],
+                'min_goal_distance': episode_record['min_goal_distance'],
+                'min_xy_goal_distance': episode_record['min_xy_goal_distance'],
+                'min_z_goal_error': episode_record['min_z_goal_error'],
+                'final_goal_distance': episode_record['final_goal_distance'],
+                'final_xy_goal_distance': episode_record['final_xy_goal_distance'],
+                'final_z_goal_error': episode_record['final_z_goal_error'],
+                'min_segment_goal_distance': episode_record['min_segment_goal_distance'],
+                'near_goal_step_count': episode_record['near_goal_step_count'],
+                'goal_reached_by_segment_count': episode_record['goal_reached_by_segment_count'],
+                'active_goal_radius': episode_record['active_goal_radius'],
+            }
+        )
+        return episode_record
+
+    def _goal_error_components(self, env=None) -> dict[str, float | list[float]]:
+        env = env or self.env
+        pos = np.asarray(env.state[:3], dtype=float)
+        goal = np.asarray(env.goal, dtype=float)
         delta = pos - goal
         return {
             'goal_distance': float(np.linalg.norm(delta)),
             'xy_goal_distance': float(np.linalg.norm(delta[:2])),
             'z_goal_error': float(abs(delta[2])),
             'position': pos.astype(float).tolist(),
-            'segment_goal_distance': float(getattr(self.env, 'last_segment_goal_distance', np.linalg.norm(delta))),
-            'goal_reached_by_segment': bool(getattr(self.env, 'last_goal_reached_by_segment', False)),
-            'active_goal_radius': float(getattr(self.env, 'active_goal_radius', self.env.scenario.goal_radius)),
+            'segment_goal_distance': float(getattr(env, 'last_segment_goal_distance', np.linalg.norm(delta))),
+            'goal_reached_by_segment': bool(getattr(env, 'last_goal_reached_by_segment', False)),
+            'active_goal_radius': float(getattr(env, 'active_goal_radius', env.scenario.goal_radius)),
         }
 
-    def _new_episode_goal_diagnostics(self) -> dict[str, Any]:
-        components = self._goal_error_components()
+    def _new_episode_goal_diagnostics(self, env=None) -> dict[str, Any]:
+        components = self._goal_error_components(env)
         return {
             'min_goal_distance': components['goal_distance'],
             'min_xy_goal_distance': components['xy_goal_distance'],
@@ -331,8 +543,8 @@ class TD3Trainer:
             'active_goal_radius': components['active_goal_radius'],
         }
 
-    def _update_episode_goal_diagnostics(self, diagnostics: dict[str, Any], step: int) -> None:
-        components = self._goal_error_components()
+    def _update_episode_goal_diagnostics(self, diagnostics: dict[str, Any], step: int, env=None) -> None:
+        components = self._goal_error_components(env)
         if float(components['goal_distance']) <= 50.0:
             diagnostics['near_goal_step_count'] += 1
         if bool(components['goal_reached_by_segment']):
@@ -346,8 +558,8 @@ class TD3Trainer:
             diagnostics['min_segment_goal_distance'] = components['segment_goal_distance']
         diagnostics['active_goal_radius'] = components['active_goal_radius']
 
-    def _finalize_episode_goal_diagnostics(self, diagnostics: dict[str, Any]) -> dict[str, float | int]:
-        components = self._goal_error_components()
+    def _finalize_episode_goal_diagnostics(self, diagnostics: dict[str, Any], env=None) -> dict[str, float | int]:
+        components = self._goal_error_components(env)
         return {
             'min_goal_distance': float(diagnostics['min_goal_distance']),
             'min_xy_goal_distance': float(diagnostics['min_xy_goal_distance']),
@@ -415,6 +627,15 @@ class TD3Trainer:
             exploration_noise, _, _ = self._current_noise()
             action = action + np.random.normal(0.0, exploration_noise, size=action.shape)
         return np.clip(action, self.env.action_space.low, self.env.action_space.high).astype(np.float32)
+
+    def select_actions(self, obs_batch: np.ndarray, with_noise: bool = False) -> np.ndarray:
+        obs_tensor = torch.tensor(obs_batch, dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            actions = self.actor(obs_tensor).cpu().numpy()
+        if with_noise:
+            exploration_noise, _, _ = self._current_noise()
+            actions = actions + np.random.normal(0.0, exploration_noise, size=actions.shape)
+        return np.clip(actions, self.env.action_space.low, self.env.action_space.high).astype(np.float32)
 
     def _warmup_action(self, obs: np.ndarray) -> np.ndarray:
         if self.warmup_strategy == 'policy':

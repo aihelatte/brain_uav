@@ -157,23 +157,12 @@ def _draw_zone_vertical_projection(ax, center_value: float, radius: float, label
     ax.plot(xs, zs, color=color, linewidth=1.4, alpha=0.8, label=label)
 
 
-def export_episode_result(
-    target_dir: Path,
-    stem: str,
-    record: dict[str, Any],
-    config_payload: dict[str, Any],
-) -> dict[str, str]:
-    """Save one episode's scenario parameters, trajectory and visualization."""
+def build_episode_payload(record: dict[str, Any], config_payload: dict[str, Any]) -> dict[str, Any]:
+    """Create the JSON payload used by online snapshots and offline rendering."""
 
-    import matplotlib.pyplot as plt
-    import numpy as np
-
-    target_dir = ensure_dir(target_dir)
-    json_path = target_dir / f'{stem}.json'
-    png_path = target_dir / f'{stem}.png'
-
-    payload = {
+    return {
         'episode': record['episode'],
+        'env_id': record.get('env_id'),
         'total_steps': record['total_steps'],
         'return': record['return'],
         'length': record['length'],
@@ -196,13 +185,37 @@ def export_episode_result(
         'info': record['info'],
         'config': config_payload,
     }
-    save_json(json_path, payload)
 
-    traj = np.asarray(record['trajectory'], dtype=float)
-    start = np.asarray(record['scenario']['state'][:3], dtype=float)
-    goal = np.asarray(record['scenario']['goal'], dtype=float)
-    zones = record['scenario']['zones']
-    scenario_cfg = config_payload['scenario']
+
+def save_episode_json(
+    target_dir: Path,
+    stem: str,
+    record: dict[str, Any],
+    config_payload: dict[str, Any],
+) -> dict[str, str]:
+    """Save one episode's scenario parameters and trajectory as JSON."""
+
+    target_dir = ensure_dir(target_dir)
+    json_path = target_dir / f'{stem}.json'
+    payload = build_episode_payload(record, config_payload)
+    save_json(json_path, payload)
+    return {'json': str(json_path)}
+
+
+def render_episode_payload(payload: dict[str, Any], png_path: Path) -> str:
+    """Render a saved episode payload into the standard three-view PNG."""
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    png_path = Path(png_path)
+    ensure_dir(png_path.parent)
+
+    traj = np.asarray(payload['trajectory'], dtype=float)
+    start = np.asarray(payload['scenario']['state'][:3], dtype=float)
+    goal = np.asarray(payload['scenario']['goal'], dtype=float)
+    zones = payload['scenario']['zones']
+    scenario_cfg = payload['config']['scenario']
     render_z_max = max(float(scenario_cfg['world_z_max']), 600.0)
 
     fig = plt.figure(figsize=(24, 28))
@@ -265,28 +278,29 @@ def export_episode_result(
         f"zone {idx}: center=({zone['center_xy'][0]:.1f}, {zone['center_xy'][1]:.1f}), r={zone['radius']:.1f}"
         for idx, zone in enumerate(zones, start=1)
     ]
-    scenario_label = record['info'].get('scenario_name')
-    scenario_id = record['info'].get('scenario_id')
-    category = record['info'].get('category')
-    corridor_width = record['info'].get('corridor_width')
-    min_clearance = record['info'].get('min_clearance_to_boundary')
+    scenario_label = payload['info'].get('scenario_name')
+    scenario_id = payload['info'].get('scenario_id')
+    category = payload['info'].get('category')
+    corridor_width = payload['info'].get('corridor_width')
+    min_clearance = payload['info'].get('min_clearance_to_boundary')
     summary = [
-        f"episode: {record['episode']}",
-        f"steps consumed: {record['total_steps']}",
-        f"steps: {record['length']}",
-        f"outcome: {record['outcome']}",
-        f"return: {record['return']:.2f}",
+        f"episode: {payload['episode']}",
+        f"env_id: {payload.get('env_id', 'n/a')}",
+        f"steps consumed: {payload['total_steps']}",
+        f"steps: {payload['length']}",
+        f"outcome: {payload['outcome']}",
+        f"return: {payload['return']:.2f}",
         f"scenario: {scenario_label or 'n/a'}",
         f"scenario_id: {scenario_id or 'n/a'}",
         f"category: {category or 'n/a'}",
-        f"curriculum_level: {record['info'].get('curriculum_level', 'unknown')}",
-        f"goal distance: {record['info']['goal_distance']:.2f}",
-        f"active_goal_radius: {record.get('active_goal_radius', scenario_cfg.get('goal_radius', 'n/a'))}",
-        f"min_goal_distance: {record.get('min_goal_distance', 'n/a')}",
-        f"min_xy_goal_distance: {record.get('min_xy_goal_distance', 'n/a')}",
-        f"min_z_goal_error: {record.get('min_z_goal_error', 'n/a')}",
-        f"min_segment_goal_distance: {record.get('min_segment_goal_distance', 'n/a')}",
-        f"final_goal_distance: {record.get('final_goal_distance', 'n/a')}",
+        f"curriculum_level: {payload['info'].get('curriculum_level', 'unknown')}",
+        f"goal distance: {payload['info']['goal_distance']:.2f}",
+        f"active_goal_radius: {payload.get('active_goal_radius', scenario_cfg.get('goal_radius', 'n/a'))}",
+        f"min_goal_distance: {payload.get('min_goal_distance', 'n/a')}",
+        f"min_xy_goal_distance: {payload.get('min_xy_goal_distance', 'n/a')}",
+        f"min_z_goal_error: {payload.get('min_z_goal_error', 'n/a')}",
+        f"min_segment_goal_distance: {payload.get('min_segment_goal_distance', 'n/a')}",
+        f"final_goal_distance: {payload.get('final_goal_distance', 'n/a')}",
         f"start: ({start[0]:.1f}, {start[1]:.1f}, {start[2]:.1f})",
         f"goal: ({goal[0]:.1f}, {goal[1]:.1f}, {goal[2]:.1f})",
         f"zone_count: {len(zones)}",
@@ -304,17 +318,47 @@ def export_episode_result(
     ax_text.text(0.02, 1.0, '\n'.join(summary), va='top', ha='left', fontsize=11, family='monospace')
     ax_text.set_title('Scenario Summary')
 
-    fig.suptitle(f"Episode {record['episode']} - {record['outcome']}", fontsize=15)
+    fig.suptitle(f"Episode {payload['episode']} - {payload['outcome']}", fontsize=15)
     fig.savefig(png_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
+    return str(png_path)
 
-    return {'json': str(json_path), 'png': str(png_path)}
+
+def render_episode_json(json_path: Path, overwrite: bool = False) -> dict[str, str]:
+    """Render a previously saved episode JSON without modifying the JSON."""
+
+    import json
+
+    json_path = Path(json_path)
+    png_path = json_path.with_suffix('.png')
+    if png_path.exists() and not overwrite:
+        return {'json': str(json_path), 'png': str(png_path), 'status': 'skipped'}
+    with json_path.open('r', encoding='utf-8') as f:
+        payload = json.load(f)
+    render_episode_payload(payload, png_path)
+    return {'json': str(json_path), 'png': str(png_path), 'status': 'rendered'}
+
+
+def export_episode_result(
+    target_dir: Path,
+    stem: str,
+    record: dict[str, Any],
+    config_payload: dict[str, Any],
+    render_png: bool = True,
+) -> dict[str, str]:
+    """Save one episode's JSON and optionally render the three-view PNG."""
+
+    outputs = save_episode_json(target_dir, stem, record, config_payload)
+    if render_png:
+        outputs['png'] = render_episode_json(Path(outputs['json']), overwrite=True)['png']
+    return outputs
 
 def make_episode_capture_callback(
     result_root: Path,
     summary_every_episodes: int,
     total_timesteps: int,
     config_payload: dict[str, Any],
+    render_during_training: bool = False,
 ) -> Callable[[dict[str, Any]], None]:
     """Create a callback that stores sparse step snapshots and goal examples.
 
@@ -335,9 +379,9 @@ def make_episode_capture_callback(
             snapshot_idx = max(1, next_snapshot_step // snapshot_interval)
             stem = (
                 f"step_{snapshot_idx:02d}_s{next_snapshot_step:06d}_"
-                f"ep{record['episode']:05d}_{record['outcome']}"
+                f"env{int(record.get('env_id', 0)):02d}_ep{record['episode']:05d}_{record['outcome']}"
             )
-            export_episode_result(snapshot_dir, stem, record, config_payload)
+            export_episode_result(snapshot_dir, stem, record, config_payload, render_png=render_during_training)
             next_snapshot_step += snapshot_interval
 
         if summary_every_episodes > 0 and record['outcome'] == 'goal':
@@ -345,8 +389,11 @@ def make_episode_capture_callback(
             goal_group_idx = window_idx // 4
             if goal_group_idx not in saved_goal_groups:
                 saved_goal_groups.add(goal_group_idx)
-                stem = f'goal_group_{goal_group_idx + 1:02d}_ep{record["episode"]:05d}'
-                export_episode_result(goal_dir, stem, record, config_payload)
+                stem = (
+                    f'goal_group_{goal_group_idx + 1:02d}_'
+                    f'env{int(record.get("env_id", 0)):02d}_ep{record["episode"]:05d}'
+                )
+                export_episode_result(goal_dir, stem, record, config_payload, render_png=render_during_training)
 
     return callback
 
@@ -448,6 +495,9 @@ def main() -> None:
     parser.add_argument('--output', type=Path, default=None)
     parser.add_argument('--metrics-out', type=Path, default=None)
     parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
+    parser.add_argument('--batch-size', type=int, default=None, help='TD3 mini-batch size (default: 128).')
+    parser.add_argument('--num-envs', type=int, default=1, help='Number of rollout environments for optional parallel sampling (default: 1).')
+    parser.add_argument('--render-during-training', action='store_true', help='Render snapshot PNGs during training; default saves JSON only.')
     parser.add_argument('--summary-every-episodes', type=int, default=15, help='Episode count per summary window (default: 15).')
     parser.add_argument(
         '--actor-freeze-steps',
@@ -480,11 +530,16 @@ def main() -> None:
 
     if args.timesteps is None:
         args.timesteps = _default_timesteps(args.model, args.curriculum_level)
+    if args.num_envs <= 0:
+        raise ValueError('--num-envs must be positive.')
     early_stop_enabled = not args.no_early_stop
 
     cfg = ExperimentConfig()
     cfg.training.device = _resolve_device(args.device)
+    if args.batch_size is not None:
+        cfg.training.batch_size = args.batch_size
     print(_device_log_line('train_td3', cfg.training.device))
+    print(f'[train_td3] num_envs={args.num_envs}, batch_size={cfg.training.batch_size}')
 
     if args.model == 'ann':
         # Use more conservative defaults for ANN to avoid late-training collapse.
@@ -534,6 +589,17 @@ def main() -> None:
         curriculum_mix=curriculum_mix,
         goal_radius_curriculum_enabled=True,
     )
+    envs = [env]
+    for env_id in range(1, args.num_envs):
+        envs.append(
+            make_env(
+                cfg,
+                seed=args.seed + env_id * 10000,
+                curriculum_level=args.curriculum_level,
+                curriculum_mix=curriculum_mix,
+                goal_radius_curriculum_enabled=True,
+            )
+        )
     obs, _ = env.reset(seed=args.seed)
     actor = make_actor(cfg, args.model, obs.shape[0], env.action_space.shape[0])
     critic1, critic2 = make_critics(cfg, obs.shape[0], env.action_space.shape[0])
@@ -564,6 +630,7 @@ def main() -> None:
         warmup_strategy='random',
         device=cfg.training.device,
         curriculum_level=args.curriculum_level,
+        envs=envs,
     )
     init_checkpoint = args.init_checkpoint or args.bc_checkpoint
     trainer.warmup_strategy = load_training_state(init_checkpoint, actor, critic1, critic2, trainer)
@@ -577,11 +644,14 @@ def main() -> None:
     config_payload = cfg.to_dict()
     config_payload['curriculum_level'] = args.curriculum_level
     config_payload['curriculum_mix'] = curriculum_mix
+    config_payload['num_envs'] = args.num_envs
+    config_payload['render_during_training'] = bool(args.render_during_training)
     episode_callback = make_episode_capture_callback(
         result_root=results_dir,
         summary_every_episodes=args.summary_every_episodes,
         total_timesteps=args.timesteps,
         config_payload=config_payload,
+        render_during_training=args.render_during_training,
     )
     early_stop_callback = make_early_stop_callback(
         enabled=early_stop_enabled and args.summary_every_episodes > 0,
@@ -606,6 +676,10 @@ def main() -> None:
     metrics_dict['log_dir'] = str(log_dir)
     metrics_dict['results_dir'] = str(results_dir)
     metrics_dict['device'] = cfg.training.device
+    metrics_dict['num_envs'] = args.num_envs
+    metrics_dict['parallel_env_sampling_enabled'] = args.num_envs > 1
+    metrics_dict['render_during_training'] = bool(args.render_during_training)
+    metrics_dict['snapshot_json_only'] = not bool(args.render_during_training)
     metrics_dict['terminal_los_radius'] = cfg.rewards.terminal_los_radius
     metrics_dict['terminal_los_weight'] = cfg.rewards.terminal_los_weight
     metrics_dict['terminal_los_penalty_weight'] = cfg.rewards.terminal_los_penalty_weight
@@ -623,6 +697,7 @@ def main() -> None:
     metrics_dict['action_delta_psi_weight'] = cfg.rewards.action_delta_psi_weight
     metrics_dict['actor_freeze_steps'] = cfg.training.actor_freeze_steps
     metrics_dict['critic_grad_clip_norm'] = cfg.training.critic_grad_clip_norm
+    metrics_dict['batch_size'] = cfg.training.batch_size
     metrics_dict['exploration_noise_current'] = trainer.exploration_noise_current
     metrics_dict['policy_noise_current'] = trainer.policy_noise_current
     metrics_dict['noise_clip_current'] = trainer.noise_clip_current
