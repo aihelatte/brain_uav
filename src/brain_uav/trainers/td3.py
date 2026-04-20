@@ -83,6 +83,9 @@ class TD3Trainer:
         success_sample_bias: float,
         near_goal_sample_bias: float = 1.0,
         near_goal_sample_radius: float = 100.0,
+        min_exploration_noise: float | None = None,
+        exploration_noise_decay_start_fraction: float = 0.5,
+        exploration_noise_decay_end_fraction: float = 1.0,
         actor_freeze_steps: int = 0,
         critic_grad_clip_norm: float | None = None,
         warmup_strategy: str = 'random',
@@ -114,6 +117,10 @@ class TD3Trainer:
         self.success_sample_bias = success_sample_bias
         self.near_goal_sample_bias = float(near_goal_sample_bias)
         self.near_goal_sample_radius = float(near_goal_sample_radius)
+        self.min_exploration_noise = min_exploration_noise
+        self.exploration_noise_decay_start_fraction = float(exploration_noise_decay_start_fraction)
+        self.exploration_noise_decay_end_fraction = float(exploration_noise_decay_end_fraction)
+        self.training_horizon = 1
         self.exploration_noise_base = exploration_noise
         self.policy_noise_base = policy_noise
         self.noise_clip_base = noise_clip
@@ -149,6 +156,7 @@ class TD3Trainer:
         episode_callback: Callable[[dict[str, Any]], None] | None = None,
         window_callback: Callable[[dict[str, Any]], str | None] | None = None,
     ) -> TD3Metrics:
+        self.training_horizon = max(int(total_timesteps), 1)
         obs, _ = self.env.reset()
         episode_return = 0.0
         episode_length = 0
@@ -369,7 +377,7 @@ class TD3Trainer:
 
     def _current_noise(self) -> tuple[float, float, float]:
         if self.curriculum_level != 'hard':
-            self.exploration_noise_current = self.exploration_noise_base
+            self.exploration_noise_current = self._scheduled_exploration_noise()
             self.policy_noise_current = self.policy_noise_base
             self.noise_clip_current = self.noise_clip_base
             return self.exploration_noise_current, self.policy_noise_current, self.noise_clip_current
@@ -383,6 +391,21 @@ class TD3Trainer:
         self.policy_noise_current = self.policy_noise_base + (0.008 - self.policy_noise_base) * factor
         self.noise_clip_current = self.noise_clip_base + (0.015 - self.noise_clip_base) * factor
         return self.exploration_noise_current, self.policy_noise_current, self.noise_clip_current
+
+    def _scheduled_exploration_noise(self) -> float:
+        if self.min_exploration_noise is None:
+            return self.exploration_noise_base
+        min_noise = float(self.min_exploration_noise)
+        start_step = self.exploration_noise_decay_start_fraction * float(self.training_horizon)
+        end_step = self.exploration_noise_decay_end_fraction * float(self.training_horizon)
+        if self.total_steps <= start_step:
+            return self.exploration_noise_base
+        if end_step <= start_step:
+            factor = 1.0
+        else:
+            factor = (float(self.total_steps) - start_step) / (end_step - start_step)
+            factor = float(np.clip(factor, 0.0, 1.0))
+        return self.exploration_noise_base + (min_noise - self.exploration_noise_base) * factor
 
     def select_action(self, obs: np.ndarray, with_noise: bool = False) -> np.ndarray:
         obs_tensor = torch.tensor(obs[None, :], dtype=torch.float32, device=self.device)

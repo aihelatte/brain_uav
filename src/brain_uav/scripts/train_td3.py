@@ -488,10 +488,13 @@ def main() -> None:
 
     if args.model == 'ann':
         # Use more conservative defaults for ANN to avoid late-training collapse.
-        cfg.training.actor_lr = 1.0e-4
-        cfg.training.critic_lr = 2e-4
+        cfg.training.actor_lr = 5.0e-5
+        cfg.training.critic_lr = 1.0e-4
         cfg.training.exploration_noise = 0.01
-        cfg.training.policy_noise = 0.01
+        cfg.training.policy_noise = 0.0075
+        cfg.training.min_exploration_noise = 0.003
+        cfg.training.exploration_noise_decay_start_fraction = 0.5
+        cfg.training.exploration_noise_decay_end_fraction = 1.0
         if args.actor_freeze_steps is None:
             cfg.training.actor_freeze_steps = 100_000
         else:
@@ -553,6 +556,9 @@ def main() -> None:
         success_sample_bias=cfg.training.success_sample_bias,
         near_goal_sample_bias=cfg.training.near_goal_sample_bias,
         near_goal_sample_radius=cfg.training.near_goal_sample_radius,
+        min_exploration_noise=cfg.training.min_exploration_noise,
+        exploration_noise_decay_start_fraction=cfg.training.exploration_noise_decay_start_fraction,
+        exploration_noise_decay_end_fraction=cfg.training.exploration_noise_decay_end_fraction,
         actor_freeze_steps=cfg.training.actor_freeze_steps,
         critic_grad_clip_norm=cfg.training.critic_grad_clip_norm,
         warmup_strategy='random',
@@ -606,8 +612,15 @@ def main() -> None:
     metrics_dict['actor_lr'] = cfg.training.actor_lr
     metrics_dict['critic_lr'] = cfg.training.critic_lr
     metrics_dict['exploration_noise'] = cfg.training.exploration_noise
+    metrics_dict['min_exploration_noise'] = cfg.training.min_exploration_noise
+    metrics_dict['exploration_noise_decay_start_fraction'] = cfg.training.exploration_noise_decay_start_fraction
+    metrics_dict['exploration_noise_decay_end_fraction'] = cfg.training.exploration_noise_decay_end_fraction
     metrics_dict['policy_noise'] = cfg.training.policy_noise
     metrics_dict['noise_clip'] = cfg.training.noise_clip
+    metrics_dict['smoothness_weight'] = cfg.rewards.smoothness_weight
+    metrics_dict['action_smoothness_weight'] = cfg.rewards.smoothness_weight
+    metrics_dict['action_delta_gamma_weight'] = cfg.rewards.action_delta_gamma_weight
+    metrics_dict['action_delta_psi_weight'] = cfg.rewards.action_delta_psi_weight
     metrics_dict['actor_freeze_steps'] = cfg.training.actor_freeze_steps
     metrics_dict['critic_grad_clip_norm'] = cfg.training.critic_grad_clip_norm
     metrics_dict['exploration_noise_current'] = trainer.exploration_noise_current

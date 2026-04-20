@@ -106,7 +106,7 @@ class RewardConfig:
     min_progress_per_window: float = 20.0
     action_delta_gamma_weight: float = 8.0
     action_delta_psi_weight: float = 3.0
-    smoothness_weight: float = 0.1
+    smoothness_weight: float = 0.15
     collision_penalty: float = 6000.0
     step_penalty: float = 3.0
     boundary_penalty: float = 6000.0
@@ -121,8 +121,8 @@ class RewardConfig:
     terminal_stall_radius: float = 50.0
     terminal_stall_penalty: float = 5.0
     terminal_los_radius: float = 200.0
-    terminal_los_weight: float = 12.0
-    terminal_los_penalty_weight: float = 6.0
+    terminal_los_weight: float = 16.0
+    terminal_los_penalty_weight: float = 8.0
     terminal_lateral_penalty_weight: float = 0.0
     terminal_miss_truncation_enabled: bool = False
 
@@ -141,6 +141,9 @@ class TrainingConfig:
     noise_clip: float = 0.03
     policy_delay: int = 2
     exploration_noise: float = 0.02
+    min_exploration_noise: float | None = None
+    exploration_noise_decay_start_fraction: float = 0.5
+    exploration_noise_decay_end_fraction: float = 1.0
     replay_size: int = 100_000
     warmup_steps: int = 256
     actor_freeze_steps: int = 50_000
