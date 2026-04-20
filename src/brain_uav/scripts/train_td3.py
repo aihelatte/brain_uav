@@ -7,6 +7,8 @@ from pathlib import Path
 from copy import deepcopy
 from typing import Any, Callable
 
+import torch
+
 from ..config import ExperimentConfig
 from ..curriculum import describe_curriculum_mix, parse_curriculum_mix
 from ..scripts.common import make_actor, make_critics, make_env
@@ -42,6 +44,24 @@ def _default_timesteps(model: str, curriculum_level: str) -> int:
     if model == 'ann' and curriculum_level == 'easy':
         return 750_000
     return 500_000
+
+
+def _resolve_device(requested: str) -> str:
+    if requested == 'cpu':
+        return 'cpu'
+    if requested == 'cuda':
+        if not torch.cuda.is_available():
+            raise RuntimeError('--device cuda was requested, but torch.cuda.is_available() is False.')
+        return 'cuda'
+    if requested == 'auto':
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+    raise ValueError(f'Unsupported device: {requested}')
+
+
+def _device_log_line(prefix: str, device: str) -> str:
+    cuda_version = torch.version.cuda or 'unavailable'
+    gpu_name = torch.cuda.get_device_name(0) if device == 'cuda' else 'n/a'
+    return f'[{prefix}] device={device}, torch_cuda={cuda_version}, gpu={gpu_name}'
 
 
 def export_training_report(base_metrics_path: Path, metrics: dict) -> dict[str, str]:
@@ -427,6 +447,7 @@ def main() -> None:
     parser.add_argument('--bc-checkpoint', type=Path, default=None)
     parser.add_argument('--output', type=Path, default=None)
     parser.add_argument('--metrics-out', type=Path, default=None)
+    parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
     parser.add_argument('--summary-every-episodes', type=int, default=15, help='Episode count per summary window (default: 15).')
     parser.add_argument(
         '--actor-freeze-steps',
@@ -462,6 +483,8 @@ def main() -> None:
     early_stop_enabled = not args.no_early_stop
 
     cfg = ExperimentConfig()
+    cfg.training.device = _resolve_device(args.device)
+    print(_device_log_line('train_td3', cfg.training.device))
 
     if args.model == 'ann':
         # Use more conservative defaults for ANN to avoid late-training collapse.
@@ -576,6 +599,7 @@ def main() -> None:
     metrics_dict['summary_every_episodes'] = args.summary_every_episodes
     metrics_dict['log_dir'] = str(log_dir)
     metrics_dict['results_dir'] = str(results_dir)
+    metrics_dict['device'] = cfg.training.device
     metrics_dict['terminal_los_radius'] = cfg.rewards.terminal_los_radius
     metrics_dict['terminal_los_weight'] = cfg.rewards.terminal_los_weight
     metrics_dict['terminal_los_penalty_weight'] = cfg.rewards.terminal_los_penalty_weight

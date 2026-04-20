@@ -25,6 +25,24 @@ from ..utils.io import (
 )
 
 
+def _resolve_device(requested: str) -> str:
+    if requested == 'cpu':
+        return 'cpu'
+    if requested == 'cuda':
+        if not torch.cuda.is_available():
+            raise RuntimeError('--device cuda was requested, but torch.cuda.is_available() is False.')
+        return 'cuda'
+    if requested == 'auto':
+        return 'cuda' if torch.cuda.is_available() else 'cpu'
+    raise ValueError(f'Unsupported device: {requested}')
+
+
+def _device_log_line(prefix: str, device: str) -> str:
+    cuda_version = torch.version.cuda or 'unavailable'
+    gpu_name = torch.cuda.get_device_name(0) if device == 'cuda' else 'n/a'
+    return f'[{prefix}] device={device}, torch_cuda={cuda_version}, gpu={gpu_name}'
+
+
 def _checkpoint_payload(
     *,
     actor,
@@ -129,9 +147,12 @@ def main() -> None:
     parser.add_argument('--output', type=Path, default=None)
     parser.add_argument('--best-output', type=Path, default=None)
     parser.add_argument('--metrics-out', type=Path, default=None)
+    parser.add_argument('--device', choices=['auto', 'cpu', 'cuda'], default='auto')
     args = parser.parse_args()
 
     cfg = ExperimentConfig()
+    cfg.training.device = _resolve_device(args.device)
+    print(_device_log_line('train_bc', cfg.training.device))
     data = np.load(args.dataset)
     dataset_version = str(data['dataset_version']) if 'dataset_version' in data else 'unknown'
     dataset_config = json.loads(str(data['config_json'])) if 'config_json' in data else None
@@ -199,6 +220,7 @@ def main() -> None:
             'log_dir': str(log_dir),
             'dataset_path': str(args.dataset),
             'dataset_version': dataset_version,
+            'device': cfg.training.device,
             'curriculum_level': curriculum_level,
             'curriculum_mix': curriculum_mix,
             'init_checkpoint': str(args.init_checkpoint) if args.init_checkpoint else None,
