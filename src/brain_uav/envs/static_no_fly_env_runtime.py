@@ -45,6 +45,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         seed: int | None = None,
         fixed_scenarios: list[dict[str, Any]] | None = None,
         curriculum_mix: dict[str, float] | None = None,
+        goal_radius_curriculum_enabled: bool = False,
     ) -> None:
         super().__init__()
         self.scenario = scenario or ScenarioConfig()
@@ -52,6 +53,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.rewards = rewards or RewardConfig()
         self.fixed_scenarios = fixed_scenarios or []
         self.curriculum_mix = normalize_curriculum_mix(curriculum_mix, fallback_level='hard') if curriculum_mix else None
+        self.goal_radius_curriculum_enabled = bool(goal_radius_curriculum_enabled)
         self._fixed_idx = 0
         self.rng = np.random.default_rng(seed)
 
@@ -83,6 +85,9 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.trajectory: list[np.ndarray] = []
         self.last_curriculum_level = 'random'
         self.best_goal_distance_so_far = 0.0
+        self.active_goal_radius = float(self.scenario.goal_radius)
+        self.last_segment_goal_distance = 0.0
+        self.last_goal_reached_by_segment = False
 
     def _normalize_time_limit(self) -> None:
         """Fill missing time-limit fields without overriding explicit max_steps."""
@@ -116,6 +121,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.recent_progress = []
         self.trajectory = [self.state[:3].copy()]
         self.best_goal_distance_so_far = self._goal_distance(self.state[:3])
+        self.last_segment_goal_distance = self.best_goal_distance_so_far
+        self.last_goal_reached_by_segment = False
         return self._get_obs(), self._info(progress=0.0)
 
     def step(self, action: np.ndarray):
@@ -126,9 +133,14 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         prev_best_goal_distance = self.best_goal_distance_so_far
         self._apply_action(action)
         self.last_delta_z = float(self.state[2] - prev_state[2])
+        self.last_segment_goal_distance = self._segment_goal_distance(prev_state[:3], self.state[:3])
         self.steps += 1
         self.trajectory.append(self.state[:3].copy())
         new_distance = self._goal_distance(self.state[:3])
+        self.last_goal_reached_by_segment = (
+            new_distance > self.active_goal_radius
+            and self.last_segment_goal_distance <= self.active_goal_radius
+        )
         step_progress = prev_distance - new_distance
         self._record_progress(step_progress)
         terminated, truncated, outcome = self._termination()
@@ -177,6 +189,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             'curriculum_level': self.last_curriculum_level,
             'distance_unit': 'km',
             'time_unit': 's',
+            'goal_radius': float(self.scenario.goal_radius),
+            'active_goal_radius': float(self.active_goal_radius),
             **self._start_goal_metadata(self.initial_state, self.goal),
         }
 
@@ -186,7 +200,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 level = self._sample_curriculum_level()
                 scenario = self._sample_curriculum_scenario(level)
                 if scenario is not None:
-                    self._load_scenario(scenario)
+                    self._load_scenario(scenario, use_curriculum_radius=self.goal_radius_curriculum_enabled)
                     self.last_curriculum_level = level
                     return
             raise RuntimeError('Failed to sample a curriculum scenario under current constraints.')
@@ -194,7 +208,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         scenario = self._sample_curriculum_scenario('hard')
         if scenario is None:
             raise RuntimeError('Failed to sample a random hard scenario under current constraints.')
-        self._load_scenario(scenario)
+        self._load_scenario(scenario, use_curriculum_radius=self.goal_radius_curriculum_enabled)
         self.last_curriculum_level = 'hard'
 
     def _sample_curriculum_level(self) -> str:
@@ -305,6 +319,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             'curriculum_level': level,
             'distance_unit': 'km',
             'time_unit': 's',
+            'goal_radius': float(self.scenario.goal_radius),
+            'active_goal_radius': float(self._goal_radius_for_level(level)),
             **self._start_goal_metadata(state, goal),
         }
 
@@ -690,7 +706,10 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 blockers += 1
         return blockers
 
-    def _load_scenario(self, payload: dict[str, Any]) -> None:
+    def _goal_radius_for_level(self, level: str) -> float:
+        return float(getattr(self.scenario, f'{level}_goal_radius', self.scenario.goal_radius))
+
+    def _load_scenario(self, payload: dict[str, Any], *, use_curriculum_radius: bool = False) -> None:
         self.state = np.asarray(payload['state'], dtype=np.float32).copy()
         self.goal = np.asarray(payload['goal'], dtype=np.float32).copy()
         self.zones = [
@@ -698,6 +717,11 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             for zone in payload['zones']
         ]
         self.last_curriculum_level = str(payload.get('curriculum_level', 'custom'))
+        self.active_goal_radius = (
+            self._goal_radius_for_level(self.last_curriculum_level)
+            if use_curriculum_radius
+            else float(self.scenario.goal_radius)
+        )
 
     def _apply_action(self, action: np.ndarray) -> None:
         x, y, z, gamma, psi = self.state
@@ -741,7 +765,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     def _termination(self) -> tuple[bool, bool, str]:
         cfg = self.scenario
         pos = self.state[:3]
-        if self._goal_distance(pos) <= cfg.goal_radius:
+        if self._goal_distance(pos) <= self.active_goal_radius or self.last_goal_reached_by_segment:
             return True, False, 'goal'
         if pos[2] <= cfg.world_z_min:
             return True, False, 'ground'
@@ -773,6 +797,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         rew -= self._ground_warning_penalty(self.state[:3])
         rew -= self._descent_trend_penalty(prev_state, self.state)
         rew -= self._inefficiency_penalty()
+        rew += self._terminal_guidance_reward(prev_state, prev_distance, new_distance, outcome)
+        rew += self._terminal_los_reward(new_distance, outcome)
         if outcome == 'goal':
             rew += self.rewards.goal_reward
         elif outcome in {'collision', 'ground'}:
@@ -782,6 +808,50 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         elif outcome == 'timeout':
             rew -= self.rewards.timeout_penalty
         return rew
+
+    def _terminal_guidance_reward(
+        self,
+        prev_state: np.ndarray,
+        prev_distance: float,
+        new_distance: float,
+        outcome: str,
+    ) -> float:
+        if outcome in {'collision', 'ground', 'boundary'}:
+            return 0.0
+        if new_distance > self.rewards.terminal_guidance_radius:
+            return 0.0
+
+        reward = self.rewards.terminal_progress_weight * (prev_distance - new_distance)
+        prev_z_error = abs(float(prev_state[2] - self.goal[2]))
+        new_z_error = abs(float(self.state[2] - self.goal[2]))
+        reward += self.rewards.terminal_z_weight * (prev_z_error - new_z_error)
+        if new_distance <= self.rewards.terminal_stall_radius and new_distance >= prev_distance:
+            reward -= self.rewards.terminal_stall_penalty
+        return float(reward)
+
+    def _terminal_los_reward(self, goal_distance: float, outcome: str) -> float:
+        if outcome in {'collision', 'ground', 'boundary'}:
+            return 0.0
+        if goal_distance > self.rewards.terminal_los_radius:
+            return 0.0
+        if goal_distance <= 1e-6:
+            return 0.0
+
+        gamma = float(self.state[3])
+        psi = float(self.state[4])
+        v_hat = np.array(
+            [
+                math.cos(gamma) * math.cos(psi),
+                math.cos(gamma) * math.sin(psi),
+                math.sin(gamma),
+            ],
+            dtype=np.float32,
+        )
+        u_goal = (self.goal - self.state[:3]) / goal_distance
+        alignment = float(np.dot(v_hat, u_goal))
+        if alignment >= 0.0:
+            return self.rewards.terminal_los_weight * alignment
+        return -self.rewards.terminal_los_penalty_weight * abs(alignment)
 
     def _record_progress(self, step_progress: float) -> None:
         self.recent_progress.append(float(step_progress))
@@ -913,6 +983,21 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     def _goal_distance(self, pos: np.ndarray) -> float:
         return float(np.linalg.norm(pos - self.goal))
 
+    def _segment_goal_distance(self, prev_pos: np.ndarray, curr_pos: np.ndarray) -> float:
+        prev = np.asarray(prev_pos, dtype=np.float32)
+        curr = np.asarray(curr_pos, dtype=np.float32)
+        segment = curr - prev
+        segment_len_sq = float(np.dot(segment, segment))
+        if segment_len_sq <= 1e-9:
+            return self._goal_distance(curr)
+        t = float(np.dot(self.goal - prev, segment) / segment_len_sq)
+        t = float(np.clip(t, 0.0, 1.0))
+        closest = prev + t * segment
+        return self._goal_distance(closest)
+
+    def _segment_reaches_goal(self, prev_pos: np.ndarray, curr_pos: np.ndarray) -> bool:
+        return self._segment_goal_distance(prev_pos, curr_pos) <= self.active_goal_radius
+
     @staticmethod
     def _inside_zone(pos: np.ndarray, zone: Zone) -> bool:
         distance = (pos[0] - zone.center_xy[0]) ** 2 + (pos[1] - zone.center_xy[1]) ** 2 + pos[2] ** 2
@@ -925,6 +1010,10 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     def _info(self, *, progress: float, outcome: str = 'running') -> dict[str, Any]:
         return {
             'goal_distance': self._goal_distance(self.state[:3]),
+            'segment_goal_distance': float(self.last_segment_goal_distance),
+            'goal_reached_by_segment': bool(self.last_goal_reached_by_segment),
+            'goal_radius': float(self.scenario.goal_radius),
+            'active_goal_radius': float(self.active_goal_radius),
             'progress': progress,
             'outcome': outcome,
             'steps': self.steps,

@@ -19,14 +19,21 @@ class Transition:
     next_obs: np.ndarray
     done: float
     success: float
+    near_goal: float
 
 
 class ReplayBuffer:
     """Store transitions and sample random mini-batches for off-policy learning."""
 
-    def __init__(self, capacity: int, success_sample_bias: float = 1.0) -> None:
+    def __init__(
+        self,
+        capacity: int,
+        success_sample_bias: float = 1.0,
+        near_goal_sample_bias: float = 1.0,
+    ) -> None:
         self.buffer: deque[Transition] = deque(maxlen=capacity)
         self.success_sample_bias = max(float(success_sample_bias), 1.0)
+        self.near_goal_sample_bias = max(float(near_goal_sample_bias), 1.0)
 
     def __len__(self) -> int:
         return len(self.buffer)
@@ -39,15 +46,18 @@ class ReplayBuffer:
         next_obs: np.ndarray,
         done: bool,
         success: bool = False,
+        near_goal: bool = False,
     ) -> None:
-        self.buffer.append(Transition(obs, action, reward, next_obs, float(done), float(success)))
+        self.buffer.append(Transition(obs, action, reward, next_obs, float(done), float(success), float(near_goal)))
 
     def sample(self, batch_size: int) -> dict[str, torch.Tensor]:
-        if self.success_sample_bias > 1.0:
-            weights = np.array(
-                [self.success_sample_bias if item.success > 0.5 else 1.0 for item in self.buffer],
-                dtype=np.float64,
-            )
+        if self.success_sample_bias > 1.0 or self.near_goal_sample_bias > 1.0:
+            weights = np.ones(len(self.buffer), dtype=np.float64)
+            for idx, item in enumerate(self.buffer):
+                if item.success > 0.5:
+                    weights[idx] *= self.success_sample_bias
+                if item.near_goal > 0.5:
+                    weights[idx] *= self.near_goal_sample_bias
             probs = weights / weights.sum()
             idx = np.random.choice(len(self.buffer), batch_size, replace=False, p=probs)
         else:
@@ -60,9 +70,15 @@ class ReplayBuffer:
             'next_obs': torch.tensor(np.stack([item.next_obs for item in batch]), dtype=torch.float32),
             'done': torch.tensor([[item.done] for item in batch], dtype=torch.float32),
             'success': torch.tensor([[item.success] for item in batch], dtype=torch.float32),
+            'near_goal': torch.tensor([[item.near_goal] for item in batch], dtype=torch.float32),
         }
 
     def success_fraction(self) -> float:
         if not self.buffer:
             return 0.0
         return float(sum(item.success for item in self.buffer) / len(self.buffer))
+
+    def near_goal_fraction(self) -> float:
+        if not self.buffer:
+            return 0.0
+        return float(sum(item.near_goal for item in self.buffer) / len(self.buffer))

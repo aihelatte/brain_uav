@@ -20,6 +20,7 @@ def make_env(
     scenario_suite: str | None = None,
     curriculum_level: str | None = None,
     curriculum_mix: dict[str, float] | str | None = None,
+    goal_radius_curriculum_enabled: bool = False,
 ) -> StaticNoFlyTrajectoryEnv:
     """Build one environment instance.
 
@@ -42,6 +43,7 @@ def make_env(
         seed=seed,
         fixed_scenarios=fixed_scenarios,
         curriculum_mix=mix_payload,
+        goal_radius_curriculum_enabled=goal_radius_curriculum_enabled,
     )
 
 

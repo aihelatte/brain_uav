@@ -27,9 +27,13 @@ class ScenarioConfig:
     delta_gamma_max: float = 0.14
     delta_psi_max: float = 0.2
     goal_radius: float = 5.0  # km, fixed training success radius
+    easy_goal_radius: float = 10.0  # km, curriculum-only relaxed capture radius
+    easy_two_zone_goal_radius: float = 8.0  # km, curriculum-only relaxed capture radius
+    medium_goal_radius: float = 6.0  # km, curriculum-only relaxed capture radius
+    hard_goal_radius: float = 5.0  # km, formal/default capture radius
     world_xy: float = 1600.0  # km, boundary is [-world_xy, world_xy] on X/Y
     world_z_min: float = 0.0  # km, ground boundary
-    world_z_max: float = 400.0  # km, independent altitude ceiling
+    world_z_max: float = 400.0  # km, true environment altitude ceiling; render axes may extend higher
     max_steps: int | None = None  # defaults to int(max_time_s / dt); explicit values are preserved
     min_no_fly_zones: int = 1
     max_no_fly_zones: int = 3
@@ -111,6 +115,16 @@ class RewardConfig:
     breakthrough_progress_threshold: float = 22.0
     breakthrough_reward_weight: float = 0.35
     breakthrough_reward_cap: float = 10.0
+    terminal_guidance_radius: float = 100.0
+    terminal_progress_weight: float = 4.0
+    terminal_z_weight: float = 2.0
+    terminal_stall_radius: float = 50.0
+    terminal_stall_penalty: float = 5.0
+    terminal_los_radius: float = 200.0
+    terminal_los_weight: float = 12.0
+    terminal_los_penalty_weight: float = 6.0
+    terminal_lateral_penalty_weight: float = 0.0
+    terminal_miss_truncation_enabled: bool = False
 
 
 @dataclass(slots=True)
@@ -129,8 +143,10 @@ class TrainingConfig:
     exploration_noise: float = 0.02
     replay_size: int = 100_000
     warmup_steps: int = 256
-    actor_freeze_steps: int = 25_000
+    actor_freeze_steps: int = 50_000
     success_sample_bias: float = 2.5
+    near_goal_sample_bias: float = 4.0
+    near_goal_sample_radius: float = 150.0
     bc_epochs: int = 10
     snn_time_window: int = 8
     hidden_dim: int = 128

@@ -30,6 +30,9 @@ class TD3Metrics:
     bc_loss: float = 0.0
     bc_lambda: float = 0.0
     bc_regularization_enabled: bool = False
+    near_goal_sample_bias: float = 1.0
+    near_goal_sample_radius: float = 0.0
+    replay_near_goal_fraction: float = 0.0
     steps: int = 0
     episodes: int = 0
     episode_returns: list[float] = field(default_factory=list)
@@ -45,6 +48,9 @@ class TD3Metrics:
             'bc_loss': self.bc_loss,
             'bc_lambda': self.bc_lambda,
             'bc_regularization_enabled': self.bc_regularization_enabled,
+            'near_goal_sample_bias': self.near_goal_sample_bias,
+            'near_goal_sample_radius': self.near_goal_sample_radius,
+            'replay_near_goal_fraction': self.replay_near_goal_fraction,
             'steps': self.steps,
             'episodes': self.episodes,
             'episode_returns': self.episode_returns,
@@ -75,6 +81,8 @@ class TD3Trainer:
         warmup_steps: int,
         exploration_noise: float,
         success_sample_bias: float,
+        near_goal_sample_bias: float = 1.0,
+        near_goal_sample_radius: float = 100.0,
         actor_freeze_steps: int = 0,
         critic_grad_clip_norm: float | None = None,
         warmup_strategy: str = 'random',
@@ -104,6 +112,8 @@ class TD3Trainer:
         self.actor_freeze_steps = actor_freeze_steps
         self.critic_grad_clip_norm = critic_grad_clip_norm
         self.success_sample_bias = success_sample_bias
+        self.near_goal_sample_bias = float(near_goal_sample_bias)
+        self.near_goal_sample_radius = float(near_goal_sample_radius)
         self.exploration_noise_base = exploration_noise
         self.policy_noise_base = policy_noise
         self.noise_clip_base = noise_clip
@@ -112,7 +122,11 @@ class TD3Trainer:
         self.noise_clip_current = noise_clip
         self.warmup_strategy = warmup_strategy
         self.device = device
-        self.replay = ReplayBuffer(replay_size, success_sample_bias=success_sample_bias)
+        self.replay = ReplayBuffer(
+            replay_size,
+            success_sample_bias=success_sample_bias,
+            near_goal_sample_bias=near_goal_sample_bias,
+        )
         self.total_steps = 0
         self.metrics = TD3Metrics()
         self.action_low = torch.tensor(env.action_space.low, dtype=torch.float32, device=device)
@@ -121,6 +135,8 @@ class TD3Trainer:
         self.stop_reason: str | None = None
         self.curriculum_level: str | None = curriculum_level
         self.bc_reference_actor: nn.Module | None = None
+        self.metrics.near_goal_sample_bias = self.near_goal_sample_bias
+        self.metrics.near_goal_sample_radius = self.near_goal_sample_radius
         if bc_reference_actor is not None:
             self.set_bc_reference_actor(bc_reference_actor)
 
@@ -136,12 +152,15 @@ class TD3Trainer:
         obs, _ = self.env.reset()
         episode_return = 0.0
         episode_length = 0
+        episode_goal_diagnostics = self._new_episode_goal_diagnostics()
         if verbose:
             print(
                 f"[TD3] start total_timesteps={total_timesteps} warmup_steps={self.warmup_steps} "
                 f"actor_freeze_steps={self.actor_freeze_steps} batch_size={self.batch_size} "
                 f"replay_size={self.replay.buffer.maxlen} warmup_strategy={self.warmup_strategy} "
-                f"summary_every_episodes={summary_every_episodes}"
+                f"summary_every_episodes={summary_every_episodes} "
+                f"near_goal_sample_bias={self.near_goal_sample_bias} "
+                f"near_goal_sample_radius={self.near_goal_sample_radius}"
             )
         for step_idx in range(total_timesteps):
             self.total_steps += 1
@@ -153,6 +172,7 @@ class TD3Trainer:
                 action = self.select_action(obs, with_noise=True)
             next_obs, reward, terminated, truncated, info = self.env.step(action)
             done = terminated or truncated
+            near_goal = float(info.get('goal_distance', float('inf'))) <= self.near_goal_sample_radius
             # Include timeouts as terminal transitions in replay.
             self.replay.add(
                 obs,
@@ -161,9 +181,12 @@ class TD3Trainer:
                 next_obs,
                 done,
                 success=bool(info.get('outcome') == 'goal'),
+                near_goal=bool(near_goal),
             )
+            self.metrics.replay_near_goal_fraction = self.replay.near_goal_fraction()
             episode_return += reward
             episode_length += 1
+            self._update_episode_goal_diagnostics(episode_goal_diagnostics, episode_length)
             obs = next_obs
             if len(self.replay) >= self.batch_size:
                 self._update()
@@ -181,11 +204,16 @@ class TD3Trainer:
                     'outcome': outcome,
                     'actor_loss': float(self.metrics.actor_loss),
                     'critic_loss': float(self.metrics.critic_loss),
+                    **self._finalize_episode_goal_diagnostics(episode_goal_diagnostics),
                     'scenario': self.env.export_scenario(),
                     'trajectory': [point.tolist() for point in self.env.trajectory],
                     'final_state': self.env.state.copy().tolist(),
                     'info': {
                         'goal_distance': float(info.get('goal_distance', 0.0)),
+                        'segment_goal_distance': float(info.get('segment_goal_distance', 0.0)),
+                        'goal_reached_by_segment': bool(info.get('goal_reached_by_segment', False)),
+                        'goal_radius': float(info.get('goal_radius', self.env.scenario.goal_radius)),
+                        'active_goal_radius': float(info.get('active_goal_radius', self.env.scenario.goal_radius)),
                         'progress': float(info.get('progress', 0.0)),
                         'steps': int(info.get('steps', episode_length)),
                         'curriculum_level': info.get('curriculum_level'),
@@ -200,6 +228,16 @@ class TD3Trainer:
                         'outcome': episode_record['outcome'],
                         'actor_loss': episode_record['actor_loss'],
                         'critic_loss': episode_record['critic_loss'],
+                        'min_goal_distance': episode_record['min_goal_distance'],
+                        'min_xy_goal_distance': episode_record['min_xy_goal_distance'],
+                        'min_z_goal_error': episode_record['min_z_goal_error'],
+                        'final_goal_distance': episode_record['final_goal_distance'],
+                        'final_xy_goal_distance': episode_record['final_xy_goal_distance'],
+                        'final_z_goal_error': episode_record['final_z_goal_error'],
+                        'min_segment_goal_distance': episode_record['min_segment_goal_distance'],
+                        'near_goal_step_count': episode_record['near_goal_step_count'],
+                        'goal_reached_by_segment_count': episode_record['goal_reached_by_segment_count'],
+                        'active_goal_radius': episode_record['active_goal_radius'],
                     }
                 )
                 if episode_callback is not None:
@@ -215,6 +253,7 @@ class TD3Trainer:
                             obs, _ = self.env.reset()
                             episode_return = 0.0
                             episode_length = 0
+                            episode_goal_diagnostics = self._new_episode_goal_diagnostics()
                             break
                 if verbose:
                     print(
@@ -224,12 +263,14 @@ class TD3Trainer:
                 obs, _ = self.env.reset()
                 episode_return = 0.0
                 episode_length = 0
+                episode_goal_diagnostics = self._new_episode_goal_diagnostics()
             if verbose and ((step_idx + 1) % log_interval == 0 or (step_idx + 1) == total_timesteps):
                 avg_return = statistics.mean(self.metrics.episode_returns[-5:]) if self.metrics.episode_returns else 0.0
                 actor_phase = 'frozen' if self.total_steps <= self.actor_freeze_steps else 'active'
                 print(
                     f"[TD3] progress={step_idx + 1}/{total_timesteps} episodes={self.metrics.episodes} "
                     f"buffer={len(self.replay)} success_frac={self.replay.success_fraction():.3f} "
+                    f"near_goal_frac={self.replay.near_goal_fraction():.3f} "
                     f"actor_phase={actor_phase} actor_loss={self.metrics.actor_loss:.4f} "
                     f"critic_loss={self.metrics.critic_loss:.4f} recent_avg_return={avg_return:.2f}"
                 )
@@ -242,6 +283,7 @@ class TD3Trainer:
                     if verbose:
                         print(f"[TD3] early stop triggered: {stop_reason}")
         self.metrics.steps = self.total_steps
+        self.metrics.replay_near_goal_fraction = self.replay.near_goal_fraction()
         self.actor.to('cpu')
         self.critic1.to('cpu')
         self.critic2.to('cpu')
@@ -254,6 +296,64 @@ class TD3Trainer:
             param.requires_grad = False
         self.metrics.bc_regularization_enabled = True
 
+    def _goal_error_components(self) -> dict[str, float | list[float]]:
+        pos = np.asarray(self.env.state[:3], dtype=float)
+        goal = np.asarray(self.env.goal, dtype=float)
+        delta = pos - goal
+        return {
+            'goal_distance': float(np.linalg.norm(delta)),
+            'xy_goal_distance': float(np.linalg.norm(delta[:2])),
+            'z_goal_error': float(abs(delta[2])),
+            'position': pos.astype(float).tolist(),
+            'segment_goal_distance': float(getattr(self.env, 'last_segment_goal_distance', np.linalg.norm(delta))),
+            'goal_reached_by_segment': bool(getattr(self.env, 'last_goal_reached_by_segment', False)),
+            'active_goal_radius': float(getattr(self.env, 'active_goal_radius', self.env.scenario.goal_radius)),
+        }
+
+    def _new_episode_goal_diagnostics(self) -> dict[str, Any]:
+        components = self._goal_error_components()
+        return {
+            'min_goal_distance': components['goal_distance'],
+            'min_xy_goal_distance': components['xy_goal_distance'],
+            'min_z_goal_error': components['z_goal_error'],
+            'min_segment_goal_distance': components['segment_goal_distance'],
+            'step_at_min_goal_distance': 0,
+            'near_goal_step_count': 0,
+            'goal_reached_by_segment_count': 0,
+            'active_goal_radius': components['active_goal_radius'],
+        }
+
+    def _update_episode_goal_diagnostics(self, diagnostics: dict[str, Any], step: int) -> None:
+        components = self._goal_error_components()
+        if float(components['goal_distance']) <= 50.0:
+            diagnostics['near_goal_step_count'] += 1
+        if bool(components['goal_reached_by_segment']):
+            diagnostics['goal_reached_by_segment_count'] += 1
+        if float(components['goal_distance']) < float(diagnostics['min_goal_distance']):
+            diagnostics['min_goal_distance'] = components['goal_distance']
+            diagnostics['min_xy_goal_distance'] = components['xy_goal_distance']
+            diagnostics['min_z_goal_error'] = components['z_goal_error']
+            diagnostics['step_at_min_goal_distance'] = int(step)
+        if float(components['segment_goal_distance']) < float(diagnostics['min_segment_goal_distance']):
+            diagnostics['min_segment_goal_distance'] = components['segment_goal_distance']
+        diagnostics['active_goal_radius'] = components['active_goal_radius']
+
+    def _finalize_episode_goal_diagnostics(self, diagnostics: dict[str, Any]) -> dict[str, float | int]:
+        components = self._goal_error_components()
+        return {
+            'min_goal_distance': float(diagnostics['min_goal_distance']),
+            'min_xy_goal_distance': float(diagnostics['min_xy_goal_distance']),
+            'min_z_goal_error': float(diagnostics['min_z_goal_error']),
+            'final_goal_distance': float(components['goal_distance']),
+            'final_xy_goal_distance': float(components['xy_goal_distance']),
+            'final_z_goal_error': float(components['z_goal_error']),
+            'min_segment_goal_distance': float(diagnostics['min_segment_goal_distance']),
+            'step_at_min_goal_distance': int(diagnostics['step_at_min_goal_distance']),
+            'near_goal_step_count': int(diagnostics['near_goal_step_count']),
+            'goal_reached_by_segment_count': int(diagnostics['goal_reached_by_segment_count']),
+            'active_goal_radius': float(diagnostics['active_goal_radius']),
+        }
+
     def _bc_lambda(self) -> float:
         if self.curriculum_level == 'hard':
             if self.total_steps <= 50_000:
@@ -261,7 +361,7 @@ class TD3Trainer:
             if self.total_steps <= 100_000:
                 return 150.0
             return 20.0
-        if self.total_steps <= 250_000:
+        if self.total_steps <= 300_000:
             return 1000.0
         if self.total_steps <= 500_000:
             return 300.0
@@ -314,6 +414,17 @@ class TD3Trainer:
             'avg_length': round(statistics.mean(item['length'] for item in window), 6),
             'avg_actor_loss': round(statistics.mean(item['actor_loss'] for item in window), 6),
             'avg_critic_loss': round(statistics.mean(item['critic_loss'] for item in window), 6),
+            'avg_min_goal_distance': round(statistics.mean(item['min_goal_distance'] for item in window), 6),
+            'avg_min_xy_goal_distance': round(statistics.mean(item['min_xy_goal_distance'] for item in window), 6),
+            'avg_min_z_goal_error': round(statistics.mean(item['min_z_goal_error'] for item in window), 6),
+            'avg_final_goal_distance': round(statistics.mean(item['final_goal_distance'] for item in window), 6),
+            'avg_final_xy_goal_distance': round(statistics.mean(item['final_xy_goal_distance'] for item in window), 6),
+            'avg_final_z_goal_error': round(statistics.mean(item['final_z_goal_error'] for item in window), 6),
+            'avg_min_segment_goal_distance': round(statistics.mean(item['min_segment_goal_distance'] for item in window), 6),
+            'avg_near_goal_step_count': round(statistics.mean(item['near_goal_step_count'] for item in window), 6),
+            'goal_reached_by_segment_count': sum(item['goal_reached_by_segment_count'] for item in window),
+            'avg_active_goal_radius': round(statistics.mean(item['active_goal_radius'] for item in window), 6),
+            'replay_near_goal_fraction': round(self.replay.near_goal_fraction(), 6),
             'goal_count': outcome_counts.get('goal', 0),
             'timeout_count': outcome_counts.get('timeout', 0),
             'boundary_count': outcome_counts.get('boundary', 0),

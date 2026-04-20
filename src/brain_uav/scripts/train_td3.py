@@ -36,6 +36,14 @@ OUTCOME_COLORS = {
 }
 
 
+def _default_timesteps(model: str, curriculum_level: str) -> int:
+    if curriculum_level == 'hard':
+        return 750_000
+    if model == 'ann' and curriculum_level == 'easy':
+        return 750_000
+    return 500_000
+
+
 def export_training_report(base_metrics_path: Path, metrics: dict) -> dict[str, str]:
     """Write AI-friendly training summary files."""
 
@@ -57,7 +65,7 @@ def export_training_report(base_metrics_path: Path, metrics: dict) -> dict[str, 
             tick_positions = x[::tick_step]
             tick_labels = labels[::tick_step]
 
-            fig, axes = plt.subplots(3, 1, figsize=(20, 16))
+            fig, axes = plt.subplots(3, 1, figsize=(22, 16))
 
             bottoms = [0] * len(labels)
             for key in OUTCOME_KEYS:
@@ -152,6 +160,15 @@ def export_episode_result(
         'outcome': record['outcome'],
         'actor_loss': record['actor_loss'],
         'critic_loss': record['critic_loss'],
+        'active_goal_radius': record.get('active_goal_radius'),
+        'min_goal_distance': record.get('min_goal_distance'),
+        'min_xy_goal_distance': record.get('min_xy_goal_distance'),
+        'min_z_goal_error': record.get('min_z_goal_error'),
+        'min_segment_goal_distance': record.get('min_segment_goal_distance'),
+        'final_goal_distance': record.get('final_goal_distance'),
+        'final_xy_goal_distance': record.get('final_xy_goal_distance'),
+        'final_z_goal_error': record.get('final_z_goal_error'),
+        'goal_reached_by_segment_count': record.get('goal_reached_by_segment_count'),
         'zone_count': len(record['scenario']['zones']),
         'scenario': record['scenario'],
         'trajectory': record['trajectory'],
@@ -166,9 +183,11 @@ def export_episode_result(
     goal = np.asarray(record['scenario']['goal'], dtype=float)
     zones = record['scenario']['zones']
     scenario_cfg = config_payload['scenario']
+    render_z_max = max(float(scenario_cfg['world_z_max']), 600.0)
 
-    fig = plt.figure(figsize=(16, 24), constrained_layout=True)
-    grid = fig.add_gridspec(4, 1, height_ratios=[8.0, 1.0, 1.0, 2.2], hspace=0.45)
+    fig = plt.figure(figsize=(24, 28))
+    grid = fig.add_gridspec(4, 1, height_ratios=[7.0, 1.7, 1.7, 2.7], hspace=0.55)
+    fig.subplots_adjust(left=0.06, right=0.86, top=0.95, bottom=0.04)
     ax_xy = fig.add_subplot(grid[0, 0])
     ax_xz = fig.add_subplot(grid[1, 0])
     ax_yz = fig.add_subplot(grid[2, 0])
@@ -201,9 +220,9 @@ def export_episode_result(
     ax_xz.set_xlabel('x')
     ax_xz.set_ylabel('z')
     ax_xz.set_xlim(-scenario_cfg['world_xy'], scenario_cfg['world_xy'])
-    ax_xz.set_ylim(0.0, scenario_cfg['world_z_max'])
+    ax_xz.set_ylim(0.0, render_z_max)
     ax_xz.grid(alpha=0.3)
-    ax_xz.legend(loc='upper left', ncol=2)
+    ax_xz.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0)
     ax_xz.set_aspect('equal', adjustable='box')
 
     ax_yz.plot(traj[:, 1], traj[:, 2], color='tab:blue', linewidth=2.0, label='trajectory')
@@ -216,9 +235,9 @@ def export_episode_result(
     ax_yz.set_xlabel('y')
     ax_yz.set_ylabel('z')
     ax_yz.set_xlim(-scenario_cfg['world_xy'], scenario_cfg['world_xy'])
-    ax_yz.set_ylim(0.0, scenario_cfg['world_z_max'])
+    ax_yz.set_ylim(0.0, render_z_max)
     ax_yz.grid(alpha=0.3)
-    ax_yz.legend(loc='upper left', ncol=2)
+    ax_yz.legend(loc='upper left', bbox_to_anchor=(1.01, 1.0), borderaxespad=0.0)
     ax_yz.set_aspect('equal', adjustable='box')
 
     ax_text.axis('off')
@@ -242,19 +261,27 @@ def export_episode_result(
         f"category: {category or 'n/a'}",
         f"curriculum_level: {record['info'].get('curriculum_level', 'unknown')}",
         f"goal distance: {record['info']['goal_distance']:.2f}",
+        f"active_goal_radius: {record.get('active_goal_radius', scenario_cfg.get('goal_radius', 'n/a'))}",
+        f"min_goal_distance: {record.get('min_goal_distance', 'n/a')}",
+        f"min_xy_goal_distance: {record.get('min_xy_goal_distance', 'n/a')}",
+        f"min_z_goal_error: {record.get('min_z_goal_error', 'n/a')}",
+        f"min_segment_goal_distance: {record.get('min_segment_goal_distance', 'n/a')}",
+        f"final_goal_distance: {record.get('final_goal_distance', 'n/a')}",
         f"start: ({start[0]:.1f}, {start[1]:.1f}, {start[2]:.1f})",
         f"goal: ({goal[0]:.1f}, {goal[1]:.1f}, {goal[2]:.1f})",
         f"zone_count: {len(zones)}",
         f"corridor_width: {corridor_width if corridor_width is not None else 'n/a'}",
         f"min_clearance_to_boundary: {min_clearance if min_clearance is not None else 'n/a'}",
         f"goal radius: {scenario_cfg['goal_radius']}",
+        f"world_z_max: {scenario_cfg['world_z_max']}",
+        f"render_z_max: {render_z_max}",
         f"warning_distance: {scenario_cfg['warning_distance']}",
         f"boundary_warning_distance: {scenario_cfg['boundary_warning_distance']}",
         f"ground_warning_height: {scenario_cfg['ground_warning_height']}",
         '',
         *zone_lines,
     ]
-    ax_text.text(0.0, 1.0, '\n'.join(summary), va='top', ha='left', fontsize=10, family='monospace')
+    ax_text.text(0.02, 1.0, '\n'.join(summary), va='top', ha='left', fontsize=11, family='monospace')
     ax_text.set_title('Scenario Summary')
 
     fig.suptitle(f"Episode {record['episode']} - {record['outcome']}", fontsize=15)
@@ -309,26 +336,37 @@ def make_early_stop_callback(
     goal_rate_threshold: float,
     consecutive_windows: int,
     min_steps: int,
+    max_failures_per_window: int | None = None,
 ) -> Callable[[dict[str, Any]], str | None] | None:
     if not enabled:
         return None
 
-    recent_goal_rates: list[float] = []
+    recent_window_passes: list[bool] = []
 
     def callback(window_row: dict[str, Any]) -> str | None:
         episode_count = max(int(window_row.get('episode_count', 0)), 1)
-        goal_rate = float(window_row.get('goal_count', 0)) / episode_count
-        recent_goal_rates.append(goal_rate)
-        if len(recent_goal_rates) > consecutive_windows:
-            recent_goal_rates.pop(0)
+        goal_count = int(window_row.get('goal_count', 0))
+        failure_count = episode_count - goal_count
+        goal_rate = float(goal_count) / episode_count
+        if max_failures_per_window is not None and max_failures_per_window >= 0:
+            window_passed = failure_count <= max_failures_per_window
+            condition_text = f'failures<={max_failures_per_window}'
+            latest_text = f'latest_failures={failure_count}/{episode_count}'
+        else:
+            window_passed = goal_rate >= goal_rate_threshold
+            condition_text = f'goal_rate>={goal_rate_threshold:.2f}'
+            latest_text = f'latest_goal_rate={goal_rate:.2f}'
+        recent_window_passes.append(window_passed)
+        if len(recent_window_passes) > consecutive_windows:
+            recent_window_passes.pop(0)
         if int(window_row.get('total_steps', 0)) < min_steps:
             return None
-        if len(recent_goal_rates) < consecutive_windows:
+        if len(recent_window_passes) < consecutive_windows:
             return None
-        if all(rate >= goal_rate_threshold for rate in recent_goal_rates):
+        if all(recent_window_passes):
             return (
-                f"goal_rate>={goal_rate_threshold:.2f} for {consecutive_windows} consecutive windows after "
-                f"min_steps={min_steps} (latest={goal_rate:.2f})"
+                f"{condition_text} for {consecutive_windows} consecutive windows after "
+                f"min_steps={min_steps} ({latest_text})"
             )
         return None
 
@@ -374,7 +412,14 @@ def load_training_state(init_checkpoint: Path | None, actor, critic1, critic2, t
 def main() -> None:
     parser = argparse.ArgumentParser(description='Train the TD3 curriculum policy stage by stage.')
     parser.add_argument('--model', choices=['snn', 'ann'], default='snn')
-    parser.add_argument('--timesteps', type=int, default=None)
+    parser.add_argument(
+        '--timesteps',
+        '--max-timesteps',
+        dest='timesteps',
+        type=int,
+        default=None,
+        help='Maximum TD3 training steps (default: 500000, 750000 for hard, or 750000 for ANN easy).',
+    )
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--curriculum-level', choices=['easy', 'easy_two_zone', 'medium', 'hard'], required=True)
     parser.add_argument('--curriculum-mix', type=str, default=None)
@@ -382,12 +427,12 @@ def main() -> None:
     parser.add_argument('--bc-checkpoint', type=Path, default=None)
     parser.add_argument('--output', type=Path, default=None)
     parser.add_argument('--metrics-out', type=Path, default=None)
-    parser.add_argument('--summary-every-episodes', type=int, default=20, help='Episode count per summary window (default: 20).')
+    parser.add_argument('--summary-every-episodes', type=int, default=15, help='Episode count per summary window (default: 15).')
     parser.add_argument(
         '--actor-freeze-steps',
         type=int,
         default=None,
-        help='Override model default actor freeze steps (SNN default: 25000, ANN default: 50000).',
+        help='Override model default actor freeze steps (SNN default: 50000, ANN default: 100000).',
     )
     parser.add_argument(
         '--critic-grad-clip-norm',
@@ -401,23 +446,31 @@ def main() -> None:
         action='store_true',
         help='Disable default early stopping.',
     )
-    parser.add_argument('--early-stop-goal-rate', type=float, default=0.95, help='Goal-rate threshold for early stopping (default: 0.95).')
-    parser.add_argument('--early-stop-windows', type=int, default=5, help='Consecutive summary windows required for early stopping (default: 5).')
-    parser.add_argument('--early-stop-min-steps', type=int, default=80000, help='Minimum training steps before early stopping can trigger (default: 80000).')
+    parser.add_argument('--early-stop-goal-rate', type=float, default=0.95, help='Goal-rate threshold fallback for early stopping (default: 0.95).')
+    parser.add_argument('--early-stop-windows', type=int, default=4, help='Consecutive summary windows required for early stopping (default: 4).')
+    parser.add_argument(
+        '--early-stop-max-failures-per-window',
+        type=int,
+        default=1,
+        help='Maximum failed episodes allowed per summary window for early stopping (default: 1; pass -1 to use goal-rate fallback).',
+    )
+    parser.add_argument('--early-stop-min-steps', type=int, default=200000, help='Minimum training steps before early stopping can trigger (default: 200000).')
     args = parser.parse_args()
 
     if args.timesteps is None:
-        args.timesteps = 300000 if args.curriculum_level == 'hard' else 200000
+        args.timesteps = _default_timesteps(args.model, args.curriculum_level)
     early_stop_enabled = not args.no_early_stop
 
     cfg = ExperimentConfig()
 
     if args.model == 'ann':
         # Use more conservative defaults for ANN to avoid late-training collapse.
-        cfg.training.actor_lr = 1.5e-4
+        cfg.training.actor_lr = 1.0e-4
         cfg.training.critic_lr = 2e-4
+        cfg.training.exploration_noise = 0.01
+        cfg.training.policy_noise = 0.01
         if args.actor_freeze_steps is None:
-            cfg.training.actor_freeze_steps = 50_000
+            cfg.training.actor_freeze_steps = 100_000
         else:
             cfg.training.actor_freeze_steps = args.actor_freeze_steps
         if args.critic_grad_clip_norm is None:
@@ -453,6 +506,7 @@ def main() -> None:
         seed=args.seed,
         curriculum_level=args.curriculum_level,
         curriculum_mix=curriculum_mix,
+        goal_radius_curriculum_enabled=True,
     )
     obs, _ = env.reset(seed=args.seed)
     actor = make_actor(cfg, args.model, obs.shape[0], env.action_space.shape[0])
@@ -474,6 +528,8 @@ def main() -> None:
         warmup_steps=cfg.training.warmup_steps,
         exploration_noise=cfg.training.exploration_noise,
         success_sample_bias=cfg.training.success_sample_bias,
+        near_goal_sample_bias=cfg.training.near_goal_sample_bias,
+        near_goal_sample_radius=cfg.training.near_goal_sample_radius,
         actor_freeze_steps=cfg.training.actor_freeze_steps,
         critic_grad_clip_norm=cfg.training.critic_grad_clip_norm,
         warmup_strategy='random',
@@ -503,6 +559,7 @@ def main() -> None:
         goal_rate_threshold=args.early_stop_goal_rate,
         consecutive_windows=args.early_stop_windows,
         min_steps=args.early_stop_min_steps,
+        max_failures_per_window=args.early_stop_max_failures_per_window,
     )
     metrics = trainer.train(
         args.timesteps,
@@ -515,15 +572,32 @@ def main() -> None:
 
     metrics_dict = metrics.to_dict()
     metrics_dict['finished_at'] = finished_at
+    metrics_dict['max_timesteps'] = args.timesteps
     metrics_dict['summary_every_episodes'] = args.summary_every_episodes
     metrics_dict['log_dir'] = str(log_dir)
     metrics_dict['results_dir'] = str(results_dir)
+    metrics_dict['terminal_los_radius'] = cfg.rewards.terminal_los_radius
+    metrics_dict['terminal_los_weight'] = cfg.rewards.terminal_los_weight
+    metrics_dict['terminal_los_penalty_weight'] = cfg.rewards.terminal_los_penalty_weight
+    metrics_dict['actor_lr'] = cfg.training.actor_lr
+    metrics_dict['critic_lr'] = cfg.training.critic_lr
+    metrics_dict['exploration_noise'] = cfg.training.exploration_noise
+    metrics_dict['policy_noise'] = cfg.training.policy_noise
+    metrics_dict['noise_clip'] = cfg.training.noise_clip
     metrics_dict['actor_freeze_steps'] = cfg.training.actor_freeze_steps
     metrics_dict['critic_grad_clip_norm'] = cfg.training.critic_grad_clip_norm
     metrics_dict['exploration_noise_current'] = trainer.exploration_noise_current
     metrics_dict['policy_noise_current'] = trainer.policy_noise_current
     metrics_dict['noise_clip_current'] = trainer.noise_clip_current
     metrics_dict['success_sample_bias'] = cfg.training.success_sample_bias
+    metrics_dict['near_goal_sample_bias'] = cfg.training.near_goal_sample_bias
+    metrics_dict['near_goal_sample_radius'] = cfg.training.near_goal_sample_radius
+    metrics_dict['replay_near_goal_fraction'] = trainer.replay.near_goal_fraction()
+    metrics_dict['avg_active_goal_radius'] = (
+        metrics_dict['episode_window_stats'][-1].get('avg_active_goal_radius')
+        if metrics_dict.get('episode_window_stats')
+        else float(getattr(env, 'active_goal_radius', cfg.scenario.goal_radius))
+    )
     metrics_dict['bc_regularization_enabled'] = trainer.metrics.bc_regularization_enabled
     metrics_dict['bc_lambda'] = trainer.metrics.bc_lambda
     metrics_dict['bc_loss'] = trainer.metrics.bc_loss
@@ -532,6 +606,7 @@ def main() -> None:
     metrics_dict['early_stop_enabled'] = bool(early_stop_enabled and args.summary_every_episodes > 0)
     metrics_dict['early_stop_goal_rate'] = args.early_stop_goal_rate
     metrics_dict['early_stop_windows'] = args.early_stop_windows
+    metrics_dict['early_stop_max_failures_per_window'] = args.early_stop_max_failures_per_window
     metrics_dict['early_stop_min_steps'] = args.early_stop_min_steps
     metrics_dict['stopped_early'] = trainer.stop_reason is not None
     metrics_dict['stop_reason'] = trainer.stop_reason

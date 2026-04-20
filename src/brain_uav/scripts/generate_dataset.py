@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -57,22 +58,70 @@ def build_planners(env, planner_names: str):
     return planners
 
 
-def collect_rollout(planner, env, max_steps: int | None = None):
+def _wrap_angle(value: float) -> float:
+    return ((value + math.pi) % (2 * math.pi)) - math.pi
+
+
+def _terminal_homing_action(env) -> np.ndarray:
+    delta = env.goal - env.state[:3]
+    horizontal_distance = float(np.linalg.norm(delta[:2]))
+    psi_target = math.atan2(float(delta[1]), float(delta[0]))
+    gamma_target = math.atan2(float(delta[2]), horizontal_distance)
+    delta_gamma = gamma_target - float(env.state[3])
+    delta_psi = _wrap_angle(psi_target - float(env.state[4]))
+    return np.array(
+        [
+            np.clip(delta_gamma, -env.scenario.delta_gamma_max, env.scenario.delta_gamma_max),
+            np.clip(delta_psi, -env.scenario.delta_psi_max, env.scenario.delta_psi_max),
+        ],
+        dtype=np.float32,
+    )
+
+
+def _terminal_homing_alpha(goal_distance: float, radius: float, full_radius: float) -> float:
+    if goal_distance > radius:
+        return 0.0
+    if goal_distance <= full_radius:
+        return 1.0
+    return float(np.clip((radius - goal_distance) / max(radius - full_radius, 1e-6), 0.0, 1.0))
+
+
+def collect_rollout(
+    planner,
+    env,
+    max_steps: int | None = None,
+    terminal_homing_enabled: bool = False,
+    terminal_homing_radius: float = 80.0,
+    terminal_homing_full_radius: float = 20.0,
+):
     """Run one planner episode and return samples plus final outcome."""
 
     obs, _ = env.reset()
     steps = max_steps or env.scenario.max_steps
     samples = []
     outcome = 'timeout'
+    homing_step_count = 0
+    homing_alpha_sum = 0.0
     for _ in range(steps):
-        action = planner.act(obs)
         goal_distance = float(env._goal_distance(env.state[:3]))
+        planner_action = planner.act(obs)
+        alpha = 0.0
+        if terminal_homing_enabled:
+            alpha = _terminal_homing_alpha(goal_distance, terminal_homing_radius, terminal_homing_full_radius)
+        if alpha > 0.0:
+            homing_action = _terminal_homing_action(env)
+            action = (1.0 - alpha) * planner_action + alpha * homing_action
+            action = np.asarray(action, dtype=np.float32).clip(env.action_space.low, env.action_space.high)
+            homing_step_count += 1
+            homing_alpha_sum += alpha
+        else:
+            action = planner_action
         samples.append((obs.copy(), action.copy(), goal_distance))
         obs, _, terminated, truncated, info = env.step(action)
         if terminated or truncated:
             outcome = info['outcome']
             break
-    return samples, outcome
+    return samples, outcome, homing_step_count, homing_alpha_sum
 
 
 def terminal_extra_repeats(goal_distance_km: float) -> int:
@@ -143,6 +192,22 @@ def main() -> None:
         help='Disable terminal capture sample augmentation.',
     )
     parser.set_defaults(terminal_augment=True)
+    homing_group = parser.add_mutually_exclusive_group()
+    homing_group.add_argument(
+        '--terminal-homing',
+        dest='terminal_homing',
+        action='store_true',
+        help='Enable terminal homing action blending for expert dataset generation.',
+    )
+    homing_group.add_argument(
+        '--no-terminal-homing',
+        dest='terminal_homing',
+        action='store_false',
+        help='Disable terminal homing action blending.',
+    )
+    parser.add_argument('--terminal-homing-radius', type=float, default=80.0)
+    parser.add_argument('--terminal-homing-full-radius', type=float, default=20.0)
+    parser.set_defaults(terminal_homing=False)
     args = parser.parse_args()
 
     cfg = ExperimentConfig()
@@ -158,10 +223,20 @@ def main() -> None:
     raw_success_samples = 0
     augmented_samples = 0
     terminal_augmented_sample_count = 0
+    terminal_homing_step_count = 0
+    terminal_homing_alpha_sum = 0.0
     fallback_samples: list[tuple[np.ndarray, np.ndarray, str]] = []
     for episode in range(args.episodes):
         planner = planners[episode % len(planners)]
-        rollout, outcome = collect_rollout(planner, env)
+        rollout, outcome, homing_steps, homing_alpha_sum = collect_rollout(
+            planner,
+            env,
+            terminal_homing_enabled=args.terminal_homing,
+            terminal_homing_radius=args.terminal_homing_radius,
+            terminal_homing_full_radius=args.terminal_homing_full_radius,
+        )
+        terminal_homing_step_count += homing_steps
+        terminal_homing_alpha_sum += homing_alpha_sum
         if outcome == 'goal':
             raw_success_samples += len(rollout)
             for obs, action, goal_distance in rollout:
@@ -218,6 +293,14 @@ def main() -> None:
         raw_success_samples=np.array(raw_success_samples, dtype=np.int64),
         augmented_samples=np.array(augmented_samples, dtype=np.int64),
         terminal_augmented_sample_count=np.array(terminal_augmented_sample_count, dtype=np.int64),
+        terminal_homing_enabled=np.array(bool(args.terminal_homing)),
+        terminal_homing_radius=np.array(float(args.terminal_homing_radius), dtype=np.float32),
+        terminal_homing_full_radius=np.array(float(args.terminal_homing_full_radius), dtype=np.float32),
+        terminal_homing_step_count=np.array(terminal_homing_step_count, dtype=np.int64),
+        terminal_homing_mean_alpha=np.array(
+            terminal_homing_alpha_sum / max(terminal_homing_step_count, 1),
+            dtype=np.float32,
+        ),
         terminal_distance_bin_labels=np.array(TERMINAL_DISTANCE_BIN_LABELS),
         terminal_distance_bin_counts=bin_counts,
         terminal_distance_bin_action_abs_mean=bin_action_abs_mean,
@@ -230,6 +313,11 @@ def main() -> None:
     print(
         f'[Dataset:{DATASET_VERSION}] raw_success_samples={raw_success_samples} '
         f'augmented_samples={augmented_samples} terminal_augmented_sample_count={terminal_augmented_sample_count}'
+    )
+    print(
+        f'[Dataset:{DATASET_VERSION}] terminal_homing_enabled={args.terminal_homing} '
+        f'terminal_homing_step_count={terminal_homing_step_count} '
+        f'terminal_homing_mean_alpha={terminal_homing_alpha_sum / max(terminal_homing_step_count, 1):.4f}'
     )
     print(f'[Dataset:{DATASET_VERSION}] terminal distance diagnostics:')
     for label, count, mean in zip(TERMINAL_DISTANCE_BIN_LABELS, bin_counts, bin_action_abs_mean):
