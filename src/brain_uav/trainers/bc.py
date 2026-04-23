@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -21,6 +22,7 @@ def train_behavior_cloning(
     lr: float,
     device: str = "cpu",
     verbose: bool = True,
+    epoch_end_callback: Callable[[int, float, list[float], nn.Module], None] | None = None,
 ) -> list[float]:
     """Train actor by supervised learning on (state, action) pairs."""
 
@@ -49,6 +51,8 @@ def train_behavior_cloning(
             count += len(batch_obs)
         epoch_loss = running / max(count, 1)
         history.append(epoch_loss)
+        if epoch_end_callback is not None:
+            epoch_end_callback(epoch_idx + 1, epoch_loss, history, actor)
         if verbose:
             print(f"[BC] epoch {epoch_idx + 1}/{epochs} loss={epoch_loss:.6f}")
     actor.to("cpu")

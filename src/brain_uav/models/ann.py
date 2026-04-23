@@ -5,6 +5,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from ..config import ScenarioConfig
+from .scaling import FixedObsScaler
+
 
 class ANNPolicyActor(nn.Module):
     """Continuous control actor implemented with a plain MLP.
@@ -13,8 +16,16 @@ class ANNPolicyActor(nn.Module):
     因 ReLU 死区导致网络长期输出接近 0 的“交白卷”现象。
     """
 
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int, action_limit: torch.Tensor) -> None:
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        action_limit: torch.Tensor,
+        scenario: ScenarioConfig,
+    ) -> None:
         super().__init__()
+        self.obs_scaler = FixedObsScaler(scenario, state_dim)
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
             nn.LeakyReLU(0.01),
@@ -40,7 +51,7 @@ class ANNPolicyActor(nn.Module):
         nn.init.uniform_(final_linear.bias, -1e-3, 1e-3)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        return self.net(obs) * self.action_limit
+        return self.net(self.obs_scaler(obs)) * self.action_limit
 
 
 class ANNCritic(nn.Module):
@@ -50,8 +61,9 @@ class ANNCritic(nn.Module):
     同样使用 LeakyReLU，避免 critic 也出现死神经元问题。
     """
 
-    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int) -> None:
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int, scenario: ScenarioConfig) -> None:
         super().__init__()
+        self.obs_scaler = FixedObsScaler(scenario, state_dim)
         self.net = nn.Sequential(
             nn.Linear(state_dim + action_dim, hidden_dim),
             nn.LeakyReLU(0.01),
@@ -68,4 +80,4 @@ class ANNCritic(nn.Module):
                 nn.init.zeros_(module.bias)
 
     def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        return self.net(torch.cat([obs, action], dim=-1))
+        return self.net(torch.cat([self.obs_scaler(obs), action], dim=-1))

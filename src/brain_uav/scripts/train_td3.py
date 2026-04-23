@@ -182,8 +182,8 @@ def export_episode_result(
         _draw_zone_top_view(ax_xy, center_xy, radius, scenario_cfg['warning_distance'])
         ax_xy.text(center_xy[0], center_xy[1], f'Z{idx}', fontsize=8, color='tab:red')
     ax_xy.set_title('Top View (X-Y)')
-    ax_xy.set_xlabel('x')
-    ax_xy.set_ylabel('y')
+    ax_xy.set_xlabel('x (km)')
+    ax_xy.set_ylabel('y (km)')
     ax_xy.set_xlim(-scenario_cfg['world_xy'], scenario_cfg['world_xy'])
     ax_xy.set_ylim(-scenario_cfg['world_xy'], scenario_cfg['world_xy'])
     ax_xy.legend(loc='upper left')
@@ -197,8 +197,8 @@ def export_episode_result(
         _draw_zone_vertical_projection(ax_xz, zone['center_xy'][0], zone['radius'], f'zone {idx}')
     ax_xz.axhline(scenario_cfg['ground_warning_height'], color='tab:orange', linestyle='--', alpha=0.7, label='ground warning')
     ax_xz.set_title('Side View (X-Z)')
-    ax_xz.set_xlabel('x')
-    ax_xz.set_ylabel('z')
+    ax_xz.set_xlabel('x (km)')
+    ax_xz.set_ylabel('z (km)')
     ax_xz.set_xlim(-scenario_cfg['world_xy'], scenario_cfg['world_xy'])
     ax_xz.set_ylim(0.0, scenario_cfg['world_z_max'])
     ax_xz.grid(alpha=0.3)
@@ -211,8 +211,8 @@ def export_episode_result(
         _draw_zone_vertical_projection(ax_yz, zone['center_xy'][1], zone['radius'], f'zone {idx}')
     ax_yz.axhline(scenario_cfg['ground_warning_height'], color='tab:orange', linestyle='--', alpha=0.7, label='ground warning')
     ax_yz.set_title('Front View (Y-Z)')
-    ax_yz.set_xlabel('y')
-    ax_yz.set_ylabel('z')
+    ax_yz.set_xlabel('y (km)')
+    ax_yz.set_ylabel('z (km)')
     ax_yz.set_xlim(-scenario_cfg['world_xy'], scenario_cfg['world_xy'])
     ax_yz.set_ylim(0.0, scenario_cfg['world_z_max'])
     ax_yz.grid(alpha=0.3)
@@ -220,7 +220,7 @@ def export_episode_result(
 
     ax_text.axis('off')
     zone_lines = [
-        f"zone {idx}: center=({zone['center_xy'][0]:.1f}, {zone['center_xy'][1]:.1f}), r={zone['radius']:.1f}"
+        f"zone {idx}: center=({zone['center_xy'][0]:.1f}, {zone['center_xy'][1]:.1f}) km, r={zone['radius']:.1f} km"
         for idx, zone in enumerate(zones, start=1)
     ]
     scenario_label = record['info'].get('scenario_name')
@@ -238,16 +238,16 @@ def export_episode_result(
         f"scenario_id: {scenario_id or 'n/a'}",
         f"category: {category or 'n/a'}",
         f"curriculum_level: {record['info'].get('curriculum_level', 'unknown')}",
-        f"goal distance: {record['info']['goal_distance']:.2f}",
-        f"start: ({start[0]:.1f}, {start[1]:.1f}, {start[2]:.1f})",
-        f"goal: ({goal[0]:.1f}, {goal[1]:.1f}, {goal[2]:.1f})",
+        f"goal distance (km): {record['info']['goal_distance']:.2f}",
+        f"start (km): ({start[0]:.1f}, {start[1]:.1f}, {start[2]:.1f})",
+        f"goal (km): ({goal[0]:.1f}, {goal[1]:.1f}, {goal[2]:.1f})",
         f"zone_count: {len(zones)}",
-        f"corridor_width: {corridor_width if corridor_width is not None else 'n/a'}",
-        f"min_clearance_to_boundary: {min_clearance if min_clearance is not None else 'n/a'}",
-        f"goal radius: {scenario_cfg['goal_radius']}",
-        f"warning_distance: {scenario_cfg['warning_distance']}",
-        f"boundary_warning_distance: {scenario_cfg['boundary_warning_distance']}",
-        f"ground_warning_height: {scenario_cfg['ground_warning_height']}",
+        f"corridor_width (km): {corridor_width if corridor_width is not None else 'n/a'}",
+        f"min_clearance_to_boundary (km): {min_clearance if min_clearance is not None else 'n/a'}",
+        f"goal radius (km): {scenario_cfg['goal_radius']}",
+        f"warning_distance (km): {scenario_cfg['warning_distance']}",
+        f"boundary_warning_distance (km): {scenario_cfg['boundary_warning_distance']}",
+        f"ground_warning_height (km): {scenario_cfg['ground_warning_height']}",
         '',
         *zone_lines,
     ]
@@ -380,6 +380,7 @@ def main() -> None:
     parser.add_argument('--bc-checkpoint', type=Path, default=None)
     parser.add_argument('--output', type=Path, default=None)
     parser.add_argument('--metrics-out', type=Path, default=None)
+    parser.add_argument('--log-root', type=Path, default=None)
     parser.add_argument('--summary-every-episodes', type=int, default=50)
     parser.add_argument('--actor-freeze-steps', type=int, default=None)
     parser.add_argument('--critic-grad-clip-norm', type=float, default=None)
@@ -426,7 +427,7 @@ def main() -> None:
         base_output,
         base_metrics,
         finished_at,
-        log_root=log_root_path('td3', level=args.curriculum_level),
+        log_root=args.log_root or log_root_path('td3', level=args.curriculum_level),
     )
     results_dir = ensure_dir(log_dir / 'results')
 
@@ -456,6 +457,7 @@ def main() -> None:
         warmup_steps=cfg.training.warmup_steps,
         exploration_noise=cfg.training.exploration_noise,
         success_sample_bias=cfg.training.success_sample_bias,
+        near_goal_sample_bias=cfg.training.near_goal_sample_bias,
         actor_freeze_steps=cfg.training.actor_freeze_steps,
         critic_grad_clip_norm=cfg.training.critic_grad_clip_norm,
         warmup_strategy='random',

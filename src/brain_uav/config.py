@@ -8,7 +8,7 @@ from pathlib import Path
 
 @dataclass(slots=True)
 class ScenarioConfig:
-    """Environment-side parameters."""
+    """Environment-side parameters with distance values expressed in km."""
 
     dt: float = 1.0
     speed: float = 25.0
@@ -89,8 +89,9 @@ class TrainingConfig:
     warmup_steps: int = 256
     actor_freeze_steps: int = 5_000
     success_sample_bias: float = 2.5
+    near_goal_sample_bias: float = 1.0
     bc_epochs: int = 10
-    snn_time_window: int = 1
+    snn_time_window: int = 4
     hidden_dim: int = 128
     critic_grad_clip_norm: float | None = None
     device: str = 'cpu'

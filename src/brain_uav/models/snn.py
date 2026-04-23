@@ -62,15 +62,18 @@ class SNNPolicyActor(nn.Module):
         self.action_dim = action_dim
         self.state_dim = state_dim
         if HAS_SPIKINGJELLY:
-            self.lif1 = neuron.LIFNode(tau=2.0, surrogate_function=surrogate.ATan())
-            self.lif2 = neuron.LIFNode(tau=2.0, surrogate_function=surrogate.ATan())
+            self.lif1 = neuron.LIFNode(tau=2.0, surrogate_function=surrogate.ATan(), step_mode='m')
+            self.lif2 = neuron.LIFNode(tau=2.0, surrogate_function=surrogate.ATan(), step_mode='m')
         else:
             self.lif1 = FallbackLIFLayer()
             self.lif2 = FallbackLIFLayer()
         self.register_buffer('action_limit', action_limit)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        action, _ = self.forward_with_diagnostics(obs)
+        if HAS_SPIKINGJELLY:
+            action, _, _ = self._forward_spikingjelly(obs)
+            return action
+        action, _, _ = self._forward_fallback(obs)
         return action
 
     def forward_with_diagnostics(self, obs: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
@@ -83,34 +86,9 @@ class SNNPolicyActor(nn.Module):
         """
 
         if HAS_SPIKINGJELLY:
-            functional.reset_net(self)
-            encoded = self.fc1(obs)
-            spike_trace_1 = []
-            for _ in range(self.time_window):
-                spike_trace_1.append(self.lif1(encoded))
-            spikes1 = torch.stack(spike_trace_1, dim=0).mean(0)
-
-            hidden = self.fc2(spikes1)
-            spike_trace_2 = []
-            mem_trace_2 = []
-            for _ in range(self.time_window):
-                spk = self.lif2(hidden)
-                spike_trace_2.append(spk)
-                mem_trace_2.append(self.lif2.v.clone())
-            spikes2 = torch.stack(spike_trace_2, dim=0).mean(0)
-            membrane = torch.stack(mem_trace_2, dim=0).mean(0)
-            spike_sum1 = torch.stack(spike_trace_1, dim=0).sum(0)
-            spike_sum2 = torch.stack(spike_trace_2, dim=0).sum(0)
-            out = self.fc3(0.5 * (spikes2 + membrane))
-            functional.reset_net(self)
+            action, spike_sum1, spike_sum2 = self._forward_spikingjelly(obs)
         else:
-            encoded = self.fc1(obs)
-            spikes1, _, spike_sum1 = self.lif1(encoded, self.time_window)
-            hidden = self.fc2(spikes1)
-            spikes2, membrane, spike_sum2 = self.lif2(hidden, self.time_window)
-            out = self.fc3(0.5 * (spikes2 + membrane))
-
-        action = torch.tanh(out) * self.action_limit
+            action, spike_sum1, spike_sum2 = self._forward_fallback(obs)
         macs_per_timestep = float(
             self.state_dim * self.hidden_dim + self.hidden_dim * self.hidden_dim + self.hidden_dim * self.action_dim
         )
@@ -131,3 +109,28 @@ class SNNPolicyActor(nn.Module):
             'dense_macs_per_timestep': float(macs_per_timestep),
         }
         return action, diagnostics
+
+    def _forward_spikingjelly(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        functional.reset_net(self)
+        encoded = self.fc1(obs)
+        encoded_seq = encoded.unsqueeze(0).expand(self.time_window, -1, -1)
+        spikes1_seq = self.lif1(encoded_seq)
+        hidden_seq = self.fc2(spikes1_seq)
+        spikes2_seq = self.lif2(hidden_seq)
+        membrane = self.lif2.v
+        features = 0.5 * (spikes2_seq.mean(0) + membrane)
+        out = self.fc3(features)
+        action = torch.tanh(out) * self.action_limit
+        spike_sum1 = spikes1_seq.sum(0)
+        spike_sum2 = spikes2_seq.sum(0)
+        functional.reset_net(self)
+        return action, spike_sum1, spike_sum2
+
+    def _forward_fallback(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        encoded = self.fc1(obs)
+        spikes1, _, spike_sum1 = self.lif1(encoded, self.time_window)
+        hidden = self.fc2(spikes1)
+        spikes2, membrane, spike_sum2 = self.lif2(hidden, self.time_window)
+        out = self.fc3(0.5 * (spikes2 + membrane))
+        action = torch.tanh(out) * self.action_limit
+        return action, spike_sum1, spike_sum2

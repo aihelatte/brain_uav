@@ -75,6 +75,7 @@ class TD3Trainer:
         warmup_steps: int,
         exploration_noise: float,
         success_sample_bias: float,
+        near_goal_sample_bias: float = 1.0,
         actor_freeze_steps: int = 0,
         critic_grad_clip_norm: float | None = None,
         warmup_strategy: str = 'random',
@@ -112,7 +113,11 @@ class TD3Trainer:
         self.noise_clip_current = noise_clip
         self.warmup_strategy = warmup_strategy
         self.device = device
-        self.replay = ReplayBuffer(replay_size, success_sample_bias=success_sample_bias)
+        self.replay = ReplayBuffer(
+            replay_size,
+            success_sample_bias=success_sample_bias,
+            near_goal_sample_bias=near_goal_sample_bias,
+        )
         self.total_steps = 0
         self.metrics = TD3Metrics()
         self.action_low = torch.tensor(env.action_space.low, dtype=torch.float32, device=device)
@@ -140,7 +145,7 @@ class TD3Trainer:
             print(
                 f"[TD3] start total_timesteps={total_timesteps} warmup_steps={self.warmup_steps} "
                 f"actor_freeze_steps={self.actor_freeze_steps} batch_size={self.batch_size} "
-                f"replay_size={self.replay.buffer.maxlen} warmup_strategy={self.warmup_strategy} "
+                f"replay_size={self.replay.capacity} warmup_strategy={self.warmup_strategy} "
                 f"summary_every_episodes={summary_every_episodes}"
             )
         for step_idx in range(total_timesteps):
@@ -159,6 +164,7 @@ class TD3Trainer:
                 next_obs,
                 done,
                 success=bool(info.get('outcome') == 'goal'),
+                near_goal=bool(info.get('goal_reached_by_segment', False)),
             )
             episode_return += reward
             episode_length += 1
@@ -184,6 +190,8 @@ class TD3Trainer:
                     'final_state': self.env.state.copy().tolist(),
                     'info': {
                         'goal_distance': float(info.get('goal_distance', 0.0)),
+                        'segment_goal_distance': float(info.get('segment_goal_distance', float('inf'))),
+                        'goal_reached_by_segment': bool(info.get('goal_reached_by_segment', False)),
                         'progress': float(info.get('progress', 0.0)),
                         'steps': int(info.get('steps', episode_length)),
                         'curriculum_level': info.get('curriculum_level'),

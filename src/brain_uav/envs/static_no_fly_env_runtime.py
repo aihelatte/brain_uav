@@ -78,6 +78,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.trajectory: list[np.ndarray] = []
         self.last_curriculum_level = 'random'
         self.best_goal_distance_so_far = 0.0
+        self.last_segment_goal_distance = float('inf')
+        self.last_goal_reached_by_segment = False
 
     def seed(self, seed: int | None = None) -> None:
         self.rng = np.random.default_rng(seed)
@@ -100,6 +102,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.recent_progress = []
         self.trajectory = [self.state[:3].copy()]
         self.best_goal_distance_so_far = self._goal_distance(self.state[:3])
+        self.last_segment_goal_distance = self.best_goal_distance_so_far
+        self.last_goal_reached_by_segment = False
         return self._get_obs(), self._info(progress=0.0)
 
     def step(self, action: np.ndarray):
@@ -113,6 +117,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.steps += 1
         self.trajectory.append(self.state[:3].copy())
         new_distance = self._goal_distance(self.state[:3])
+        self.last_segment_goal_distance = self._segment_goal_distance(prev_state[:3], self.state[:3])
+        self.last_goal_reached_by_segment = self.last_segment_goal_distance <= self._active_goal_radius()
         step_progress = prev_distance - new_distance
         self._record_progress(step_progress)
         terminated, truncated, outcome = self._termination()
@@ -606,7 +612,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     def _termination(self) -> tuple[bool, bool, str]:
         cfg = self.scenario
         pos = self.state[:3]
-        if self._goal_distance(pos) <= cfg.goal_radius:
+        if self._goal_distance(pos) <= self._active_goal_radius() or self.last_goal_reached_by_segment:
             return True, False, 'goal'
         if pos[2] <= cfg.world_z_min:
             return True, False, 'ground'
@@ -778,6 +784,19 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     def _goal_distance(self, pos: np.ndarray) -> float:
         return float(np.linalg.norm(pos - self.goal))
 
+    def _active_goal_radius(self) -> float:
+        return float(self.scenario.goal_radius)
+
+    def _segment_goal_distance(self, start: np.ndarray, end: np.ndarray) -> float:
+        segment = end - start
+        segment_norm_sq = float(np.dot(segment, segment))
+        if segment_norm_sq <= 1e-12:
+            return self._goal_distance(end)
+        projection = float(np.dot(self.goal - start, segment) / segment_norm_sq)
+        projection = float(np.clip(projection, 0.0, 1.0))
+        closest = start + projection * segment
+        return float(np.linalg.norm(closest - self.goal))
+
     @staticmethod
     def _inside_zone(pos: np.ndarray, zone: Zone) -> bool:
         distance = (pos[0] - zone.center_xy[0]) ** 2 + (pos[1] - zone.center_xy[1]) ** 2 + pos[2] ** 2
@@ -790,6 +809,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     def _info(self, *, progress: float, outcome: str = 'running') -> dict[str, Any]:
         return {
             'goal_distance': self._goal_distance(self.state[:3]),
+            'segment_goal_distance': float(self.last_segment_goal_distance),
+            'goal_reached_by_segment': bool(self.last_goal_reached_by_segment),
             'progress': progress,
             'outcome': outcome,
             'steps': self.steps,
