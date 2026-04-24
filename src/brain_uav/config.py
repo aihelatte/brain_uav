@@ -91,6 +91,7 @@ class TrainingConfig:
     success_sample_bias: float = 4.0
     near_goal_sample_bias: float = 1.0
     actor_grad_clip_norm: float | None = 1.0
+    actor_rl_scale_alpha: float = 2.5
     bc_epochs: int = 10
     snn_time_window: int = 4
     snn_backend: str = 'torch'

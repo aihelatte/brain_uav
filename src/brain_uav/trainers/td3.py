@@ -27,6 +27,8 @@ class TD3Metrics:
     actor_loss: float = 0.0
     critic_loss: float = 0.0
     rl_actor_loss: float = 0.0
+    scaled_rl_actor_loss: float = 0.0
+    actor_rl_scale: float = 1.0
     bc_loss: float = 0.0
     bc_lambda: float = 0.0
     bc_regularization_enabled: bool = False
@@ -42,6 +44,8 @@ class TD3Metrics:
             'actor_loss': self.actor_loss,
             'critic_loss': self.critic_loss,
             'rl_actor_loss': self.rl_actor_loss,
+            'scaled_rl_actor_loss': self.scaled_rl_actor_loss,
+            'actor_rl_scale': self.actor_rl_scale,
             'bc_loss': self.bc_loss,
             'bc_lambda': self.bc_lambda,
             'bc_regularization_enabled': self.bc_regularization_enabled,
@@ -78,6 +82,7 @@ class TD3Trainer:
         near_goal_sample_bias: float = 1.0,
         actor_freeze_steps: int = 0,
         actor_grad_clip_norm: float | None = None,
+        actor_rl_scale_alpha: float = 2.5,
         critic_grad_clip_norm: float | None = None,
         warmup_strategy: str = 'random',
         device: str = 'cpu',
@@ -105,6 +110,7 @@ class TD3Trainer:
         self.exploration_noise = exploration_noise
         self.actor_freeze_steps = actor_freeze_steps
         self.actor_grad_clip_norm = actor_grad_clip_norm
+        self.actor_rl_scale_alpha = actor_rl_scale_alpha
         self.critic_grad_clip_norm = critic_grad_clip_norm
         self.success_sample_bias = success_sample_bias
         self.exploration_noise_base = exploration_noise
@@ -334,6 +340,28 @@ class TD3Trainer:
         self._current_window = []
         return row
 
+    def _compute_actor_loss_terms(
+        self,
+        obs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+        actor_actions = self.actor(obs)
+        q_values = self.critic1(obs, actor_actions)
+        rl_actor_loss = -q_values.mean()
+        scaled_rl_actor_loss = rl_actor_loss
+        actor_rl_scale = 1.0
+        bc_lambda = 0.0
+        bc_loss = torch.zeros((), device=self.device)
+        if self.bc_reference_actor is not None:
+            q_scale = q_values.detach().abs().mean().clamp(min=1.0)
+            actor_rl_scale = float(self.actor_rl_scale_alpha / q_scale.item())
+            scaled_rl_actor_loss = rl_actor_loss * actor_rl_scale
+            bc_lambda = self._bc_lambda()
+            with torch.no_grad():
+                bc_actions = self.bc_reference_actor(obs)
+            bc_loss = F.mse_loss(actor_actions, bc_actions)
+        actor_loss = scaled_rl_actor_loss + bc_lambda * bc_loss
+        return actor_loss, rl_actor_loss, scaled_rl_actor_loss, bc_loss, bc_lambda, actor_rl_scale
+
     def _update(self) -> None:
         batch = self.replay.sample(self.batch_size)
         obs = batch['obs'].to(self.device)
@@ -367,16 +395,7 @@ class TD3Trainer:
             self._soft_update(self.critic1, self.critic1_target)
             self._soft_update(self.critic2, self.critic2_target)
             if self.total_steps > self.actor_freeze_steps:
-                actor_actions = self.actor(obs)
-                rl_actor_loss = -self.critic1(obs, actor_actions).mean()
-                bc_lambda = 0.0
-                bc_loss = torch.zeros((), device=self.device)
-                if self.bc_reference_actor is not None:
-                    bc_lambda = self._bc_lambda()
-                    with torch.no_grad():
-                        bc_actions = self.bc_reference_actor(obs)
-                    bc_loss = F.mse_loss(actor_actions, bc_actions)
-                actor_loss = rl_actor_loss + bc_lambda * bc_loss
+                actor_loss, rl_actor_loss, scaled_rl_actor_loss, bc_loss, bc_lambda, actor_rl_scale = self._compute_actor_loss_terms(obs)
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 if self.actor_grad_clip_norm is not None and self.actor_grad_clip_norm > 0.0:
@@ -388,6 +407,8 @@ class TD3Trainer:
                 self._soft_update(self.actor, self.actor_target)
                 self.metrics.actor_loss = float(actor_loss.item())
                 self.metrics.rl_actor_loss = float(rl_actor_loss.item())
+                self.metrics.scaled_rl_actor_loss = float(scaled_rl_actor_loss.item())
+                self.metrics.actor_rl_scale = float(actor_rl_scale)
                 self.metrics.bc_loss = float(bc_loss.item())
                 self.metrics.bc_lambda = float(bc_lambda)
 

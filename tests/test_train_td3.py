@@ -68,6 +68,16 @@ class _DummyCritic(torch.nn.Module):
         return self.linear(torch.cat([obs, action], dim=-1))
 
 
+class _ConstantCritic(torch.nn.Module):
+    def __init__(self, value: float) -> None:
+        super().__init__()
+        self.value = float(value)
+
+    def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        del action
+        return torch.full((obs.shape[0], 1), self.value, dtype=obs.dtype, device=obs.device)
+
+
 class TestTrainTD3Helpers(unittest.TestCase):
     def test_parser_accepts_snn_backend(self):
         parser = build_parser()
@@ -87,6 +97,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(cfg.training.actor_grad_clip_norm, 1.0)
         self.assertGreater(cfg.rewards.timeout_penalty, 1500.0)
         self.assertEqual(cfg.rewards.timeout_penalty, 2500.0)
+        self.assertEqual(cfg.training.actor_rl_scale_alpha, 2.5)
 
     def test_ann_default_actor_freeze_steps_is_5000(self):
         parser = build_parser()
@@ -187,6 +198,91 @@ class TestTrainTD3Helpers(unittest.TestCase):
 
         clip_mock.assert_called_once()
         self.assertEqual(clip_mock.call_args.kwargs['max_norm'], 1.0)
+
+    def test_actor_loss_uses_scaled_rl_term_with_bc_reference(self):
+        trainer = TD3Trainer(
+            env=_OneStepEnv(),
+            actor=_DummyActor(),
+            critic1=_ConstantCritic(10.0),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=2,
+            warmup_steps=0,
+            exploration_noise=0.01,
+            success_sample_bias=1.0,
+            actor_rl_scale_alpha=2.5,
+            bc_reference_actor=_DummyActor(),
+        )
+        trainer.total_steps = 20_000
+        obs = torch.zeros((2, 4), dtype=torch.float32)
+
+        actor_loss, rl_actor_loss, scaled_rl_actor_loss, bc_loss, bc_lambda, actor_rl_scale = trainer._compute_actor_loss_terms(obs)
+
+        self.assertAlmostEqual(rl_actor_loss.item(), -10.0)
+        self.assertAlmostEqual(actor_rl_scale, 0.25)
+        self.assertAlmostEqual(scaled_rl_actor_loss.item(), -2.5)
+        self.assertAlmostEqual(actor_loss.item(), scaled_rl_actor_loss.item() + bc_lambda * bc_loss.item(), places=6)
+
+    def test_actor_loss_without_bc_reference_stays_raw_rl_loss(self):
+        trainer = TD3Trainer(
+            env=_OneStepEnv(),
+            actor=_DummyActor(),
+            critic1=_ConstantCritic(8.0),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=2,
+            warmup_steps=0,
+            exploration_noise=0.01,
+            success_sample_bias=1.0,
+            actor_rl_scale_alpha=2.5,
+        )
+        obs = torch.zeros((2, 4), dtype=torch.float32)
+
+        actor_loss, rl_actor_loss, scaled_rl_actor_loss, bc_loss, bc_lambda, actor_rl_scale = trainer._compute_actor_loss_terms(obs)
+
+        self.assertAlmostEqual(rl_actor_loss.item(), -8.0)
+        self.assertAlmostEqual(scaled_rl_actor_loss.item(), rl_actor_loss.item())
+        self.assertEqual(actor_rl_scale, 1.0)
+        self.assertEqual(bc_lambda, 0.0)
+        self.assertAlmostEqual(bc_loss.item(), 0.0)
+        self.assertAlmostEqual(actor_loss.item(), rl_actor_loss.item())
+
+    def test_metrics_include_scaled_rl_fields(self):
+        metrics = TD3Trainer(
+            env=_OneStepEnv(),
+            actor=_DummyActor(),
+            critic1=_DummyCritic(),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=2,
+            warmup_steps=0,
+            exploration_noise=0.01,
+            success_sample_bias=1.0,
+        ).metrics.to_dict()
+
+        self.assertIn('scaled_rl_actor_loss', metrics)
+        self.assertIn('actor_rl_scale', metrics)
 
     def test_true_early_stop_sets_early_stopped(self):
         trainer = TD3Trainer(

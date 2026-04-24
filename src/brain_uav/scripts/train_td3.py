@@ -511,6 +511,7 @@ def main() -> None:
         near_goal_sample_bias=cfg.training.near_goal_sample_bias,
         actor_freeze_steps=cfg.training.actor_freeze_steps,
         actor_grad_clip_norm=cfg.training.actor_grad_clip_norm,
+        actor_rl_scale_alpha=cfg.training.actor_rl_scale_alpha,
         critic_grad_clip_norm=cfg.training.critic_grad_clip_norm,
         warmup_strategy='random',
         device=cfg.training.device,
@@ -567,6 +568,9 @@ def main() -> None:
     metrics_dict['bc_lambda'] = trainer.metrics.bc_lambda
     metrics_dict['bc_loss'] = trainer.metrics.bc_loss
     metrics_dict['rl_actor_loss'] = trainer.metrics.rl_actor_loss
+    metrics_dict['scaled_rl_actor_loss'] = trainer.metrics.scaled_rl_actor_loss
+    metrics_dict['actor_rl_scale'] = trainer.metrics.actor_rl_scale
+    metrics_dict['actor_rl_scale_alpha'] = cfg.training.actor_rl_scale_alpha
     metrics_dict['total_actor_loss'] = trainer.metrics.actor_loss
     metrics_dict['early_stop_enabled'] = bool(args.early_stop_enabled and args.summary_every_episodes > 0)
     metrics_dict['early_stop_goal_rate'] = args.early_stop_goal_rate
