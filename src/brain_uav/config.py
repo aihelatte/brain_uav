@@ -64,7 +64,7 @@ class RewardConfig:
     collision_penalty: float = 6000.0
     step_penalty: float = 3.0
     boundary_penalty: float = 6000.0
-    timeout_penalty: float = 1500.0
+    timeout_penalty: float = 2500.0
     breakthrough_reward_distance: float = 220.0
     breakthrough_progress_threshold: float = 22.0
     breakthrough_reward_weight: float = 0.35
@@ -88,8 +88,9 @@ class TrainingConfig:
     replay_size: int = 100_000
     warmup_steps: int = 256
     actor_freeze_steps: int = 5_000
-    success_sample_bias: float = 2.5
+    success_sample_bias: float = 4.0
     near_goal_sample_bias: float = 1.0
+    actor_grad_clip_norm: float | None = 1.0
     bc_epochs: int = 10
     snn_time_window: int = 4
     snn_backend: str = 'torch'

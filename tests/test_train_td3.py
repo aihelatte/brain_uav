@@ -1,6 +1,7 @@
 """Tests for TD3 script helpers."""
 
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -79,6 +80,14 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(args.early_stop_goal_rate, 0.95)
         self.assertEqual(args.early_stop_min_steps, 12000)
 
+    def test_training_config_defaults_raise_timeout_and_success_bias(self):
+        cfg = ExperimentConfig()
+
+        self.assertEqual(cfg.training.success_sample_bias, 4.0)
+        self.assertEqual(cfg.training.actor_grad_clip_norm, 1.0)
+        self.assertGreater(cfg.rewards.timeout_penalty, 1500.0)
+        self.assertEqual(cfg.rewards.timeout_penalty, 2500.0)
+
     def test_ann_default_actor_freeze_steps_is_5000(self):
         parser = build_parser()
         args = parser.parse_args(['--model', 'ann', '--curriculum-level', 'easy'])
@@ -145,6 +154,39 @@ class TestTrainTD3Helpers(unittest.TestCase):
         for steps, value in expected.items():
             trainer.total_steps = steps
             self.assertEqual(trainer._bc_lambda(), value)
+
+    def test_actor_grad_clip_is_used_in_actor_update(self):
+        trainer = TD3Trainer(
+            env=_OneStepEnv(),
+            actor=_DummyActor(),
+            critic1=_DummyCritic(),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=1,
+            replay_size=32,
+            batch_size=2,
+            warmup_steps=0,
+            exploration_noise=0.01,
+            success_sample_bias=1.0,
+            actor_freeze_steps=0,
+            actor_grad_clip_norm=1.0,
+        )
+        obs = np.zeros(4, dtype=np.float32)
+        action = np.zeros(2, dtype=np.float32)
+        trainer.replay.add(obs, action, 1.0, obs, False)
+        trainer.replay.add(obs + 1.0, action, 1.0, obs + 1.0, True)
+        trainer.total_steps = 1
+
+        with mock.patch('torch.nn.utils.clip_grad_norm_') as clip_mock:
+            trainer._update()
+
+        clip_mock.assert_called_once()
+        self.assertEqual(clip_mock.call_args.kwargs['max_norm'], 1.0)
 
     def test_true_early_stop_sets_early_stopped(self):
         trainer = TD3Trainer(

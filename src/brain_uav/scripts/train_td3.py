@@ -442,7 +442,7 @@ def apply_model_training_overrides(cfg: ExperimentConfig, args: argparse.Namespa
         if args.curriculum_level == 'hard':
             cfg.training.actor_lr *= 0.75
             cfg.training.critic_lr *= 0.85
-            cfg.training.success_sample_bias = 5.0
+            cfg.training.success_sample_bias = 4.0
         return
 
     if args.actor_freeze_steps is not None:
@@ -510,6 +510,7 @@ def main() -> None:
         success_sample_bias=cfg.training.success_sample_bias,
         near_goal_sample_bias=cfg.training.near_goal_sample_bias,
         actor_freeze_steps=cfg.training.actor_freeze_steps,
+        actor_grad_clip_norm=cfg.training.actor_grad_clip_norm,
         critic_grad_clip_norm=cfg.training.critic_grad_clip_norm,
         warmup_strategy='random',
         device=cfg.training.device,
@@ -556,6 +557,7 @@ def main() -> None:
     metrics_dict['log_dir'] = str(log_dir)
     metrics_dict['results_dir'] = str(results_dir)
     metrics_dict['actor_freeze_steps'] = cfg.training.actor_freeze_steps
+    metrics_dict['actor_grad_clip_norm'] = cfg.training.actor_grad_clip_norm
     metrics_dict['critic_grad_clip_norm'] = cfg.training.critic_grad_clip_norm
     metrics_dict['exploration_noise_current'] = trainer.exploration_noise_current
     metrics_dict['policy_noise_current'] = trainer.policy_noise_current

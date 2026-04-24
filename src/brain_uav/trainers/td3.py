@@ -77,6 +77,7 @@ class TD3Trainer:
         success_sample_bias: float,
         near_goal_sample_bias: float = 1.0,
         actor_freeze_steps: int = 0,
+        actor_grad_clip_norm: float | None = None,
         critic_grad_clip_norm: float | None = None,
         warmup_strategy: str = 'random',
         device: str = 'cpu',
@@ -103,6 +104,7 @@ class TD3Trainer:
         self.warmup_steps = warmup_steps
         self.exploration_noise = exploration_noise
         self.actor_freeze_steps = actor_freeze_steps
+        self.actor_grad_clip_norm = actor_grad_clip_norm
         self.critic_grad_clip_norm = critic_grad_clip_norm
         self.success_sample_bias = success_sample_bias
         self.exploration_noise_base = exploration_noise
@@ -377,6 +379,11 @@ class TD3Trainer:
                 actor_loss = rl_actor_loss + bc_lambda * bc_loss
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
+                if self.actor_grad_clip_norm is not None and self.actor_grad_clip_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(
+                        self.actor.parameters(),
+                        max_norm=self.actor_grad_clip_norm,
+                    )
                 self.actor_optimizer.step()
                 self._soft_update(self.actor, self.actor_target)
                 self.metrics.actor_loss = float(actor_loss.item())
