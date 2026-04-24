@@ -6,7 +6,8 @@ import torch
 
 from brain_uav.config import ScenarioConfig
 from brain_uav.models import ANNPolicyActor, FixedObsScaler, SNNPolicyActor
-from brain_uav.models.snn import HAS_SPIKINGJELLY
+from brain_uav.models.snn import HAS_SPIKINGJELLY, validate_snn_backend
+from brain_uav.scripts.common import build_log_prefix
 
 
 class TestModelUtilities(unittest.TestCase):
@@ -46,6 +47,13 @@ class TestModelUtilities(unittest.TestCase):
         actor = ANNPolicyActor(self.state_dim, 2, 32, self.action_limit, self.scenario)
         action = actor(self.obs)
         self.assertEqual(action.shape, (4, 2))
+
+    def test_snn_backend_validation_for_torch(self):
+        self.assertEqual(validate_snn_backend('torch'), 'torch')
+
+    def test_log_prefix_format(self):
+        self.assertEqual(build_log_prefix('ann', 'easy'), '[ANN easy]')
+        self.assertEqual(build_log_prefix('snn', 'bc'), '[SNN bc]')
 
 
 if __name__ == '__main__':

@@ -18,6 +18,19 @@ except ImportError:
     surrogate = None
 
 
+def validate_snn_backend(backend: str) -> str:
+    if backend not in {'torch', 'cupy'}:
+        raise ValueError(f'Unsupported SNN backend: {backend}')
+    if backend == 'cupy':
+        if not HAS_SPIKINGJELLY:
+            raise RuntimeError('SNN backend "cupy" requires SpikingJelly to be installed.')
+        try:
+            import cupy  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError('SNN backend "cupy" was requested, but CuPy is not installed.') from exc
+    return backend
+
+
 class FallbackLIFLayer(nn.Module):
     """A tiny differentiable LIF approximation used only as fallback."""
 
@@ -52,6 +65,7 @@ class SNNPolicyActor(nn.Module):
         hidden_dim: int,
         time_window: int,
         action_limit: torch.Tensor,
+        backend: str = 'torch',
     ) -> None:
         super().__init__()
         self.fc1 = nn.Linear(state_dim, hidden_dim)
@@ -61,9 +75,20 @@ class SNNPolicyActor(nn.Module):
         self.hidden_dim = hidden_dim
         self.action_dim = action_dim
         self.state_dim = state_dim
+        self.backend = validate_snn_backend(backend)
         if HAS_SPIKINGJELLY:
-            self.lif1 = neuron.LIFNode(tau=2.0, surrogate_function=surrogate.ATan(), step_mode='m')
-            self.lif2 = neuron.LIFNode(tau=2.0, surrogate_function=surrogate.ATan(), step_mode='m')
+            self.lif1 = neuron.LIFNode(
+                tau=2.0,
+                surrogate_function=surrogate.ATan(),
+                step_mode='m',
+                backend=self.backend,
+            )
+            self.lif2 = neuron.LIFNode(
+                tau=2.0,
+                surrogate_function=surrogate.ATan(),
+                step_mode='m',
+                backend=self.backend,
+            )
         else:
             self.lif1 = FallbackLIFLayer()
             self.lif2 = FallbackLIFLayer()
@@ -100,7 +125,7 @@ class SNNPolicyActor(nn.Module):
         )
         effective_macs *= float(self.time_window)
         diagnostics = {
-            'backend': 'spikingjelly' if HAS_SPIKINGJELLY else 'fallback',
+            'backend': self.backend if HAS_SPIKINGJELLY else 'fallback',
             'time_window': float(self.time_window),
             'spike_rate_l1': float((spike_sum1 / self.time_window).mean().detach().cpu()),
             'spike_rate_l2': float((spike_sum2 / self.time_window).mean().detach().cpu()),

@@ -10,7 +10,13 @@ from pathlib import Path
 import numpy as np
 
 from ..config import ExperimentConfig
-from ..scripts.common import make_actor
+from ..scripts.common import (
+    DEVICE_CHOICES,
+    SNN_BACKEND_CHOICES,
+    build_log_prefix,
+    configure_training_runtime,
+    make_actor,
+)
 from ..trainers import train_behavior_cloning
 from ..utils.io import (
     build_log_paths,
@@ -34,6 +40,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--best-output', type=Path, default=None)
     parser.add_argument('--metrics-out', type=Path, default=None)
     parser.add_argument('--log-root', type=Path, default=None)
+    parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
+    parser.add_argument('--snn-backend', choices=SNN_BACKEND_CHOICES, default='torch')
     return parser
 
 
@@ -79,6 +87,13 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = ExperimentConfig()
+    resolved_device = configure_training_runtime(
+        cfg,
+        model_type=args.model,
+        device=args.device,
+        snn_backend=args.snn_backend,
+    )
+    log_prefix = build_log_prefix(args.model, 'bc')
     data = np.load(args.dataset)
     dataset_version = str(data['dataset_version']) if 'dataset_version' in data else 'unknown'
     dataset_config = json.loads(str(data['config_json'])) if 'config_json' in data else None
@@ -140,6 +155,7 @@ def main() -> None:
         lr=cfg.training.actor_lr,
         device=cfg.training.device,
         epoch_end_callback=save_best_checkpoint,
+        log_prefix=log_prefix,
     )
 
     recorded_best_loss = None if best_epoch < 0 else best_loss
@@ -175,6 +191,8 @@ def main() -> None:
             'best_output': str(best_output),
             'finished_at': finished_at,
             'log_dir': str(log_dir),
+            'device': resolved_device,
+            'snn_backend': cfg.training.snn_backend if args.model == 'snn' else None,
             'dataset_path': str(args.dataset),
             'dataset_version': dataset_version,
             'curriculum_level': curriculum_level,
@@ -182,11 +200,11 @@ def main() -> None:
             'init_checkpoint': str(args.init_checkpoint) if args.init_checkpoint else None,
         },
     )
-    print(f'Saved BC checkpoint to {output}')
-    print(f'Saved BC best checkpoint to {best_output}')
-    print(f'Saved BC metrics to {metrics_out}')
-    print(f'BC dataset version: {dataset_version}, curriculum={curriculum_level}')
-    print(f'Final BC loss: {history[-1]:.6f}')
+    print(f'{log_prefix} saved checkpoint to {output}')
+    print(f'{log_prefix} saved best checkpoint to {best_output}')
+    print(f'{log_prefix} saved metrics to {metrics_out}')
+    print(f'{log_prefix} dataset version={dataset_version} curriculum={curriculum_level} device={resolved_device}')
+    print(f'{log_prefix} final loss={history[-1]:.6f}')
 
 
 if __name__ == '__main__':

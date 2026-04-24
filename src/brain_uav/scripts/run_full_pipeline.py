@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..curriculum import CURRICULUM_LEVELS
+from ..scripts.common import DEVICE_CHOICES, SNN_BACKEND_CHOICES, build_log_prefix
 from ..scripts.generate_dataset import DATASET_VERSION
 from ..utils.io import ensure_dir, save_json
 
@@ -35,6 +36,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--max-stage', choices=list(CURRICULUM_LEVELS), default='hard')
     parser.add_argument('--output-root', type=Path, default=Path('outputs/full_run'))
+    parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
+    parser.add_argument('--snn-backend', choices=SNN_BACKEND_CHOICES, default='torch')
     return parser
 
 
@@ -115,9 +118,13 @@ def run_full_pipeline(args: argparse.Namespace) -> dict:
         'run_root': str(layout.root),
         'timesteps_source': 'train_td3 defaults',
         'dataset_version': DATASET_VERSION,
+        'device': args.device,
+        'snn_backend': args.snn_backend if args.model == 'snn' else None,
     }
 
     dataset_path = layout.data_dir / f'bc_dataset_easy_{DATASET_VERSION}.npz'
+    data_prefix = build_log_prefix(args.model, 'data')
+    print(f'{data_prefix} starting dataset generation')
     run_command(
         [
             sys.executable,
@@ -133,11 +140,14 @@ def run_full_pipeline(args: argparse.Namespace) -> dict:
         cwd=project_root,
         env=env,
     )
+    print(f'{data_prefix} dataset saved to {dataset_path}')
     report['dataset_path'] = str(dataset_path)
 
     bc_output = layout.models_dir / f'bc_{args.model}_final.pt'
     bc_best_output = layout.models_dir / f'bc_{args.model}_best.pt'
     bc_log_root = layout.logs_dir / 'bc'
+    bc_prefix = build_log_prefix(args.model, 'bc')
+    print(f'{bc_prefix} starting BC training')
     run_command(
         [
             sys.executable,
@@ -155,11 +165,16 @@ def run_full_pipeline(args: argparse.Namespace) -> dict:
             f'bc_{args.model}_metrics.json',
             '--log-root',
             str(bc_log_root),
+            '--device',
+            args.device,
+            '--snn-backend',
+            args.snn_backend,
         ],
         cwd=project_root,
         env=env,
     )
     bc_metrics = find_latest_metrics_file(bc_log_root, f'bc_{args.model}_metrics.json')
+    print(f'{bc_prefix} finished BC training best_checkpoint={bc_best_output}')
     report['bc'] = {
         'final_checkpoint': str(bc_output),
         'best_checkpoint': str(bc_best_output),
@@ -172,6 +187,8 @@ def run_full_pipeline(args: argparse.Namespace) -> dict:
         stage_output = layout.models_dir / f'td3_{args.model}_{stage}.pt'
         stage_log_root = layout.logs_dir / 'td3' / stage
         metrics_name = f'td3_{args.model}_{stage}_metrics.json'
+        stage_prefix = build_log_prefix(args.model, stage)
+        print(f'{stage_prefix} starting TD3 stage')
         run_command(
             [
                 sys.executable,
@@ -192,12 +209,27 @@ def run_full_pipeline(args: argparse.Namespace) -> dict:
                 '--seed',
                 str(args.seed),
                 '--early-stop-enabled',
+                '--summary-every-episodes',
+                '15',
+                '--early-stop-windows',
+                '4',
+                '--early-stop-max-failures-per-window',
+                '1',
+                '--early-stop-goal-rate',
+                '0.95',
+                '--early-stop-min-steps',
+                '12000',
+                '--device',
+                args.device,
+                '--snn-backend',
+                args.snn_backend,
             ],
             cwd=project_root,
             env=env,
         )
         metrics_path = find_latest_metrics_file(stage_log_root, metrics_name)
         metrics_payload = ensure_stage_stopped_early(metrics_path, stage)
+        print(f'{stage_prefix} finished TD3 stage stop_reason={metrics_payload.get("stop_reason")}')
         stage_reports.append(
             {
                 'stage': stage,

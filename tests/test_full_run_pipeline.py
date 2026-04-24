@@ -12,6 +12,7 @@ from brain_uav.scripts.run_full_pipeline import (
     build_parser,
     create_full_run_layout,
     ensure_stage_stopped_early,
+    run_full_pipeline,
     main,
 )
 
@@ -51,6 +52,42 @@ class TestFullRunPipeline(unittest.TestCase):
             with self.assertRaises(SystemExit) as ctx:
                 main(['--model', 'ann'])
         self.assertEqual(ctx.exception.code, 1)
+
+    def test_run_full_pipeline_passes_device_and_early_stop_args(self):
+        parser = build_parser()
+        args = parser.parse_args(['--model', 'snn', '--device', 'cuda', '--snn-backend', 'cupy'])
+        command_calls: list[list[str]] = []
+
+        def fake_run_command(command: list[str], *, cwd: Path, env: dict[str, str]) -> None:
+            command_calls.append(command)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args.output_root = Path(tmpdir)
+            with mock.patch('brain_uav.scripts.run_full_pipeline.run_command', side_effect=fake_run_command):
+                with mock.patch(
+                    'brain_uav.scripts.run_full_pipeline.find_latest_metrics_file',
+                    return_value=Path(tmpdir) / 'metrics.json',
+                ):
+                    with mock.patch(
+                        'brain_uav.scripts.run_full_pipeline.ensure_stage_stopped_early',
+                        return_value={'stopped_early': True, 'stop_reason': 'ok'},
+                    ):
+                        with mock.patch('brain_uav.scripts.run_full_pipeline.save_json'):
+                            run_full_pipeline(args)
+
+        bc_command = next(cmd for cmd in command_calls if 'brain_uav.scripts.train_bc' in cmd)
+        td3_command = next(cmd for cmd in command_calls if 'brain_uav.scripts.train_td3' in cmd)
+        self.assertIn('--device', bc_command)
+        self.assertIn('cuda', bc_command)
+        self.assertIn('--snn-backend', bc_command)
+        self.assertIn('cupy', bc_command)
+        self.assertIn('--device', td3_command)
+        self.assertIn('--summary-every-episodes', td3_command)
+        self.assertIn('15', td3_command)
+        self.assertIn('--early-stop-max-failures-per-window', td3_command)
+        self.assertIn('1', td3_command)
+        self.assertIn('--early-stop-goal-rate', td3_command)
+        self.assertIn('0.95', td3_command)
 
 
 if __name__ == '__main__':

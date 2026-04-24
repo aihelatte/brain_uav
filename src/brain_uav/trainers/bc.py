@@ -23,6 +23,7 @@ def train_behavior_cloning(
     device: str = "cpu",
     verbose: bool = True,
     epoch_end_callback: Callable[[int, float, list[float], nn.Module], None] | None = None,
+    log_prefix: str = '[BC]',
 ) -> list[float]:
     """Train actor by supervised learning on (state, action) pairs."""
 
@@ -35,7 +36,7 @@ def train_behavior_cloning(
     criterion = nn.MSELoss()
     history: list[float] = []
     if verbose:
-        print(f"[BC] dataset={dataset_path} samples={len(obs)} batch_size={batch_size} epochs={epochs}")
+        print(f"{log_prefix} dataset={dataset_path} samples={len(obs)} batch_size={batch_size} epochs={epochs}")
     for epoch_idx in range(epochs):
         running = 0.0
         count = 0
@@ -54,6 +55,6 @@ def train_behavior_cloning(
         if epoch_end_callback is not None:
             epoch_end_callback(epoch_idx + 1, epoch_loss, history, actor)
         if verbose:
-            print(f"[BC] epoch {epoch_idx + 1}/{epochs} loss={epoch_loss:.6f}")
+            print(f"{log_prefix} epoch {epoch_idx + 1}/{epochs} loss={epoch_loss:.6f}")
     actor.to("cpu")
     return history

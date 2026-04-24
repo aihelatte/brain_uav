@@ -14,8 +14,12 @@ from brain_uav.utils.io import load_checkpoint, save_checkpoint
 class TestTrainBCHelpers(unittest.TestCase):
     def test_best_output_argument_is_parsed(self):
         parser = build_parser()
-        args = parser.parse_args(['--dataset', 'data/demo.npz', '--best-output', 'models/best.pt'])
+        args = parser.parse_args(
+            ['--dataset', 'data/demo.npz', '--best-output', 'models/best.pt', '--device', 'cuda', '--snn-backend', 'cupy']
+        )
         self.assertEqual(args.best_output, Path('models/best.pt'))
+        self.assertEqual(args.device, 'cuda')
+        self.assertEqual(args.snn_backend, 'cupy')
 
     def test_checkpoint_payload_records_best_fields(self):
         cfg = ExperimentConfig()

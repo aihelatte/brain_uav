@@ -14,6 +14,48 @@ from ..models import ANNCritic, ANNPolicyActor, SNNPolicyActor
 from ..scenarios import build_benchmark_scenarios
 
 
+DEVICE_CHOICES = ('auto', 'cpu', 'cuda')
+SNN_BACKEND_CHOICES = ('torch', 'cupy')
+
+
+def build_log_prefix(model_type: str, stage: str) -> str:
+    return f'[{model_type.upper()} {stage}]'
+
+
+def resolve_training_device(device: str) -> str:
+    if device == 'auto':
+        resolved = 'cuda' if torch.cuda.is_available() else 'cpu'
+    elif device == 'cuda':
+        if not torch.cuda.is_available():
+            raise RuntimeError('CUDA was requested but torch.cuda.is_available() is False.')
+        resolved = 'cuda'
+    elif device == 'cpu':
+        resolved = 'cpu'
+    else:
+        raise ValueError(f'Unsupported device: {device}')
+    if resolved == 'cuda':
+        torch.set_num_threads(2)
+    return resolved
+
+
+def configure_training_runtime(
+    cfg: ExperimentConfig,
+    *,
+    model_type: str,
+    device: str,
+    snn_backend: str,
+) -> str:
+    resolved_device = resolve_training_device(device)
+    cfg.training.device = resolved_device
+    if model_type == 'snn':
+        if snn_backend not in SNN_BACKEND_CHOICES:
+            raise ValueError(f'Unsupported snn_backend: {snn_backend}')
+        if snn_backend == 'cupy' and resolved_device != 'cuda':
+            raise RuntimeError('SNN CuPy backend requires device=cuda.')
+        cfg.training.snn_backend = snn_backend
+    return resolved_device
+
+
 def make_env(
     cfg: ExperimentConfig,
     seed: int | None = None,
@@ -53,7 +95,12 @@ def make_actor(cfg: ExperimentConfig, model_type: str, state_dim: int, action_di
     )
     if model_type == 'snn':
         return SNNPolicyActor(
-            state_dim, action_dim, cfg.training.hidden_dim, cfg.training.snn_time_window, action_limit
+            state_dim,
+            action_dim,
+            cfg.training.hidden_dim,
+            cfg.training.snn_time_window,
+            action_limit,
+            backend=cfg.training.snn_backend,
         )
     if model_type == 'ann':
         return ANNPolicyActor(state_dim, action_dim, cfg.training.hidden_dim, action_limit, cfg.scenario)

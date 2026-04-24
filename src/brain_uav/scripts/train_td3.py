@@ -9,7 +9,15 @@ from typing import Any, Callable
 
 from ..config import ExperimentConfig
 from ..curriculum import describe_curriculum_mix, parse_curriculum_mix
-from ..scripts.common import make_actor, make_critics, make_env
+from ..scripts.common import (
+    DEVICE_CHOICES,
+    SNN_BACKEND_CHOICES,
+    build_log_prefix,
+    configure_training_runtime,
+    make_actor,
+    make_critics,
+    make_env,
+)
 from ..trainers import TD3Trainer
 from ..utils.io import (
     build_log_paths,
@@ -302,38 +310,62 @@ def make_episode_capture_callback(
     return callback
 
 
+def is_qualified_early_stop_window(
+    window_row: dict[str, Any],
+    *,
+    goal_rate_threshold: float,
+    max_failures_per_window: int,
+) -> tuple[bool, dict[str, float]]:
+    episode_count = max(int(window_row.get('episode_count', 0)), 1)
+    goal_count = int(window_row.get('goal_count', 0))
+    failures = episode_count - goal_count
+    goal_rate = float(goal_count) / episode_count
+    qualified = failures <= max_failures_per_window or goal_rate >= goal_rate_threshold
+    return qualified, {
+        'episode_count': float(episode_count),
+        'goal_count': float(goal_count),
+        'failures': float(failures),
+        'goal_rate': goal_rate,
+    }
+
+
 def make_early_stop_callback(
     enabled: bool,
     goal_rate_threshold: float,
     consecutive_windows: int,
     min_steps: int,
+    max_failures_per_window: int,
 ) -> Callable[[dict[str, Any]], str | None] | None:
     if not enabled:
         return None
 
-    recent_goal_rates: list[float] = []
+    consecutive_qualified = 0
 
     def callback(window_row: dict[str, Any]) -> str | None:
-        episode_count = max(int(window_row.get('episode_count', 0)), 1)
-        goal_rate = float(window_row.get('goal_count', 0)) / episode_count
-        recent_goal_rates.append(goal_rate)
-        if len(recent_goal_rates) > consecutive_windows:
-            recent_goal_rates.pop(0)
+        nonlocal consecutive_qualified
+        qualified, stats = is_qualified_early_stop_window(
+            window_row,
+            goal_rate_threshold=goal_rate_threshold,
+            max_failures_per_window=max_failures_per_window,
+        )
+        if qualified:
+            consecutive_qualified += 1
+        else:
+            consecutive_qualified = 0
         if int(window_row.get('total_steps', 0)) < min_steps:
             return None
-        if len(recent_goal_rates) < consecutive_windows:
+        if consecutive_qualified < consecutive_windows:
             return None
-        if all(rate >= goal_rate_threshold for rate in recent_goal_rates):
-            return (
-                f"goal_rate>={goal_rate_threshold:.2f} for {consecutive_windows} consecutive windows after "
-                f"min_steps={min_steps} (latest={goal_rate:.2f})"
-            )
-        return None
+        return (
+            f'qualified_windows={consecutive_qualified}/{consecutive_windows} after min_steps={min_steps} '
+            f"(failures={int(stats['failures'])}, goal_rate={stats['goal_rate']:.2f}, "
+            f'failures_limit={max_failures_per_window}, goal_rate_threshold={goal_rate_threshold:.2f})'
+        )
 
     return callback
 
 
-def load_training_state(init_checkpoint: Path | None, actor, critic1, critic2, trainer) -> str:
+def load_training_state(init_checkpoint: Path | None, actor, critic1, critic2, trainer, log_prefix: str) -> str:
     """Restore checkpoint according to whether it is BC or TD3."""
 
     if init_checkpoint is None:
@@ -344,7 +376,7 @@ def load_training_state(init_checkpoint: Path | None, actor, critic1, critic2, t
     has_critics = 'critic1_state_dict' in checkpoint and 'critic2_state_dict' in checkpoint
     if not has_critics:
         trainer.actor_target.load_state_dict(checkpoint['state_dict'])
-        print('Loaded Actor only from BC checkpoint; critics are randomly initialized.')
+        print(f'{log_prefix} loaded actor-only BC checkpoint; critics are randomly initialized.')
         return 'policy'
 
     critic1.load_state_dict(checkpoint['critic1_state_dict'])
@@ -365,11 +397,11 @@ def load_training_state(init_checkpoint: Path | None, actor, critic1, critic2, t
         trainer.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
     if 'critic_optimizer_state_dict' in checkpoint:
         trainer.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
-    print('Loaded Actor and Twin Critics from TD3 checkpoint for curriculum continuation.')
+    print(f'{log_prefix} loaded actor and twin critics from TD3 checkpoint for continuation.')
     return 'policy'
 
 
-def main() -> None:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Train the TD3 curriculum policy stage by stage.')
     parser.add_argument('--model', choices=['snn', 'ann'], default='snn')
     parser.add_argument('--timesteps', type=int, default=None)
@@ -381,19 +413,34 @@ def main() -> None:
     parser.add_argument('--output', type=Path, default=None)
     parser.add_argument('--metrics-out', type=Path, default=None)
     parser.add_argument('--log-root', type=Path, default=None)
-    parser.add_argument('--summary-every-episodes', type=int, default=50)
+    parser.add_argument('--summary-every-episodes', type=int, default=15)
     parser.add_argument('--actor-freeze-steps', type=int, default=None)
     parser.add_argument('--critic-grad-clip-norm', type=float, default=None)
-    parser.add_argument('--early-stop-enabled', action='store_true')
-    parser.add_argument('--early-stop-goal-rate', type=float, default=0.94)
-    parser.add_argument('--early-stop-windows', type=int, default=5)
-    parser.add_argument('--early-stop-min-steps', type=int, default=120000)
+    parser.add_argument('--early-stop-enabled', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--early-stop-goal-rate', type=float, default=0.95)
+    parser.add_argument('--early-stop-windows', type=int, default=4)
+    parser.add_argument('--early-stop-max-failures-per-window', type=int, default=1)
+    parser.add_argument('--early-stop-min-steps', type=int, default=12000)
+    parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
+    parser.add_argument('--snn-backend', choices=SNN_BACKEND_CHOICES, default='torch')
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
     args = parser.parse_args()
 
     if args.timesteps is None:
         args.timesteps = 300000 if args.curriculum_level == 'hard' else 200000
 
     cfg = ExperimentConfig()
+    resolved_device = configure_training_runtime(
+        cfg,
+        model_type=args.model,
+        device=args.device,
+        snn_backend=args.snn_backend,
+    )
+    log_prefix = build_log_prefix(args.model, args.curriculum_level)
 
     if args.model == 'ann':
         # Use more conservative defaults for ANN to avoid late-training collapse.
@@ -465,7 +512,7 @@ def main() -> None:
         curriculum_level=args.curriculum_level,
     )
     init_checkpoint = args.init_checkpoint or args.bc_checkpoint
-    trainer.warmup_strategy = load_training_state(init_checkpoint, actor, critic1, critic2, trainer)
+    trainer.warmup_strategy = load_training_state(init_checkpoint, actor, critic1, critic2, trainer, log_prefix)
 
     if init_checkpoint is not None and args.curriculum_level == 'easy':
         checkpoint = load_checkpoint(init_checkpoint)
@@ -487,6 +534,7 @@ def main() -> None:
         goal_rate_threshold=args.early_stop_goal_rate,
         consecutive_windows=args.early_stop_windows,
         min_steps=args.early_stop_min_steps,
+        max_failures_per_window=args.early_stop_max_failures_per_window,
     )
     metrics = trainer.train(
         args.timesteps,
@@ -495,6 +543,7 @@ def main() -> None:
         summary_every_episodes=args.summary_every_episodes,
         episode_callback=episode_callback,
         window_callback=early_stop_callback,
+        log_prefix=log_prefix,
     )
 
     metrics_dict = metrics.to_dict()
@@ -516,6 +565,7 @@ def main() -> None:
     metrics_dict['early_stop_enabled'] = bool(args.early_stop_enabled and args.summary_every_episodes > 0)
     metrics_dict['early_stop_goal_rate'] = args.early_stop_goal_rate
     metrics_dict['early_stop_windows'] = args.early_stop_windows
+    metrics_dict['early_stop_max_failures_per_window'] = args.early_stop_max_failures_per_window
     metrics_dict['early_stop_min_steps'] = args.early_stop_min_steps
     metrics_dict['stopped_early'] = trainer.stop_reason is not None
     metrics_dict['stop_reason'] = trainer.stop_reason
@@ -523,6 +573,8 @@ def main() -> None:
     metrics_dict['curriculum_level'] = args.curriculum_level
     metrics_dict['curriculum_mix'] = curriculum_mix
     metrics_dict['init_checkpoint'] = str(init_checkpoint) if init_checkpoint else None
+    metrics_dict['device'] = resolved_device
+    metrics_dict['snn_backend'] = cfg.training.snn_backend if args.model == 'snn' else None
 
     save_checkpoint(
         output,
@@ -547,13 +599,13 @@ def main() -> None:
         },
     )
     report_outputs = export_training_report(metrics_out, metrics_dict)
-    print(f'Saved TD3 checkpoint to {output}')
-    print(f'Curriculum level={args.curriculum_level}, mix={describe_curriculum_mix(curriculum_mix)}')
-    print(f"Episodes: {metrics.episodes}, Steps: {metrics.steps}, Critic loss: {metrics.critic_loss:.4f}")
+    print(f'{log_prefix} saved checkpoint to {output}')
+    print(f'{log_prefix} curriculum mix={describe_curriculum_mix(curriculum_mix)} device={resolved_device}')
+    print(f"{log_prefix} episodes={metrics.episodes} steps={metrics.steps} critic_loss={metrics.critic_loss:.4f}")
     if trainer.stop_reason is not None:
-        print(f"Early stop: {trainer.stop_reason}")
-    print(f'Result directory: {results_dir}')
-    print(f"Training reports: {report_outputs}")
+        print(f"{log_prefix} early stop: {trainer.stop_reason}")
+    print(f'{log_prefix} result directory: {results_dir}')
+    print(f"{log_prefix} training reports: {report_outputs}")
 
 
 if __name__ == '__main__':

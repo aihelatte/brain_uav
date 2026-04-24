@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..baselines import AStarPlanner, ArtificialPotentialFieldPlanner, HeuristicPlanner
+from ..baselines import ArtificialPotentialFieldPlanner, HeuristicPlanner
 from ..config import ExperimentConfig
 from ..curriculum import describe_curriculum_mix, parse_curriculum_mix
 from ..scripts.common import make_env
@@ -21,6 +21,10 @@ from ..utils.seeding import set_global_seed
 
 
 DATASET_VERSION = 'v6'
+
+
+def build_planners(env) -> list:
+    return [HeuristicPlanner(env), ArtificialPotentialFieldPlanner(env)]
 
 
 def collect_rollout(planner, env, max_steps: int | None = None):
@@ -53,7 +57,7 @@ def main() -> None:
     curriculum_mix = parse_curriculum_mix(args.curriculum_mix, fallback_level=args.curriculum_level)
     set_global_seed(args.seed)
     env = make_env(cfg, seed=args.seed, curriculum_level=args.curriculum_level, curriculum_mix=curriculum_mix)
-    planners = [HeuristicPlanner(env), ArtificialPotentialFieldPlanner(env), AStarPlanner(env)]
+    planners = build_planners(env)
     observations: list[np.ndarray] = []
     actions: list[np.ndarray] = []
     planner_tags: list[str] = []

@@ -137,13 +137,14 @@ class TD3Trainer:
         summary_every_episodes: int = 50,
         episode_callback: Callable[[dict[str, Any]], None] | None = None,
         window_callback: Callable[[dict[str, Any]], str | None] | None = None,
+        log_prefix: str = '[TD3]',
     ) -> TD3Metrics:
         obs, _ = self.env.reset()
         episode_return = 0.0
         episode_length = 0
         if verbose:
             print(
-                f"[TD3] start total_timesteps={total_timesteps} warmup_steps={self.warmup_steps} "
+                f"{log_prefix} start total_timesteps={total_timesteps} warmup_steps={self.warmup_steps} "
                 f"actor_freeze_steps={self.actor_freeze_steps} batch_size={self.batch_size} "
                 f"replay_size={self.replay.capacity} warmup_strategy={self.warmup_strategy} "
                 f"summary_every_episodes={summary_every_episodes}"
@@ -217,14 +218,14 @@ class TD3Trainer:
                         if stop_reason:
                             self.stop_reason = stop_reason
                             if verbose:
-                                print(f"[TD3] early stop triggered: {stop_reason}")
+                                print(f"{log_prefix} early stop triggered: {stop_reason}")
                             obs, _ = self.env.reset()
                             episode_return = 0.0
                             episode_length = 0
                             break
                 if verbose:
                     print(
-                        f"[TD3] episode={self.metrics.episodes} step={self.total_steps}/{total_timesteps} "
+                        f"{log_prefix} episode={self.metrics.episodes} step={self.total_steps}/{total_timesteps} "
                         f"return={episode_return:.2f} length={episode_length} outcome={outcome}"
                     )
                 obs, _ = self.env.reset()
@@ -234,7 +235,7 @@ class TD3Trainer:
                 avg_return = statistics.mean(self.metrics.episode_returns[-5:]) if self.metrics.episode_returns else 0.0
                 actor_phase = 'frozen' if self.total_steps <= self.actor_freeze_steps else 'active'
                 print(
-                    f"[TD3] progress={step_idx + 1}/{total_timesteps} episodes={self.metrics.episodes} "
+                    f"{log_prefix} progress={step_idx + 1}/{total_timesteps} episodes={self.metrics.episodes} "
                     f"buffer={len(self.replay)} success_frac={self.replay.success_fraction():.3f} "
                     f"actor_phase={actor_phase} actor_loss={self.metrics.actor_loss:.4f} "
                     f"critic_loss={self.metrics.critic_loss:.4f} recent_avg_return={avg_return:.2f}"
@@ -246,7 +247,7 @@ class TD3Trainer:
                 if stop_reason:
                     self.stop_reason = stop_reason
                     if verbose:
-                        print(f"[TD3] early stop triggered: {stop_reason}")
+                        print(f"{log_prefix} early stop triggered: {stop_reason}")
         self.metrics.steps = self.total_steps
         self.actor.to('cpu')
         self.critic1.to('cpu')

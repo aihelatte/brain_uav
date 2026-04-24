@@ -92,6 +92,7 @@ class TrainingConfig:
     near_goal_sample_bias: float = 1.0
     bc_epochs: int = 10
     snn_time_window: int = 4
+    snn_backend: str = 'torch'
     hidden_dim: int = 128
     critic_grad_clip_norm: float | None = None
     device: str = 'cpu'
