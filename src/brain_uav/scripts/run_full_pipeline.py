@@ -96,7 +96,7 @@ def ensure_stage_stopped_early(metrics_path: Path, stage: str) -> dict:
     import json
 
     payload = json.loads(metrics_path.read_text(encoding='utf-8'))
-    if payload.get('stopped_early') or payload.get('stop_reason'):
+    if payload.get('stopped_early') is True:
         return payload
     raise FullRunStageError(f'Stage {stage} did not stop early successfully: {metrics_path}')
 

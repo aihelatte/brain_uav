@@ -44,6 +44,16 @@ class TestFullRunPipeline(unittest.TestCase):
             with self.assertRaises(FullRunStageError):
                 ensure_stage_stopped_early(metrics_path, 'easy')
 
+    def test_stage_helper_rejects_stop_reason_without_true_early_stop(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            metrics_path = Path(tmpdir) / 'metrics.json'
+            metrics_path.write_text(
+                json.dumps({'stopped_early': False, 'stop_reason': 'final flush only'}),
+                encoding='utf-8',
+            )
+            with self.assertRaises(FullRunStageError):
+                ensure_stage_stopped_early(metrics_path, 'easy')
+
     def test_main_exits_nonzero_on_stage_failure(self):
         with mock.patch(
             'brain_uav.scripts.run_full_pipeline.run_full_pipeline',

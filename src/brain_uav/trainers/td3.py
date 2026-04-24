@@ -124,6 +124,7 @@ class TD3Trainer:
         self.action_high = torch.tensor(env.action_space.high, dtype=torch.float32, device=device)
         self._current_window: list[dict] = []
         self.stop_reason: str | None = None
+        self.early_stopped = False
         self.curriculum_level: str | None = curriculum_level
         self.bc_reference_actor: nn.Module | None = None
         if bc_reference_actor is not None:
@@ -217,6 +218,7 @@ class TD3Trainer:
                         stop_reason = window_callback(window_row)
                         if stop_reason:
                             self.stop_reason = stop_reason
+                            self.early_stopped = True
                             if verbose:
                                 print(f"{log_prefix} early stop triggered: {stop_reason}")
                             obs, _ = self.env.reset()
@@ -262,17 +264,13 @@ class TD3Trainer:
         self.metrics.bc_regularization_enabled = True
 
     def _bc_lambda(self) -> float:
-        if self.curriculum_level == 'hard':
-            if self.total_steps <= 50_000:
-                return 600.0
-            if self.total_steps <= 100_000:
-                return 150.0
-            return 20.0
-        if self.total_steps <= 50_000:
-            return 1000.0
-        if self.total_steps <= 100_000:
-            return 300.0
-        return 50.0
+        if self.total_steps < 10_000:
+            return 500.0
+        if self.total_steps < 20_000:
+            return 150.0
+        if self.total_steps < 50_000:
+            return 30.0
+        return 5.0
 
     def _current_noise(self) -> tuple[float, float, float]:
         if self.curriculum_level != 'hard':

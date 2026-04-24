@@ -567,7 +567,7 @@ def main() -> None:
     metrics_dict['early_stop_windows'] = args.early_stop_windows
     metrics_dict['early_stop_max_failures_per_window'] = args.early_stop_max_failures_per_window
     metrics_dict['early_stop_min_steps'] = args.early_stop_min_steps
-    metrics_dict['stopped_early'] = trainer.stop_reason is not None
+    metrics_dict['stopped_early'] = trainer.early_stopped
     metrics_dict['stop_reason'] = trainer.stop_reason
     metrics_dict['success_sample_bias'] = cfg.training.success_sample_bias
     metrics_dict['curriculum_level'] = args.curriculum_level
