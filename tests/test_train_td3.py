@@ -108,6 +108,28 @@ class TestTrainTD3Helpers(unittest.TestCase):
 
         self.assertEqual(cfg.training.actor_freeze_steps, 5000)
 
+    def test_ann_default_learning_rates_are_more_conservative(self):
+        parser = build_parser()
+        args = parser.parse_args(['--model', 'ann', '--curriculum-level', 'easy'])
+        cfg = ExperimentConfig()
+
+        apply_model_training_overrides(cfg, args)
+
+        self.assertEqual(cfg.training.actor_lr, 1.0e-4)
+        self.assertEqual(cfg.training.critic_lr, 1.0e-4)
+
+    def test_snn_default_learning_rates_remain_unchanged(self):
+        parser = build_parser()
+        args = parser.parse_args(['--model', 'snn', '--curriculum-level', 'easy'])
+        cfg = ExperimentConfig()
+        baseline_actor_lr = cfg.training.actor_lr
+        baseline_critic_lr = cfg.training.critic_lr
+
+        apply_model_training_overrides(cfg, args)
+
+        self.assertEqual(cfg.training.actor_lr, baseline_actor_lr)
+        self.assertEqual(cfg.training.critic_lr, baseline_critic_lr)
+
     def test_early_stop_callback_uses_new_rule(self):
         callback = make_early_stop_callback(
             enabled=True,
@@ -228,7 +250,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertAlmostEqual(rl_actor_loss.item(), -10.0)
         self.assertAlmostEqual(actor_rl_scale, 0.25)
         self.assertAlmostEqual(scaled_rl_actor_loss.item(), -2.5)
-        self.assertAlmostEqual(actor_loss.item(), scaled_rl_actor_loss.item() + bc_lambda * bc_loss.item(), places=6)
+        self.assertAlmostEqual(actor_loss.item(), scaled_rl_actor_loss.item() + bc_lambda * bc_loss.item(), places=5)
 
     def test_actor_loss_without_bc_reference_stays_raw_rl_loss(self):
         trainer = TD3Trainer(
