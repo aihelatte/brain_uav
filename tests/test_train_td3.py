@@ -5,7 +5,8 @@ import unittest
 import numpy as np
 import torch
 
-from brain_uav.scripts.train_td3 import build_parser, make_early_stop_callback
+from brain_uav.config import ExperimentConfig
+from brain_uav.scripts.train_td3 import apply_model_training_overrides, build_parser, make_early_stop_callback
 from brain_uav.trainers.td3 import TD3Trainer
 
 
@@ -78,6 +79,15 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(args.early_stop_goal_rate, 0.95)
         self.assertEqual(args.early_stop_min_steps, 12000)
 
+    def test_ann_default_actor_freeze_steps_is_5000(self):
+        parser = build_parser()
+        args = parser.parse_args(['--model', 'ann', '--curriculum-level', 'easy'])
+        cfg = ExperimentConfig()
+
+        apply_model_training_overrides(cfg, args)
+
+        self.assertEqual(cfg.training.actor_freeze_steps, 5000)
+
     def test_early_stop_callback_uses_new_rule(self):
         callback = make_early_stop_callback(
             enabled=True,
@@ -103,7 +113,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertIsInstance(reason, str)
         self.assertIn('qualified_windows=4/4', reason)
 
-    def test_bc_lambda_schedule_is_500_150_30_5_5(self):
+    def test_bc_lambda_schedule_is_500_150_30_5(self):
         trainer = TD3Trainer(
             env=_OneStepEnv(),
             actor=_DummyActor(),
@@ -124,14 +134,12 @@ class TestTrainTD3Helpers(unittest.TestCase):
         )
         expected = {
             0: 500.0,
-            9999: 500.0,
-            10000: 150.0,
-            19999: 150.0,
-            20000: 30.0,
+            14999: 500.0,
+            15000: 150.0,
+            29999: 150.0,
+            30000: 30.0,
             49999: 30.0,
             50000: 5.0,
-            99999: 5.0,
-            100000: 5.0,
             150000: 5.0,
         }
         for steps, value in expected.items():

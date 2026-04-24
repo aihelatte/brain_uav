@@ -426,6 +426,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def apply_model_training_overrides(cfg: ExperimentConfig, args: argparse.Namespace) -> None:
+    if args.model == 'ann':
+        # Use more conservative defaults for ANN to avoid late-training collapse.
+        cfg.training.actor_lr = 1.5e-4
+        cfg.training.critic_lr = 2e-4
+        if args.actor_freeze_steps is None:
+            cfg.training.actor_freeze_steps = 5_000
+        else:
+            cfg.training.actor_freeze_steps = args.actor_freeze_steps
+        if args.critic_grad_clip_norm is None:
+            cfg.training.critic_grad_clip_norm = 1.0
+        else:
+            cfg.training.critic_grad_clip_norm = args.critic_grad_clip_norm
+        if args.curriculum_level == 'hard':
+            cfg.training.actor_lr *= 0.75
+            cfg.training.critic_lr *= 0.85
+            cfg.training.success_sample_bias = 5.0
+        return
+
+    if args.actor_freeze_steps is not None:
+        cfg.training.actor_freeze_steps = args.actor_freeze_steps
+    if args.critic_grad_clip_norm is not None:
+        cfg.training.critic_grad_clip_norm = args.critic_grad_clip_norm
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -441,28 +466,7 @@ def main() -> None:
         snn_backend=args.snn_backend,
     )
     log_prefix = build_log_prefix(args.model, args.curriculum_level)
-
-    if args.model == 'ann':
-        # Use more conservative defaults for ANN to avoid late-training collapse.
-        cfg.training.actor_lr = 1.5e-4
-        cfg.training.critic_lr = 2e-4
-        if args.actor_freeze_steps is None:
-            cfg.training.actor_freeze_steps = 10_000
-        else:
-            cfg.training.actor_freeze_steps = args.actor_freeze_steps
-        if args.critic_grad_clip_norm is None:
-            cfg.training.critic_grad_clip_norm = 1.0
-        else:
-            cfg.training.critic_grad_clip_norm = args.critic_grad_clip_norm
-        if args.curriculum_level == 'hard':
-            cfg.training.actor_lr *= 0.75
-            cfg.training.critic_lr *= 0.85
-            cfg.training.success_sample_bias = 5.0
-    else:
-        if args.actor_freeze_steps is not None:
-            cfg.training.actor_freeze_steps = args.actor_freeze_steps
-        if args.critic_grad_clip_norm is not None:
-            cfg.training.critic_grad_clip_norm = args.critic_grad_clip_norm
+    apply_model_training_overrides(cfg, args)
 
     set_global_seed(args.seed)
 

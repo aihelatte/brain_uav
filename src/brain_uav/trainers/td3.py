@@ -264,9 +264,9 @@ class TD3Trainer:
         self.metrics.bc_regularization_enabled = True
 
     def _bc_lambda(self) -> float:
-        if self.total_steps < 10_000:
+        if self.total_steps < 15_000:
             return 500.0
-        if self.total_steps < 20_000:
+        if self.total_steps < 30_000:
             return 150.0
         if self.total_steps < 50_000:
             return 30.0
