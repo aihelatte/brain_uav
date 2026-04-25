@@ -279,7 +279,7 @@ def make_episode_capture_callback(
 
     Current policy:
     - save one step snapshot every 1/20 of total training steps
-    - save at most one goal example per 4 episode windows
+    - save at most one goal example per 10 episode windows
     """
     snapshot_dir = ensure_dir(result_root / 'step_snapshots')
     goal_dir = ensure_dir(result_root / 'goal_examples')
@@ -301,7 +301,7 @@ def make_episode_capture_callback(
 
         if summary_every_episodes > 0 and record['outcome'] == 'goal':
             window_idx = (record['episode'] - 1) // summary_every_episodes
-            goal_group_idx = window_idx // 4
+            goal_group_idx = window_idx // 10
             if goal_group_idx not in saved_goal_groups:
                 saved_goal_groups.add(goal_group_idx)
                 stem = f'goal_group_{goal_group_idx + 1:02d}_ep{record["episode"]:05d}'
@@ -420,7 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--early-stop-goal-rate', type=float, default=0.95)
     parser.add_argument('--early-stop-windows', type=int, default=4)
     parser.add_argument('--early-stop-max-failures-per-window', type=int, default=1)
-    parser.add_argument('--early-stop-min-steps', type=int, default=12000)
+    parser.add_argument('--early-stop-min-steps', type=int, default=80000)
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--snn-backend', choices=SNN_BACKEND_CHOICES, default='torch')
     return parser

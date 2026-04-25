@@ -7,7 +7,12 @@ import numpy as np
 import torch
 
 from brain_uav.config import ExperimentConfig
-from brain_uav.scripts.train_td3 import apply_model_training_overrides, build_parser, make_early_stop_callback
+from brain_uav.scripts.train_td3 import (
+    apply_model_training_overrides,
+    build_parser,
+    make_early_stop_callback,
+    make_episode_capture_callback,
+)
 from brain_uav.trainers.td3 import TD3Trainer
 
 
@@ -88,7 +93,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(args.early_stop_windows, 4)
         self.assertEqual(args.early_stop_max_failures_per_window, 1)
         self.assertEqual(args.early_stop_goal_rate, 0.95)
-        self.assertEqual(args.early_stop_min_steps, 12000)
+        self.assertEqual(args.early_stop_min_steps, 80000)
 
     def test_training_config_defaults_raise_timeout_and_success_bias(self):
         cfg = ExperimentConfig()
@@ -135,7 +140,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
             enabled=True,
             goal_rate_threshold=0.95,
             consecutive_windows=4,
-            min_steps=12000,
+            min_steps=80000,
             max_failures_per_window=1,
         )
         window = {
@@ -146,14 +151,53 @@ class TestTrainTD3Helpers(unittest.TestCase):
             'ground_count': 0,
             'collision_count': 0,
             'other_count': 0,
-            'total_steps': 12000,
+            'total_steps': 80000,
         }
         self.assertIsNone(callback({**window, 'total_steps': 3000}))
-        self.assertIsNone(callback({**window, 'total_steps': 12000}))
-        self.assertIsNone(callback({**window, 'total_steps': 13000}))
-        reason = callback({**window, 'total_steps': 14000})
+        self.assertIsNone(callback({**window, 'total_steps': 80000}))
+        self.assertIsNone(callback({**window, 'total_steps': 81000}))
+        reason = callback({**window, 'total_steps': 82000})
         self.assertIsInstance(reason, str)
         self.assertIn('qualified_windows=4/4', reason)
+
+    def test_goal_examples_are_kept_once_per_ten_windows(self):
+        callback = make_episode_capture_callback(
+            result_root=self._make_dummy_path(),
+            summary_every_episodes=15,
+            total_timesteps=200000,
+            config_payload={'scenario': {'world_xy': 80.0, 'world_z_max': 40.0, 'goal_radius': 4.5,
+                                         'warning_distance': 10.0, 'boundary_warning_distance': 10.0,
+                                         'ground_warning_height': 4.0}},
+        )
+        record = {
+            'episode': 1,
+            'total_steps': 1,
+            'return': 0.0,
+            'length': 1,
+            'outcome': 'goal',
+            'actor_loss': 0.0,
+            'critic_loss': 0.0,
+            'scenario': {'state': [0, 0, 0, 0, 0], 'goal': [1, 1, 1], 'zones': []},
+            'trajectory': [[0, 0, 0], [1, 1, 1]],
+            'final_state': [1, 1, 1, 0, 0],
+            'info': {'goal_distance': 0.0, 'curriculum_level': 'easy'},
+        }
+        saved_stems: list[str] = []
+
+        with mock.patch('brain_uav.scripts.train_td3.export_episode_result', side_effect=lambda target_dir, stem, record, config_payload: saved_stems.append(stem) or {}):
+            for window_idx in range(12):
+                episode = window_idx * 15 + 1
+                callback({**record, 'episode': episode, 'total_steps': episode})
+
+        goal_stems = [stem for stem in saved_stems if stem.startswith('goal_group_')]
+        self.assertEqual(goal_stems, ['goal_group_01_ep00001', 'goal_group_02_ep00151'])
+
+    @staticmethod
+    def _make_dummy_path():
+        import tempfile
+        from pathlib import Path
+
+        return Path(tempfile.mkdtemp())
 
     def test_bc_lambda_schedule_is_500_150_30_5(self):
         trainer = TD3Trainer(

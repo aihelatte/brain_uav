@@ -25,12 +25,12 @@ class ReplayBuffer:
         self.done = np.zeros((self.capacity, 1), dtype=np.float32)
         self.success = np.zeros(self.capacity, dtype=np.bool_)
         self.near_goal = np.zeros(self.capacity, dtype=np.bool_)
+        self.sample_weight = np.ones(self.capacity, dtype=np.float64)
         self.size = 0
         self.position = 0
         self.success_count = 0
         self.near_goal_count = 0
-        self._probabilities_cache: np.ndarray | None = None
-        self._probabilities_cache_token: tuple[int, int, int] | None = None
+        self.total_sample_weight = 0.0
 
     def __len__(self) -> int:
         return self.size
@@ -51,14 +51,17 @@ class ReplayBuffer:
         self._ensure_storage(obs, action, next_obs)
 
         idx = self.position
+        previous_weight = 0.0
         if self.size == self.capacity:
             if self.success[idx]:
                 self.success_count -= 1
             if self.near_goal[idx]:
                 self.near_goal_count -= 1
+            previous_weight = float(self.sample_weight[idx])
         else:
             self.size += 1
 
+        self.total_sample_weight -= previous_weight
         self.obs[idx] = obs
         self.action[idx] = action
         self.reward[idx, 0] = float(reward)
@@ -72,8 +75,9 @@ class ReplayBuffer:
         if self.near_goal[idx]:
             self.near_goal_count += 1
 
+        self.sample_weight[idx] = self._slot_weight(idx)
+        self.total_sample_weight += float(self.sample_weight[idx])
         self.position = (self.position + 1) % self.capacity
-        self._invalidate_probability_cache()
 
     def sample(self, batch_size: int) -> dict[str, torch.Tensor]:
         if batch_size > self.size:
@@ -110,26 +114,19 @@ class ReplayBuffer:
             self.action = np.zeros((self.capacity, *action.shape), dtype=np.float32)
             self.next_obs = np.zeros((self.capacity, *next_obs.shape), dtype=np.float32)
 
-    def _invalidate_probability_cache(self) -> None:
-        self._probabilities_cache = None
-        self._probabilities_cache_token = None
+    def _slot_weight(self, idx: int) -> float:
+        weight = 1.0
+        if self.success_sample_bias > 1.0 and self.success[idx]:
+            weight *= self.success_sample_bias
+        if self.near_goal_sample_bias > 1.0 and self.near_goal[idx]:
+            weight *= self.near_goal_sample_bias
+        return float(weight)
 
     def _sampling_probabilities(self) -> np.ndarray | None:
         if self.size == 0:
             return None
         if self.success_sample_bias <= 1.0 and self.near_goal_sample_bias <= 1.0:
             return None
-
-        token = (self.size, self.success_count, self.near_goal_count)
-        if self._probabilities_cache is not None and self._probabilities_cache_token == token:
-            return self._probabilities_cache
-
-        weights = np.ones(self.size, dtype=np.float64)
-        if self.success_sample_bias > 1.0:
-            weights *= np.where(self.success[: self.size], self.success_sample_bias, 1.0)
-        if self.near_goal_sample_bias > 1.0:
-            weights *= np.where(self.near_goal[: self.size], self.near_goal_sample_bias, 1.0)
-        probs = weights / weights.sum()
-        self._probabilities_cache = probs
-        self._probabilities_cache_token = token
-        return probs
+        if self.total_sample_weight <= 0.0:
+            return None
+        return self.sample_weight[: self.size] / self.total_sample_weight

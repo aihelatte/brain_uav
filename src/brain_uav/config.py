@@ -11,32 +11,32 @@ class ScenarioConfig:
     """Environment-side parameters with distance values expressed in km."""
 
     dt: float = 1.0
-    speed: float = 25.0
+    speed: float = 2.5
     gamma_max: float = 0.6
     delta_gamma_max: float = 0.14
     delta_psi_max: float = 0.2
-    goal_radius: float = 45.0
-    world_xy: float = 800.0
-    world_z_min: float = 1.0
-    world_z_max: float = 400.0
+    goal_radius: float = 4.5
+    world_xy: float = 80.0
+    world_z_min: float = 0.1
+    world_z_max: float = 40.0
     max_steps: int = 200
     min_no_fly_zones: int = 1
     max_no_fly_zones: int = 3
-    no_fly_radius_range: tuple[float, float] = (60.0, 140.0)
-    warning_distance: float = 100.0
-    boundary_warning_distance: float = 100.0
-    ground_warning_height: float = 40.0
-    descent_penalty_height: float = 120.0
+    no_fly_radius_range: tuple[float, float] = (6.0, 14.0)
+    warning_distance: float = 10.0
+    boundary_warning_distance: float = 10.0
+    ground_warning_height: float = 4.0
+    descent_penalty_height: float = 12.0
     descent_gamma_threshold: float = 0.08
     nearest_zone_count: int = 3
     scenario_max_sampling_attempts: int = 80
-    start_zone_clearance: float = 25.0
+    start_zone_clearance: float = 2.5
     zone_overlap_ratio_limit: float = 0.55
-    corridor_blocking_margin: float = 35.0
+    corridor_blocking_margin: float = 3.5
     max_corridor_blockers: int = 2
-    max_start_goal_height_gap: float = 110.0
-    dual_zone_min_margin: float = 130.0
-    easy_two_zone_min_gap: float = 220.0
+    max_start_goal_height_gap: float = 11.0
+    dual_zone_min_margin: float = 13.0
+    easy_two_zone_min_gap: float = 22.0
     easy_two_zone_blocker_probability: float = 0.5
 
 
@@ -57,7 +57,7 @@ class RewardConfig:
     inefficiency_penalty_weight: float = 14.0
     inefficiency_penalty_cap: float = 30.0
     progress_window_size: int = 10
-    min_progress_per_window: float = 20.0
+    min_progress_per_window: float = 2.0
     action_delta_gamma_weight: float = 8.0
     action_delta_psi_weight: float = 3.0
     smoothness_weight: float = 0.1
@@ -65,8 +65,8 @@ class RewardConfig:
     step_penalty: float = 3.0
     boundary_penalty: float = 6000.0
     timeout_penalty: float = 2500.0
-    breakthrough_reward_distance: float = 220.0
-    breakthrough_progress_threshold: float = 22.0
+    breakthrough_reward_distance: float = 22.0
+    breakthrough_progress_threshold: float = 2.2
     breakthrough_reward_weight: float = 0.35
     breakthrough_reward_cap: float = 10.0
 

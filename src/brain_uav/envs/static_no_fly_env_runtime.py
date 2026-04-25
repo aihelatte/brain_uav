@@ -208,7 +208,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 [
                     self.rng.uniform(-0.8 * cfg.world_xy, -0.58 * cfg.world_xy),
                     self.rng.uniform(-0.10 * cfg.world_xy, 0.10 * cfg.world_xy),
-                    self.rng.uniform(110.0, 155.0),
+                    self.rng.uniform(11.0, 15.5),
                     0.0,
                     self.rng.uniform(-0.10, 0.10),
                 ],
@@ -218,19 +218,19 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 [
                     self.rng.uniform(0.52 * cfg.world_xy, 0.80 * cfg.world_xy),
                     self.rng.uniform(-0.12 * cfg.world_xy, 0.12 * cfg.world_xy),
-                    self.rng.uniform(105.0, 165.0),
+                    self.rng.uniform(10.5, 16.5),
                 ],
                 dtype=np.float32,
             )
-            if abs(float(goal[2] - state[2])) > 55.0:
+            if abs(float(goal[2] - state[2])) > 5.5:
                 continue
-            radius = float(self.rng.uniform(70.0, 105.0))
+            radius = float(self.rng.uniform(7.0, 10.5))
             line_y = float((state[1] + goal[1]) * 0.5)
             zone = Zone(
                 center_xy=np.array(
                     [
                         self.rng.uniform(-0.05 * cfg.world_xy, 0.35 * cfg.world_xy),
-                        line_y + self.rng.choice([-1.0, 1.0]) * self.rng.uniform(170.0, 280.0),
+                        line_y + self.rng.choice([-1.0, 1.0]) * self.rng.uniform(17.0, 28.0),
                     ],
                     dtype=np.float32,
                 ),
@@ -238,7 +238,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             )
             if not self._zone_candidate_is_valid(state, goal, [], zone.center_xy, zone.radius):
                 continue
-            blockers = self._count_corridor_blockers(state, goal, [zone], margin=20.0)
+            blockers = self._count_corridor_blockers(state, goal, [zone], margin=2.0)
             if blockers != 0:
                 continue
             return {
@@ -256,7 +256,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 [
                     self.rng.uniform(-0.82 * cfg.world_xy, -0.60 * cfg.world_xy),
                     self.rng.uniform(-0.12 * cfg.world_xy, 0.12 * cfg.world_xy),
-                    self.rng.uniform(105.0, 160.0),
+                    self.rng.uniform(10.5, 16.0),
                     0.0,
                     self.rng.uniform(-0.12, 0.12),
                 ],
@@ -266,11 +266,11 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 [
                     self.rng.uniform(0.50 * cfg.world_xy, 0.82 * cfg.world_xy),
                     self.rng.uniform(-0.16 * cfg.world_xy, 0.16 * cfg.world_xy),
-                    self.rng.uniform(100.0, 175.0),
+                    self.rng.uniform(10.0, 17.5),
                 ],
                 dtype=np.float32,
             )
-            if abs(float(goal[2] - state[2])) > 65.0:
+            if abs(float(goal[2] - state[2])) > 6.5:
                 continue
             force_blocker = bool(self.rng.random() < cfg.easy_two_zone_blocker_probability)
             zones = self._sample_easy_two_zone_pair(state, goal, force_blocker)
@@ -300,11 +300,11 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             center_1 = np.array(
                 [
                     self.rng.uniform(-0.02 * cfg.world_xy, 0.22 * cfg.world_xy),
-                    mean_y + self.rng.uniform(-45.0, 45.0),
+                    mean_y + self.rng.uniform(-4.5, 4.5),
                 ],
                 dtype=np.float32,
             )
-            radius_1 = float(self.rng.uniform(90.0, 120.0))
+            radius_1 = float(self.rng.uniform(9.0, 12.0))
             if not self._zone_candidate_is_valid(state, goal, zones, center_1, radius_1):
                 return None
             zones.append(Zone(center_xy=center_1, radius=radius_1))
@@ -312,28 +312,28 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             side = float(self.rng.choice([-1.0, 1.0]))
             center_2 = np.array(
                 [
-                    center_1[0] + self.rng.uniform(130.0, 220.0),
-                    mean_y + side * self.rng.uniform(170.0, 250.0),
+                    center_1[0] + self.rng.uniform(13.0, 22.0),
+                    mean_y + side * self.rng.uniform(17.0, 25.0),
                 ],
                 dtype=np.float32,
             )
-            radius_2 = float(self.rng.uniform(80.0, 110.0))
+            radius_2 = float(self.rng.uniform(8.0, 11.0))
             if not self._zone_candidate_is_valid(state, goal, zones, center_2, radius_2):
                 return None
             zones.append(Zone(center_xy=center_2, radius=radius_2))
         else:
             base_x = self.rng.uniform(-0.05 * cfg.world_xy, 0.20 * cfg.world_xy)
-            offsets = [self.rng.uniform(160.0, 240.0), -self.rng.uniform(160.0, 240.0)]
+            offsets = [self.rng.uniform(16.0, 24.0), -self.rng.uniform(16.0, 24.0)]
             self.rng.shuffle(offsets)
             for idx, offset in enumerate(offsets):
                 center_xy = np.array(
                     [
-                        base_x + idx * self.rng.uniform(130.0, 200.0),
+                        base_x + idx * self.rng.uniform(13.0, 20.0),
                         mean_y + offset,
                     ],
                     dtype=np.float32,
                 )
-                radius = float(self.rng.uniform(80.0, 110.0))
+                radius = float(self.rng.uniform(8.0, 11.0))
                 if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
                     return None
                 zones.append(Zone(center_xy=center_xy, radius=radius))
@@ -349,7 +349,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 [
                     self.rng.uniform(-0.82 * cfg.world_xy, -0.60 * cfg.world_xy),
                     self.rng.uniform(-0.16 * cfg.world_xy, 0.16 * cfg.world_xy),
-                    self.rng.uniform(105.0, 165.0),
+                    self.rng.uniform(10.5, 16.5),
                     0.0,
                     self.rng.uniform(-0.15, 0.15),
                 ],
@@ -359,11 +359,11 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 [
                     self.rng.uniform(0.50 * cfg.world_xy, 0.82 * cfg.world_xy),
                     self.rng.uniform(-0.20 * cfg.world_xy, 0.20 * cfg.world_xy),
-                    self.rng.uniform(95.0, 185.0),
+                    self.rng.uniform(9.5, 18.5),
                 ],
                 dtype=np.float32,
             )
-            if abs(float(goal[2] - state[2])) > 75.0:
+            if abs(float(goal[2] - state[2])) > 7.5:
                 continue
             mode = str(self.rng.choice(['single_block', 'double_detour']))
             if mode == 'single_block':
@@ -392,11 +392,11 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         center_xy = np.array(
             [
                 self.rng.uniform(0.00 * cfg.world_xy, 0.30 * cfg.world_xy),
-                self.rng.uniform(-60.0, 60.0) + 0.5 * (state[1] + goal[1]),
+                self.rng.uniform(-6.0, 6.0) + 0.5 * (state[1] + goal[1]),
             ],
             dtype=np.float32,
         )
-        radius = float(self.rng.uniform(105.0, 145.0))
+        radius = float(self.rng.uniform(10.5, 14.5))
         if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
             return None
         zones.append(Zone(center_xy=center_xy, radius=radius))
@@ -406,17 +406,17 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         cfg = self.scenario
         zones: list[Zone] = []
         base_x = self.rng.uniform(-0.05 * cfg.world_xy, 0.20 * cfg.world_xy)
-        offsets = [self.rng.uniform(120.0, 190.0), -self.rng.uniform(120.0, 190.0)]
+        offsets = [self.rng.uniform(12.0, 19.0), -self.rng.uniform(12.0, 19.0)]
         self.rng.shuffle(offsets)
         for idx, offset in enumerate(offsets):
             center_xy = np.array(
                 [
-                    base_x + idx * self.rng.uniform(120.0, 190.0),
+                    base_x + idx * self.rng.uniform(12.0, 19.0),
                     0.5 * (state[1] + goal[1]) + offset,
                 ],
                 dtype=np.float32,
             )
-            radius = float(self.rng.uniform(85.0, 120.0))
+            radius = float(self.rng.uniform(8.5, 12.0))
             if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
                 return None
             zones.append(Zone(center_xy=center_xy, radius=radius))
@@ -431,7 +431,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 [
                     self.rng.uniform(-0.8 * cfg.world_xy, -0.5 * cfg.world_xy),
                     self.rng.uniform(-0.2 * cfg.world_xy, 0.2 * cfg.world_xy),
-                    self.rng.uniform(80.0, 160.0),
+                    self.rng.uniform(8.0, 16.0),
                     0.0,
                     self.rng.uniform(-0.2, 0.2),
                 ],
@@ -441,7 +441,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 [
                     self.rng.uniform(0.45 * cfg.world_xy, 0.8 * cfg.world_xy),
                     self.rng.uniform(-0.3 * cfg.world_xy, 0.3 * cfg.world_xy),
-                    self.rng.uniform(80.0, 220.0),
+                    self.rng.uniform(8.0, 22.0),
                 ],
                 dtype=np.float32,
             )
@@ -501,7 +501,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 np.array([goal[0] - center_xy[0], goal[1] - center_xy[1], goal[2]], dtype=np.float32)
             )
         )
-        safe_margin = radius + cfg.warning_distance + cfg.goal_radius + 10.0
+        safe_margin = radius + cfg.warning_distance + cfg.goal_radius + 1.0
         if dist_to_goal <= safe_margin:
             return False
 
@@ -743,7 +743,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         return min(penalty, self.rewards.boundary_soft_penalty_cap)
 
     def _ground_warning_penalty(self, pos: np.ndarray) -> float:
-        warning_height = min(self.scenario.ground_warning_height, 80.0)
+        warning_height = min(self.scenario.ground_warning_height, 8.0)
         effective_span = max(warning_height - self.scenario.world_z_min, 1e-6)
         if float(pos[2]) >= warning_height:
             return 0.0
