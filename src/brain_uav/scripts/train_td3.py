@@ -429,7 +429,7 @@ def build_parser() -> argparse.ArgumentParser:
 def apply_model_training_overrides(cfg: ExperimentConfig, args: argparse.Namespace) -> None:
     if args.model == 'ann':
         # Use more conservative defaults for ANN to avoid late-training collapse.
-        cfg.training.actor_lr = 1.5e-4
+        cfg.training.actor_lr = 2e-4
         cfg.training.critic_lr = 2e-4
         if args.actor_freeze_steps is None:
             cfg.training.actor_freeze_steps = 5_000
