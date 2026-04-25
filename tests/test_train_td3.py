@@ -115,8 +115,8 @@ class TestTrainTD3Helpers(unittest.TestCase):
 
         apply_model_training_overrides(cfg, args)
 
-        self.assertEqual(cfg.training.actor_lr, 2.0e-4)
-        self.assertEqual(cfg.training.critic_lr, 2.0e-4)
+        self.assertEqual(cfg.training.actor_lr, 1.5e-4)
+        self.assertEqual(cfg.training.critic_lr, 2.5e-4)
 
     def test_snn_default_learning_rates_remain_unchanged(self):
         parser = build_parser()
