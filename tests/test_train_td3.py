@@ -108,15 +108,15 @@ class TestTrainTD3Helpers(unittest.TestCase):
 
         self.assertEqual(cfg.training.actor_freeze_steps, 5000)
 
-    def test_ann_default_learning_rates_are_more_conservative(self):
+    def test_ann_default_learning_rates_are_midrange(self):
         parser = build_parser()
         args = parser.parse_args(['--model', 'ann', '--curriculum-level', 'easy'])
         cfg = ExperimentConfig()
 
         apply_model_training_overrides(cfg, args)
 
-        self.assertEqual(cfg.training.actor_lr, 1.0e-4)
-        self.assertEqual(cfg.training.critic_lr, 1.0e-4)
+        self.assertEqual(cfg.training.actor_lr, 1.5e-4)
+        self.assertEqual(cfg.training.critic_lr, 1.5e-4)
 
     def test_snn_default_learning_rates_remain_unchanged(self):
         parser = build_parser()
