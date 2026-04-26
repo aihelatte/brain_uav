@@ -23,7 +23,7 @@ class ArtificialPotentialFieldPlanner:
         for zone in self.env.zones:
             delta = np.array([pos[0] - zone.center_xy[0], pos[1] - zone.center_xy[1], pos[2]], dtype=np.float32)
             distance = max(float(np.linalg.norm(delta)), 1e-6)
-            threshold = zone.radius + self.env.scenario.warning_distance + 60.0
+            threshold = zone.radius + self.env.scenario.warning_distance + 6.0
             if distance < threshold:
                 # APF 的核心：进入作用范围后，障碍物会产生斥力。
                 strength = self.repulsive_gain * ((1.0 / distance) - (1.0 / threshold)) / (distance**2)

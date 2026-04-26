@@ -27,7 +27,7 @@ class HeuristicPlanner:
         for zone in self.env.zones:
             vector = np.array([pos[0] - zone.center_xy[0], pos[1] - zone.center_xy[1], pos[2]], dtype=np.float32)
             distance = max(float(np.linalg.norm(vector)), 1e-6)
-            influence = zone.radius + self.env.scenario.warning_distance + 40.0
+            influence = zone.radius + self.env.scenario.warning_distance + 4.0
             if distance < influence:
                 # 越靠近禁飞区，排斥效果越强。
                 repulsion += vector / distance * (influence - distance) * 3.0

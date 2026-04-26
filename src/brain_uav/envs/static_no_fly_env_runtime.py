@@ -33,6 +33,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     """Gymnasium-style environment for static no-fly-zone trajectory planning."""
 
     metadata = {"render_modes": ["human"]}
+    _distance_reward_scale_compensation = 10.0
 
     def __init__(
         self,
@@ -634,7 +635,9 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         outcome: str,
         prev_best_goal_distance: float,
     ) -> float:
-        rew = self.rewards.progress_weight * (prev_distance - new_distance)
+        rew = self.rewards.progress_weight * (
+            (prev_distance - new_distance) * self._distance_reward_scale_compensation
+        )
         rew += self._breakthrough_reward(new_distance, prev_best_goal_distance, outcome)
         rew -= self.rewards.step_penalty
         rew -= self.rewards.smoothness_weight * float(np.square(action).sum())
@@ -693,7 +696,9 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             return 0.0
         if self._nearest_zone_surface_clearance(self.state[:3]) > self.rewards.breakthrough_reward_distance:
             return 0.0
-        reward = self.rewards.breakthrough_reward_weight * window_progress
+        reward = self.rewards.breakthrough_reward_weight * (
+            window_progress * self._distance_reward_scale_compensation
+        )
         return min(reward, self.rewards.breakthrough_reward_cap)
 
     def _nearest_zone_surface_clearance(self, pos: np.ndarray) -> float:

@@ -23,6 +23,10 @@ from ..utils.seeding import set_global_seed
 DATASET_VERSION = 'v6'
 
 
+def build_dataset_log_prefix(curriculum_level: str) -> str:
+    return f'[DATA {curriculum_level}]'
+
+
 def build_planners(env) -> list:
     return [HeuristicPlanner(env), ArtificialPotentialFieldPlanner(env)]
 
@@ -57,6 +61,7 @@ def main() -> None:
     curriculum_mix = parse_curriculum_mix(args.curriculum_mix, fallback_level=args.curriculum_level)
     set_global_seed(args.seed)
     env = make_env(cfg, seed=args.seed, curriculum_level=args.curriculum_level, curriculum_mix=curriculum_mix)
+    log_prefix = build_dataset_log_prefix(args.curriculum_level)
     planners = build_planners(env)
     observations: list[np.ndarray] = []
     actions: list[np.ndarray] = []
@@ -74,7 +79,7 @@ def main() -> None:
         elif not fallback_samples:
             fallback_samples = [(obs, action, planner.__class__.__name__) for obs, action in rollout]
         print(
-            f"[Dataset:{DATASET_VERSION}] episode {episode + 1}/{args.episodes} planner={planner.__class__.__name__} "
+            f"{log_prefix} episode {episode + 1}/{args.episodes} planner={planner.__class__.__name__} "
             f"outcome={outcome} level={args.curriculum_level} mix={describe_curriculum_mix(curriculum_mix)} "
             f"kept_samples={len(observations)}"
         )
@@ -82,7 +87,7 @@ def main() -> None:
         observations = [item[0] for item in fallback_samples]
         actions = [item[1] for item in fallback_samples]
         planner_tags = [item[2] for item in fallback_samples]
-        print('[Dataset] warning: no successful trajectories found, using one fallback rollout to avoid empty dataset')
+        print(f'{log_prefix} warning: no successful trajectories found, using one fallback rollout to avoid empty dataset')
     if not observations:
         raise RuntimeError('Dataset generation produced zero samples. Please increase episodes or improve baselines.')
     target = ensure_parent(args.output)
@@ -97,7 +102,7 @@ def main() -> None:
         config_json=np.array(json.dumps(cfg.to_dict(), ensure_ascii=False)),
     )
     print(
-        f'Saved dataset {DATASET_VERSION} with {len(observations)} samples from '
+        f'{log_prefix} saved dataset {DATASET_VERSION} with {len(observations)} samples from '
         f'{success_count} successful episodes to {target}'
     )
 
