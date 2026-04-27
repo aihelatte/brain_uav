@@ -205,7 +205,7 @@ class TestTerminalCaptureEnhancements(unittest.TestCase):
             scaled_rl_actor_loss,
             bc_loss,
             bc_lambda,
-            _actor_rl_scale,
+            actor_rl_scale,
             terminal_geo_loss,
             terminal_geo_lambda,
         ) = trainer._compute_actor_loss_terms(obs, safe_mask)
@@ -217,7 +217,9 @@ class TestTerminalCaptureEnhancements(unittest.TestCase):
             scaled_rl_actor_loss.item() + bc_lambda * bc_loss.item() + terminal_geo_lambda * terminal_geo_loss.item(),
             places=5,
         )
-        self.assertAlmostEqual(rl_actor_loss.item(), scaled_rl_actor_loss.item(), places=5)
+        self.assertAlmostEqual(actor_rl_scale, 2.5 / 6.0, places=5)
+        self.assertAlmostEqual(scaled_rl_actor_loss.item(), -2.5, places=5)
+        self.assertNotAlmostEqual(rl_actor_loss.item(), scaled_rl_actor_loss.item(), places=5)
 
     def test_terminal_geo_loss_zero_without_terminal_samples(self):
         trainer = TD3Trainer(

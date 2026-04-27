@@ -10,8 +10,10 @@ from brain_uav.config import ExperimentConfig, ScenarioConfig
 from brain_uav.scripts.train_td3 import (
     apply_model_training_overrides,
     build_parser,
+    export_episode_result,
     make_early_stop_callback,
     make_episode_capture_callback,
+    _resolve_active_goal_radius,
 )
 from brain_uav.trainers.td3 import TD3Trainer
 
@@ -222,7 +224,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertIsInstance(reason, str)
         self.assertIn('qualified_windows=4/4', reason)
 
-    def test_goal_examples_are_kept_once_per_ten_windows(self):
+    def test_goal_examples_are_kept_once_per_five_windows(self):
         callback = make_episode_capture_callback(
             result_root=self._make_dummy_path(),
             summary_every_episodes=15,
@@ -252,7 +254,46 @@ class TestTrainTD3Helpers(unittest.TestCase):
                 callback({**record, 'episode': episode, 'total_steps': episode})
 
         goal_stems = [stem for stem in saved_stems if stem.startswith('goal_group_')]
-        self.assertEqual(goal_stems, ['goal_group_01_ep00001', 'goal_group_02_ep00151'])
+        self.assertEqual(goal_stems, ['goal_group_01_ep00001', 'goal_group_02_ep00076', 'goal_group_03_ep00151'])
+
+    def test_export_episode_result_prefers_active_goal_radius_and_writes_outputs(self):
+        import tempfile
+        from pathlib import Path
+
+        record = {
+            'episode': 1,
+            'total_steps': 1,
+            'return': 0.0,
+            'length': 1,
+            'outcome': 'goal',
+            'actor_loss': 0.0,
+            'critic_loss': 0.0,
+            'scenario': {'state': [0, 0, 10, 0, 0], 'goal': [20, 0, 10], 'zones': []},
+            'trajectory': [[0, 0, 10], [20, 0, 10]],
+            'final_state': [20, 0, 10, 0, 0],
+            'info': {'goal_distance': 0.0, 'curriculum_level': 'easy', 'active_goal_radius': 10.0},
+        }
+        config_payload = {
+            'scenario': {
+                'world_xy': ScenarioConfig().world_xy,
+                'world_z_max': ScenarioConfig().world_z_max,
+                'goal_radius': 5.0,
+                'warning_distance': 10.0,
+                'boundary_warning_distance': 10.0,
+                'ground_warning_height': 4.0,
+            }
+        }
+
+        self.assertEqual(_resolve_active_goal_radius(record, config_payload['scenario']), 10.0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch('brain_uav.scripts.train_td3._draw_goal_radius_projection') as goal_radius_mock:
+                outputs = export_episode_result(Path(tmpdir), 'episode_demo', record, config_payload)
+            self.assertTrue(Path(outputs['json']).is_file())
+            self.assertTrue(Path(outputs['png']).is_file())
+            self.assertEqual(goal_radius_mock.call_count, 3)
+            for call in goal_radius_mock.call_args_list:
+                self.assertEqual(call.args[2], 10.0)
 
     @staticmethod
     def _make_dummy_path():
@@ -371,7 +412,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertAlmostEqual(terminal_geo_loss.item(), 0.0)
         self.assertEqual(terminal_geo_lambda, 0.0)
 
-    def test_actor_loss_without_bc_reference_stays_raw_rl_loss(self):
+    def test_actor_loss_without_bc_reference_still_uses_q_scale(self):
         trainer = TD3Trainer(
             env=_OneStepEnv(),
             actor=_DummyActor(),
@@ -407,11 +448,11 @@ class TestTrainTD3Helpers(unittest.TestCase):
         ) = trainer._compute_actor_loss_terms(obs, line_to_goal_safe)
 
         self.assertAlmostEqual(rl_actor_loss.item(), -8.0)
-        self.assertAlmostEqual(scaled_rl_actor_loss.item(), rl_actor_loss.item())
-        self.assertEqual(actor_rl_scale, 1.0)
+        self.assertAlmostEqual(actor_rl_scale, 0.3125)
+        self.assertAlmostEqual(scaled_rl_actor_loss.item(), -2.5)
         self.assertEqual(bc_lambda, 0.0)
         self.assertAlmostEqual(bc_loss.item(), 0.0)
-        self.assertAlmostEqual(actor_loss.item(), rl_actor_loss.item())
+        self.assertAlmostEqual(actor_loss.item(), scaled_rl_actor_loss.item())
         self.assertAlmostEqual(terminal_geo_loss.item(), 0.0)
         self.assertEqual(terminal_geo_lambda, 0.0)
 

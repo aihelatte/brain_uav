@@ -426,14 +426,12 @@ class TD3Trainer:
         actor_actions = self.actor(obs)
         q_values = self.critic1(obs, actor_actions)
         rl_actor_loss = -q_values.mean()
-        scaled_rl_actor_loss = rl_actor_loss
-        actor_rl_scale = 1.0
+        q_scale = q_values.detach().abs().mean().clamp(min=1.0)
+        actor_rl_scale = float(self.actor_rl_scale_alpha / q_scale.item())
+        scaled_rl_actor_loss = rl_actor_loss * actor_rl_scale
         bc_lambda = 0.0
         bc_loss = torch.zeros((), device=self.device)
         if self.bc_reference_actor is not None:
-            q_scale = q_values.detach().abs().mean().clamp(min=1.0)
-            actor_rl_scale = float(self.actor_rl_scale_alpha / q_scale.item())
-            scaled_rl_actor_loss = rl_actor_loss * actor_rl_scale
             bc_lambda = self._bc_lambda()
             with torch.no_grad():
                 bc_actions = self.bc_reference_actor(obs)

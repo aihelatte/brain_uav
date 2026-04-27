@@ -137,6 +137,26 @@ def _draw_zone_vertical_projection(ax, center_value: float, radius: float, label
     ax.plot(xs, zs, color=color, linewidth=1.4, alpha=0.8, label=label)
 
 
+def _draw_goal_radius_projection(ax, center: tuple[float, float], radius: float) -> None:
+    import matplotlib.patches as patches
+
+    goal_patch = patches.Circle(
+        center,
+        radius,
+        fill=False,
+        color='tab:green',
+        linestyle='--',
+        linewidth=1.2,
+        alpha=0.5,
+        label='goal radius',
+    )
+    ax.add_patch(goal_patch)
+
+
+def _resolve_active_goal_radius(record: dict[str, Any], scenario_cfg: dict[str, Any]) -> float:
+    return float(record['info'].get('active_goal_radius', scenario_cfg['goal_radius']))
+
+
 def export_episode_result(
     target_dir: Path,
     stem: str,
@@ -174,16 +194,20 @@ def export_episode_result(
     goal = np.asarray(record['scenario']['goal'], dtype=float)
     zones = record['scenario']['zones']
     scenario_cfg = config_payload['scenario']
+    active_goal_radius = _resolve_active_goal_radius(record, scenario_cfg)
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-    ax_xy = axes[0, 0]
-    ax_xz = axes[0, 1]
-    ax_yz = axes[1, 0]
-    ax_text = axes[1, 1]
+    fig, axes = plt.subplots(
+        3,
+        1,
+        figsize=(14, 18),
+        gridspec_kw={'height_ratios': [6, 1, 1]},
+    )
+    ax_xy, ax_xz, ax_yz = axes
 
     ax_xy.plot(traj[:, 0], traj[:, 1], color='tab:blue', linewidth=2.0, label='trajectory')
     ax_xy.scatter(start[0], start[1], color='tab:blue', s=55, marker='o', label='start')
     ax_xy.scatter(goal[0], goal[1], color='tab:green', s=70, marker='*', label='goal')
+    _draw_goal_radius_projection(ax_xy, (goal[0], goal[1]), active_goal_radius)
     for idx, zone in enumerate(zones, start=1):
         center_xy = zone['center_xy']
         radius = zone['radius']
@@ -201,6 +225,7 @@ def export_episode_result(
     ax_xz.plot(traj[:, 0], traj[:, 2], color='tab:blue', linewidth=2.0, label='trajectory')
     ax_xz.scatter(start[0], start[2], color='tab:blue', s=55, marker='o', label='start')
     ax_xz.scatter(goal[0], goal[2], color='tab:green', s=70, marker='*', label='goal')
+    _draw_goal_radius_projection(ax_xz, (goal[0], goal[2]), active_goal_radius)
     for idx, zone in enumerate(zones, start=1):
         _draw_zone_vertical_projection(ax_xz, zone['center_xy'][0], zone['radius'], f'zone {idx}')
     ax_xz.axhline(scenario_cfg['ground_warning_height'], color='tab:orange', linestyle='--', alpha=0.7, label='ground warning')
@@ -215,6 +240,7 @@ def export_episode_result(
     ax_yz.plot(traj[:, 1], traj[:, 2], color='tab:blue', linewidth=2.0, label='trajectory')
     ax_yz.scatter(start[1], start[2], color='tab:blue', s=55, marker='o', label='start')
     ax_yz.scatter(goal[1], goal[2], color='tab:green', s=70, marker='*', label='goal')
+    _draw_goal_radius_projection(ax_yz, (goal[1], goal[2]), active_goal_radius)
     for idx, zone in enumerate(zones, start=1):
         _draw_zone_vertical_projection(ax_yz, zone['center_xy'][1], zone['radius'], f'zone {idx}')
     ax_yz.axhline(scenario_cfg['ground_warning_height'], color='tab:orange', linestyle='--', alpha=0.7, label='ground warning')
@@ -226,7 +252,6 @@ def export_episode_result(
     ax_yz.grid(alpha=0.3)
     ax_yz.legend(loc='upper left', ncol=2)
 
-    ax_text.axis('off')
     zone_lines = [
         f"zone {idx}: center=({zone['center_xy'][0]:.1f}, {zone['center_xy'][1]:.1f}) km, r={zone['radius']:.1f} km"
         for idx, zone in enumerate(zones, start=1)
@@ -252,18 +277,17 @@ def export_episode_result(
         f"zone_count: {len(zones)}",
         f"corridor_width (km): {corridor_width if corridor_width is not None else 'n/a'}",
         f"min_clearance_to_boundary (km): {min_clearance if min_clearance is not None else 'n/a'}",
-        f"goal radius (km): {scenario_cfg['goal_radius']}",
+        f"active goal radius (km): {active_goal_radius}",
         f"warning_distance (km): {scenario_cfg['warning_distance']}",
         f"boundary_warning_distance (km): {scenario_cfg['boundary_warning_distance']}",
         f"ground_warning_height (km): {scenario_cfg['ground_warning_height']}",
         '',
         *zone_lines,
     ]
-    ax_text.text(0.0, 1.0, '\n'.join(summary), va='top', ha='left', fontsize=10, family='monospace')
-    ax_text.set_title('Scenario Summary')
+    fig.text(0.02, 0.015, ' | '.join(summary[:10]), ha='left', va='bottom', fontsize=8, family='monospace')
 
     fig.suptitle(f"Episode {record['episode']} - {record['outcome']}", fontsize=15)
-    fig.tight_layout(rect=[0, 0, 1, 0.97], pad=2.0)
+    fig.tight_layout(rect=[0, 0.04, 1, 0.97], pad=2.0)
     fig.savefig(png_path, dpi=200, bbox_inches='tight')
     plt.close(fig)
 
@@ -279,7 +303,7 @@ def make_episode_capture_callback(
 
     Current policy:
     - save one step snapshot every 1/20 of total training steps
-    - save at most one goal example per 10 episode windows
+    - save at most one goal example per 5 episode windows
     """
     snapshot_dir = ensure_dir(result_root / 'step_snapshots')
     goal_dir = ensure_dir(result_root / 'goal_examples')
@@ -301,7 +325,7 @@ def make_episode_capture_callback(
 
         if summary_every_episodes > 0 and record['outcome'] == 'goal':
             window_idx = (record['episode'] - 1) // summary_every_episodes
-            goal_group_idx = window_idx // 10
+            goal_group_idx = window_idx // 5
             if goal_group_idx not in saved_goal_groups:
                 saved_goal_groups.add(goal_group_idx)
                 stem = f'goal_group_{goal_group_idx + 1:02d}_ep{record["episode"]:05d}'
