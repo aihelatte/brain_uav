@@ -152,7 +152,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(args.early_stop_windows, 4)
         self.assertEqual(args.early_stop_max_failures_per_window, 1)
         self.assertEqual(args.early_stop_goal_rate, 0.95)
-        self.assertEqual(args.early_stop_min_steps, 80000)
+        self.assertEqual(args.early_stop_min_steps, 20000)
 
     def test_training_config_defaults_raise_timeout_and_success_bias(self):
         cfg = ExperimentConfig()
@@ -202,7 +202,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
             enabled=True,
             goal_rate_threshold=0.95,
             consecutive_windows=4,
-            min_steps=80000,
+            min_steps=20000,
             max_failures_per_window=1,
         )
         window = {
@@ -213,12 +213,12 @@ class TestTrainTD3Helpers(unittest.TestCase):
             'ground_count': 0,
             'collision_count': 0,
             'other_count': 0,
-            'total_steps': 80000,
+            'total_steps': 20000,
         }
         self.assertIsNone(callback({**window, 'total_steps': 3000}))
-        self.assertIsNone(callback({**window, 'total_steps': 80000}))
-        self.assertIsNone(callback({**window, 'total_steps': 81000}))
-        reason = callback({**window, 'total_steps': 82000})
+        self.assertIsNone(callback({**window, 'total_steps': 20000}))
+        self.assertIsNone(callback({**window, 'total_steps': 21000}))
+        reason = callback({**window, 'total_steps': 22000})
         self.assertIsInstance(reason, str)
         self.assertIn('qualified_windows=4/4', reason)
 

@@ -420,7 +420,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--early-stop-goal-rate', type=float, default=0.95)
     parser.add_argument('--early-stop-windows', type=int, default=4)
     parser.add_argument('--early-stop-max-failures-per-window', type=int, default=1)
-    parser.add_argument('--early-stop-min-steps', type=int, default=80000)
+    parser.add_argument('--early-stop-min-steps', type=int, default=20000)
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--snn-backend', choices=SNN_BACKEND_CHOICES, default='torch')
     return parser
