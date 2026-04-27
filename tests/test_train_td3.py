@@ -28,7 +28,7 @@ class _DummySpace:
 class _OneStepEnv:
     def __init__(self) -> None:
         self.action_space = _DummySpace()
-        self._obs = np.zeros(4, dtype=np.float32)
+        self._obs = np.zeros(24, dtype=np.float32)
         self.trajectory = [np.zeros(3, dtype=np.float32)]
         self.state = np.zeros(5, dtype=np.float32)
 
@@ -58,7 +58,7 @@ class _OneStepEnv:
 class _DummyActor(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.linear = torch.nn.Linear(4, 2)
+        self.linear = torch.nn.Linear(24, 2)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return self.linear(obs)
@@ -67,7 +67,7 @@ class _DummyActor(torch.nn.Module):
 class _DummyCritic(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
-        self.linear = torch.nn.Linear(6, 1)
+        self.linear = torch.nn.Linear(26, 1)
 
     def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         return self.linear(torch.cat([obs, action], dim=-1))
@@ -76,11 +76,12 @@ class _DummyCritic(torch.nn.Module):
 class _ConstantCritic(torch.nn.Module):
     def __init__(self, value: float) -> None:
         super().__init__()
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
         self.value = float(value)
 
     def forward(self, obs: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
         del action
-        return torch.full((obs.shape[0], 1), self.value, dtype=obs.dtype, device=obs.device)
+        return torch.ones((obs.shape[0], 1), dtype=obs.dtype, device=obs.device) * (self.anchor + self.value)
 
 
 class TestTrainTD3Helpers(unittest.TestCase):
@@ -101,7 +102,8 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(cfg.training.success_sample_bias, 4.0)
         self.assertEqual(cfg.training.actor_grad_clip_norm, 1.0)
         self.assertGreater(cfg.rewards.timeout_penalty, 1500.0)
-        self.assertEqual(cfg.rewards.timeout_penalty, 2500.0)
+        self.assertEqual(cfg.rewards.timeout_penalty, 4000.0)
+        self.assertEqual(cfg.rewards.goal_reward, 5000.0)
         self.assertEqual(cfg.training.actor_rl_scale_alpha, 2.5)
 
     def test_ann_default_actor_freeze_steps_is_5000(self):
@@ -253,7 +255,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
             actor_freeze_steps=0,
             actor_grad_clip_norm=1.0,
         )
-        obs = np.zeros(4, dtype=np.float32)
+        obs = np.zeros(24, dtype=np.float32)
         action = np.zeros(2, dtype=np.float32)
         trainer.replay.add(obs, action, 1.0, obs, False)
         trainer.replay.add(obs + 1.0, action, 1.0, obs + 1.0, True)
@@ -285,16 +287,29 @@ class TestTrainTD3Helpers(unittest.TestCase):
             success_sample_bias=1.0,
             actor_rl_scale_alpha=2.5,
             bc_reference_actor=_DummyActor(),
+            terminal_geo_regularization_enabled=False,
         )
         trainer.total_steps = 20_000
-        obs = torch.zeros((2, 4), dtype=torch.float32)
+        obs = torch.zeros((2, 24), dtype=torch.float32)
+        line_to_goal_safe = torch.ones((2, 1), dtype=torch.float32)
 
-        actor_loss, rl_actor_loss, scaled_rl_actor_loss, bc_loss, bc_lambda, actor_rl_scale = trainer._compute_actor_loss_terms(obs)
+        (
+            actor_loss,
+            rl_actor_loss,
+            scaled_rl_actor_loss,
+            bc_loss,
+            bc_lambda,
+            actor_rl_scale,
+            terminal_geo_loss,
+            terminal_geo_lambda,
+        ) = trainer._compute_actor_loss_terms(obs, line_to_goal_safe)
 
         self.assertAlmostEqual(rl_actor_loss.item(), -10.0)
         self.assertAlmostEqual(actor_rl_scale, 0.25)
         self.assertAlmostEqual(scaled_rl_actor_loss.item(), -2.5)
         self.assertAlmostEqual(actor_loss.item(), scaled_rl_actor_loss.item() + bc_lambda * bc_loss.item(), places=5)
+        self.assertAlmostEqual(terminal_geo_loss.item(), 0.0)
+        self.assertEqual(terminal_geo_lambda, 0.0)
 
     def test_actor_loss_without_bc_reference_stays_raw_rl_loss(self):
         trainer = TD3Trainer(
@@ -315,10 +330,21 @@ class TestTrainTD3Helpers(unittest.TestCase):
             exploration_noise=0.01,
             success_sample_bias=1.0,
             actor_rl_scale_alpha=2.5,
+            terminal_geo_regularization_enabled=False,
         )
-        obs = torch.zeros((2, 4), dtype=torch.float32)
+        obs = torch.zeros((2, 24), dtype=torch.float32)
+        line_to_goal_safe = torch.ones((2, 1), dtype=torch.float32)
 
-        actor_loss, rl_actor_loss, scaled_rl_actor_loss, bc_loss, bc_lambda, actor_rl_scale = trainer._compute_actor_loss_terms(obs)
+        (
+            actor_loss,
+            rl_actor_loss,
+            scaled_rl_actor_loss,
+            bc_loss,
+            bc_lambda,
+            actor_rl_scale,
+            terminal_geo_loss,
+            terminal_geo_lambda,
+        ) = trainer._compute_actor_loss_terms(obs, line_to_goal_safe)
 
         self.assertAlmostEqual(rl_actor_loss.item(), -8.0)
         self.assertAlmostEqual(scaled_rl_actor_loss.item(), rl_actor_loss.item())
@@ -326,6 +352,8 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(bc_lambda, 0.0)
         self.assertAlmostEqual(bc_loss.item(), 0.0)
         self.assertAlmostEqual(actor_loss.item(), rl_actor_loss.item())
+        self.assertAlmostEqual(terminal_geo_loss.item(), 0.0)
+        self.assertEqual(terminal_geo_lambda, 0.0)
 
     def test_metrics_include_scaled_rl_fields(self):
         metrics = TD3Trainer(
@@ -349,6 +377,8 @@ class TestTrainTD3Helpers(unittest.TestCase):
 
         self.assertIn('scaled_rl_actor_loss', metrics)
         self.assertIn('actor_rl_scale', metrics)
+        self.assertIn('terminal_geo_loss', metrics)
+        self.assertIn('terminal_geo_lambda', metrics)
 
     def test_true_early_stop_sets_early_stopped(self):
         trainer = TD3Trainer(

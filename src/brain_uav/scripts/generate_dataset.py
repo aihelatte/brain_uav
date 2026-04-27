@@ -60,7 +60,13 @@ def main() -> None:
     cfg = ExperimentConfig()
     curriculum_mix = parse_curriculum_mix(args.curriculum_mix, fallback_level=args.curriculum_level)
     set_global_seed(args.seed)
-    env = make_env(cfg, seed=args.seed, curriculum_level=args.curriculum_level, curriculum_mix=curriculum_mix)
+    env = make_env(
+        cfg,
+        seed=args.seed,
+        curriculum_level=args.curriculum_level,
+        curriculum_mix=curriculum_mix,
+        goal_radius_curriculum_enabled=False,
+    )
     log_prefix = build_dataset_log_prefix(args.curriculum_level)
     planners = build_planners(env)
     observations: list[np.ndarray] = []

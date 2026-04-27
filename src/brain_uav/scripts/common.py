@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import torch
 
 from ..config import ExperimentConfig
@@ -62,6 +64,7 @@ def make_env(
     scenario_suite: str | None = None,
     curriculum_level: str | None = None,
     curriculum_mix: dict[str, float] | str | None = None,
+    goal_radius_curriculum_enabled: bool = False,
 ) -> StaticNoFlyTrajectoryEnv:
     """Build one environment instance.
 
@@ -71,6 +74,11 @@ def make_env(
 
     fixed_scenarios = None
     mix_payload = None
+    scenario_cfg = (
+        replace(cfg.scenario, goal_radius_curriculum_enabled=goal_radius_curriculum_enabled)
+        if cfg.scenario.goal_radius_curriculum_enabled != goal_radius_curriculum_enabled
+        else cfg.scenario
+    )
     if scenario_suite == 'benchmark':
         fixed_scenarios = [item.scenario for item in build_benchmark_scenarios()]
     elif curriculum_level is not None:
@@ -79,7 +87,7 @@ def make_env(
         else:
             mix_payload = normalize_curriculum_mix(curriculum_mix, fallback_level=curriculum_level)
     return StaticNoFlyTrajectoryEnv(
-        cfg.scenario,
+        scenario_cfg,
         cfg.rewards,
         seed=seed,
         fixed_scenarios=fixed_scenarios,

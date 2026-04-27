@@ -27,6 +27,16 @@ class ScenarioConfig:
     )
     world_xy_margin_ratio: float = 0.75
     goal_radius: float = 5.0
+    goal_radius_curriculum_enabled: bool = False
+    goal_radius_curriculum: dict[str, float] = field(
+        default_factory=lambda: {
+            'easy': 10.0,
+            'easy_two_zone': 8.0,
+            'medium': 6.5,
+            'hard': 5.0,
+            'benchmark': 5.0,
+        }
+    )
     world_xy: float | None = None
     world_z_min: float = 0.1
     world_z_max: float | None = None
@@ -73,7 +83,7 @@ class RewardConfig:
     """Reward weights used by reinforcement learning."""
 
     progress_weight: float = 2.4
-    goal_reward: float = 3500.0
+    goal_reward: float = 5000.0
     zone_penalty_weight: float = 180.0
     zone_penalty_cap: float = 300.0
     boundary_soft_penalty_weight: float = 120.0
@@ -92,11 +102,19 @@ class RewardConfig:
     collision_penalty: float = 6000.0
     step_penalty: float = 3.0
     boundary_penalty: float = 6000.0
-    timeout_penalty: float = 2500.0
+    timeout_penalty: float = 4000.0
     breakthrough_reward_distance: float = 22.0
     breakthrough_progress_threshold: float = 2.2
     breakthrough_reward_weight: float = 0.35
     breakthrough_reward_cap: float = 10.0
+    terminal_guidance_radius: float = 80.0
+    terminal_los_weight: float = 45.0
+    terminal_los_penalty_weight: float = 70.0
+    terminal_los_reward_cap: float = 80.0
+    terminal_tangential_radius: float = 80.0
+    terminal_radial_weight: float = 45.0
+    terminal_tangential_penalty_weight: float = 60.0
+    terminal_tangential_penalty_cap: float = 80.0
 
 
 @dataclass(slots=True)
@@ -120,6 +138,10 @@ class TrainingConfig:
     near_goal_sample_bias: float = 1.0
     actor_grad_clip_norm: float | None = 1.0
     actor_rl_scale_alpha: float = 2.5
+    terminal_geo_regularization_enabled: bool = True
+    terminal_geo_radius: float = 80.0
+    terminal_geo_lambda: float = 0.15
+    terminal_geo_safe_clearance: float = 3.0
     bc_epochs: int = 10
     snn_time_window: int = 4
     snn_backend: str = 'torch'

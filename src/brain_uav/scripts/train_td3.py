@@ -487,6 +487,7 @@ def main() -> None:
         seed=args.seed,
         curriculum_level=args.curriculum_level,
         curriculum_mix=curriculum_mix,
+        goal_radius_curriculum_enabled=True,
     )
     obs, _ = env.reset(seed=args.seed)
     actor = make_actor(cfg, args.model, obs.shape[0], env.action_space.shape[0])
@@ -512,6 +513,10 @@ def main() -> None:
         actor_freeze_steps=cfg.training.actor_freeze_steps,
         actor_grad_clip_norm=cfg.training.actor_grad_clip_norm,
         actor_rl_scale_alpha=cfg.training.actor_rl_scale_alpha,
+        terminal_geo_regularization_enabled=cfg.training.terminal_geo_regularization_enabled,
+        terminal_geo_radius=cfg.training.terminal_geo_radius,
+        terminal_geo_lambda=cfg.training.terminal_geo_lambda,
+        terminal_geo_safe_clearance=cfg.training.terminal_geo_safe_clearance,
         critic_grad_clip_norm=cfg.training.critic_grad_clip_norm,
         warmup_strategy='random',
         device=cfg.training.device,
@@ -527,6 +532,7 @@ def main() -> None:
             trainer.set_bc_reference_actor(deepcopy(actor))
 
     config_payload = cfg.to_dict()
+    config_payload['scenario']['goal_radius_curriculum_enabled'] = True
     config_payload['curriculum_level'] = args.curriculum_level
     config_payload['curriculum_mix'] = curriculum_mix
     episode_callback = make_episode_capture_callback(
@@ -571,6 +577,13 @@ def main() -> None:
     metrics_dict['scaled_rl_actor_loss'] = trainer.metrics.scaled_rl_actor_loss
     metrics_dict['actor_rl_scale'] = trainer.metrics.actor_rl_scale
     metrics_dict['actor_rl_scale_alpha'] = cfg.training.actor_rl_scale_alpha
+    metrics_dict['terminal_geo_loss'] = trainer.metrics.terminal_geo_loss
+    metrics_dict['terminal_geo_lambda'] = trainer.metrics.terminal_geo_lambda
+    metrics_dict['terminal_geo_regularization_enabled'] = cfg.training.terminal_geo_regularization_enabled
+    metrics_dict['terminal_geo_radius'] = cfg.training.terminal_geo_radius
+    metrics_dict['terminal_geo_safe_clearance'] = cfg.training.terminal_geo_safe_clearance
+    metrics_dict['goal_radius_curriculum_enabled'] = True
+    metrics_dict['goal_radius_curriculum'] = cfg.scenario.goal_radius_curriculum
     metrics_dict['total_actor_loss'] = trainer.metrics.actor_loss
     metrics_dict['early_stop_enabled'] = bool(args.early_stop_enabled and args.summary_every_episodes > 0)
     metrics_dict['early_stop_goal_rate'] = args.early_stop_goal_rate

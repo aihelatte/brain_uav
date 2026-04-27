@@ -31,6 +31,8 @@ class TD3Metrics:
     actor_rl_scale: float = 1.0
     bc_loss: float = 0.0
     bc_lambda: float = 0.0
+    terminal_geo_loss: float = 0.0
+    terminal_geo_lambda: float = 0.0
     bc_regularization_enabled: bool = False
     steps: int = 0
     episodes: int = 0
@@ -48,6 +50,8 @@ class TD3Metrics:
             'actor_rl_scale': self.actor_rl_scale,
             'bc_loss': self.bc_loss,
             'bc_lambda': self.bc_lambda,
+            'terminal_geo_loss': self.terminal_geo_loss,
+            'terminal_geo_lambda': self.terminal_geo_lambda,
             'bc_regularization_enabled': self.bc_regularization_enabled,
             'steps': self.steps,
             'episodes': self.episodes,
@@ -83,6 +87,10 @@ class TD3Trainer:
         actor_freeze_steps: int = 0,
         actor_grad_clip_norm: float | None = None,
         actor_rl_scale_alpha: float = 2.5,
+        terminal_geo_regularization_enabled: bool = True,
+        terminal_geo_radius: float = 80.0,
+        terminal_geo_lambda: float = 0.15,
+        terminal_geo_safe_clearance: float = 3.0,
         critic_grad_clip_norm: float | None = None,
         warmup_strategy: str = 'random',
         device: str = 'cpu',
@@ -111,6 +119,10 @@ class TD3Trainer:
         self.actor_freeze_steps = actor_freeze_steps
         self.actor_grad_clip_norm = actor_grad_clip_norm
         self.actor_rl_scale_alpha = actor_rl_scale_alpha
+        self.terminal_geo_regularization_enabled = terminal_geo_regularization_enabled
+        self.terminal_geo_radius = terminal_geo_radius
+        self.terminal_geo_lambda = terminal_geo_lambda
+        self.terminal_geo_safe_clearance = terminal_geo_safe_clearance
         self.critic_grad_clip_norm = critic_grad_clip_norm
         self.success_sample_bias = success_sample_bias
         self.exploration_noise_base = exploration_noise
@@ -160,6 +172,12 @@ class TD3Trainer:
             )
         for step_idx in range(total_timesteps):
             self.total_steps += 1
+            line_to_goal_safe = bool(
+                getattr(self.env, '_line_to_goal_is_safe', lambda pos, clearance=0.0: True)(
+                    self.env.state[:3],
+                    clearance=self.terminal_geo_safe_clearance,
+                )
+            )
             if self.total_steps <= self.warmup_steps:
                 action = self._warmup_action(obs)
             else:
@@ -175,6 +193,7 @@ class TD3Trainer:
                 done,
                 success=bool(info.get('outcome') == 'goal'),
                 near_goal=bool(info.get('goal_reached_by_segment', False)),
+                line_to_goal_safe=line_to_goal_safe,
             )
             episode_return += reward
             episode_length += 1
@@ -343,7 +362,8 @@ class TD3Trainer:
     def _compute_actor_loss_terms(
         self,
         obs: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+        line_to_goal_safe: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float, torch.Tensor, float]:
         actor_actions = self.actor(obs)
         q_values = self.critic1(obs, actor_actions)
         rl_actor_loss = -q_values.mean()
@@ -359,8 +379,66 @@ class TD3Trainer:
             with torch.no_grad():
                 bc_actions = self.bc_reference_actor(obs)
             bc_loss = F.mse_loss(actor_actions, bc_actions)
-        actor_loss = scaled_rl_actor_loss + bc_lambda * bc_loss
-        return actor_loss, rl_actor_loss, scaled_rl_actor_loss, bc_loss, bc_lambda, actor_rl_scale
+        terminal_geo_loss = torch.zeros((), device=self.device)
+        terminal_geo_lambda = 0.0
+        if self.terminal_geo_regularization_enabled:
+            terminal_geo_loss = self._terminal_geo_loss(obs, actor_actions, line_to_goal_safe)
+            if terminal_geo_loss.detach().abs().item() > 0.0:
+                terminal_geo_lambda = self.terminal_geo_lambda
+        actor_loss = scaled_rl_actor_loss + bc_lambda * bc_loss + terminal_geo_lambda * terminal_geo_loss
+        return (
+            actor_loss,
+            rl_actor_loss,
+            scaled_rl_actor_loss,
+            bc_loss,
+            bc_lambda,
+            actor_rl_scale,
+            terminal_geo_loss,
+            terminal_geo_lambda,
+        )
+
+    def _terminal_geo_loss(
+        self,
+        obs: torch.Tensor,
+        actor_actions: torch.Tensor,
+        line_to_goal_safe: torch.Tensor,
+    ) -> torch.Tensor:
+        if not self.terminal_geo_regularization_enabled:
+            return torch.zeros((), device=self.device)
+
+        rel_goal = obs[:, 5:8]
+        goal_distance = torch.linalg.norm(rel_goal, dim=1)
+        safe_mask = line_to_goal_safe.squeeze(-1) > 0.5
+        eligible_mask = safe_mask & (goal_distance <= self.terminal_geo_radius)
+        if not torch.any(eligible_mask):
+            return torch.zeros((), device=self.device)
+
+        gamma = obs[:, 3]
+        psi = obs[:, 4]
+        dx = rel_goal[:, 0]
+        dy = rel_goal[:, 1]
+        dz = rel_goal[:, 2]
+        horizontal = torch.sqrt(torch.clamp(dx.square() + dy.square(), min=1e-9))
+        target_gamma = torch.atan2(dz, horizontal)
+        target_psi = torch.atan2(dy, dx)
+
+        delta_gamma = torch.clamp(
+            target_gamma - gamma,
+            min=float(self.action_low[0].item()),
+            max=float(self.action_high[0].item()),
+        )
+        delta_psi = torch.clamp(
+            self._wrap_angle_tensor(target_psi - psi),
+            min=float(self.action_low[1].item()),
+            max=float(self.action_high[1].item()),
+        )
+        target_action = torch.stack([delta_gamma, delta_psi], dim=-1)
+        return F.mse_loss(actor_actions[eligible_mask], target_action[eligible_mask])
+
+    @staticmethod
+    def _wrap_angle_tensor(value: torch.Tensor) -> torch.Tensor:
+        two_pi = float(2.0 * np.pi)
+        return torch.remainder(value + float(np.pi), two_pi) - float(np.pi)
 
     def _update(self) -> None:
         batch = self.replay.sample(self.batch_size)
@@ -369,6 +447,7 @@ class TD3Trainer:
         rewards = batch['reward'].to(self.device)
         next_obs = batch['next_obs'].to(self.device)
         done = batch['done'].to(self.device)
+        line_to_goal_safe = batch['line_to_goal_safe'].to(self.device)
 
         with torch.no_grad():
             _, policy_noise, noise_clip = self._current_noise()
@@ -395,7 +474,16 @@ class TD3Trainer:
             self._soft_update(self.critic1, self.critic1_target)
             self._soft_update(self.critic2, self.critic2_target)
             if self.total_steps > self.actor_freeze_steps:
-                actor_loss, rl_actor_loss, scaled_rl_actor_loss, bc_loss, bc_lambda, actor_rl_scale = self._compute_actor_loss_terms(obs)
+                (
+                    actor_loss,
+                    rl_actor_loss,
+                    scaled_rl_actor_loss,
+                    bc_loss,
+                    bc_lambda,
+                    actor_rl_scale,
+                    terminal_geo_loss,
+                    terminal_geo_lambda,
+                ) = self._compute_actor_loss_terms(obs, line_to_goal_safe)
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 if self.actor_grad_clip_norm is not None and self.actor_grad_clip_norm > 0.0:
@@ -411,6 +499,8 @@ class TD3Trainer:
                 self.metrics.actor_rl_scale = float(actor_rl_scale)
                 self.metrics.bc_loss = float(bc_loss.item())
                 self.metrics.bc_lambda = float(bc_lambda)
+                self.metrics.terminal_geo_loss = float(terminal_geo_loss.item())
+                self.metrics.terminal_geo_lambda = float(terminal_geo_lambda)
 
     def _soft_update(self, model: nn.Module, target: nn.Module) -> None:
         for param, target_param in zip(model.parameters(), target.parameters()):

@@ -493,6 +493,79 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             }
         return None
 
+    def _flight_direction(self, gamma: float, psi: float) -> np.ndarray:
+        direction = np.array(
+            [
+                math.cos(gamma) * math.cos(psi),
+                math.cos(gamma) * math.sin(psi),
+                math.sin(gamma),
+            ],
+            dtype=np.float32,
+        )
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-6:
+            return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        return direction / norm
+
+    def _goal_direction(self, pos: np.ndarray) -> np.ndarray | None:
+        rel_goal = self.goal - pos
+        norm = float(np.linalg.norm(rel_goal))
+        if norm <= 1e-6:
+            return None
+        return rel_goal / norm
+
+    def _inside_zone_with_clearance(self, pos: np.ndarray, zone: Zone, clearance: float = 0.0) -> bool:
+        effective_radius = zone.radius + max(clearance, 0.0)
+        distance = (pos[0] - zone.center_xy[0]) ** 2 + (pos[1] - zone.center_xy[1]) ** 2 + pos[2] ** 2
+        return bool(distance <= effective_radius**2)
+
+    def _line_to_goal_is_safe(self, pos: np.ndarray, samples: int = 32, clearance: float = 0.0) -> bool:
+        if not self.zones:
+            return True
+        sample_count = max(int(samples), 1)
+        for idx in range(1, sample_count + 1):
+            t = idx / sample_count
+            point = pos + t * (self.goal - pos)
+            if any(self._inside_zone_with_clearance(point, zone, clearance) for zone in self.zones):
+                return False
+        return True
+
+    def _terminal_reward_active(self, pos: np.ndarray, radius: float, outcome: str) -> bool:
+        if outcome in {'collision', 'ground', 'boundary'}:
+            return False
+        if self._goal_distance(pos) > radius:
+            return False
+        return self._line_to_goal_is_safe(pos, clearance=0.0)
+
+    def _terminal_los_reward(self, pos: np.ndarray, gamma: float, psi: float, outcome: str) -> float:
+        if not self._terminal_reward_active(pos, self.rewards.terminal_guidance_radius, outcome):
+            return 0.0
+        goal_dir = self._goal_direction(pos)
+        if goal_dir is None:
+            return 0.0
+        alignment = float(np.dot(self._flight_direction(gamma, psi), goal_dir))
+        if alignment >= 0.0:
+            reward = self.rewards.terminal_los_weight * alignment
+        else:
+            reward = -self.rewards.terminal_los_penalty_weight * abs(alignment)
+        cap = self.rewards.terminal_los_reward_cap
+        return float(np.clip(reward, -cap, cap))
+
+    def _terminal_radial_tangential_reward(self, pos: np.ndarray, gamma: float, psi: float, outcome: str) -> float:
+        if not self._terminal_reward_active(pos, self.rewards.terminal_tangential_radius, outcome):
+            return 0.0
+        goal_dir = self._goal_direction(pos)
+        if goal_dir is None:
+            return 0.0
+        radial_component = float(np.dot(self._flight_direction(gamma, psi), goal_dir))
+        tangential_component = math.sqrt(max(1.0 - radial_component**2, 0.0))
+        reward = self.rewards.terminal_radial_weight * max(radial_component, 0.0)
+        penalty = min(
+            self.rewards.terminal_tangential_penalty_weight * tangential_component,
+            self.rewards.terminal_tangential_penalty_cap,
+        )
+        return reward - penalty
+
     def _sample_zones_for_pair(self, state: np.ndarray, goal: np.ndarray) -> list[Zone] | None:
         cfg = self.scenario
         zones: list[Zone] = []
@@ -668,6 +741,13 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             (prev_distance - new_distance) * self._distance_reward_scale_compensation
         )
         rew += self._breakthrough_reward(new_distance, prev_best_goal_distance, outcome)
+        rew += self._terminal_los_reward(self.state[:3], float(self.state[3]), float(self.state[4]), outcome)
+        rew += self._terminal_radial_tangential_reward(
+            self.state[:3],
+            float(self.state[3]),
+            float(self.state[4]),
+            outcome,
+        )
         rew -= self.rewards.step_penalty
         rew -= self.rewards.smoothness_weight * float(np.square(action).sum())
         rew -= self._action_change_penalty(prev_action, action)
@@ -819,6 +899,10 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         return float(np.linalg.norm(pos - self.goal))
 
     def _active_goal_radius(self) -> float:
+        if self.scenario.goal_radius_curriculum_enabled:
+            level = self.last_curriculum_level
+            if level in self.scenario.goal_radius_curriculum:
+                return float(self.scenario.goal_radius_curriculum[level])
         return float(self.scenario.goal_radius)
 
     def _segment_goal_distance(self, start: np.ndarray, end: np.ndarray) -> float:
@@ -849,4 +933,5 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             'outcome': outcome,
             'steps': self.steps,
             'curriculum_level': self.last_curriculum_level,
+            'active_goal_radius': self._active_goal_radius(),
         }
