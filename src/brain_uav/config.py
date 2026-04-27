@@ -15,7 +15,7 @@ class ScenarioConfig:
     gamma_max: float = 0.6
     delta_gamma_max: float = 0.14
     delta_psi_max: float = 0.2
-    target_distance: float = 350.0
+    target_distance: float = 700.0
     curriculum_distance_ratios: dict[str, tuple[float, float]] = field(
         default_factory=lambda: {
             'easy': (0.55, 0.70),
@@ -40,24 +40,33 @@ class ScenarioConfig:
     world_xy: float | None = None
     world_z_min: float = 0.1
     world_z_max: float | None = None
-    max_steps: int = 200
+    max_steps: int = 400
     min_no_fly_zones: int = 1
     max_no_fly_zones: int = 3
-    no_fly_radius_range: tuple[float, float] = (6.0, 14.0)
-    warning_distance: float = 10.0
+    no_fly_radius_range: tuple[float, float] = (100.0, 125.0)
+    no_fly_radius_curriculum: dict[str, tuple[float, float]] = field(
+        default_factory=lambda: {
+            'easy': (60.0, 80.0),
+            'easy_two_zone': (75.0, 95.0),
+            'medium': (90.0, 110.0),
+            'hard': (100.0, 125.0),
+            'benchmark': (100.0, 125.0),
+        }
+    )
+    warning_distance: float = 40.0
     boundary_warning_distance: float = 10.0
     ground_warning_height: float = 4.0
     descent_penalty_height: float = 12.0
     descent_gamma_threshold: float = 0.08
     nearest_zone_count: int = 3
     scenario_max_sampling_attempts: int = 80
-    start_zone_clearance: float = 2.5
+    start_zone_clearance: float = 30.0
     zone_overlap_ratio_limit: float = 0.55
-    corridor_blocking_margin: float = 3.5
+    corridor_blocking_margin: float = 20.0
     max_corridor_blockers: int = 2
     max_start_goal_height_gap: float = 11.0
-    dual_zone_min_margin: float = 13.0
-    easy_two_zone_min_gap: float = 22.0
+    dual_zone_min_margin: float = 55.0
+    easy_two_zone_min_gap: float = 65.0
     easy_two_zone_blocker_probability: float = 0.5
 
     def __post_init__(self) -> None:
@@ -77,6 +86,13 @@ class ScenarioConfig:
         ratio_min, ratio_max = self.distance_ratio_range_for_level(level)
         return self.target_distance * ratio_min, self.target_distance * ratio_max
 
+    def radius_range_for_level(self, level: str) -> tuple[float, float]:
+        try:
+            radius_range = self.no_fly_radius_curriculum[level]
+        except KeyError as exc:
+            raise ValueError(f'Unsupported curriculum level: {level}') from exc
+        return float(radius_range[0]), float(radius_range[1])
+
 
 @dataclass(slots=True)
 class RewardConfig:
@@ -84,8 +100,8 @@ class RewardConfig:
 
     progress_weight: float = 2.4
     goal_reward: float = 5000.0
-    zone_penalty_weight: float = 180.0
-    zone_penalty_cap: float = 300.0
+    zone_penalty_weight: float = 240.0
+    zone_penalty_cap: float = 500.0
     boundary_soft_penalty_weight: float = 120.0
     boundary_soft_penalty_cap: float = 160.0
     ground_soft_penalty_weight: float = 60.0
@@ -99,19 +115,19 @@ class RewardConfig:
     action_delta_gamma_weight: float = 8.0
     action_delta_psi_weight: float = 3.0
     smoothness_weight: float = 0.1
-    collision_penalty: float = 6000.0
-    step_penalty: float = 3.0
+    collision_penalty: float = 7500.0
+    step_penalty: float = 2.5
     boundary_penalty: float = 6000.0
-    timeout_penalty: float = 4000.0
-    breakthrough_reward_distance: float = 22.0
+    timeout_penalty: float = 4500.0
+    breakthrough_reward_distance: float = 60.0
     breakthrough_progress_threshold: float = 2.2
     breakthrough_reward_weight: float = 0.35
     breakthrough_reward_cap: float = 10.0
-    terminal_guidance_radius: float = 80.0
+    terminal_guidance_radius: float = 100.0
     terminal_los_weight: float = 45.0
     terminal_los_penalty_weight: float = 70.0
     terminal_los_reward_cap: float = 80.0
-    terminal_tangential_radius: float = 80.0
+    terminal_tangential_radius: float = 100.0
     terminal_radial_weight: float = 45.0
     terminal_tangential_penalty_weight: float = 60.0
     terminal_tangential_penalty_cap: float = 80.0
@@ -131,18 +147,18 @@ class TrainingConfig:
     noise_clip: float = 0.03
     policy_delay: int = 2
     exploration_noise: float = 0.02
-    replay_size: int = 100_000
-    warmup_steps: int = 256
-    actor_freeze_steps: int = 5_000
+    replay_size: int = 200_000
+    warmup_steps: int = 512
+    actor_freeze_steps: int = 10_000
     success_sample_bias: float = 4.0
     near_goal_sample_bias: float = 2.0
-    near_goal_radius: float = 80.0
+    near_goal_radius: float = 100.0
     success_replay_fraction: float = 0.25
     success_batch_fraction: float = 0.25
     actor_grad_clip_norm: float | None = 1.0
     actor_rl_scale_alpha: float = 2.5
     terminal_geo_regularization_enabled: bool = True
-    terminal_geo_radius: float = 80.0
+    terminal_geo_radius: float = 100.0
     terminal_geo_lambda: float = 100.0
     terminal_geo_safe_clearance: float = 3.0
     noise_decay_fraction: float = 0.5

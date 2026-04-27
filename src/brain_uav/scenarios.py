@@ -148,12 +148,21 @@ def _zone_payload(center_xy: list[float], radius: float, cfg: ScenarioConfig) ->
     return {'center_xy': _clamp_zone_center(center_xy, cfg), 'radius': float(radius)}
 
 
+def _benchmark_radius_range(cfg: ScenarioConfig) -> tuple[float, float]:
+    return cfg.radius_range_for_level('benchmark')
+
+
+def _clamp_radius(radius: float, radius_min: float, radius_max: float) -> float:
+    return float(max(radius_min, min(radius_max, radius)))
+
+
 def _make_single_detour(rng, idx: int) -> NamedScenario:
     cfg = ScenarioConfig()
     state, goal = _sample_benchmark_start_goal(rng, cfg)
     state_y = float(state[1])
     goal_y = float(goal[1])
-    radius = float(rng.uniform(120.0, 190.0))
+    radius_min, radius_max = _benchmark_radius_range(cfg)
+    radius = float(rng.uniform(radius_min, radius_max))
     center_x = float(rng.uniform(-80.0, 80.0))
     mean_y = 0.5 * (state_y + goal_y)
     lateral = float(rng.uniform(-120.0, 120.0))
@@ -180,8 +189,9 @@ def _make_double_channel(rng, idx: int) -> NamedScenario:
     state, goal = _sample_benchmark_start_goal(rng, cfg)
     state_y = float(state[1])
     goal_y = float(goal[1])
-    radius_1 = float(rng.uniform(110.0, 180.0))
-    radius_2 = float(rng.uniform(110.0, 180.0))
+    radius_min, radius_max = _benchmark_radius_range(cfg)
+    radius_1 = float(rng.uniform(radius_min, radius_max))
+    radius_2 = float(rng.uniform(radius_min, radius_max))
     corridor_width = float(rng.uniform(140.0, 260.0))
     x_base = float(rng.uniform(-40.0, 40.0))
     x_offset = float(rng.uniform(-60.0, 60.0))
@@ -212,14 +222,15 @@ def _make_boundary_margin(rng, idx: int) -> NamedScenario:
     state, goal = _sample_benchmark_start_goal(rng, cfg)
     state_y = float(state[1])
     goal_y = float(goal[1])
-    radius = float(rng.uniform(110.0, 170.0))
+    radius_min, radius_max = _benchmark_radius_range(cfg)
+    radius = float(rng.uniform(radius_min, radius_max))
     min_clearance = float(rng.uniform(20.0, 70.0))
     path_y = 0.5 * (state_y + goal_y)
     sign = 1.0 if rng.random() < 0.5 else -1.0
     main_center = [float(rng.uniform(-60.0, 120.0)), path_y + sign * (radius + min_clearance)]
     zones = [_zone_payload(main_center, radius, cfg)]
     if rng.random() < 0.45:
-        aux_radius = float(rng.uniform(110.0, 150.0))
+        aux_radius = float(rng.uniform(radius_min, radius_max))
         aux_center = [float(rng.uniform(180.0, 360.0)), path_y - sign * float(rng.uniform(180.0, 320.0))]
         zones.append(_zone_payload(aux_center, aux_radius, cfg))
     scenario_id = f'BM{idx:03d}'
@@ -239,7 +250,8 @@ def _make_boundary_margin(rng, idx: int) -> NamedScenario:
 def _make_wall_pressure(rng, idx: int) -> NamedScenario:
     cfg = ScenarioConfig()
     corridor_width = float(rng.uniform(120.0, 220.0))
-    radius_base = float(rng.uniform(105.0, 145.0))
+    radius_min, radius_max = _benchmark_radius_range(cfg)
+    radius_base = float(rng.uniform(radius_min, radius_max))
     state, goal = _sample_benchmark_start_goal(rng, cfg)
     state_y = float(state[1])
     goal_y = float(goal[1])
@@ -258,7 +270,7 @@ def _make_wall_pressure(rng, idx: int) -> NamedScenario:
         zones.append(
             _zone_payload(
                 [x_lower + float(rng.uniform(-30.0, 30.0)), lower_start - i * vertical_step],
-                float(radius_base + rng.uniform(-12.0, 12.0)),
+                _clamp_radius(float(radius_base + rng.uniform(-12.0, 12.0)), radius_min, radius_max),
                 cfg,
             )
         )
@@ -266,7 +278,7 @@ def _make_wall_pressure(rng, idx: int) -> NamedScenario:
         zones.append(
             _zone_payload(
                 [x_upper + float(rng.uniform(-30.0, 30.0)), upper_start + i * vertical_step],
-                float(radius_base + rng.uniform(-12.0, 12.0)),
+                _clamp_radius(float(radius_base + rng.uniform(-12.0, 12.0)), radius_min, radius_max),
                 cfg,
             )
         )
@@ -274,7 +286,7 @@ def _make_wall_pressure(rng, idx: int) -> NamedScenario:
         zones.append(
             _zone_payload(
                 [float(rng.uniform(220.0, 320.0)), corridor_center + float(rng.uniform(-260.0, 260.0))],
-                float(radius_base + rng.uniform(-8.0, 8.0)),
+                _clamp_radius(float(radius_base + rng.uniform(-8.0, 8.0)), radius_min, radius_max),
                 cfg,
             )
         )

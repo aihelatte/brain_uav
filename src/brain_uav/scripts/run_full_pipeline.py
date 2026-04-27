@@ -218,7 +218,7 @@ def run_full_pipeline(args: argparse.Namespace) -> dict:
                 '--early-stop-goal-rate',
                 '0.95',
                 '--early-stop-min-steps',
-                '20000',
+                '40000',
                 '--device',
                 args.device,
                 '--snn-backend',

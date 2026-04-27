@@ -13,6 +13,7 @@ class TestBenchmarkScenarios(unittest.TestCase):
         cfg = ScenarioConfig()
         payload = generate_benchmark_suite(seed=123, count_per_category=2)
         distance_min, distance_max = cfg.distance_range_for_level('benchmark')
+        radius_min, radius_max = cfg.radius_range_for_level('benchmark')
         start_z_range = (0.18 * cfg.world_z_max, 0.30 * cfg.world_z_max)
         goal_z_range = (0.18 * cfg.world_z_max, 0.36 * cfg.world_z_max)
         max_height_gap = 0.15 * cfg.world_z_max
@@ -35,6 +36,9 @@ class TestBenchmarkScenarios(unittest.TestCase):
             self.assertLessEqual(abs(float(goal[2] - state[2])), max_height_gap)
             self.assertLessEqual(max(abs(float(state[0])), abs(float(goal[0]))), cfg.world_xy)
             self.assertLessEqual(max(abs(float(state[1])), abs(float(goal[1]))), cfg.world_xy)
+            for zone in scenario['zones']:
+                self.assertGreaterEqual(float(zone['radius']), radius_min)
+                self.assertLessEqual(float(zone['radius']), radius_max)
 
 
 if __name__ == '__main__':

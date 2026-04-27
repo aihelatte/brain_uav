@@ -287,13 +287,14 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             if pair is None:
                 continue
             state, goal = pair
-            radius = float(self.rng.uniform(7.0, 10.5))
+            radius = self._sample_zone_radius('easy')
             line_y = float((state[1] + goal[1]) * 0.5)
+            side_offset = float(self.rng.uniform(1.35 * radius, 1.60 * radius))
             zone = Zone(
                 center_xy=np.array(
                     [
                         self.rng.uniform(-0.05 * cfg.world_xy, 0.35 * cfg.world_xy),
-                        line_y + self.rng.choice([-1.0, 1.0]) * self.rng.uniform(17.0, 28.0),
+                        line_y + self.rng.choice([-1.0, 1.0]) * side_offset,
                     ],
                     dtype=np.float32,
                 ),
@@ -301,7 +302,12 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             )
             if not self._zone_candidate_is_valid(state, goal, [], zone.center_xy, zone.radius):
                 continue
-            blockers = self._count_corridor_blockers(state, goal, [zone], margin=2.0)
+            blockers = self._count_corridor_blockers(
+                state,
+                goal,
+                [zone],
+                margin=cfg.corridor_blocking_margin,
+            )
             if blockers != 0:
                 continue
             return {
@@ -348,44 +354,51 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         cfg = self.scenario
         zones: list[Zone] = []
         mean_y = 0.5 * (state[1] + goal[1])
+        radius_min, radius_max = cfg.radius_range_for_level('easy_two_zone')
         if force_blocker:
+            radius_1 = float(self.rng.uniform(radius_min, radius_max))
             center_1 = np.array(
                 [
                     self.rng.uniform(-0.02 * cfg.world_xy, 0.22 * cfg.world_xy),
-                    mean_y + self.rng.uniform(-4.5, 4.5),
+                    mean_y + self.rng.uniform(-0.15 * radius_1, 0.15 * radius_1),
                 ],
                 dtype=np.float32,
             )
-            radius_1 = float(self.rng.uniform(9.0, 12.0))
             if not self._zone_candidate_is_valid(state, goal, zones, center_1, radius_1):
                 return None
             zones.append(Zone(center_xy=center_1, radius=radius_1))
 
             side = float(self.rng.choice([-1.0, 1.0]))
+            radius_2 = float(self.rng.uniform(radius_min, radius_max))
             center_2 = np.array(
                 [
-                    center_1[0] + self.rng.uniform(13.0, 22.0),
-                    mean_y + side * self.rng.uniform(17.0, 25.0),
+                    center_1[0] + self.rng.uniform(0.85 * radius_1, 1.25 * radius_1),
+                    mean_y + side * self.rng.uniform(0.75 * radius_2, 1.10 * radius_2),
                 ],
                 dtype=np.float32,
             )
-            radius_2 = float(self.rng.uniform(8.0, 11.0))
+            center_2 = self._separate_zone_center(center_2, zones, radius_2, cfg.easy_two_zone_min_gap)
             if not self._zone_candidate_is_valid(state, goal, zones, center_2, radius_2):
                 return None
             zones.append(Zone(center_xy=center_2, radius=radius_2))
         else:
             base_x = self.rng.uniform(-0.05 * cfg.world_xy, 0.20 * cfg.world_xy)
-            offsets = [self.rng.uniform(16.0, 24.0), -self.rng.uniform(16.0, 24.0)]
-            self.rng.shuffle(offsets)
-            for idx, offset in enumerate(offsets):
+            signs = [1.0, -1.0]
+            self.rng.shuffle(signs)
+            x_cursor = 0.0
+            for idx, side in enumerate(signs):
+                radius = float(self.rng.uniform(radius_min, radius_max))
+                if idx > 0:
+                    x_cursor += float(self.rng.uniform(0.85 * radius, 1.20 * radius))
+                offset = side * float(self.rng.uniform(0.80 * radius, 1.20 * radius))
                 center_xy = np.array(
                     [
-                        base_x + idx * self.rng.uniform(13.0, 20.0),
+                        base_x + x_cursor,
                         mean_y + offset,
                     ],
                     dtype=np.float32,
                 )
-                radius = float(self.rng.uniform(8.0, 11.0))
+                center_xy = self._separate_zone_center(center_xy, zones, radius, cfg.easy_two_zone_min_gap)
                 if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
                     return None
                 zones.append(Zone(center_xy=center_xy, radius=radius))
@@ -430,14 +443,14 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     def _sample_medium_single_block(self, state: np.ndarray, goal: np.ndarray) -> list[Zone] | None:
         cfg = self.scenario
         zones: list[Zone] = []
+        radius = self._sample_zone_radius('medium')
         center_xy = np.array(
             [
                 self.rng.uniform(0.00 * cfg.world_xy, 0.30 * cfg.world_xy),
-                self.rng.uniform(-6.0, 6.0) + 0.5 * (state[1] + goal[1]),
+                self.rng.uniform(-0.12 * radius, 0.12 * radius) + 0.5 * (state[1] + goal[1]),
             ],
             dtype=np.float32,
         )
-        radius = float(self.rng.uniform(10.5, 14.5))
         if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
             return None
         zones.append(Zone(center_xy=center_xy, radius=radius))
@@ -447,17 +460,22 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         cfg = self.scenario
         zones: list[Zone] = []
         base_x = self.rng.uniform(-0.05 * cfg.world_xy, 0.20 * cfg.world_xy)
-        offsets = [self.rng.uniform(12.0, 19.0), -self.rng.uniform(12.0, 19.0)]
-        self.rng.shuffle(offsets)
-        for idx, offset in enumerate(offsets):
+        signs = [1.0, -1.0]
+        self.rng.shuffle(signs)
+        x_cursor = 0.0
+        for idx, side in enumerate(signs):
+            radius = self._sample_zone_radius('medium')
+            if idx > 0:
+                x_cursor += float(self.rng.uniform(0.80 * radius, 1.15 * radius))
+            offset = side * float(self.rng.uniform(0.70 * radius, 1.05 * radius))
             center_xy = np.array(
                 [
-                    base_x + idx * self.rng.uniform(12.0, 19.0),
+                    base_x + x_cursor,
                     0.5 * (state[1] + goal[1]) + offset,
                 ],
                 dtype=np.float32,
             )
-            radius = float(self.rng.uniform(8.5, 12.0))
+            center_xy = self._separate_zone_center(center_xy, zones, radius, cfg.dual_zone_min_margin)
             if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
                 return None
             zones.append(Zone(center_xy=center_xy, radius=radius))
@@ -477,7 +495,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             if pair is None:
                 continue
             state, goal = pair
-            zones = self._sample_zones_for_pair(state, goal)
+            zones = self._sample_zones_for_pair(state, goal, level='hard')
             if zones is None:
                 continue
             if not self._corridor_is_reasonable(state, goal, zones):
@@ -566,9 +584,35 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         )
         return reward - penalty
 
-    def _sample_zones_for_pair(self, state: np.ndarray, goal: np.ndarray) -> list[Zone] | None:
+    def _sample_zone_radius(self, level: str) -> float:
+        radius_min, radius_max = self.scenario.radius_range_for_level(level)
+        return float(self.rng.uniform(radius_min, radius_max))
+
+    def _separate_zone_center(
+        self,
+        center_xy: np.ndarray,
+        existing_zones: list[Zone],
+        radius: float,
+        min_margin: float,
+    ) -> np.ndarray:
+        adjusted = np.asarray(center_xy, dtype=np.float32).copy()
+        for zone in existing_zones:
+            delta = adjusted - zone.center_xy
+            distance = float(np.linalg.norm(delta))
+            min_distance = zone.radius + radius + min_margin + 1.0
+            if distance > min_distance:
+                continue
+            if distance <= 1e-6:
+                delta = np.array([1.0, 0.0], dtype=np.float32)
+                distance = 1.0
+            adjusted = zone.center_xy + delta / distance * min_distance
+        limit = float(self.scenario.world_xy)
+        return np.clip(adjusted, -limit, limit).astype(np.float32)
+
+    def _sample_zones_for_pair(self, state: np.ndarray, goal: np.ndarray, level: str = 'hard') -> list[Zone] | None:
         cfg = self.scenario
         zones: list[Zone] = []
+        radius_min, radius_max = cfg.radius_range_for_level(level)
         zone_count = int(self.rng.integers(max(2, cfg.min_no_fly_zones), cfg.max_no_fly_zones + 1))
         for _ in range(zone_count):
             accepted = False
@@ -580,7 +624,11 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                     ],
                     dtype=np.float32,
                 )
-                radius = float(self.rng.uniform(*cfg.no_fly_radius_range))
+                radius = float(self.rng.uniform(radius_min, radius_max))
+                if zones:
+                    center_xy = self._separate_zone_center(center_xy, zones, radius, cfg.dual_zone_min_margin)
+                if not self._zone_gap_is_valid(zones, center_xy, radius, cfg.dual_zone_min_margin):
+                    continue
                 if not self._zone_candidate_is_valid(state, goal, zones, center_xy, radius):
                     continue
                 zones.append(Zone(center_xy=center_xy, radius=radius))
@@ -589,6 +637,19 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             if not accepted:
                 return None
         return zones
+
+    @staticmethod
+    def _zone_gap_is_valid(
+        existing_zones: list[Zone],
+        center_xy: np.ndarray,
+        radius: float,
+        min_margin: float,
+    ) -> bool:
+        for zone in existing_zones:
+            center_distance = float(np.linalg.norm(center_xy - zone.center_xy))
+            if center_distance <= zone.radius + radius + min_margin:
+                return False
+        return True
 
     def _zone_candidate_is_valid(
         self,
