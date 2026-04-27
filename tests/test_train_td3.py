@@ -6,7 +6,7 @@ from unittest import mock
 import numpy as np
 import torch
 
-from brain_uav.config import ExperimentConfig
+from brain_uav.config import ExperimentConfig, ScenarioConfig
 from brain_uav.scripts.train_td3 import (
     apply_model_training_overrides,
     build_parser,
@@ -165,7 +165,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
             result_root=self._make_dummy_path(),
             summary_every_episodes=15,
             total_timesteps=200000,
-            config_payload={'scenario': {'world_xy': 80.0, 'world_z_max': 40.0, 'goal_radius': 5.0,
+            config_payload={'scenario': {'world_xy': ScenarioConfig().world_xy, 'world_z_max': ScenarioConfig().world_z_max, 'goal_radius': 5.0,
                                          'warning_distance': 10.0, 'boundary_warning_distance': 10.0,
                                          'ground_warning_height': 4.0}},
         )

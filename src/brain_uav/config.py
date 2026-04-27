@@ -15,10 +15,21 @@ class ScenarioConfig:
     gamma_max: float = 0.6
     delta_gamma_max: float = 0.14
     delta_psi_max: float = 0.2
+    target_distance: float = 350.0
+    curriculum_distance_ratios: dict[str, tuple[float, float]] = field(
+        default_factory=lambda: {
+            'easy': (0.55, 0.70),
+            'easy_two_zone': (0.70, 0.85),
+            'medium': (0.80, 0.95),
+            'hard': (0.90, 1.10),
+            'benchmark': (0.90, 1.10),
+        }
+    )
+    world_xy_margin_ratio: float = 0.75
     goal_radius: float = 5.0
-    world_xy: float = 80.0
+    world_xy: float | None = None
     world_z_min: float = 0.1
-    world_z_max: float = 40.0
+    world_z_max: float | None = None
     max_steps: int = 200
     min_no_fly_zones: int = 1
     max_no_fly_zones: int = 3
@@ -38,6 +49,23 @@ class ScenarioConfig:
     dual_zone_min_margin: float = 13.0
     easy_two_zone_min_gap: float = 22.0
     easy_two_zone_blocker_probability: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.world_xy is None:
+            object.__setattr__(self, 'world_xy', self.target_distance * self.world_xy_margin_ratio)
+        if self.world_z_max is None:
+            object.__setattr__(self, 'world_z_max', self.world_xy / 3.0)
+
+    def distance_ratio_range_for_level(self, level: str) -> tuple[float, float]:
+        try:
+            ratio_range = self.curriculum_distance_ratios[level]
+        except KeyError as exc:
+            raise ValueError(f'Unsupported curriculum level: {level}') from exc
+        return float(ratio_range[0]), float(ratio_range[1])
+
+    def distance_range_for_level(self, level: str) -> tuple[float, float]:
+        ratio_min, ratio_max = self.distance_ratio_range_for_level(level)
+        return self.target_distance * ratio_min, self.target_distance * ratio_max
 
 
 @dataclass(slots=True)

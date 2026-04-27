@@ -29,15 +29,17 @@ class TestStaticNoFlyEnv(unittest.TestCase):
         self.assertIsInstance(truncated, bool)
         self.assertIn("outcome", info)
 
-    def test_config_distance_scales_are_reduced_tenfold(self):
+    def test_config_uses_target_distance_derived_world_xy(self):
         cfg = ScenarioConfig()
         rewards = RewardConfig()
 
+        self.assertEqual(cfg.target_distance, 350.0)
+        self.assertAlmostEqual(cfg.world_xy, 262.5)
+        self.assertAlmostEqual(cfg.world_z_max, 87.5)
         self.assertEqual(cfg.speed, 2.5)
         self.assertEqual(cfg.goal_radius, 5.0)
-        self.assertEqual(cfg.world_xy, 80.0)
         self.assertEqual(cfg.world_z_min, 0.1)
-        self.assertEqual(cfg.world_z_max, 40.0)
+        self.assertEqual(cfg.max_steps, 200)
         self.assertEqual(cfg.no_fly_radius_range, (6.0, 14.0))
         self.assertEqual(cfg.warning_distance, 10.0)
         self.assertEqual(cfg.boundary_warning_distance, 10.0)
@@ -52,22 +54,43 @@ class TestStaticNoFlyEnv(unittest.TestCase):
         self.assertEqual(rewards.breakthrough_reward_distance, 22.0)
         self.assertEqual(rewards.breakthrough_progress_threshold, 2.2)
 
-    def test_easy_scenario_sampling_uses_scaled_ranges(self):
-        scenario = self.env._sample_easy_scenario()
-        self.assertIsNotNone(scenario)
-        assert scenario is not None
+    def test_curriculum_distance_ratios_include_benchmark_match(self):
+        cfg = ScenarioConfig()
 
-        state = np.asarray(scenario['state'], dtype=np.float32)
-        goal = np.asarray(scenario['goal'], dtype=np.float32)
-        zone = scenario['zones'][0]
+        self.assertEqual(cfg.distance_ratio_range_for_level('hard'), (0.90, 1.10))
+        self.assertEqual(cfg.distance_ratio_range_for_level('benchmark'), (0.90, 1.10))
 
-        self.assertGreaterEqual(state[2], 11.0)
-        self.assertLessEqual(state[2], 15.5)
-        self.assertGreaterEqual(goal[2], 10.5)
-        self.assertLessEqual(goal[2], 16.5)
-        self.assertLessEqual(abs(float(goal[2] - state[2])), 5.5)
-        self.assertGreaterEqual(zone['radius'], 7.0)
-        self.assertLessEqual(zone['radius'], 10.5)
+    def test_explicit_world_z_max_overrides_default_derivation(self):
+        cfg = ScenarioConfig(world_z_max=40.0)
+
+        self.assertEqual(cfg.world_xy, 262.5)
+        self.assertEqual(cfg.world_z_max, 40.0)
+
+    def test_curriculum_scenarios_follow_distance_ranges(self):
+        for level in ('easy', 'easy_two_zone', 'medium', 'hard'):
+            with self.subTest(level=level):
+                env = StaticNoFlyTrajectoryEnv(ScenarioConfig(), RewardConfig(), seed=7)
+                scenario = env._sample_curriculum_scenario(level)
+                self.assertIsNotNone(scenario)
+                assert scenario is not None
+
+                state = np.asarray(scenario['state'], dtype=np.float32)
+                goal = np.asarray(scenario['goal'], dtype=np.float32)
+                sampled_distance = float(np.linalg.norm(goal - state[:3]))
+                distance_min, distance_max = env.scenario.distance_range_for_level(level)
+                state_z_range, goal_z_range, max_height_gap = env._z_sampling_spec(level)
+
+                self.assertGreaterEqual(sampled_distance, distance_min)
+                self.assertLessEqual(sampled_distance, distance_max)
+                self.assertGreaterEqual(float(state[2]), state_z_range[0])
+                self.assertLessEqual(float(state[2]), state_z_range[1])
+                self.assertGreaterEqual(float(goal[2]), goal_z_range[0])
+                self.assertLessEqual(float(goal[2]), goal_z_range[1])
+                self.assertGreaterEqual(float(state[2]), env.scenario.world_z_min)
+                self.assertGreaterEqual(float(goal[2]), env.scenario.world_z_min)
+                self.assertLessEqual(float(state[2]), env.scenario.world_z_max)
+                self.assertLessEqual(float(goal[2]), env.scenario.world_z_max)
+                self.assertLessEqual(abs(float(goal[2] - state[2])), max_height_gap)
 
     def test_progress_reward_uses_scale_compensation(self):
         prev_state = np.zeros(5, dtype=np.float32)

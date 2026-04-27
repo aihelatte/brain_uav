@@ -11,6 +11,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .config import ScenarioConfig
+
 
 DEFAULT_BENCHMARK_SUITE_NAME = 'fixed_benchmark_suite_v2'
 DEFAULT_BENCHMARK_SUITE_PATH = Path('outputs/benchmarks') / f'{DEFAULT_BENCHMARK_SUITE_NAME}.json'
@@ -100,13 +102,57 @@ def _difficulty(zone_count: int, *, corridor_width: float | None = None, min_cle
     return round(score, 3)
 
 
+def _benchmark_z_ranges(cfg: ScenarioConfig) -> tuple[tuple[float, float], tuple[float, float], float]:
+    return (
+        (0.18 * cfg.world_z_max, 0.30 * cfg.world_z_max),
+        (0.18 * cfg.world_z_max, 0.36 * cfg.world_z_max),
+        0.15 * cfg.world_z_max,
+    )
+
+
+def _sample_benchmark_start_goal(rng, cfg: ScenarioConfig) -> tuple[list[float], list[float]]:
+    distance_min, distance_max = cfg.distance_range_for_level('benchmark')
+    state_z_range, goal_z_range, max_height_gap = _benchmark_z_ranges(cfg)
+    for _ in range(80):
+        distance = float(rng.uniform(distance_min, distance_max))
+        mean_y = float(rng.uniform(-0.18 * cfg.world_xy, 0.18 * cfg.world_xy))
+        state_z = float(rng.uniform(*state_z_range))
+        goal_z = float(rng.uniform(*goal_z_range))
+        delta_z = goal_z - state_z
+        if abs(delta_z) > max_height_gap:
+            continue
+        lateral_offset = float(rng.uniform(-0.10 * distance, 0.10 * distance))
+        remaining_sq = distance**2 - lateral_offset**2 - delta_z**2
+        if remaining_sq <= 1e-6:
+            continue
+        delta_x = math.sqrt(remaining_sq)
+        state = [-0.5 * delta_x, mean_y - 0.5 * lateral_offset, state_z, 0.0, 0.0]
+        goal = [0.5 * delta_x, mean_y + 0.5 * lateral_offset, goal_z]
+        if max(abs(state[0]), abs(goal[0])) > cfg.world_xy:
+            continue
+        if max(abs(state[1]), abs(goal[1])) > cfg.world_xy:
+            continue
+        return state, goal
+    raise RuntimeError('Failed to sample benchmark start-goal pair under current physical constraints.')
+
+
+def _clamp_zone_center(center_xy: list[float], cfg: ScenarioConfig) -> list[float]:
+    limit = float(cfg.world_xy)
+    return [
+        float(max(-limit, min(limit, center_xy[0]))),
+        float(max(-limit, min(limit, center_xy[1]))),
+    ]
+
+
+def _zone_payload(center_xy: list[float], radius: float, cfg: ScenarioConfig) -> dict[str, Any]:
+    return {'center_xy': _clamp_zone_center(center_xy, cfg), 'radius': float(radius)}
+
+
 def _make_single_detour(rng, idx: int) -> NamedScenario:
-    state_y = float(rng.uniform(-90.0, 90.0))
-    goal_y = float(state_y + rng.uniform(-45.0, 45.0))
-    state_z = float(rng.uniform(110.0, 160.0))
-    goal_z = float(rng.uniform(110.0, 160.0))
-    state = [-650.0, state_y, state_z, 0.0, 0.0]
-    goal = [650.0, goal_y, goal_z]
+    cfg = ScenarioConfig()
+    state, goal = _sample_benchmark_start_goal(rng, cfg)
+    state_y = float(state[1])
+    goal_y = float(goal[1])
     radius = float(rng.uniform(120.0, 190.0))
     center_x = float(rng.uniform(-80.0, 80.0))
     mean_y = 0.5 * (state_y + goal_y)
@@ -115,7 +161,7 @@ def _make_single_detour(rng, idx: int) -> NamedScenario:
     blocker_distance = _distance_point_to_segment((center_x, center_y), (state[0], state[1]), (goal[0], goal[1]))
     if blocker_distance > radius * 0.72:
         center_y = mean_y + math.copysign(radius * 0.58, lateral if abs(lateral) > 1e-3 else 1.0)
-    zones = [{'center_xy': [center_x, center_y], 'radius': radius}]
+    zones = [_zone_payload([center_x, center_y], radius, cfg)]
     scenario_id = f'SD{idx:03d}'
     return _scenario_payload(
         state,
@@ -130,11 +176,10 @@ def _make_single_detour(rng, idx: int) -> NamedScenario:
 
 
 def _make_double_channel(rng, idx: int) -> NamedScenario:
-    state_y = float(rng.uniform(-70.0, 70.0))
-    goal_y = float(state_y + rng.uniform(-35.0, 35.0))
-    z_ref = float(rng.uniform(115.0, 155.0))
-    state = [-650.0, state_y, z_ref, 0.0, 0.0]
-    goal = [650.0, goal_y, float(z_ref + rng.uniform(-12.0, 12.0))]
+    cfg = ScenarioConfig()
+    state, goal = _sample_benchmark_start_goal(rng, cfg)
+    state_y = float(state[1])
+    goal_y = float(goal[1])
     radius_1 = float(rng.uniform(110.0, 180.0))
     radius_2 = float(rng.uniform(110.0, 180.0))
     corridor_width = float(rng.uniform(140.0, 260.0))
@@ -145,8 +190,8 @@ def _make_double_channel(rng, idx: int) -> NamedScenario:
     center_1 = [x_base, centerline_y - 0.5 * total_sep]
     center_2 = [x_base + x_offset, centerline_y + 0.5 * total_sep]
     zones = [
-        {'center_xy': center_1, 'radius': radius_1},
-        {'center_xy': center_2, 'radius': radius_2},
+        _zone_payload(center_1, radius_1, cfg),
+        _zone_payload(center_2, radius_2, cfg),
     ]
     scenario_id = f'DC{idx:03d}'
     return _scenario_payload(
@@ -163,21 +208,20 @@ def _make_double_channel(rng, idx: int) -> NamedScenario:
 
 
 def _make_boundary_margin(rng, idx: int) -> NamedScenario:
-    state_y = float(rng.uniform(-250.0, 250.0))
-    goal_y = float(state_y + rng.uniform(-40.0, 40.0))
-    z_ref = float(rng.uniform(110.0, 150.0))
-    state = [-650.0, state_y, z_ref, 0.0, 0.0]
-    goal = [650.0, goal_y, float(z_ref + rng.uniform(-10.0, 10.0))]
+    cfg = ScenarioConfig()
+    state, goal = _sample_benchmark_start_goal(rng, cfg)
+    state_y = float(state[1])
+    goal_y = float(goal[1])
     radius = float(rng.uniform(110.0, 170.0))
     min_clearance = float(rng.uniform(20.0, 70.0))
     path_y = 0.5 * (state_y + goal_y)
     sign = 1.0 if rng.random() < 0.5 else -1.0
     main_center = [float(rng.uniform(-60.0, 120.0)), path_y + sign * (radius + min_clearance)]
-    zones = [{'center_xy': main_center, 'radius': radius}]
+    zones = [_zone_payload(main_center, radius, cfg)]
     if rng.random() < 0.45:
         aux_radius = float(rng.uniform(110.0, 150.0))
         aux_center = [float(rng.uniform(180.0, 360.0)), path_y - sign * float(rng.uniform(180.0, 320.0))]
-        zones.append({'center_xy': aux_center, 'radius': aux_radius})
+        zones.append(_zone_payload(aux_center, aux_radius, cfg))
     scenario_id = f'BM{idx:03d}'
     return _scenario_payload(
         state,
@@ -193,14 +237,13 @@ def _make_boundary_margin(rng, idx: int) -> NamedScenario:
 
 
 def _make_wall_pressure(rng, idx: int) -> NamedScenario:
+    cfg = ScenarioConfig()
     corridor_width = float(rng.uniform(120.0, 220.0))
-    corridor_center = float(rng.uniform(-120.0, 120.0))
     radius_base = float(rng.uniform(105.0, 145.0))
-    state_y = float(corridor_center + rng.uniform(-25.0, 25.0))
-    goal_y = float(corridor_center + rng.uniform(-25.0, 25.0))
-    z_ref = float(rng.uniform(120.0, 160.0))
-    state = [-670.0, state_y, z_ref, 0.0, 0.0]
-    goal = [670.0, goal_y, float(z_ref + rng.uniform(-12.0, 12.0))]
+    state, goal = _sample_benchmark_start_goal(rng, cfg)
+    state_y = float(state[1])
+    goal_y = float(goal[1])
+    corridor_center = 0.5 * (state_y + goal_y)
 
     zones: list[dict[str, Any]] = []
     lower_count = int(rng.integers(2, 4))
@@ -213,24 +256,27 @@ def _make_wall_pressure(rng, idx: int) -> NamedScenario:
 
     for i in range(lower_count):
         zones.append(
-            {
-                'center_xy': [x_lower + float(rng.uniform(-30.0, 30.0)), lower_start - i * vertical_step],
-                'radius': float(radius_base + rng.uniform(-12.0, 12.0)),
-            }
+            _zone_payload(
+                [x_lower + float(rng.uniform(-30.0, 30.0)), lower_start - i * vertical_step],
+                float(radius_base + rng.uniform(-12.0, 12.0)),
+                cfg,
+            )
         )
     for i in range(upper_count):
         zones.append(
-            {
-                'center_xy': [x_upper + float(rng.uniform(-30.0, 30.0)), upper_start + i * vertical_step],
-                'radius': float(radius_base + rng.uniform(-12.0, 12.0)),
-            }
+            _zone_payload(
+                [x_upper + float(rng.uniform(-30.0, 30.0)), upper_start + i * vertical_step],
+                float(radius_base + rng.uniform(-12.0, 12.0)),
+                cfg,
+            )
         )
     if len(zones) < 4:
         zones.append(
-            {
-                'center_xy': [float(rng.uniform(220.0, 320.0)), corridor_center + float(rng.uniform(-260.0, 260.0))],
-                'radius': float(radius_base + rng.uniform(-8.0, 8.0)),
-            }
+            _zone_payload(
+                [float(rng.uniform(220.0, 320.0)), corridor_center + float(rng.uniform(-260.0, 260.0))],
+                float(radius_base + rng.uniform(-8.0, 8.0)),
+                cfg,
+            )
         )
     if len(zones) > 7:
         zones = zones[:7]

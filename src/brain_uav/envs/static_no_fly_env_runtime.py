@@ -202,29 +202,91 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             return self._sample_hard_scenario()
         raise ValueError(f'Unsupported curriculum level: {level}')
 
-    def _sample_easy_scenario(self) -> dict[str, Any] | None:
+    def _distance_range_for_level(self, level: str) -> tuple[float, float]:
+        return self.scenario.distance_range_for_level(level)
+
+    def _z_sampling_spec(
+        self,
+        level: str,
+    ) -> tuple[tuple[float, float], tuple[float, float], float]:
         cfg = self.scenario
+        z_specs = {
+            'easy': ((0.16, 0.26), (0.16, 0.30), 0.10),
+            'easy_two_zone': ((0.17, 0.28), (0.17, 0.33), 0.12),
+            'medium': ((0.18, 0.30), (0.18, 0.35), 0.14),
+            'hard': ((0.18, 0.30), (0.18, 0.36), 0.15),
+            'benchmark': ((0.18, 0.30), (0.18, 0.36), 0.15),
+        }
+        try:
+            state_ratio_range, goal_ratio_range, max_gap_ratio = z_specs[level]
+        except KeyError as exc:
+            raise ValueError(f'Unsupported z sampling level: {level}') from exc
+        state_z_range = tuple(ratio * cfg.world_z_max for ratio in state_ratio_range)
+        goal_z_range = tuple(ratio * cfg.world_z_max for ratio in goal_ratio_range)
+        max_height_gap = max_gap_ratio * cfg.world_z_max
+        return state_z_range, goal_z_range, max_height_gap
+
+    def _sample_start_goal_pair(
+        self,
+        level: str,
+        *,
+        mean_y_ratio: float,
+        lateral_offset_ratio: float,
+        psi_range: tuple[float, float],
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        cfg = self.scenario
+        dist_min, dist_max = self._distance_range_for_level(level)
+        state_z_range, goal_z_range, max_height_gap = self._z_sampling_spec(level)
         for _ in range(40):
+            distance = float(self.rng.uniform(dist_min, dist_max))
+            mean_y = float(self.rng.uniform(-mean_y_ratio * cfg.world_xy, mean_y_ratio * cfg.world_xy))
+            state_z = float(self.rng.uniform(*state_z_range))
+            goal_z = float(self.rng.uniform(*goal_z_range))
+            delta_z = goal_z - state_z
+            if abs(delta_z) > max_height_gap:
+                continue
+            lateral_offset = float(self.rng.uniform(-lateral_offset_ratio * distance, lateral_offset_ratio * distance))
+            remaining_sq = distance**2 - lateral_offset**2 - delta_z**2
+            if remaining_sq <= 1e-6:
+                continue
+            delta_x = math.sqrt(remaining_sq)
             state = np.array(
                 [
-                    self.rng.uniform(-0.8 * cfg.world_xy, -0.58 * cfg.world_xy),
-                    self.rng.uniform(-0.10 * cfg.world_xy, 0.10 * cfg.world_xy),
-                    self.rng.uniform(11.0, 15.5),
+                    -0.5 * delta_x,
+                    mean_y - 0.5 * lateral_offset,
+                    state_z,
                     0.0,
-                    self.rng.uniform(-0.10, 0.10),
+                    self.rng.uniform(*psi_range),
                 ],
                 dtype=np.float32,
             )
             goal = np.array(
                 [
-                    self.rng.uniform(0.52 * cfg.world_xy, 0.80 * cfg.world_xy),
-                    self.rng.uniform(-0.12 * cfg.world_xy, 0.12 * cfg.world_xy),
-                    self.rng.uniform(10.5, 16.5),
+                    0.5 * delta_x,
+                    mean_y + 0.5 * lateral_offset,
+                    goal_z,
                 ],
                 dtype=np.float32,
             )
-            if abs(float(goal[2] - state[2])) > 5.5:
+            if max(abs(float(state[0])), abs(float(goal[0]))) > cfg.world_xy:
                 continue
+            if max(abs(float(state[1])), abs(float(goal[1]))) > cfg.world_xy:
+                continue
+            return state, goal
+        return None
+
+    def _sample_easy_scenario(self) -> dict[str, Any] | None:
+        cfg = self.scenario
+        for _ in range(40):
+            pair = self._sample_start_goal_pair(
+                'easy',
+                mean_y_ratio=0.10,
+                lateral_offset_ratio=0.06,
+                psi_range=(-0.10, 0.10),
+            )
+            if pair is None:
+                continue
+            state, goal = pair
             radius = float(self.rng.uniform(7.0, 10.5))
             line_y = float((state[1] + goal[1]) * 0.5)
             zone = Zone(
@@ -253,26 +315,15 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     def _sample_easy_two_zone_scenario(self) -> dict[str, Any] | None:
         cfg = self.scenario
         for _ in range(70):
-            state = np.array(
-                [
-                    self.rng.uniform(-0.82 * cfg.world_xy, -0.60 * cfg.world_xy),
-                    self.rng.uniform(-0.12 * cfg.world_xy, 0.12 * cfg.world_xy),
-                    self.rng.uniform(10.5, 16.0),
-                    0.0,
-                    self.rng.uniform(-0.12, 0.12),
-                ],
-                dtype=np.float32,
+            pair = self._sample_start_goal_pair(
+                'easy_two_zone',
+                mean_y_ratio=0.12,
+                lateral_offset_ratio=0.08,
+                psi_range=(-0.12, 0.12),
             )
-            goal = np.array(
-                [
-                    self.rng.uniform(0.50 * cfg.world_xy, 0.82 * cfg.world_xy),
-                    self.rng.uniform(-0.16 * cfg.world_xy, 0.16 * cfg.world_xy),
-                    self.rng.uniform(10.0, 17.5),
-                ],
-                dtype=np.float32,
-            )
-            if abs(float(goal[2] - state[2])) > 6.5:
+            if pair is None:
                 continue
+            state, goal = pair
             force_blocker = bool(self.rng.random() < cfg.easy_two_zone_blocker_probability)
             zones = self._sample_easy_two_zone_pair(state, goal, force_blocker)
             if not zones:
@@ -346,26 +397,15 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     def _sample_medium_scenario(self) -> dict[str, Any] | None:
         cfg = self.scenario
         for _ in range(60):
-            state = np.array(
-                [
-                    self.rng.uniform(-0.82 * cfg.world_xy, -0.60 * cfg.world_xy),
-                    self.rng.uniform(-0.16 * cfg.world_xy, 0.16 * cfg.world_xy),
-                    self.rng.uniform(10.5, 16.5),
-                    0.0,
-                    self.rng.uniform(-0.15, 0.15),
-                ],
-                dtype=np.float32,
+            pair = self._sample_start_goal_pair(
+                'medium',
+                mean_y_ratio=0.16,
+                lateral_offset_ratio=0.10,
+                psi_range=(-0.15, 0.15),
             )
-            goal = np.array(
-                [
-                    self.rng.uniform(0.50 * cfg.world_xy, 0.82 * cfg.world_xy),
-                    self.rng.uniform(-0.20 * cfg.world_xy, 0.20 * cfg.world_xy),
-                    self.rng.uniform(9.5, 18.5),
-                ],
-                dtype=np.float32,
-            )
-            if abs(float(goal[2] - state[2])) > 7.5:
+            if pair is None:
                 continue
+            state, goal = pair
             mode = str(self.rng.choice(['single_block', 'double_detour']))
             if mode == 'single_block':
                 zones = self._sample_medium_single_block(state, goal)
@@ -428,26 +468,15 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
     def _sample_hard_scenario(self) -> dict[str, Any] | None:
         cfg = self.scenario
         for _attempt in range(cfg.scenario_max_sampling_attempts):
-            state = np.array(
-                [
-                    self.rng.uniform(-0.8 * cfg.world_xy, -0.5 * cfg.world_xy),
-                    self.rng.uniform(-0.2 * cfg.world_xy, 0.2 * cfg.world_xy),
-                    self.rng.uniform(8.0, 16.0),
-                    0.0,
-                    self.rng.uniform(-0.2, 0.2),
-                ],
-                dtype=np.float32,
+            pair = self._sample_start_goal_pair(
+                'hard',
+                mean_y_ratio=0.22,
+                lateral_offset_ratio=0.12,
+                psi_range=(-0.2, 0.2),
             )
-            goal = np.array(
-                [
-                    self.rng.uniform(0.45 * cfg.world_xy, 0.8 * cfg.world_xy),
-                    self.rng.uniform(-0.3 * cfg.world_xy, 0.3 * cfg.world_xy),
-                    self.rng.uniform(8.0, 22.0),
-                ],
-                dtype=np.float32,
-            )
-            if abs(float(goal[2] - state[2])) > cfg.max_start_goal_height_gap:
+            if pair is None:
                 continue
+            state, goal = pair
             zones = self._sample_zones_for_pair(state, goal)
             if zones is None:
                 continue
