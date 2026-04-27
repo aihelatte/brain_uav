@@ -34,7 +34,7 @@ class TestStaticNoFlyEnv(unittest.TestCase):
         rewards = RewardConfig()
 
         self.assertEqual(cfg.speed, 2.5)
-        self.assertEqual(cfg.goal_radius, 4.5)
+        self.assertEqual(cfg.goal_radius, 5.0)
         self.assertEqual(cfg.world_xy, 80.0)
         self.assertEqual(cfg.world_z_min, 0.1)
         self.assertEqual(cfg.world_z_max, 40.0)

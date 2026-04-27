@@ -15,7 +15,7 @@ class ScenarioConfig:
     gamma_max: float = 0.6
     delta_gamma_max: float = 0.14
     delta_psi_max: float = 0.2
-    goal_radius: float = 4.5
+    goal_radius: float = 5.0
     world_xy: float = 80.0
     world_z_min: float = 0.1
     world_z_max: float = 40.0

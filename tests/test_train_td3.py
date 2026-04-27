@@ -165,7 +165,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
             result_root=self._make_dummy_path(),
             summary_every_episodes=15,
             total_timesteps=200000,
-            config_payload={'scenario': {'world_xy': 80.0, 'world_z_max': 40.0, 'goal_radius': 4.5,
+            config_payload={'scenario': {'world_xy': 80.0, 'world_z_max': 40.0, 'goal_radius': 5.0,
                                          'warning_distance': 10.0, 'boundary_warning_distance': 10.0,
                                          'ground_warning_height': 4.0}},
         )
