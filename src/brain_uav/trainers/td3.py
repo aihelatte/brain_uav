@@ -33,6 +33,12 @@ class TD3Metrics:
     bc_lambda: float = 0.0
     terminal_geo_loss: float = 0.0
     terminal_geo_lambda: float = 0.0
+    replay_success_fraction: float = 0.0
+    replay_near_goal_fraction: float = 0.0
+    success_replay_size: int = 0
+    success_replay_fraction: float = 0.0
+    sample_success_fraction: float = 0.0
+    sample_near_goal_fraction: float = 0.0
     bc_regularization_enabled: bool = False
     steps: int = 0
     episodes: int = 0
@@ -52,6 +58,12 @@ class TD3Metrics:
             'bc_lambda': self.bc_lambda,
             'terminal_geo_loss': self.terminal_geo_loss,
             'terminal_geo_lambda': self.terminal_geo_lambda,
+            'replay_success_fraction': self.replay_success_fraction,
+            'replay_near_goal_fraction': self.replay_near_goal_fraction,
+            'success_replay_size': self.success_replay_size,
+            'success_replay_fraction': self.success_replay_fraction,
+            'sample_success_fraction': self.sample_success_fraction,
+            'sample_near_goal_fraction': self.sample_near_goal_fraction,
             'bc_regularization_enabled': self.bc_regularization_enabled,
             'steps': self.steps,
             'episodes': self.episodes,
@@ -89,8 +101,15 @@ class TD3Trainer:
         actor_rl_scale_alpha: float = 2.5,
         terminal_geo_regularization_enabled: bool = True,
         terminal_geo_radius: float = 80.0,
-        terminal_geo_lambda: float = 0.15,
+        terminal_geo_lambda: float = 100.0,
         terminal_geo_safe_clearance: float = 3.0,
+        near_goal_radius: float = 80.0,
+        success_replay_fraction: float = 0.25,
+        success_batch_fraction: float = 0.25,
+        noise_decay_fraction: float = 0.5,
+        exploration_noise_final: float = 0.005,
+        policy_noise_final: float = 0.006,
+        noise_clip_final: float = 0.012,
         critic_grad_clip_norm: float | None = None,
         warmup_strategy: str = 'random',
         device: str = 'cpu',
@@ -123,6 +142,13 @@ class TD3Trainer:
         self.terminal_geo_radius = terminal_geo_radius
         self.terminal_geo_lambda = terminal_geo_lambda
         self.terminal_geo_safe_clearance = terminal_geo_safe_clearance
+        self.near_goal_radius = near_goal_radius
+        self.success_replay_fraction = success_replay_fraction
+        self.success_batch_fraction = success_batch_fraction
+        self.noise_decay_fraction = noise_decay_fraction
+        self.exploration_noise_final = exploration_noise_final
+        self.policy_noise_final = policy_noise_final
+        self.noise_clip_final = noise_clip_final
         self.critic_grad_clip_norm = critic_grad_clip_norm
         self.success_sample_bias = success_sample_bias
         self.exploration_noise_base = exploration_noise
@@ -137,6 +163,8 @@ class TD3Trainer:
             replay_size,
             success_sample_bias=success_sample_bias,
             near_goal_sample_bias=near_goal_sample_bias,
+            success_replay_fraction=success_replay_fraction,
+            success_batch_fraction=success_batch_fraction,
         )
         self.total_steps = 0
         self.metrics = TD3Metrics()
@@ -146,6 +174,7 @@ class TD3Trainer:
         self.stop_reason: str | None = None
         self.early_stopped = False
         self.curriculum_level: str | None = curriculum_level
+        self.current_stage_timesteps = 1
         self.bc_reference_actor: nn.Module | None = None
         if bc_reference_actor is not None:
             self.set_bc_reference_actor(bc_reference_actor)
@@ -160,9 +189,11 @@ class TD3Trainer:
         window_callback: Callable[[dict[str, Any]], str | None] | None = None,
         log_prefix: str = '[TD3]',
     ) -> TD3Metrics:
+        self.current_stage_timesteps = max(int(total_timesteps), 1)
         obs, _ = self.env.reset()
         episode_return = 0.0
         episode_length = 0
+        episode_transitions: list[dict[str, Any]] = []
         if verbose:
             print(
                 f"{log_prefix} start total_timesteps={total_timesteps} warmup_steps={self.warmup_steps} "
@@ -184,6 +215,7 @@ class TD3Trainer:
                 action = self.select_action(obs, with_noise=True)
             next_obs, reward, terminated, truncated, info = self.env.step(action)
             done = terminated or truncated
+            near_goal = self._is_near_goal(info)
             # Include timeouts as terminal transitions in replay.
             self.replay.add(
                 obs,
@@ -192,8 +224,19 @@ class TD3Trainer:
                 next_obs,
                 done,
                 success=bool(info.get('outcome') == 'goal'),
-                near_goal=bool(info.get('goal_reached_by_segment', False)),
+                near_goal=near_goal,
                 line_to_goal_safe=line_to_goal_safe,
+            )
+            episode_transitions.append(
+                {
+                    'obs': obs.copy(),
+                    'action': action.copy(),
+                    'reward': float(reward),
+                    'next_obs': next_obs.copy(),
+                    'done': bool(done),
+                    'near_goal': near_goal,
+                    'line_to_goal_safe': line_to_goal_safe,
+                }
             )
             episode_return += reward
             episode_length += 1
@@ -206,6 +249,9 @@ class TD3Trainer:
                 self.metrics.episode_lengths.append(int(episode_length))
                 outcome = info.get('outcome', 'unknown')
                 self.metrics.outcomes[outcome] = self.metrics.outcomes.get(outcome, 0) + 1
+                if outcome == 'goal':
+                    for transition in episode_transitions:
+                        self.replay.add_success_transition(**transition)
                 episode_record = {
                     'episode': self.metrics.episodes,
                     'total_steps': self.total_steps,
@@ -260,6 +306,7 @@ class TD3Trainer:
                 obs, _ = self.env.reset()
                 episode_return = 0.0
                 episode_length = 0
+                episode_transitions = []
             if verbose and ((step_idx + 1) % log_interval == 0 or (step_idx + 1) == total_timesteps):
                 avg_return = statistics.mean(self.metrics.episode_returns[-5:]) if self.metrics.episode_returns else 0.0
                 actor_phase = 'frozen' if self.total_steps <= self.actor_freeze_steps else 'active'
@@ -299,21 +346,33 @@ class TD3Trainer:
             return 30.0
         return 5.0
 
+    def _is_near_goal(self, info: dict[str, Any]) -> bool:
+        goal_distance = float(info.get('goal_distance', float('inf')))
+        segment_goal_distance = float(info.get('segment_goal_distance', float('inf')))
+        goal_reached_by_segment = bool(info.get('goal_reached_by_segment', False))
+        return (
+            goal_distance <= self.near_goal_radius
+            or segment_goal_distance <= self.near_goal_radius
+            or goal_reached_by_segment
+        )
+
     def _current_noise(self) -> tuple[float, float, float]:
-        if self.curriculum_level != 'hard':
-            self.exploration_noise_current = self.exploration_noise_base
-            self.policy_noise_current = self.policy_noise_base
-            self.noise_clip_current = self.noise_clip_base
+        stage_progress = min(float(self.total_steps) / max(float(self.current_stage_timesteps), 1.0), 1.0)
+        decay_progress = min(stage_progress / max(self.noise_decay_fraction, 1e-6), 1.0)
+        if decay_progress >= 1.0:
+            self.exploration_noise_current = self.exploration_noise_final
+            self.policy_noise_current = self.policy_noise_final
+            self.noise_clip_current = self.noise_clip_final
             return self.exploration_noise_current, self.policy_noise_current, self.noise_clip_current
-        if self.total_steps <= 100_000:
-            factor = 0.0
-        elif self.total_steps <= 200_000:
-            factor = (self.total_steps - 100_000) / 100_000
-        else:
-            factor = 1.0
-        self.exploration_noise_current = self.exploration_noise_base + (0.01 - self.exploration_noise_base) * factor
-        self.policy_noise_current = self.policy_noise_base + (0.008 - self.policy_noise_base) * factor
-        self.noise_clip_current = self.noise_clip_base + (0.015 - self.noise_clip_base) * factor
+        self.exploration_noise_current = self.exploration_noise_base + (
+            self.exploration_noise_final - self.exploration_noise_base
+        ) * decay_progress
+        self.policy_noise_current = self.policy_noise_base + (
+            self.policy_noise_final - self.policy_noise_base
+        ) * decay_progress
+        self.noise_clip_current = self.noise_clip_base + (
+            self.noise_clip_final - self.noise_clip_base
+        ) * decay_progress
         return self.exploration_noise_current, self.policy_noise_current, self.noise_clip_current
 
     def select_action(self, obs: np.ndarray, with_noise: bool = False) -> np.ndarray:
@@ -448,6 +507,12 @@ class TD3Trainer:
         next_obs = batch['next_obs'].to(self.device)
         done = batch['done'].to(self.device)
         line_to_goal_safe = batch['line_to_goal_safe'].to(self.device)
+        self.metrics.replay_success_fraction = self.replay.success_fraction()
+        self.metrics.replay_near_goal_fraction = self.replay.near_goal_fraction()
+        self.metrics.success_replay_size = self.replay.success_size
+        self.metrics.success_replay_fraction = self.success_replay_fraction
+        self.metrics.sample_success_fraction = float(batch['success'].float().mean().item())
+        self.metrics.sample_near_goal_fraction = float(batch['near_goal'].float().mean().item())
 
         with torch.no_grad():
             _, policy_noise, noise_clip = self._current_noise()

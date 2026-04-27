@@ -54,6 +54,64 @@ class _OneStepEnv:
     def export_scenario(self):
         return {'state': [0, 0, 0, 0, 0], 'goal': [0, 0, 0], 'zones': [], 'curriculum_level': 'easy'}
 
+    def _line_to_goal_is_safe(self, pos, clearance=0.0):
+        del pos, clearance
+        return True
+
+
+class _EpisodeSequenceEnv:
+    def __init__(self, outcomes: list[str], episode_length: int = 5) -> None:
+        self.action_space = _DummySpace()
+        self._obs = np.zeros(24, dtype=np.float32)
+        self.trajectory = [np.zeros(3, dtype=np.float32)]
+        self.state = np.zeros(5, dtype=np.float32)
+        self.outcomes = outcomes
+        self.episode_length = episode_length
+        self.episode_idx = -1
+        self.step_idx = 0
+        self.current_outcome = outcomes[0]
+
+    def reset(self, seed: int | None = None):
+        del seed
+        self.episode_idx += 1
+        self.step_idx = 0
+        self.current_outcome = self.outcomes[min(self.episode_idx, len(self.outcomes) - 1)]
+        self.trajectory = [np.zeros(3, dtype=np.float32)]
+        self.state = np.zeros(5, dtype=np.float32)
+        return self._obs.copy(), {}
+
+    def step(self, action):
+        del action
+        self.step_idx += 1
+        self.trajectory.append(np.zeros(3, dtype=np.float32))
+        done = self.step_idx >= self.episode_length
+        if done:
+            outcome = self.current_outcome
+            terminated = outcome != 'timeout'
+            truncated = outcome == 'timeout'
+        else:
+            outcome = 'running'
+            terminated = False
+            truncated = False
+        goal_distance = 60.0 if self.step_idx >= self.episode_length - 1 else 120.0
+        segment_goal_distance = 70.0 if self.step_idx >= self.episode_length - 1 else 120.0
+        return self._obs.copy(), 1.0, terminated, truncated, {
+            'outcome': outcome,
+            'goal_distance': goal_distance,
+            'segment_goal_distance': segment_goal_distance,
+            'goal_reached_by_segment': bool(done and self.current_outcome == 'goal'),
+            'progress': 1.0,
+            'steps': self.step_idx,
+            'curriculum_level': 'easy',
+        }
+
+    def export_scenario(self):
+        return {'state': [0, 0, 0, 0, 0], 'goal': [0, 0, 0], 'zones': [], 'curriculum_level': 'easy'}
+
+    def _line_to_goal_is_safe(self, pos, clearance=0.0):
+        del pos, clearance
+        return True
+
 
 class _DummyActor(torch.nn.Module):
     def __init__(self) -> None:
@@ -100,6 +158,8 @@ class TestTrainTD3Helpers(unittest.TestCase):
         cfg = ExperimentConfig()
 
         self.assertEqual(cfg.training.success_sample_bias, 4.0)
+        self.assertEqual(cfg.training.near_goal_sample_bias, 2.0)
+        self.assertEqual(cfg.training.terminal_geo_lambda, 100.0)
         self.assertEqual(cfg.training.actor_grad_clip_norm, 1.0)
         self.assertGreater(cfg.rewards.timeout_penalty, 1500.0)
         self.assertEqual(cfg.rewards.timeout_penalty, 4000.0)
@@ -437,6 +497,143 @@ class TestTrainTD3Helpers(unittest.TestCase):
         )
         self.assertFalse(trainer.early_stopped)
         self.assertEqual(trainer.stop_reason, 'final flush stop')
+
+    def test_success_episode_enters_success_replay(self):
+        trainer = TD3Trainer(
+            env=_EpisodeSequenceEnv(['goal']),
+            actor=_DummyActor(),
+            critic1=_DummyCritic(),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=64,
+            warmup_steps=10,
+            exploration_noise=0.01,
+            success_sample_bias=1.0,
+        )
+
+        trainer.train(total_timesteps=5, verbose=False, summary_every_episodes=10)
+
+        self.assertEqual(trainer.replay.success_size, 5)
+
+    def test_failed_episode_does_not_enter_success_replay(self):
+        trainer = TD3Trainer(
+            env=_EpisodeSequenceEnv(['boundary']),
+            actor=_DummyActor(),
+            critic1=_DummyCritic(),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=64,
+            warmup_steps=10,
+            exploration_noise=0.01,
+            success_sample_bias=1.0,
+        )
+
+        trainer.train(total_timesteps=5, verbose=False, summary_every_episodes=10)
+
+        self.assertEqual(trainer.replay.success_size, 0)
+
+    def test_failure_samples_do_not_overwrite_success_replay(self):
+        trainer = TD3Trainer(
+            env=_EpisodeSequenceEnv(['goal', 'boundary']),
+            actor=_DummyActor(),
+            critic1=_DummyCritic(),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=64,
+            warmup_steps=10,
+            exploration_noise=0.01,
+            success_sample_bias=1.0,
+        )
+
+        trainer.train(total_timesteps=10, verbose=False, summary_every_episodes=10)
+
+        self.assertEqual(trainer.replay.success_size, 5)
+
+    def test_near_goal_radius_uses_goal_or_segment_distance(self):
+        trainer = TD3Trainer(
+            env=_OneStepEnv(),
+            actor=_DummyActor(),
+            critic1=_DummyCritic(),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=2,
+            warmup_steps=0,
+            exploration_noise=0.01,
+            success_sample_bias=1.0,
+            near_goal_radius=80.0,
+        )
+
+        self.assertTrue(trainer._is_near_goal({'goal_distance': 79.0, 'segment_goal_distance': 200.0, 'goal_reached_by_segment': False}))
+        self.assertTrue(trainer._is_near_goal({'goal_distance': 120.0, 'segment_goal_distance': 79.0, 'goal_reached_by_segment': False}))
+        self.assertTrue(trainer._is_near_goal({'goal_distance': 120.0, 'segment_goal_distance': 120.0, 'goal_reached_by_segment': True}))
+
+    def test_noise_decays_in_first_half_then_stays_final(self):
+        trainer = TD3Trainer(
+            env=_OneStepEnv(),
+            actor=_DummyActor(),
+            critic1=_DummyCritic(),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.015,
+            noise_clip=0.03,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=2,
+            warmup_steps=0,
+            exploration_noise=0.02,
+            success_sample_bias=1.0,
+            noise_decay_fraction=0.5,
+            exploration_noise_final=0.005,
+            policy_noise_final=0.006,
+            noise_clip_final=0.012,
+        )
+        trainer.current_stage_timesteps = 200
+
+        trainer.total_steps = 0
+        self.assertEqual(trainer._current_noise(), (0.02, 0.015, 0.03))
+
+        trainer.total_steps = 50
+        exploration_noise, policy_noise, noise_clip = trainer._current_noise()
+        self.assertAlmostEqual(exploration_noise, 0.0125)
+        self.assertAlmostEqual(policy_noise, 0.0105)
+        self.assertAlmostEqual(noise_clip, 0.021)
+
+        trainer.total_steps = 100
+        self.assertEqual(trainer._current_noise(), (0.005, 0.006, 0.012))
+
+        trainer.total_steps = 180
+        self.assertEqual(trainer._current_noise(), (0.005, 0.006, 0.012))
 
 
 if __name__ == '__main__':
