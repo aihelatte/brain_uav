@@ -3,6 +3,7 @@
 import unittest
 from unittest import mock
 from pathlib import Path
+import tempfile
 
 import numpy as np
 import torch
@@ -15,6 +16,7 @@ from brain_uav.scripts.train_td3 import (
     make_early_stop_callback,
     make_episode_capture_callback,
     _resolve_active_goal_radius,
+    load_training_state,
 )
 from brain_uav.trainers.td3 import TD3Trainer
 
@@ -162,7 +164,8 @@ class TestTrainTD3Helpers(unittest.TestCase):
 
         self.assertEqual(cfg.training.success_sample_bias, 4.0)
         self.assertEqual(cfg.training.near_goal_sample_bias, 2.0)
-        self.assertEqual(cfg.training.terminal_geo_lambda, 100.0)
+        self.assertEqual(cfg.training.terminal_geo_lambda, 3000.0)
+        self.assertEqual(cfg.training.terminal_geo_safe_clearance, 40.0)
         self.assertEqual(cfg.training.actor_grad_clip_norm, 1.0)
         self.assertGreater(cfg.rewards.timeout_penalty, 1500.0)
         self.assertEqual(cfg.rewards.timeout_penalty, 5000.0)
@@ -310,6 +313,88 @@ class TestTrainTD3Helpers(unittest.TestCase):
         from pathlib import Path
 
         return Path(tempfile.mkdtemp())
+
+    @staticmethod
+    def _make_trainer(actor=None, critic1=None, critic2=None) -> TD3Trainer:
+        return TD3Trainer(
+            env=_OneStepEnv(),
+            actor=actor or _DummyActor(),
+            critic1=critic1 or _DummyCritic(),
+            critic2=critic2 or _DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=2,
+            warmup_steps=0,
+            exploration_noise=0.01,
+            success_sample_bias=1.0,
+        )
+
+    def test_actor_only_checkpoint_sets_bc_reference_source(self):
+        actor = _DummyActor()
+        critic1 = _DummyCritic()
+        critic2 = _DummyCritic()
+        trainer = self._make_trainer(actor=actor, critic1=critic1, critic2=critic2)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / 'bc.pt'
+            torch.save({'state_dict': actor.state_dict()}, checkpoint)
+            strategy = load_training_state(checkpoint, actor, critic1, critic2, trainer, '[TEST]')
+
+        self.assertEqual(strategy, 'policy')
+        self.assertTrue(trainer.metrics.bc_regularization_enabled)
+        self.assertEqual(trainer.metrics.reference_source, 'bc')
+        self.assertIsNotNone(trainer.bc_reference_actor)
+
+    def test_td3_checkpoint_sets_previous_stage_reference_source(self):
+        actor = _DummyActor()
+        critic1 = _DummyCritic()
+        critic2 = _DummyCritic()
+        trainer = self._make_trainer(actor=actor, critic1=critic1, critic2=critic2)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint = Path(tmpdir) / 'td3.pt'
+            torch.save(
+                {
+                    'state_dict': actor.state_dict(),
+                    'critic1_state_dict': critic1.state_dict(),
+                    'critic2_state_dict': critic2.state_dict(),
+                },
+                checkpoint,
+            )
+            strategy = load_training_state(checkpoint, actor, critic1, critic2, trainer, '[TEST]')
+
+        self.assertEqual(strategy, 'policy')
+        self.assertTrue(trainer.metrics.bc_regularization_enabled)
+        self.assertEqual(trainer.metrics.reference_source, 'previous_stage')
+        self.assertIsNotNone(trainer.bc_reference_actor)
+
+    def test_previous_stage_reference_contributes_bc_loss_terms(self):
+        trainer = self._make_trainer(actor=_DummyActor())
+        trainer.set_bc_reference_actor(_DummyActor(), source='previous_stage')
+        trainer.total_steps = 80_000
+        obs = torch.zeros((2, 24), dtype=torch.float32)
+        line_to_goal_safe = torch.zeros((2, 1), dtype=torch.float32)
+
+        (
+            _actor_loss,
+            _rl_actor_loss,
+            _scaled_rl_actor_loss,
+            bc_loss,
+            bc_lambda,
+            _actor_rl_scale,
+            _terminal_geo_loss,
+            _terminal_geo_lambda,
+        ) = trainer._compute_actor_loss_terms(obs, line_to_goal_safe)
+
+        self.assertEqual(trainer.metrics.reference_source, 'previous_stage')
+        self.assertGreater(bc_lambda, 0.0)
+        self.assertGreaterEqual(bc_loss.item(), 0.0)
 
     def test_bc_lambda_schedule_is_500_150_30_5(self):
         trainer = TD3Trainer(
@@ -489,6 +574,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertIn('actor_rl_scale', metrics)
         self.assertIn('terminal_geo_loss', metrics)
         self.assertIn('terminal_geo_lambda', metrics)
+        self.assertIn('reference_source', metrics)
 
     def test_true_early_stop_sets_early_stopped(self):
         trainer = TD3Trainer(

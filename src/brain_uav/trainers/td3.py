@@ -40,6 +40,7 @@ class TD3Metrics:
     sample_success_fraction: float = 0.0
     sample_near_goal_fraction: float = 0.0
     bc_regularization_enabled: bool = False
+    reference_source: str | None = None
     steps: int = 0
     episodes: int = 0
     episode_returns: list[float] = field(default_factory=list)
@@ -65,6 +66,7 @@ class TD3Metrics:
             'sample_success_fraction': self.sample_success_fraction,
             'sample_near_goal_fraction': self.sample_near_goal_fraction,
             'bc_regularization_enabled': self.bc_regularization_enabled,
+            'reference_source': self.reference_source,
             'steps': self.steps,
             'episodes': self.episodes,
             'episode_returns': self.episode_returns,
@@ -101,8 +103,8 @@ class TD3Trainer:
         actor_rl_scale_alpha: float = 2.5,
         terminal_geo_regularization_enabled: bool = True,
         terminal_geo_radius: float = 200.0,
-        terminal_geo_lambda: float = 100.0,
-        terminal_geo_safe_clearance: float = 3.0,
+        terminal_geo_lambda: float = 3000.0,
+        terminal_geo_safe_clearance: float = 40.0,
         near_goal_radius: float = 200.0,
         success_replay_fraction: float = 0.25,
         success_batch_fraction: float = 0.25,
@@ -330,12 +332,13 @@ class TD3Trainer:
         self.critic2.to('cpu')
         return self.metrics
 
-    def set_bc_reference_actor(self, actor: nn.Module) -> None:
+    def set_bc_reference_actor(self, actor: nn.Module, source: str = 'bc') -> None:
         self.bc_reference_actor = actor.to(self.device)
         self.bc_reference_actor.eval()
         for param in self.bc_reference_actor.parameters():
             param.requires_grad = False
         self.metrics.bc_regularization_enabled = True
+        self.metrics.reference_source = source
 
     def _bc_lambda(self) -> float:
         if self.total_steps < 60_000:

@@ -400,6 +400,7 @@ def load_training_state(init_checkpoint: Path | None, actor, critic1, critic2, t
     has_critics = 'critic1_state_dict' in checkpoint and 'critic2_state_dict' in checkpoint
     if not has_critics:
         trainer.actor_target.load_state_dict(checkpoint['state_dict'])
+        trainer.set_bc_reference_actor(deepcopy(actor), source='bc')
         print(f'{log_prefix} loaded actor-only BC checkpoint; critics are randomly initialized.')
         return 'policy'
 
@@ -421,6 +422,7 @@ def load_training_state(init_checkpoint: Path | None, actor, critic1, critic2, t
         trainer.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
     if 'critic_optimizer_state_dict' in checkpoint:
         trainer.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+    trainer.set_bc_reference_actor(deepcopy(actor), source='previous_stage')
     print(f'{log_prefix} loaded actor and twin critics from TD3 checkpoint for continuation.')
     return 'policy'
 
@@ -555,12 +557,11 @@ def main() -> None:
     )
     init_checkpoint = args.init_checkpoint or args.bc_checkpoint
     trainer.warmup_strategy = load_training_state(init_checkpoint, actor, critic1, critic2, trainer, log_prefix)
-
-    if init_checkpoint is not None and args.curriculum_level == 'easy':
-        checkpoint = load_checkpoint(init_checkpoint)
-        has_critics = 'critic1_state_dict' in checkpoint and 'critic2_state_dict' in checkpoint
-        if not has_critics:
-            trainer.set_bc_reference_actor(deepcopy(actor))
+    print(
+        f'{log_prefix} bc_regularization_enabled={trainer.metrics.bc_regularization_enabled} '
+        f'reference_source={trainer.metrics.reference_source} '
+        f'actor_freeze_steps={cfg.training.actor_freeze_steps}'
+    )
 
     config_payload = cfg.to_dict()
     config_payload['scenario']['goal_radius_curriculum_enabled'] = True
@@ -610,6 +611,7 @@ def main() -> None:
     metrics_dict['policy_noise_final'] = cfg.training.policy_noise_final
     metrics_dict['noise_clip_final'] = cfg.training.noise_clip_final
     metrics_dict['bc_regularization_enabled'] = trainer.metrics.bc_regularization_enabled
+    metrics_dict['reference_source'] = trainer.metrics.reference_source
     metrics_dict['bc_lambda'] = trainer.metrics.bc_lambda
     metrics_dict['bc_loss'] = trainer.metrics.bc_loss
     metrics_dict['rl_actor_loss'] = trainer.metrics.rl_actor_loss

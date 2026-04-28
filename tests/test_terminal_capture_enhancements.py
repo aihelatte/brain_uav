@@ -96,9 +96,12 @@ def _terminal_obs(*, dx: float, dy: float, dz: float, gamma: float = 0.0, psi: f
 class TestTerminalCaptureEnhancements(unittest.TestCase):
     def test_reward_config_defaults_for_terminal_capture(self):
         rewards = RewardConfig()
+        cfg = ExperimentConfig()
 
         self.assertEqual(rewards.goal_reward, 5000.0)
         self.assertEqual(rewards.timeout_penalty, 5000.0)
+        self.assertEqual(cfg.training.terminal_geo_lambda, 3000.0)
+        self.assertEqual(cfg.training.terminal_geo_safe_clearance, 40.0)
 
     def test_goal_radius_curriculum_per_level(self):
         scenario = ScenarioConfig(goal_radius_curriculum_enabled=True)
@@ -194,7 +197,7 @@ class TestTerminalCaptureEnhancements(unittest.TestCase):
             terminal_geo_regularization_enabled=True,
             terminal_geo_radius=200.0,
             terminal_geo_lambda=0.15,
-            terminal_geo_safe_clearance=3.0,
+            terminal_geo_safe_clearance=40.0,
         )
         obs = _terminal_obs(dx=20.0, dy=20.0, dz=0.0)
         safe_mask = torch.ones((1, 1), dtype=torch.float32)
@@ -242,7 +245,7 @@ class TestTerminalCaptureEnhancements(unittest.TestCase):
             terminal_geo_regularization_enabled=True,
             terminal_geo_radius=200.0,
             terminal_geo_lambda=0.15,
-            terminal_geo_safe_clearance=3.0,
+            terminal_geo_safe_clearance=40.0,
         )
         obs = _terminal_obs(dx=120.0, dy=0.0, dz=0.0)
         safe_mask = torch.zeros((1, 1), dtype=torch.float32)
