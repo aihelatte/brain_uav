@@ -34,28 +34,29 @@ class TestStaticNoFlyEnv(unittest.TestCase):
         cfg = ScenarioConfig()
         rewards = RewardConfig()
 
-        self.assertEqual(cfg.target_distance, 700.0)
-        self.assertAlmostEqual(cfg.world_xy, 525.0)
-        self.assertAlmostEqual(cfg.world_z_max, 175.0)
+        self.assertEqual(cfg.target_distance, 1400.0)
+        self.assertAlmostEqual(cfg.world_xy, 1050.0)
+        self.assertAlmostEqual(cfg.world_z_max, 350.0)
         self.assertEqual(cfg.speed, 2.5)
         self.assertEqual(cfg.goal_radius, 5.0)
         self.assertEqual(cfg.world_z_min, 0.1)
-        self.assertEqual(cfg.max_steps, 400)
-        self.assertEqual(cfg.no_fly_radius_range, (100.0, 125.0))
-        self.assertEqual(cfg.warning_distance, 40.0)
+        self.assertEqual(cfg.max_steps, 800)
+        self.assertEqual(cfg.no_fly_radius_range, (200.0, 250.0))
+        self.assertEqual(cfg.warning_distance, 80.0)
         self.assertEqual(cfg.boundary_warning_distance, 10.0)
         self.assertEqual(cfg.ground_warning_height, 4.0)
         self.assertEqual(cfg.descent_penalty_height, 12.0)
-        self.assertEqual(cfg.start_zone_clearance, 30.0)
-        self.assertEqual(cfg.corridor_blocking_margin, 20.0)
+        self.assertEqual(cfg.start_zone_clearance, 60.0)
+        self.assertEqual(cfg.corridor_blocking_margin, 40.0)
         self.assertEqual(cfg.max_start_goal_height_gap, 11.0)
-        self.assertEqual(cfg.dual_zone_min_margin, 55.0)
-        self.assertEqual(cfg.easy_two_zone_min_gap, 65.0)
-        self.assertEqual(rewards.zone_penalty_weight, 240.0)
-        self.assertEqual(rewards.zone_penalty_cap, 500.0)
-        self.assertEqual(rewards.collision_penalty, 7500.0)
+        self.assertEqual(cfg.dual_zone_min_margin, 110.0)
+        self.assertEqual(cfg.easy_two_zone_min_gap, 130.0)
+        self.assertEqual(rewards.zone_penalty_weight, 300.0)
+        self.assertEqual(rewards.zone_penalty_cap, 800.0)
+        self.assertEqual(rewards.collision_penalty, 9000.0)
+        self.assertEqual(rewards.timeout_penalty, 5000.0)
         self.assertEqual(rewards.min_progress_per_window, 2.0)
-        self.assertEqual(rewards.breakthrough_reward_distance, 60.0)
+        self.assertEqual(rewards.breakthrough_reward_distance, 120.0)
         self.assertEqual(rewards.breakthrough_progress_threshold, 2.2)
 
     def test_curriculum_distance_ratios_include_benchmark_match(self):
@@ -67,16 +68,16 @@ class TestStaticNoFlyEnv(unittest.TestCase):
     def test_curriculum_radius_ranges(self):
         cfg = ScenarioConfig()
 
-        self.assertEqual(cfg.radius_range_for_level('easy'), (60.0, 80.0))
-        self.assertEqual(cfg.radius_range_for_level('easy_two_zone'), (75.0, 95.0))
-        self.assertEqual(cfg.radius_range_for_level('medium'), (90.0, 110.0))
-        self.assertEqual(cfg.radius_range_for_level('hard'), (100.0, 125.0))
-        self.assertEqual(cfg.radius_range_for_level('benchmark'), (100.0, 125.0))
+        self.assertEqual(cfg.radius_range_for_level('easy'), (120.0, 160.0))
+        self.assertEqual(cfg.radius_range_for_level('easy_two_zone'), (150.0, 190.0))
+        self.assertEqual(cfg.radius_range_for_level('medium'), (180.0, 220.0))
+        self.assertEqual(cfg.radius_range_for_level('hard'), (200.0, 250.0))
+        self.assertEqual(cfg.radius_range_for_level('benchmark'), (200.0, 250.0))
 
     def test_explicit_world_z_max_overrides_default_derivation(self):
         cfg = ScenarioConfig(world_z_max=40.0)
 
-        self.assertEqual(cfg.world_xy, 525.0)
+        self.assertEqual(cfg.world_xy, 1050.0)
         self.assertEqual(cfg.world_z_max, 40.0)
 
     def test_curriculum_scenarios_follow_distance_ranges(self):
@@ -108,24 +109,56 @@ class TestStaticNoFlyEnv(unittest.TestCase):
                 for zone in scenario['zones']:
                     self.assertGreaterEqual(float(zone['radius']), radius_min)
                     self.assertLessEqual(float(zone['radius']), radius_max)
-
                 zones = [
                     Zone(center_xy=np.asarray(zone['center_xy'], dtype=np.float32), radius=float(zone['radius']))
                     for zone in scenario['zones']
                 ]
-                blockers = env._count_corridor_blockers(
-                    state,
-                    goal,
-                    zones,
-                    margin=env.scenario.corridor_blocking_margin,
-                )
                 if level == 'easy':
+                    blockers = env._count_corridor_blockers(
+                        state,
+                        goal,
+                        zones,
+                        margin=env.scenario.corridor_blocking_margin,
+                    )
                     self.assertEqual(blockers, 0)
                 if level == 'hard':
                     for idx, zone_a in enumerate(zones):
                         for zone_b in zones[idx + 1:]:
-                            surface_gap = float(np.linalg.norm(zone_a.center_xy - zone_b.center_xy))
-                            surface_gap -= zone_a.radius + zone_b.radius
+                            center_distance = float(np.linalg.norm(zone_a.center_xy - zone_b.center_xy))
+                            surface_gap = center_distance - zone_a.radius - zone_b.radius
+                            self.assertGreaterEqual(surface_gap, env.scenario.dual_zone_min_margin)
+
+    def test_curriculum_sampling_is_stable_at_large_zone_scale(self):
+        env = StaticNoFlyTrajectoryEnv(ScenarioConfig(), RewardConfig(), seed=123)
+
+        for level in ('easy', 'easy_two_zone', 'medium', 'hard'):
+            radius_min, radius_max = env.scenario.radius_range_for_level(level)
+            for _ in range(10):
+                scenario = env._sample_curriculum_scenario(level)
+                self.assertIsNotNone(scenario)
+                assert scenario is not None
+                state = np.asarray(scenario['state'], dtype=np.float32)
+                goal = np.asarray(scenario['goal'], dtype=np.float32)
+                zones = [
+                    Zone(center_xy=np.asarray(zone['center_xy'], dtype=np.float32), radius=float(zone['radius']))
+                    for zone in scenario['zones']
+                ]
+                for zone in zones:
+                    self.assertGreaterEqual(zone.radius, radius_min)
+                    self.assertLessEqual(zone.radius, radius_max)
+                if level == 'easy':
+                    blockers = env._count_corridor_blockers(
+                        state,
+                        goal,
+                        zones,
+                        margin=env.scenario.corridor_blocking_margin,
+                    )
+                    self.assertEqual(blockers, 0)
+                if level == 'hard':
+                    for idx, zone_a in enumerate(zones):
+                        for zone_b in zones[idx + 1:]:
+                            center_distance = float(np.linalg.norm(zone_a.center_xy - zone_b.center_xy))
+                            surface_gap = center_distance - zone_a.radius - zone_b.radius
                             self.assertGreaterEqual(surface_gap, env.scenario.dual_zone_min_margin)
 
     def test_progress_reward_uses_scale_compensation(self):

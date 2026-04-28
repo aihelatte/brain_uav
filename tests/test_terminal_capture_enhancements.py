@@ -98,7 +98,7 @@ class TestTerminalCaptureEnhancements(unittest.TestCase):
         rewards = RewardConfig()
 
         self.assertEqual(rewards.goal_reward, 5000.0)
-        self.assertEqual(rewards.timeout_penalty, 4500.0)
+        self.assertEqual(rewards.timeout_penalty, 5000.0)
 
     def test_goal_radius_curriculum_per_level(self):
         scenario = ScenarioConfig(goal_radius_curriculum_enabled=True)
@@ -152,7 +152,7 @@ class TestTerminalCaptureEnhancements(unittest.TestCase):
         self.assertGreater(safe_los, 0.0)
         self.assertGreater(safe_tangent, 0.0)
 
-        env.goal = np.array([120.0, 0.0, 20.0], dtype=np.float32)
+        env.goal = np.array([220.0, 0.0, 20.0], dtype=np.float32)
         self.assertEqual(env._terminal_los_reward(env.state[:3], float(env.state[3]), float(env.state[4]), 'running'), 0.0)
         self.assertEqual(
             env._terminal_radial_tangential_reward(env.state[:3], float(env.state[3]), float(env.state[4]), 'running'),
@@ -192,7 +192,7 @@ class TestTerminalCaptureEnhancements(unittest.TestCase):
             exploration_noise=0.01,
             success_sample_bias=1.0,
             terminal_geo_regularization_enabled=True,
-            terminal_geo_radius=100.0,
+            terminal_geo_radius=200.0,
             terminal_geo_lambda=0.15,
             terminal_geo_safe_clearance=3.0,
         )
@@ -240,7 +240,7 @@ class TestTerminalCaptureEnhancements(unittest.TestCase):
             exploration_noise=0.01,
             success_sample_bias=1.0,
             terminal_geo_regularization_enabled=True,
-            terminal_geo_radius=100.0,
+            terminal_geo_radius=200.0,
             terminal_geo_lambda=0.15,
             terminal_geo_safe_clearance=3.0,
         )
