@@ -26,13 +26,13 @@ class TestModelUtilities(unittest.TestCase):
         self.assertTrue(torch.isfinite(scaled).all())
 
     def test_snn_forward_does_not_depend_on_diagnostics_path(self):
-        actor = SNNPolicyActor(self.state_dim, 2, 32, 4, self.action_limit)
+        actor = SNNPolicyActor(self.state_dim, 2, 32, 4, self.action_limit, self.scenario)
         actor.forward_with_diagnostics = lambda _: (_ for _ in ()).throw(AssertionError('unexpected diagnostics call'))
         action = actor(self.obs)
         self.assertEqual(action.shape, (4, 2))
 
     def test_snn_forward_with_diagnostics_smoke(self):
-        actor = SNNPolicyActor(self.state_dim, 2, 32, 4, self.action_limit)
+        actor = SNNPolicyActor(self.state_dim, 2, 32, 4, self.action_limit, self.scenario)
         action = actor(self.obs)
         action_diag, diagnostics = actor.forward_with_diagnostics(self.obs)
         self.assertEqual(action.shape, (4, 2))
@@ -47,6 +47,13 @@ class TestModelUtilities(unittest.TestCase):
         actor = ANNPolicyActor(self.state_dim, 2, 32, self.action_limit, self.scenario)
         action = actor(self.obs)
         self.assertEqual(action.shape, (4, 2))
+
+    def test_snn_actor_uses_fixed_obs_scaler(self):
+        actor = SNNPolicyActor(self.state_dim, 2, 32, 4, self.action_limit, self.scenario)
+        self.assertIsInstance(actor.obs_scaler, FixedObsScaler)
+        scaled = actor.obs_scaler(self.obs)
+        self.assertEqual(scaled.shape, self.obs.shape)
+        self.assertTrue(torch.isfinite(scaled).all())
 
     def test_snn_backend_validation_for_torch(self):
         self.assertEqual(validate_snn_backend('torch'), 'torch')

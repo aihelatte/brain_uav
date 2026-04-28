@@ -108,6 +108,7 @@ def make_actor(cfg: ExperimentConfig, model_type: str, state_dim: int, action_di
             cfg.training.hidden_dim,
             cfg.training.snn_time_window,
             action_limit,
+            cfg.scenario,
             backend=cfg.training.snn_backend,
         )
     if model_type == 'ann':

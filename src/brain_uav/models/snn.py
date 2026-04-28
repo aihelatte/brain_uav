@@ -8,6 +8,9 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from ..config import ScenarioConfig
+from .scaling import FixedObsScaler
+
 try:
     from spikingjelly.activation_based import functional, neuron, surrogate
     HAS_SPIKINGJELLY = True
@@ -65,9 +68,11 @@ class SNNPolicyActor(nn.Module):
         hidden_dim: int,
         time_window: int,
         action_limit: torch.Tensor,
+        scenario: ScenarioConfig,
         backend: str = 'torch',
     ) -> None:
         super().__init__()
+        self.obs_scaler = FixedObsScaler(scenario, state_dim)
         self.fc1 = nn.Linear(state_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.fc3 = nn.Linear(hidden_dim, action_dim)
@@ -137,7 +142,8 @@ class SNNPolicyActor(nn.Module):
 
     def _forward_spikingjelly(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         functional.reset_net(self)
-        encoded = self.fc1(obs)
+        scaled_obs = self.obs_scaler(obs)
+        encoded = self.fc1(scaled_obs)
         encoded_seq = encoded.unsqueeze(0).expand(self.time_window, -1, -1)
         spikes1_seq = self.lif1(encoded_seq)
         hidden_seq = self.fc2(spikes1_seq)
@@ -152,7 +158,7 @@ class SNNPolicyActor(nn.Module):
         return action, spike_sum1, spike_sum2
 
     def _forward_fallback(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        encoded = self.fc1(obs)
+        encoded = self.fc1(self.obs_scaler(obs))
         spikes1, _, spike_sum1 = self.lif1(encoded, self.time_window)
         hidden = self.fc2(spikes1)
         spikes2, membrane, spike_sum2 = self.lif2(hidden, self.time_window)
