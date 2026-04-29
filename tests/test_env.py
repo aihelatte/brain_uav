@@ -34,13 +34,13 @@ class TestStaticNoFlyEnv(unittest.TestCase):
         cfg = ScenarioConfig()
         rewards = RewardConfig()
 
-        self.assertEqual(cfg.target_distance, 1400.0)
-        self.assertAlmostEqual(cfg.world_xy, 1050.0)
-        self.assertAlmostEqual(cfg.world_z_max, 350.0)
+        self.assertEqual(cfg.target_distance, 1750.0)
+        self.assertAlmostEqual(cfg.world_xy, 1312.5)
+        self.assertAlmostEqual(cfg.world_z_max, 437.5)
         self.assertEqual(cfg.speed, 2.5)
         self.assertEqual(cfg.goal_radius, 5.0)
         self.assertEqual(cfg.world_z_min, 0.1)
-        self.assertEqual(cfg.max_steps, 800)
+        self.assertEqual(cfg.max_steps, 1000)
         self.assertEqual(cfg.no_fly_radius_range, (200.0, 250.0))
         self.assertEqual(cfg.warning_distance, 80.0)
         self.assertEqual(cfg.boundary_warning_distance, 10.0)
@@ -85,7 +85,7 @@ class TestStaticNoFlyEnv(unittest.TestCase):
     def test_explicit_world_z_max_overrides_default_derivation(self):
         cfg = ScenarioConfig(world_z_max=40.0)
 
-        self.assertEqual(cfg.world_xy, 1050.0)
+        self.assertEqual(cfg.world_xy, 1312.5)
         self.assertEqual(cfg.world_z_max, 40.0)
 
     def test_curriculum_scenarios_follow_distance_ranges(self):

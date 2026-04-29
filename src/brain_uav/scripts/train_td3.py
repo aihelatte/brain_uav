@@ -446,7 +446,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--early-stop-goal-rate', type=float, default=0.95)
     parser.add_argument('--early-stop-windows', type=int, default=4)
     parser.add_argument('--early-stop-max-failures-per-window', type=int, default=1)
-    parser.add_argument('--early-stop-min-steps', type=int, default=100000)
+    parser.add_argument('--early-stop-min-steps', type=int, default=125000)
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--snn-backend', choices=SNN_BACKEND_CHOICES, default='torch')
     return parser
@@ -458,7 +458,7 @@ def apply_model_training_overrides(cfg: ExperimentConfig, args: argparse.Namespa
         cfg.training.actor_lr = 1.5e-4
         cfg.training.critic_lr = 2.5e-4
         if args.actor_freeze_steps is None:
-            cfg.training.actor_freeze_steps = 20_000
+            cfg.training.actor_freeze_steps = 25_000
         else:
             cfg.training.actor_freeze_steps = args.actor_freeze_steps
         if args.critic_grad_clip_norm is None:
@@ -482,7 +482,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.timesteps is None:
-        args.timesteps = 1000000 if args.curriculum_level == 'hard' else 750000
+        args.timesteps = 1200000 if args.curriculum_level == 'hard' else 900000
 
     cfg = ExperimentConfig()
     resolved_device = configure_training_runtime(

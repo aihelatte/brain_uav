@@ -15,7 +15,7 @@ class ScenarioConfig:
     gamma_max: float = 0.6
     delta_gamma_max: float = 0.14
     delta_psi_max: float = 0.2
-    target_distance: float = 1400.0
+    target_distance: float = 1750.0
     curriculum_distance_ratios: dict[str, tuple[float, float]] = field(
         default_factory=lambda: {
             'easy': (0.55, 0.70),
@@ -40,7 +40,7 @@ class ScenarioConfig:
     world_xy: float | None = None
     world_z_min: float = 0.1
     world_z_max: float | None = None
-    max_steps: int = 800
+    max_steps: int = 1000
     min_no_fly_zones: int = 1
     max_no_fly_zones: int = 3
     no_fly_radius_range: tuple[float, float] = (200.0, 250.0)
@@ -123,11 +123,11 @@ class RewardConfig:
     breakthrough_progress_threshold: float = 2.2
     breakthrough_reward_weight: float = 0.35
     breakthrough_reward_cap: float = 10.0
-    terminal_guidance_radius: float = 200.0
+    terminal_guidance_radius: float = 250.0
     terminal_los_weight: float = 45.0
     terminal_los_penalty_weight: float = 70.0
     terminal_los_reward_cap: float = 80.0
-    terminal_tangential_radius: float = 200.0
+    terminal_tangential_radius: float = 250.0
     terminal_radial_weight: float = 45.0
     terminal_tangential_penalty_weight: float = 60.0
     terminal_tangential_penalty_cap: float = 80.0
@@ -147,18 +147,18 @@ class TrainingConfig:
     noise_clip: float = 0.03
     policy_delay: int = 2
     exploration_noise: float = 0.02
-    replay_size: int = 400_000
-    warmup_steps: int = 1024
-    actor_freeze_steps: int = 20_000
+    replay_size: int = 500_000
+    warmup_steps: int = 1280
+    actor_freeze_steps: int = 25_000
     success_sample_bias: float = 4.0
     near_goal_sample_bias: float = 2.0
-    near_goal_radius: float = 200.0
+    near_goal_radius: float = 250.0
     success_replay_fraction: float = 0.25
     success_batch_fraction: float = 0.25
     actor_grad_clip_norm: float | None = 1.0
     actor_rl_scale_alpha: float = 2.5
     terminal_geo_regularization_enabled: bool = True
-    terminal_geo_radius: float = 200.0
+    terminal_geo_radius: float = 250.0
     terminal_geo_lambda: float = 3000.0
     terminal_geo_safe_clearance: float = 40.0
     noise_decay_fraction: float = 0.5

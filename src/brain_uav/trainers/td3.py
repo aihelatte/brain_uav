@@ -102,10 +102,10 @@ class TD3Trainer:
         actor_grad_clip_norm: float | None = None,
         actor_rl_scale_alpha: float = 2.5,
         terminal_geo_regularization_enabled: bool = True,
-        terminal_geo_radius: float = 200.0,
+        terminal_geo_radius: float = 250.0,
         terminal_geo_lambda: float = 3000.0,
         terminal_geo_safe_clearance: float = 40.0,
-        near_goal_radius: float = 200.0,
+        near_goal_radius: float = 250.0,
         success_replay_fraction: float = 0.25,
         success_batch_fraction: float = 0.25,
         noise_decay_fraction: float = 0.5,
@@ -341,11 +341,11 @@ class TD3Trainer:
         self.metrics.reference_source = source
 
     def _bc_lambda(self) -> float:
-        if self.total_steps < 60_000:
+        if self.total_steps < 75_000:
             return 500.0
-        if self.total_steps < 120_000:
+        if self.total_steps < 150_000:
             return 150.0
-        if self.total_steps < 200_000:
+        if self.total_steps < 250_000:
             return 30.0
         return 5.0
 

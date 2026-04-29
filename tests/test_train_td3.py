@@ -157,13 +157,17 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(args.early_stop_windows, 4)
         self.assertEqual(args.early_stop_max_failures_per_window, 1)
         self.assertEqual(args.early_stop_goal_rate, 0.95)
-        self.assertEqual(args.early_stop_min_steps, 100000)
+        self.assertEqual(args.early_stop_min_steps, 125000)
 
     def test_training_config_defaults_raise_timeout_and_success_bias(self):
         cfg = ExperimentConfig()
 
         self.assertEqual(cfg.training.success_sample_bias, 4.0)
         self.assertEqual(cfg.training.near_goal_sample_bias, 2.0)
+        self.assertEqual(cfg.training.replay_size, 500_000)
+        self.assertEqual(cfg.training.warmup_steps, 1280)
+        self.assertEqual(cfg.training.near_goal_radius, 250.0)
+        self.assertEqual(cfg.training.terminal_geo_radius, 250.0)
         self.assertEqual(cfg.training.terminal_geo_lambda, 3000.0)
         self.assertEqual(cfg.training.terminal_geo_safe_clearance, 40.0)
         self.assertEqual(cfg.training.actor_grad_clip_norm, 1.0)
@@ -172,14 +176,14 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(cfg.rewards.goal_reward, 5000.0)
         self.assertEqual(cfg.training.actor_rl_scale_alpha, 2.5)
 
-    def test_ann_default_actor_freeze_steps_is_20000(self):
+    def test_ann_default_actor_freeze_steps_is_25000(self):
         parser = build_parser()
         args = parser.parse_args(['--model', 'ann', '--curriculum-level', 'easy'])
         cfg = ExperimentConfig()
 
         apply_model_training_overrides(cfg, args)
 
-        self.assertEqual(cfg.training.actor_freeze_steps, 20000)
+        self.assertEqual(cfg.training.actor_freeze_steps, 25000)
 
     def test_ann_default_learning_rates_are_midrange(self):
         parser = build_parser()
@@ -203,11 +207,11 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(cfg.training.actor_lr, baseline_actor_lr)
         self.assertEqual(cfg.training.critic_lr, baseline_critic_lr)
 
-    def test_td3_default_timesteps_use_800_step_scale(self):
+    def test_td3_default_timesteps_use_1000_step_scale(self):
         source = Path('E:/wurenji/my_project/src/brain_uav/scripts/train_td3.py').read_text(encoding='utf-8')
 
         self.assertIn(
-            "args.timesteps = 1000000 if args.curriculum_level == 'hard' else 750000",
+            "args.timesteps = 1200000 if args.curriculum_level == 'hard' else 900000",
             source,
         )
 
@@ -216,7 +220,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
             enabled=True,
             goal_rate_threshold=0.95,
             consecutive_windows=4,
-            min_steps=100000,
+            min_steps=125000,
             max_failures_per_window=1,
         )
         window = {
@@ -227,12 +231,12 @@ class TestTrainTD3Helpers(unittest.TestCase):
             'ground_count': 0,
             'collision_count': 0,
             'other_count': 0,
-            'total_steps': 100000,
+            'total_steps': 125000,
         }
         self.assertIsNone(callback({**window, 'total_steps': 3000}))
-        self.assertIsNone(callback({**window, 'total_steps': 100000}))
-        self.assertIsNone(callback({**window, 'total_steps': 101000}))
-        reason = callback({**window, 'total_steps': 102000})
+        self.assertIsNone(callback({**window, 'total_steps': 125000}))
+        self.assertIsNone(callback({**window, 'total_steps': 126000}))
+        reason = callback({**window, 'total_steps': 127000})
         self.assertIsInstance(reason, str)
         self.assertIn('qualified_windows=4/4', reason)
 
@@ -240,7 +244,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
         callback = make_episode_capture_callback(
             result_root=self._make_dummy_path(),
             summary_every_episodes=15,
-            total_timesteps=750000,
+            total_timesteps=900000,
             config_payload={'scenario': {'world_xy': ScenarioConfig().world_xy, 'world_z_max': ScenarioConfig().world_z_max, 'goal_radius': 5.0,
                                          'warning_distance': 10.0, 'boundary_warning_distance': 10.0,
                                          'ground_warning_height': 4.0}},
@@ -417,13 +421,13 @@ class TestTrainTD3Helpers(unittest.TestCase):
         )
         expected = {
             0: 500.0,
-            59999: 500.0,
-            60000: 150.0,
-            119999: 150.0,
-            120000: 30.0,
-            199999: 30.0,
-            200000: 5.0,
+            74999: 500.0,
+            75000: 150.0,
+            149999: 150.0,
+            150000: 30.0,
+            249999: 30.0,
             250000: 5.0,
+            300000: 5.0,
         }
         for steps, value in expected.items():
             trainer.total_steps = steps
@@ -724,11 +728,11 @@ class TestTrainTD3Helpers(unittest.TestCase):
             warmup_steps=0,
             exploration_noise=0.01,
             success_sample_bias=1.0,
-            near_goal_radius=200.0,
+            near_goal_radius=250.0,
         )
 
-        self.assertTrue(trainer._is_near_goal({'goal_distance': 199.0, 'segment_goal_distance': 300.0, 'goal_reached_by_segment': False}))
-        self.assertTrue(trainer._is_near_goal({'goal_distance': 300.0, 'segment_goal_distance': 199.0, 'goal_reached_by_segment': False}))
+        self.assertTrue(trainer._is_near_goal({'goal_distance': 249.0, 'segment_goal_distance': 300.0, 'goal_reached_by_segment': False}))
+        self.assertTrue(trainer._is_near_goal({'goal_distance': 300.0, 'segment_goal_distance': 249.0, 'goal_reached_by_segment': False}))
         self.assertTrue(trainer._is_near_goal({'goal_distance': 300.0, 'segment_goal_distance': 300.0, 'goal_reached_by_segment': True}))
 
     def test_noise_decays_in_first_half_then_stays_final(self):

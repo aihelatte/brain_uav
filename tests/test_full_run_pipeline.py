@@ -99,7 +99,7 @@ class TestFullRunPipeline(unittest.TestCase):
         self.assertIn('--early-stop-goal-rate', td3_command)
         self.assertIn('0.95', td3_command)
         self.assertIn('--early-stop-min-steps', td3_command)
-        self.assertIn('100000', td3_command)
+        self.assertIn('125000', td3_command)
 
 
 if __name__ == '__main__':
