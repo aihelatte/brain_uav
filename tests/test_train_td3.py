@@ -195,6 +195,50 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(cfg.training.actor_lr, 1.5e-4)
         self.assertEqual(cfg.training.critic_lr, 2.5e-4)
 
+    def test_ann_easy_two_zone_uses_conservative_stability_overrides(self):
+        parser = build_parser()
+        args = parser.parse_args(['--model', 'ann', '--curriculum-level', 'easy_two_zone'])
+        cfg = ExperimentConfig()
+
+        apply_model_training_overrides(cfg, args)
+
+        self.assertEqual(cfg.training.actor_lr, 1.5e-4)
+        self.assertEqual(cfg.training.critic_lr, 2.0e-4)
+        self.assertEqual(cfg.rewards.collision_penalty, 18_000.0)
+        self.assertEqual(cfg.rewards.ground_soft_penalty_weight, 180.0)
+        self.assertEqual(cfg.rewards.ground_soft_penalty_cap, 300.0)
+        self.assertEqual(cfg.rewards.descent_trend_penalty_weight, 120.0)
+        self.assertEqual(cfg.rewards.descent_trend_penalty_cap, 260.0)
+
+    def test_ann_easy_medium_hard_do_not_use_easy_two_zone_reward_overrides(self):
+        parser = build_parser()
+        for level in ('easy', 'medium', 'hard'):
+            with self.subTest(level=level):
+                args = parser.parse_args(['--model', 'ann', '--curriculum-level', level])
+                cfg = ExperimentConfig()
+
+                apply_model_training_overrides(cfg, args)
+
+                self.assertEqual(cfg.rewards.collision_penalty, 12_000.0)
+                self.assertEqual(cfg.rewards.ground_soft_penalty_weight, 120.0)
+                self.assertEqual(cfg.rewards.ground_soft_penalty_cap, 200.0)
+                self.assertEqual(cfg.rewards.descent_trend_penalty_weight, 80.0)
+                self.assertEqual(cfg.rewards.descent_trend_penalty_cap, 180.0)
+
+    def test_snn_easy_two_zone_does_not_use_ann_stability_overrides(self):
+        parser = build_parser()
+        args = parser.parse_args(['--model', 'snn', '--curriculum-level', 'easy_two_zone'])
+        cfg = ExperimentConfig()
+        baseline_actor_lr = cfg.training.actor_lr
+        baseline_critic_lr = cfg.training.critic_lr
+
+        apply_model_training_overrides(cfg, args)
+
+        self.assertEqual(cfg.training.actor_lr, baseline_actor_lr)
+        self.assertEqual(cfg.training.critic_lr, baseline_critic_lr)
+        self.assertEqual(cfg.rewards.collision_penalty, 12_000.0)
+        self.assertEqual(cfg.rewards.ground_soft_penalty_weight, 120.0)
+
     def test_snn_default_learning_rates_remain_unchanged(self):
         parser = build_parser()
         args = parser.parse_args(['--model', 'snn', '--curriculum-level', 'easy'])
@@ -433,6 +477,66 @@ class TestTrainTD3Helpers(unittest.TestCase):
             trainer.total_steps = steps
             self.assertEqual(trainer._bc_lambda(), value)
 
+    def test_easy_two_zone_bc_lambda_keeps_stronger_late_anchor(self):
+        trainer = TD3Trainer(
+            env=_OneStepEnv(),
+            actor=_DummyActor(),
+            critic1=_DummyCritic(),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=2,
+            warmup_steps=0,
+            exploration_noise=0.01,
+            success_sample_bias=1.0,
+            curriculum_level='easy_two_zone',
+            easy_two_zone_late_bc_lambda=20.0,
+        )
+        expected = {
+            0: 500.0,
+            74999: 500.0,
+            75000: 150.0,
+            149999: 150.0,
+            150000: 30.0,
+            249999: 30.0,
+            250000: 20.0,
+            600000: 20.0,
+        }
+        for steps, value in expected.items():
+            trainer.total_steps = steps
+            self.assertEqual(trainer._bc_lambda(), value)
+
+    def test_easy_two_zone_bc_lambda_defaults_to_global_schedule_without_override(self):
+        trainer = TD3Trainer(
+            env=_OneStepEnv(),
+            actor=_DummyActor(),
+            critic1=_DummyCritic(),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=2,
+            warmup_steps=0,
+            exploration_noise=0.01,
+            success_sample_bias=1.0,
+            curriculum_level='easy_two_zone',
+        )
+
+        trainer.total_steps = 250000
+
+        self.assertEqual(trainer._bc_lambda(), 5.0)
+
     def test_actor_grad_clip_is_used_in_actor_update(self):
         trainer = TD3Trainer(
             env=_OneStepEnv(),
@@ -578,6 +682,8 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertIn('actor_rl_scale', metrics)
         self.assertIn('terminal_geo_loss', metrics)
         self.assertIn('terminal_geo_lambda', metrics)
+        self.assertIn('bc_actor_loss_contribution', metrics)
+        self.assertIn('terminal_geo_loss_contribution', metrics)
         self.assertIn('reference_source', metrics)
 
     def test_true_early_stop_sets_early_stopped(self):

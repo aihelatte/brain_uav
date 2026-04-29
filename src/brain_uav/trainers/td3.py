@@ -31,8 +31,10 @@ class TD3Metrics:
     actor_rl_scale: float = 1.0
     bc_loss: float = 0.0
     bc_lambda: float = 0.0
+    bc_actor_loss_contribution: float = 0.0
     terminal_geo_loss: float = 0.0
     terminal_geo_lambda: float = 0.0
+    terminal_geo_loss_contribution: float = 0.0
     replay_success_fraction: float = 0.0
     replay_near_goal_fraction: float = 0.0
     success_replay_size: int = 0
@@ -57,8 +59,10 @@ class TD3Metrics:
             'actor_rl_scale': self.actor_rl_scale,
             'bc_loss': self.bc_loss,
             'bc_lambda': self.bc_lambda,
+            'bc_actor_loss_contribution': self.bc_actor_loss_contribution,
             'terminal_geo_loss': self.terminal_geo_loss,
             'terminal_geo_lambda': self.terminal_geo_lambda,
+            'terminal_geo_loss_contribution': self.terminal_geo_loss_contribution,
             'replay_success_fraction': self.replay_success_fraction,
             'replay_near_goal_fraction': self.replay_near_goal_fraction,
             'success_replay_size': self.success_replay_size,
@@ -117,6 +121,7 @@ class TD3Trainer:
         device: str = 'cpu',
         bc_reference_actor: nn.Module | None = None,
         curriculum_level: str | None = None,
+        easy_two_zone_late_bc_lambda: float | None = None,
     ) -> None:
         self.env = env
         self.actor = actor.to(device)
@@ -161,6 +166,7 @@ class TD3Trainer:
         self.noise_clip_current = noise_clip
         self.warmup_strategy = warmup_strategy
         self.device = device
+        self.easy_two_zone_late_bc_lambda = easy_two_zone_late_bc_lambda
         self.replay = ReplayBuffer(
             replay_size,
             success_sample_bias=success_sample_bias,
@@ -347,6 +353,8 @@ class TD3Trainer:
             return 150.0
         if self.total_steps < 250_000:
             return 30.0
+        if self.curriculum_level == 'easy_two_zone' and self.easy_two_zone_late_bc_lambda is not None:
+            return float(self.easy_two_zone_late_bc_lambda)
         return 5.0
 
     def _is_near_goal(self, info: dict[str, Any]) -> bool:
@@ -565,8 +573,12 @@ class TD3Trainer:
                 self.metrics.actor_rl_scale = float(actor_rl_scale)
                 self.metrics.bc_loss = float(bc_loss.item())
                 self.metrics.bc_lambda = float(bc_lambda)
+                self.metrics.bc_actor_loss_contribution = float((bc_lambda * bc_loss).item())
                 self.metrics.terminal_geo_loss = float(terminal_geo_loss.item())
                 self.metrics.terminal_geo_lambda = float(terminal_geo_lambda)
+                self.metrics.terminal_geo_loss_contribution = float(
+                    (terminal_geo_lambda * terminal_geo_loss).item()
+                )
 
     def _soft_update(self, model: nn.Module, target: nn.Module) -> None:
         for param, target_param in zip(model.parameters(), target.parameters()):

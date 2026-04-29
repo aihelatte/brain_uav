@@ -465,6 +465,13 @@ def apply_model_training_overrides(cfg: ExperimentConfig, args: argparse.Namespa
             cfg.training.critic_grad_clip_norm = 1.0
         else:
             cfg.training.critic_grad_clip_norm = args.critic_grad_clip_norm
+        if args.curriculum_level == 'easy_two_zone':
+            cfg.training.critic_lr = 2.0e-4
+            cfg.rewards.collision_penalty = 18_000.0
+            cfg.rewards.ground_soft_penalty_weight = 180.0
+            cfg.rewards.ground_soft_penalty_cap = 300.0
+            cfg.rewards.descent_trend_penalty_weight = 120.0
+            cfg.rewards.descent_trend_penalty_cap = 260.0
         if args.curriculum_level == 'hard':
             cfg.training.actor_lr *= 0.75
             cfg.training.critic_lr *= 0.85
@@ -554,6 +561,9 @@ def main() -> None:
         warmup_strategy='random',
         device=cfg.training.device,
         curriculum_level=args.curriculum_level,
+        easy_two_zone_late_bc_lambda=20.0
+        if args.model == 'ann' and args.curriculum_level == 'easy_two_zone'
+        else None,
     )
     init_checkpoint = args.init_checkpoint or args.bc_checkpoint
     trainer.warmup_strategy = load_training_state(init_checkpoint, actor, critic1, critic2, trainer, log_prefix)
@@ -614,12 +624,14 @@ def main() -> None:
     metrics_dict['reference_source'] = trainer.metrics.reference_source
     metrics_dict['bc_lambda'] = trainer.metrics.bc_lambda
     metrics_dict['bc_loss'] = trainer.metrics.bc_loss
+    metrics_dict['bc_actor_loss_contribution'] = trainer.metrics.bc_actor_loss_contribution
     metrics_dict['rl_actor_loss'] = trainer.metrics.rl_actor_loss
     metrics_dict['scaled_rl_actor_loss'] = trainer.metrics.scaled_rl_actor_loss
     metrics_dict['actor_rl_scale'] = trainer.metrics.actor_rl_scale
     metrics_dict['actor_rl_scale_alpha'] = cfg.training.actor_rl_scale_alpha
     metrics_dict['terminal_geo_loss'] = trainer.metrics.terminal_geo_loss
     metrics_dict['terminal_geo_lambda'] = trainer.metrics.terminal_geo_lambda
+    metrics_dict['terminal_geo_loss_contribution'] = trainer.metrics.terminal_geo_loss_contribution
     metrics_dict['terminal_geo_regularization_enabled'] = cfg.training.terminal_geo_regularization_enabled
     metrics_dict['terminal_geo_radius'] = cfg.training.terminal_geo_radius
     metrics_dict['terminal_geo_safe_clearance'] = cfg.training.terminal_geo_safe_clearance
