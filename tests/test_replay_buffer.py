@@ -9,6 +9,44 @@ from brain_uav.trainers.replay_buffer import ReplayBuffer
 
 
 class TestReplayBuffer(unittest.TestCase):
+    def test_add_returns_slot_ref_and_mark_success_slots_updates_weights(self):
+        buffer = ReplayBuffer(capacity=4, success_sample_bias=3.0, near_goal_sample_bias=2.0)
+        obs = np.zeros(4, dtype=np.float32)
+        action = np.zeros(2, dtype=np.float32)
+
+        slot_ref = buffer.add(obs, action, 0.0, obs + 1.0, False, success=False, near_goal=True)
+
+        self.assertEqual(slot_ref, (0, 0))
+        self.assertEqual(buffer.success_count, 0)
+        self.assertAlmostEqual(buffer.sample_weight[0], 2.0)
+        self.assertAlmostEqual(buffer.total_sample_weight, 2.0)
+
+        updated = buffer.mark_success_slots([slot_ref], success=True)
+
+        self.assertEqual(updated, 1)
+        self.assertTrue(buffer.success[0])
+        self.assertEqual(buffer.success_count, 1)
+        self.assertAlmostEqual(buffer.sample_weight[0], 6.0)
+        self.assertAlmostEqual(buffer.total_sample_weight, 6.0)
+
+    def test_mark_success_slots_ignores_overwritten_slot_refs(self):
+        buffer = ReplayBuffer(capacity=1, success_sample_bias=3.0)
+        obs = np.zeros(4, dtype=np.float32)
+        action = np.zeros(2, dtype=np.float32)
+
+        stale_ref = buffer.add(obs, action, 0.0, obs + 1.0, False)
+        live_ref = buffer.add(obs + 2.0, action, 1.0, obs + 3.0, False)
+
+        self.assertEqual(stale_ref, (0, 0))
+        self.assertEqual(live_ref, (0, 1))
+        self.assertEqual(buffer.mark_success_slots([stale_ref], success=True), 0)
+        self.assertEqual(buffer.success_count, 0)
+        self.assertFalse(buffer.success[0])
+
+        self.assertEqual(buffer.mark_success_slots([live_ref], success=True), 1)
+        self.assertEqual(buffer.success_count, 1)
+        self.assertTrue(buffer.success[0])
+
     def test_counts_and_incremental_sampling_weights_update(self):
         buffer = ReplayBuffer(capacity=3, success_sample_bias=2.0, near_goal_sample_bias=3.0)
         obs = np.zeros(4, dtype=np.float32)

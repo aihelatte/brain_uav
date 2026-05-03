@@ -542,6 +542,7 @@ def main() -> None:
         warmup_steps=cfg.training.warmup_steps,
         exploration_noise=cfg.training.exploration_noise,
         success_sample_bias=cfg.training.success_sample_bias,
+        success_min_zone_clearance=cfg.training.success_min_zone_clearance,
         near_goal_sample_bias=cfg.training.near_goal_sample_bias,
         actor_freeze_steps=cfg.training.actor_freeze_steps,
         actor_grad_clip_norm=cfg.training.actor_grad_clip_norm,
@@ -612,6 +613,7 @@ def main() -> None:
     metrics_dict['policy_noise_current'] = trainer.policy_noise_current
     metrics_dict['noise_clip_current'] = trainer.noise_clip_current
     metrics_dict['success_sample_bias'] = cfg.training.success_sample_bias
+    metrics_dict['success_min_zone_clearance'] = cfg.training.success_min_zone_clearance
     metrics_dict['near_goal_radius'] = cfg.training.near_goal_radius
     metrics_dict['near_goal_sample_bias'] = cfg.training.near_goal_sample_bias
     metrics_dict['success_replay_fraction'] = cfg.training.success_replay_fraction
@@ -638,6 +640,12 @@ def main() -> None:
     metrics_dict['replay_success_fraction'] = trainer.metrics.replay_success_fraction
     metrics_dict['replay_near_goal_fraction'] = trainer.metrics.replay_near_goal_fraction
     metrics_dict['success_replay_size'] = trainer.metrics.success_replay_size
+    metrics_dict['last_episode_min_zone_clearance'] = trainer.metrics.last_episode_min_zone_clearance
+    metrics_dict['success_episode_accept_count'] = trainer.metrics.success_episode_accept_count
+    metrics_dict['success_episode_reject_count'] = trainer.metrics.success_episode_reject_count
+    metrics_dict['success_episode_reject_reason_zone_clearance'] = (
+        trainer.metrics.success_episode_reject_reason_zone_clearance
+    )
     metrics_dict['sample_success_fraction'] = trainer.metrics.sample_success_fraction
     metrics_dict['sample_near_goal_fraction'] = trainer.metrics.sample_near_goal_fraction
     metrics_dict['goal_radius_curriculum_enabled'] = True

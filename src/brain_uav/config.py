@@ -151,6 +151,7 @@ class TrainingConfig:
     warmup_steps: int = 1280
     actor_freeze_steps: int = 25_000
     success_sample_bias: float = 4.0
+    success_min_zone_clearance: float = 30.0
     near_goal_sample_bias: float = 2.0
     near_goal_radius: float = 250.0
     success_replay_fraction: float = 0.25

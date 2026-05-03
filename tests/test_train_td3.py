@@ -30,6 +30,12 @@ class _DummySpace:
         return np.zeros(2, dtype=np.float32)
 
 
+class _SimpleZone:
+    def __init__(self, center_xy, radius: float) -> None:
+        self.center_xy = np.asarray(center_xy, dtype=np.float32)
+        self.radius = float(radius)
+
+
 class _OneStepEnv:
     def __init__(self) -> None:
         self.action_space = _DummySpace()
@@ -65,30 +71,42 @@ class _OneStepEnv:
 
 
 class _EpisodeSequenceEnv:
-    def __init__(self, outcomes: list[str], episode_length: int = 5) -> None:
+    def __init__(
+        self,
+        outcomes: list[str],
+        episode_length: int = 5,
+        zones: list[_SimpleZone] | None = None,
+        trajectory_point: np.ndarray | None = None,
+    ) -> None:
         self.action_space = _DummySpace()
         self._obs = np.zeros(24, dtype=np.float32)
-        self.trajectory = [np.zeros(3, dtype=np.float32)]
+        self._trajectory_point = (
+            np.asarray(trajectory_point, dtype=np.float32)
+            if trajectory_point is not None
+            else np.zeros(3, dtype=np.float32)
+        )
+        self.trajectory = [self._trajectory_point.copy()]
         self.state = np.zeros(5, dtype=np.float32)
         self.outcomes = outcomes
         self.episode_length = episode_length
         self.episode_idx = -1
         self.step_idx = 0
         self.current_outcome = outcomes[0]
+        self.zones = zones or []
 
     def reset(self, seed: int | None = None):
         del seed
         self.episode_idx += 1
         self.step_idx = 0
         self.current_outcome = self.outcomes[min(self.episode_idx, len(self.outcomes) - 1)]
-        self.trajectory = [np.zeros(3, dtype=np.float32)]
+        self.trajectory = [self._trajectory_point.copy()]
         self.state = np.zeros(5, dtype=np.float32)
         return self._obs.copy(), {}
 
     def step(self, action):
         del action
         self.step_idx += 1
-        self.trajectory.append(np.zeros(3, dtype=np.float32))
+        self.trajectory.append(self._trajectory_point.copy())
         done = self.step_idx >= self.episode_length
         if done:
             outcome = self.current_outcome
@@ -163,6 +181,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
         cfg = ExperimentConfig()
 
         self.assertEqual(cfg.training.success_sample_bias, 4.0)
+        self.assertEqual(cfg.training.success_min_zone_clearance, 30.0)
         self.assertEqual(cfg.training.near_goal_sample_bias, 2.0)
         self.assertEqual(cfg.training.replay_size, 500_000)
         self.assertEqual(cfg.training.warmup_steps, 1280)
@@ -767,6 +786,9 @@ class TestTrainTD3Helpers(unittest.TestCase):
         trainer.train(total_timesteps=5, verbose=False, summary_every_episodes=10)
 
         self.assertEqual(trainer.replay.success_size, 5)
+        self.assertEqual(trainer.replay.success_count, 5)
+        self.assertEqual(trainer.metrics.success_episode_accept_count, 1)
+        self.assertEqual(trainer.metrics.success_episode_reject_count, 0)
 
     def test_failed_episode_does_not_enter_success_replay(self):
         trainer = TD3Trainer(
@@ -791,6 +813,42 @@ class TestTrainTD3Helpers(unittest.TestCase):
         trainer.train(total_timesteps=5, verbose=False, summary_every_episodes=10)
 
         self.assertEqual(trainer.replay.success_size, 0)
+        self.assertEqual(trainer.replay.success_count, 0)
+
+    def test_low_clearance_goal_does_not_enter_success_replay_or_primary_success_bias(self):
+        trainer = TD3Trainer(
+            env=_EpisodeSequenceEnv(
+                ['goal'],
+                zones=[_SimpleZone([0.0, 0.0], radius=10.0)],
+                trajectory_point=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+            ),
+            actor=_DummyActor(),
+            critic1=_DummyCritic(),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=64,
+            warmup_steps=10,
+            exploration_noise=0.01,
+            success_sample_bias=4.0,
+            success_min_zone_clearance=30.0,
+        )
+
+        trainer.train(total_timesteps=5, verbose=False, summary_every_episodes=10)
+
+        self.assertEqual(len(trainer.replay), 5)
+        self.assertEqual(trainer.replay.success_size, 0)
+        self.assertEqual(trainer.replay.success_count, 0)
+        self.assertEqual(trainer.metrics.success_episode_accept_count, 0)
+        self.assertEqual(trainer.metrics.success_episode_reject_count, 1)
+        self.assertEqual(trainer.metrics.success_episode_reject_reason_zone_clearance, 1)
+        self.assertLess(trainer.metrics.last_episode_min_zone_clearance, 30.0)
 
     def test_failure_samples_do_not_overwrite_success_replay(self):
         trainer = TD3Trainer(
@@ -815,6 +873,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
         trainer.train(total_timesteps=10, verbose=False, summary_every_episodes=10)
 
         self.assertEqual(trainer.replay.success_size, 5)
+        self.assertEqual(trainer.replay.success_count, 5)
 
     def test_near_goal_radius_uses_goal_or_segment_distance(self):
         trainer = TD3Trainer(

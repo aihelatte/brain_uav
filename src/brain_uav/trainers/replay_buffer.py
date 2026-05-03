@@ -31,6 +31,8 @@ class ReplayBuffer:
         self.near_goal = np.zeros(self.capacity, dtype=np.bool_)
         self.line_to_goal_safe = np.zeros(self.capacity, dtype=np.bool_)
         self.sample_weight = np.ones(self.capacity, dtype=np.float64)
+        self.write_id = np.full(self.capacity, -1, dtype=np.int64)
+        self.next_write_id = 0
         self.size = 0
         self.position = 0
         self.success_count = 0
@@ -60,13 +62,15 @@ class ReplayBuffer:
         success: bool = False,
         near_goal: bool = False,
         line_to_goal_safe: bool = False,
-    ) -> None:
+    ) -> tuple[int, int]:
         obs = np.asarray(obs, dtype=np.float32)
         action = np.asarray(action, dtype=np.float32)
         next_obs = np.asarray(next_obs, dtype=np.float32)
         self._ensure_storage(obs, action, next_obs)
 
         idx = self.position
+        write_id = int(self.next_write_id)
+        self.next_write_id += 1
         previous_weight = 0.0
         if self.size == self.capacity:
             if self.success[idx]:
@@ -86,6 +90,7 @@ class ReplayBuffer:
         self.success[idx] = bool(success)
         self.near_goal[idx] = bool(near_goal)
         self.line_to_goal_safe[idx] = bool(line_to_goal_safe)
+        self.write_id[idx] = write_id
 
         if self.success[idx]:
             self.success_count += 1
@@ -95,6 +100,32 @@ class ReplayBuffer:
         self.sample_weight[idx] = self._slot_weight(idx)
         self.total_sample_weight += float(self.sample_weight[idx])
         self.position = (self.position + 1) % self.capacity
+        return idx, write_id
+
+    def mark_success_slots(self, slot_refs: list[tuple[int, int]], success: bool = True) -> int:
+        """Update success flags for still-live primary replay slots."""
+        updated = 0
+        for idx, write_id in slot_refs:
+            idx = int(idx)
+            if idx < 0 or idx >= self.capacity:
+                continue
+            if int(self.write_id[idx]) != int(write_id):
+                continue
+            current = bool(self.success[idx])
+            desired = bool(success)
+            if current == desired:
+                continue
+            previous_weight = float(self.sample_weight[idx])
+            self.total_sample_weight -= previous_weight
+            self.success[idx] = desired
+            if desired:
+                self.success_count += 1
+            else:
+                self.success_count -= 1
+            self.sample_weight[idx] = self._slot_weight(idx)
+            self.total_sample_weight += float(self.sample_weight[idx])
+            updated += 1
+        return updated
 
     def add_success_transition(
         self,

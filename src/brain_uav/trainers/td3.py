@@ -39,6 +39,11 @@ class TD3Metrics:
     replay_near_goal_fraction: float = 0.0
     success_replay_size: int = 0
     success_replay_fraction: float = 0.0
+    success_min_zone_clearance: float = 0.0
+    last_episode_min_zone_clearance: float | None = None
+    success_episode_accept_count: int = 0
+    success_episode_reject_count: int = 0
+    success_episode_reject_reason_zone_clearance: int = 0
     sample_success_fraction: float = 0.0
     sample_near_goal_fraction: float = 0.0
     bc_regularization_enabled: bool = False
@@ -67,6 +72,11 @@ class TD3Metrics:
             'replay_near_goal_fraction': self.replay_near_goal_fraction,
             'success_replay_size': self.success_replay_size,
             'success_replay_fraction': self.success_replay_fraction,
+            'success_min_zone_clearance': self.success_min_zone_clearance,
+            'last_episode_min_zone_clearance': self.last_episode_min_zone_clearance,
+            'success_episode_accept_count': self.success_episode_accept_count,
+            'success_episode_reject_count': self.success_episode_reject_count,
+            'success_episode_reject_reason_zone_clearance': self.success_episode_reject_reason_zone_clearance,
             'sample_success_fraction': self.sample_success_fraction,
             'sample_near_goal_fraction': self.sample_near_goal_fraction,
             'bc_regularization_enabled': self.bc_regularization_enabled,
@@ -101,6 +111,7 @@ class TD3Trainer:
         warmup_steps: int,
         exploration_noise: float,
         success_sample_bias: float,
+        success_min_zone_clearance: float = 30.0,
         near_goal_sample_bias: float = 1.0,
         actor_freeze_steps: int = 0,
         actor_grad_clip_norm: float | None = None,
@@ -158,6 +169,7 @@ class TD3Trainer:
         self.noise_clip_final = noise_clip_final
         self.critic_grad_clip_norm = critic_grad_clip_norm
         self.success_sample_bias = success_sample_bias
+        self.success_min_zone_clearance = float(success_min_zone_clearance)
         self.exploration_noise_base = exploration_noise
         self.policy_noise_base = policy_noise
         self.noise_clip_base = noise_clip
@@ -176,6 +188,7 @@ class TD3Trainer:
         )
         self.total_steps = 0
         self.metrics = TD3Metrics()
+        self.metrics.success_min_zone_clearance = self.success_min_zone_clearance
         self.action_low = torch.tensor(env.action_space.low, dtype=torch.float32, device=device)
         self.action_high = torch.tensor(env.action_space.high, dtype=torch.float32, device=device)
         self._current_window: list[dict] = []
@@ -202,6 +215,7 @@ class TD3Trainer:
         episode_return = 0.0
         episode_length = 0
         episode_transitions: list[dict[str, Any]] = []
+        episode_replay_slots: list[tuple[int, int]] = []
         if verbose:
             print(
                 f"{log_prefix} start total_timesteps={total_timesteps} warmup_steps={self.warmup_steps} "
@@ -227,16 +241,17 @@ class TD3Trainer:
             near_goal = False if switch_transition else self._is_near_goal(info)
             if not switch_transition:
                 # Include timeouts as terminal transitions in replay.
-                self.replay.add(
+                slot_ref = self.replay.add(
                     obs,
                     action,
                     reward,
                     next_obs,
                     done,
-                    success=bool(info.get('outcome') == 'goal'),
+                    success=False,
                     near_goal=near_goal,
                     line_to_goal_safe=line_to_goal_safe,
                 )
+                episode_replay_slots.append(slot_ref)
                 episode_transitions.append(
                     {
                         'obs': obs.copy(),
@@ -259,9 +274,17 @@ class TD3Trainer:
                 self.metrics.episode_lengths.append(int(episode_length))
                 outcome = info.get('outcome', 'unknown')
                 self.metrics.outcomes[outcome] = self.metrics.outcomes.get(outcome, 0) + 1
+                episode_min_zone_clearance = self._episode_min_zone_clearance()
+                self.metrics.last_episode_min_zone_clearance = float(episode_min_zone_clearance)
                 if outcome == 'goal':
-                    for transition in episode_transitions:
-                        self.replay.add_success_transition(**transition)
+                    if episode_min_zone_clearance >= self.success_min_zone_clearance:
+                        self.replay.mark_success_slots(episode_replay_slots, success=True)
+                        for transition in episode_transitions:
+                            self.replay.add_success_transition(**transition)
+                        self.metrics.success_episode_accept_count += 1
+                    else:
+                        self.metrics.success_episode_reject_count += 1
+                        self.metrics.success_episode_reject_reason_zone_clearance += 1
                 episode_record = {
                     'episode': self.metrics.episodes,
                     'total_steps': self.total_steps,
@@ -277,6 +300,7 @@ class TD3Trainer:
                         'goal_distance': float(info.get('goal_distance', 0.0)),
                         'segment_goal_distance': float(info.get('segment_goal_distance', float('inf'))),
                         'goal_reached_by_segment': bool(info.get('goal_reached_by_segment', False)),
+                        'episode_min_zone_clearance': float(episode_min_zone_clearance),
                         'progress': float(info.get('progress', 0.0)),
                         'steps': int(info.get('steps', episode_length)),
                         'curriculum_level': info.get('curriculum_level'),
@@ -317,6 +341,7 @@ class TD3Trainer:
                 episode_return = 0.0
                 episode_length = 0
                 episode_transitions = []
+                episode_replay_slots = []
             if verbose and ((step_idx + 1) % log_interval == 0 or (step_idx + 1) == total_timesteps):
                 avg_return = statistics.mean(self.metrics.episode_returns[-5:]) if self.metrics.episode_returns else 0.0
                 actor_phase = 'frozen' if self.total_steps <= self.actor_freeze_steps else 'active'
@@ -368,6 +393,28 @@ class TD3Trainer:
             or segment_goal_distance <= self.near_goal_radius
             or goal_reached_by_segment
         )
+
+    def _episode_min_zone_clearance(self) -> float:
+        zones = getattr(self.env, 'zones', None) or []
+        if not zones:
+            return float('inf')
+        trajectory = getattr(self.env, 'trajectory', None) or []
+        if not trajectory:
+            return float('inf')
+        min_clearance = float('inf')
+        for point in trajectory:
+            pos = np.asarray(point, dtype=np.float64)
+            if pos.shape[0] < 3:
+                continue
+            for zone in zones:
+                center_xy = np.asarray(getattr(zone, 'center_xy'), dtype=np.float64)
+                radius = float(getattr(zone, 'radius'))
+                dx = float(pos[0] - center_xy[0])
+                dy = float(pos[1] - center_xy[1])
+                dz = float(pos[2])
+                clearance = float(np.sqrt(dx * dx + dy * dy + dz * dz) - radius)
+                min_clearance = min(min_clearance, clearance)
+        return min_clearance
 
     def _current_noise(self) -> tuple[float, float, float]:
         stage_progress = min(float(self.total_steps) / max(float(self.current_stage_timesteps), 1.0), 1.0)
