@@ -180,7 +180,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
     def test_training_config_defaults_raise_timeout_and_success_bias(self):
         cfg = ExperimentConfig()
 
-        self.assertEqual(cfg.training.success_sample_bias, 2.0)
+        self.assertEqual(cfg.training.success_sample_bias, 4.0)
         self.assertEqual(cfg.training.success_replay_min_zone_clearance, 30.0)
         self.assertEqual(cfg.training.success_primary_min_zone_clearance, 80.0)
         self.assertEqual(cfg.training.success_batch_fraction, 0.25)
@@ -225,7 +225,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
 
         self.assertEqual(cfg.training.actor_lr, 1.5e-4)
         self.assertEqual(cfg.training.critic_lr, 2.0e-4)
-        self.assertEqual(cfg.rewards.collision_penalty, 18_000.0)
+        self.assertEqual(cfg.rewards.collision_penalty, 24_000.0)
         self.assertEqual(cfg.rewards.ground_soft_penalty_weight, 180.0)
         self.assertEqual(cfg.rewards.ground_soft_penalty_cap, 300.0)
         self.assertEqual(cfg.rewards.descent_trend_penalty_weight, 120.0)
@@ -240,7 +240,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
 
                 apply_model_training_overrides(cfg, args)
 
-                self.assertEqual(cfg.rewards.collision_penalty, 12_000.0)
+                self.assertEqual(cfg.rewards.collision_penalty, 18_000.0)
                 self.assertEqual(cfg.rewards.ground_soft_penalty_weight, 120.0)
                 self.assertEqual(cfg.rewards.ground_soft_penalty_cap, 200.0)
                 self.assertEqual(cfg.rewards.descent_trend_penalty_weight, 80.0)
@@ -257,7 +257,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
 
         self.assertEqual(cfg.training.actor_lr, baseline_actor_lr)
         self.assertEqual(cfg.training.critic_lr, baseline_critic_lr)
-        self.assertEqual(cfg.rewards.collision_penalty, 12_000.0)
+        self.assertEqual(cfg.rewards.collision_penalty, 18_000.0)
         self.assertEqual(cfg.rewards.ground_soft_penalty_weight, 120.0)
 
     def test_snn_default_learning_rates_remain_unchanged(self):
@@ -828,7 +828,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(trainer.replay.success_size, 0)
         self.assertEqual(trainer.replay.success_count, 0)
 
-    def test_low_clearance_goal_does_not_enter_success_replay_or_primary_success_bias(self):
+    def test_low_clearance_goal_enters_success_replay_and_primary_success_bias(self):
         trainer = TD3Trainer(
             env=_EpisodeSequenceEnv(
                 ['goal'],
@@ -849,7 +849,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
             batch_size=64,
             warmup_steps=10,
             exploration_noise=0.01,
-            success_sample_bias=2.0,
+            success_sample_bias=4.0,
             success_replay_min_zone_clearance=30.0,
             success_primary_min_zone_clearance=80.0,
         )
@@ -857,19 +857,19 @@ class TestTrainTD3Helpers(unittest.TestCase):
         trainer.train(total_timesteps=5, verbose=False, summary_every_episodes=10)
 
         self.assertEqual(len(trainer.replay), 5)
-        self.assertEqual(trainer.replay.success_size, 0)
-        self.assertEqual(trainer.replay.success_count, 0)
-        self.assertEqual(trainer.metrics.success_episode_accept_count, 0)
-        self.assertEqual(trainer.metrics.success_episode_reject_count, 1)
-        self.assertEqual(trainer.metrics.success_episode_reject_reason_zone_clearance, 1)
-        self.assertEqual(trainer.metrics.success_replay_accept_count, 0)
-        self.assertEqual(trainer.metrics.success_replay_reject_count, 1)
-        self.assertEqual(trainer.metrics.success_replay_reject_reason_zone_clearance, 1)
-        self.assertEqual(trainer.metrics.success_primary_accept_count, 0)
-        self.assertEqual(trainer.metrics.success_primary_reject_count, 1)
+        self.assertEqual(trainer.replay.success_size, 5)
+        self.assertEqual(trainer.replay.success_count, 5)
+        self.assertEqual(trainer.metrics.success_episode_accept_count, 1)
+        self.assertEqual(trainer.metrics.success_episode_reject_count, 0)
+        self.assertEqual(trainer.metrics.success_episode_reject_reason_zone_clearance, 0)
+        self.assertEqual(trainer.metrics.success_replay_accept_count, 1)
+        self.assertEqual(trainer.metrics.success_replay_reject_count, 0)
+        self.assertEqual(trainer.metrics.success_replay_reject_reason_zone_clearance, 0)
+        self.assertEqual(trainer.metrics.success_primary_accept_count, 1)
+        self.assertEqual(trainer.metrics.success_primary_reject_count, 0)
         self.assertLess(trainer.metrics.last_episode_min_zone_clearance, 30.0)
 
-    def test_medium_clearance_goal_enters_success_replay_without_primary_success_bias(self):
+    def test_medium_clearance_goal_enters_success_replay_and_primary_success_bias(self):
         trainer = TD3Trainer(
             env=_EpisodeSequenceEnv(
                 ['goal'],
@@ -890,7 +890,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
             batch_size=64,
             warmup_steps=10,
             exploration_noise=0.01,
-            success_sample_bias=2.0,
+            success_sample_bias=4.0,
             success_replay_min_zone_clearance=30.0,
             success_primary_min_zone_clearance=80.0,
         )
@@ -899,11 +899,11 @@ class TestTrainTD3Helpers(unittest.TestCase):
 
         self.assertEqual(len(trainer.replay), 5)
         self.assertEqual(trainer.replay.success_size, 5)
-        self.assertEqual(trainer.replay.success_count, 0)
+        self.assertEqual(trainer.replay.success_count, 5)
         self.assertEqual(trainer.metrics.success_replay_accept_count, 1)
         self.assertEqual(trainer.metrics.success_replay_reject_count, 0)
-        self.assertEqual(trainer.metrics.success_primary_accept_count, 0)
-        self.assertEqual(trainer.metrics.success_primary_reject_count, 1)
+        self.assertEqual(trainer.metrics.success_primary_accept_count, 1)
+        self.assertEqual(trainer.metrics.success_primary_reject_count, 0)
         self.assertGreaterEqual(trainer.metrics.last_episode_min_zone_clearance, 30.0)
         self.assertLess(trainer.metrics.last_episode_min_zone_clearance, 80.0)
 
@@ -928,7 +928,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
             batch_size=64,
             warmup_steps=10,
             exploration_noise=0.01,
-            success_sample_bias=2.0,
+            success_sample_bias=4.0,
             success_replay_min_zone_clearance=30.0,
             success_primary_min_zone_clearance=80.0,
         )

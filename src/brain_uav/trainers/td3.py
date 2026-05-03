@@ -296,21 +296,12 @@ class TD3Trainer:
                 episode_min_zone_clearance = self._episode_min_zone_clearance()
                 self.metrics.last_episode_min_zone_clearance = float(episode_min_zone_clearance)
                 if outcome == 'goal':
-                    if episode_min_zone_clearance >= self.success_replay_min_zone_clearance:
-                        for transition in episode_transitions:
-                            self.replay.add_success_transition(**transition)
-                        self.metrics.success_replay_accept_count += 1
-                        self.metrics.success_episode_accept_count += 1
-                    else:
-                        self.metrics.success_replay_reject_count += 1
-                        self.metrics.success_replay_reject_reason_zone_clearance += 1
-                        self.metrics.success_episode_reject_count += 1
-                        self.metrics.success_episode_reject_reason_zone_clearance += 1
-                    if episode_min_zone_clearance >= self.success_primary_min_zone_clearance:
-                        self.replay.mark_success_slots(episode_replay_slots, success=True)
-                        self.metrics.success_primary_accept_count += 1
-                    else:
-                        self.metrics.success_primary_reject_count += 1
+                    for transition in episode_transitions:
+                        self.replay.add_success_transition(**transition)
+                    self.replay.mark_success_slots(episode_replay_slots, success=True)
+                    self.metrics.success_replay_accept_count += 1
+                    self.metrics.success_primary_accept_count += 1
+                    self.metrics.success_episode_accept_count += 1
                 episode_record = {
                     'episode': self.metrics.episodes,
                     'total_steps': self.total_steps,

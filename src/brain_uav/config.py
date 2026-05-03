@@ -53,7 +53,7 @@ class ScenarioConfig:
             'benchmark': (200.0, 250.0),
         }
     )
-    warning_distance: float = 80.0
+    warning_distance: float = 100.0
     boundary_warning_distance: float = 10.0
     ground_warning_height: float = 4.0
     descent_penalty_height: float = 12.0
@@ -100,8 +100,8 @@ class RewardConfig:
 
     progress_weight: float = 2.4
     goal_reward: float = 5000.0
-    zone_penalty_weight: float = 300.0
-    zone_penalty_cap: float = 800.0
+    zone_penalty_weight: float = 450.0
+    zone_penalty_cap: float = 1200.0
     boundary_soft_penalty_weight: float = 120.0
     boundary_soft_penalty_cap: float = 160.0
     ground_soft_penalty_weight: float = 120.0
@@ -115,7 +115,7 @@ class RewardConfig:
     action_delta_gamma_weight: float = 12.0
     action_delta_psi_weight: float = 8.0
     smoothness_weight: float = 1.0
-    collision_penalty: float = 12000.0
+    collision_penalty: float = 18000.0
     step_penalty: float = 2.5
     boundary_penalty: float = 10000.0
     timeout_penalty: float = 5000.0
@@ -150,7 +150,7 @@ class TrainingConfig:
     replay_size: int = 500_000
     warmup_steps: int = 1280
     actor_freeze_steps: int = 25_000
-    success_sample_bias: float = 2.0
+    success_sample_bias: float = 4.0
     success_replay_min_zone_clearance: float = 30.0
     success_primary_min_zone_clearance: float = 80.0
     success_min_zone_clearance: float = 30.0

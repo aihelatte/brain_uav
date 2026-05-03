@@ -467,7 +467,7 @@ def apply_model_training_overrides(cfg: ExperimentConfig, args: argparse.Namespa
             cfg.training.critic_grad_clip_norm = args.critic_grad_clip_norm
         if args.curriculum_level == 'easy_two_zone':
             cfg.training.critic_lr = 2.0e-4
-            cfg.rewards.collision_penalty = 18_000.0
+            cfg.rewards.collision_penalty = 24_000.0
             cfg.rewards.ground_soft_penalty_weight = 180.0
             cfg.rewards.ground_soft_penalty_cap = 300.0
             cfg.rewards.descent_trend_penalty_weight = 120.0
