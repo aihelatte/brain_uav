@@ -39,8 +39,14 @@ class TD3Metrics:
     replay_near_goal_fraction: float = 0.0
     success_replay_size: int = 0
     success_replay_fraction: float = 0.0
-    success_min_zone_clearance: float = 0.0
+    success_replay_min_zone_clearance: float = 0.0
+    success_primary_min_zone_clearance: float = 0.0
     last_episode_min_zone_clearance: float | None = None
+    success_replay_accept_count: int = 0
+    success_replay_reject_count: int = 0
+    success_replay_reject_reason_zone_clearance: int = 0
+    success_primary_accept_count: int = 0
+    success_primary_reject_count: int = 0
     success_episode_accept_count: int = 0
     success_episode_reject_count: int = 0
     success_episode_reject_reason_zone_clearance: int = 0
@@ -72,8 +78,14 @@ class TD3Metrics:
             'replay_near_goal_fraction': self.replay_near_goal_fraction,
             'success_replay_size': self.success_replay_size,
             'success_replay_fraction': self.success_replay_fraction,
-            'success_min_zone_clearance': self.success_min_zone_clearance,
+            'success_replay_min_zone_clearance': self.success_replay_min_zone_clearance,
+            'success_primary_min_zone_clearance': self.success_primary_min_zone_clearance,
             'last_episode_min_zone_clearance': self.last_episode_min_zone_clearance,
+            'success_replay_accept_count': self.success_replay_accept_count,
+            'success_replay_reject_count': self.success_replay_reject_count,
+            'success_replay_reject_reason_zone_clearance': self.success_replay_reject_reason_zone_clearance,
+            'success_primary_accept_count': self.success_primary_accept_count,
+            'success_primary_reject_count': self.success_primary_reject_count,
             'success_episode_accept_count': self.success_episode_accept_count,
             'success_episode_reject_count': self.success_episode_reject_count,
             'success_episode_reject_reason_zone_clearance': self.success_episode_reject_reason_zone_clearance,
@@ -111,7 +123,9 @@ class TD3Trainer:
         warmup_steps: int,
         exploration_noise: float,
         success_sample_bias: float,
-        success_min_zone_clearance: float = 30.0,
+        success_replay_min_zone_clearance: float = 30.0,
+        success_primary_min_zone_clearance: float = 80.0,
+        success_min_zone_clearance: float | None = None,
         near_goal_sample_bias: float = 1.0,
         actor_freeze_steps: int = 0,
         actor_grad_clip_norm: float | None = None,
@@ -169,7 +183,11 @@ class TD3Trainer:
         self.noise_clip_final = noise_clip_final
         self.critic_grad_clip_norm = critic_grad_clip_norm
         self.success_sample_bias = success_sample_bias
-        self.success_min_zone_clearance = float(success_min_zone_clearance)
+        if success_min_zone_clearance is not None:
+            success_replay_min_zone_clearance = float(success_min_zone_clearance)
+            success_primary_min_zone_clearance = float(success_min_zone_clearance)
+        self.success_replay_min_zone_clearance = float(success_replay_min_zone_clearance)
+        self.success_primary_min_zone_clearance = float(success_primary_min_zone_clearance)
         self.exploration_noise_base = exploration_noise
         self.policy_noise_base = policy_noise
         self.noise_clip_base = noise_clip
@@ -188,7 +206,8 @@ class TD3Trainer:
         )
         self.total_steps = 0
         self.metrics = TD3Metrics()
-        self.metrics.success_min_zone_clearance = self.success_min_zone_clearance
+        self.metrics.success_replay_min_zone_clearance = self.success_replay_min_zone_clearance
+        self.metrics.success_primary_min_zone_clearance = self.success_primary_min_zone_clearance
         self.action_low = torch.tensor(env.action_space.low, dtype=torch.float32, device=device)
         self.action_high = torch.tensor(env.action_space.high, dtype=torch.float32, device=device)
         self._current_window: list[dict] = []
@@ -277,14 +296,21 @@ class TD3Trainer:
                 episode_min_zone_clearance = self._episode_min_zone_clearance()
                 self.metrics.last_episode_min_zone_clearance = float(episode_min_zone_clearance)
                 if outcome == 'goal':
-                    if episode_min_zone_clearance >= self.success_min_zone_clearance:
-                        self.replay.mark_success_slots(episode_replay_slots, success=True)
+                    if episode_min_zone_clearance >= self.success_replay_min_zone_clearance:
                         for transition in episode_transitions:
                             self.replay.add_success_transition(**transition)
+                        self.metrics.success_replay_accept_count += 1
                         self.metrics.success_episode_accept_count += 1
                     else:
+                        self.metrics.success_replay_reject_count += 1
+                        self.metrics.success_replay_reject_reason_zone_clearance += 1
                         self.metrics.success_episode_reject_count += 1
                         self.metrics.success_episode_reject_reason_zone_clearance += 1
+                    if episode_min_zone_clearance >= self.success_primary_min_zone_clearance:
+                        self.replay.mark_success_slots(episode_replay_slots, success=True)
+                        self.metrics.success_primary_accept_count += 1
+                    else:
+                        self.metrics.success_primary_reject_count += 1
                 episode_record = {
                     'episode': self.metrics.episodes,
                     'total_steps': self.total_steps,

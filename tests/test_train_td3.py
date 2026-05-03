@@ -180,8 +180,10 @@ class TestTrainTD3Helpers(unittest.TestCase):
     def test_training_config_defaults_raise_timeout_and_success_bias(self):
         cfg = ExperimentConfig()
 
-        self.assertEqual(cfg.training.success_sample_bias, 4.0)
-        self.assertEqual(cfg.training.success_min_zone_clearance, 30.0)
+        self.assertEqual(cfg.training.success_sample_bias, 2.0)
+        self.assertEqual(cfg.training.success_replay_min_zone_clearance, 30.0)
+        self.assertEqual(cfg.training.success_primary_min_zone_clearance, 80.0)
+        self.assertEqual(cfg.training.success_batch_fraction, 0.25)
         self.assertEqual(cfg.training.near_goal_sample_bias, 2.0)
         self.assertEqual(cfg.training.replay_size, 500_000)
         self.assertEqual(cfg.training.warmup_steps, 1280)
@@ -704,6 +706,13 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertIn('bc_actor_loss_contribution', metrics)
         self.assertIn('terminal_geo_loss_contribution', metrics)
         self.assertIn('reference_source', metrics)
+        self.assertIn('success_replay_min_zone_clearance', metrics)
+        self.assertIn('success_primary_min_zone_clearance', metrics)
+        self.assertIn('last_episode_min_zone_clearance', metrics)
+        self.assertIn('success_replay_accept_count', metrics)
+        self.assertIn('success_replay_reject_count', metrics)
+        self.assertIn('success_primary_accept_count', metrics)
+        self.assertIn('success_primary_reject_count', metrics)
 
     def test_true_early_stop_sets_early_stopped(self):
         trainer = TD3Trainer(
@@ -789,6 +798,10 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(trainer.replay.success_count, 5)
         self.assertEqual(trainer.metrics.success_episode_accept_count, 1)
         self.assertEqual(trainer.metrics.success_episode_reject_count, 0)
+        self.assertEqual(trainer.metrics.success_replay_accept_count, 1)
+        self.assertEqual(trainer.metrics.success_replay_reject_count, 0)
+        self.assertEqual(trainer.metrics.success_primary_accept_count, 1)
+        self.assertEqual(trainer.metrics.success_primary_reject_count, 0)
 
     def test_failed_episode_does_not_enter_success_replay(self):
         trainer = TD3Trainer(
@@ -836,8 +849,9 @@ class TestTrainTD3Helpers(unittest.TestCase):
             batch_size=64,
             warmup_steps=10,
             exploration_noise=0.01,
-            success_sample_bias=4.0,
-            success_min_zone_clearance=30.0,
+            success_sample_bias=2.0,
+            success_replay_min_zone_clearance=30.0,
+            success_primary_min_zone_clearance=80.0,
         )
 
         trainer.train(total_timesteps=5, verbose=False, summary_every_episodes=10)
@@ -848,7 +862,86 @@ class TestTrainTD3Helpers(unittest.TestCase):
         self.assertEqual(trainer.metrics.success_episode_accept_count, 0)
         self.assertEqual(trainer.metrics.success_episode_reject_count, 1)
         self.assertEqual(trainer.metrics.success_episode_reject_reason_zone_clearance, 1)
+        self.assertEqual(trainer.metrics.success_replay_accept_count, 0)
+        self.assertEqual(trainer.metrics.success_replay_reject_count, 1)
+        self.assertEqual(trainer.metrics.success_replay_reject_reason_zone_clearance, 1)
+        self.assertEqual(trainer.metrics.success_primary_accept_count, 0)
+        self.assertEqual(trainer.metrics.success_primary_reject_count, 1)
         self.assertLess(trainer.metrics.last_episode_min_zone_clearance, 30.0)
+
+    def test_medium_clearance_goal_enters_success_replay_without_primary_success_bias(self):
+        trainer = TD3Trainer(
+            env=_EpisodeSequenceEnv(
+                ['goal'],
+                zones=[_SimpleZone([0.0, 0.0], radius=10.0)],
+                trajectory_point=np.array([60.0, 0.0, 0.0], dtype=np.float32),
+            ),
+            actor=_DummyActor(),
+            critic1=_DummyCritic(),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=64,
+            warmup_steps=10,
+            exploration_noise=0.01,
+            success_sample_bias=2.0,
+            success_replay_min_zone_clearance=30.0,
+            success_primary_min_zone_clearance=80.0,
+        )
+
+        trainer.train(total_timesteps=5, verbose=False, summary_every_episodes=10)
+
+        self.assertEqual(len(trainer.replay), 5)
+        self.assertEqual(trainer.replay.success_size, 5)
+        self.assertEqual(trainer.replay.success_count, 0)
+        self.assertEqual(trainer.metrics.success_replay_accept_count, 1)
+        self.assertEqual(trainer.metrics.success_replay_reject_count, 0)
+        self.assertEqual(trainer.metrics.success_primary_accept_count, 0)
+        self.assertEqual(trainer.metrics.success_primary_reject_count, 1)
+        self.assertGreaterEqual(trainer.metrics.last_episode_min_zone_clearance, 30.0)
+        self.assertLess(trainer.metrics.last_episode_min_zone_clearance, 80.0)
+
+    def test_high_clearance_goal_enters_success_replay_and_primary_success_bias(self):
+        trainer = TD3Trainer(
+            env=_EpisodeSequenceEnv(
+                ['goal'],
+                zones=[_SimpleZone([0.0, 0.0], radius=10.0)],
+                trajectory_point=np.array([100.0, 0.0, 0.0], dtype=np.float32),
+            ),
+            actor=_DummyActor(),
+            critic1=_DummyCritic(),
+            critic2=_DummyCritic(),
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.005,
+            policy_noise=0.01,
+            noise_clip=0.02,
+            policy_delay=2,
+            replay_size=32,
+            batch_size=64,
+            warmup_steps=10,
+            exploration_noise=0.01,
+            success_sample_bias=2.0,
+            success_replay_min_zone_clearance=30.0,
+            success_primary_min_zone_clearance=80.0,
+        )
+
+        trainer.train(total_timesteps=5, verbose=False, summary_every_episodes=10)
+
+        self.assertEqual(len(trainer.replay), 5)
+        self.assertEqual(trainer.replay.success_size, 5)
+        self.assertEqual(trainer.replay.success_count, 5)
+        self.assertEqual(trainer.metrics.success_replay_accept_count, 1)
+        self.assertEqual(trainer.metrics.success_primary_accept_count, 1)
+        self.assertEqual(trainer.metrics.success_primary_reject_count, 0)
+        self.assertGreaterEqual(trainer.metrics.last_episode_min_zone_clearance, 80.0)
 
     def test_failure_samples_do_not_overwrite_success_replay(self):
         trainer = TD3Trainer(
