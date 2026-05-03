@@ -168,6 +168,16 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             'curriculum_level': self.last_curriculum_level,
         }
 
+    def set_goal(self, new_goal, *, reset_leg_timer: bool = True):
+        self.goal = np.asarray(new_goal, dtype=np.float32).copy()
+        if reset_leg_timer:
+            self.steps = 0
+        self.recent_progress = []
+        self.best_goal_distance_so_far = self._goal_distance(self.state[:3])
+        self.last_segment_goal_distance = self.best_goal_distance_so_far
+        self.last_goal_reached_by_segment = False
+        return self._get_obs(), self._info(progress=0.0)
+
     def _sample_scenario(self) -> None:
         if self.curriculum_mix:
             for _ in range(self.scenario.scenario_max_sampling_attempts):

@@ -223,29 +223,31 @@ class TD3Trainer:
                 action = self.select_action(obs, with_noise=True)
             next_obs, reward, terminated, truncated, info = self.env.step(action)
             done = terminated or truncated
-            near_goal = self._is_near_goal(info)
-            # Include timeouts as terminal transitions in replay.
-            self.replay.add(
-                obs,
-                action,
-                reward,
-                next_obs,
-                done,
-                success=bool(info.get('outcome') == 'goal'),
-                near_goal=near_goal,
-                line_to_goal_safe=line_to_goal_safe,
-            )
-            episode_transitions.append(
-                {
-                    'obs': obs.copy(),
-                    'action': action.copy(),
-                    'reward': float(reward),
-                    'next_obs': next_obs.copy(),
-                    'done': bool(done),
-                    'near_goal': near_goal,
-                    'line_to_goal_safe': line_to_goal_safe,
-                }
-            )
+            switch_transition = bool(info.get('switch_transition', False))
+            near_goal = False if switch_transition else self._is_near_goal(info)
+            if not switch_transition:
+                # Include timeouts as terminal transitions in replay.
+                self.replay.add(
+                    obs,
+                    action,
+                    reward,
+                    next_obs,
+                    done,
+                    success=bool(info.get('outcome') == 'goal'),
+                    near_goal=near_goal,
+                    line_to_goal_safe=line_to_goal_safe,
+                )
+                episode_transitions.append(
+                    {
+                        'obs': obs.copy(),
+                        'action': action.copy(),
+                        'reward': float(reward),
+                        'next_obs': next_obs.copy(),
+                        'done': bool(done),
+                        'near_goal': near_goal,
+                        'line_to_goal_safe': line_to_goal_safe,
+                    }
+                )
             episode_return += reward
             episode_length += 1
             obs = next_obs
