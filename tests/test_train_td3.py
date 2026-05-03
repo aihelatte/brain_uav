@@ -255,7 +255,7 @@ class TestTrainTD3Helpers(unittest.TestCase):
         source = Path('E:/wurenji/my_project/src/brain_uav/scripts/train_td3.py').read_text(encoding='utf-8')
 
         self.assertIn(
-            "args.timesteps = 1200000 if args.curriculum_level == 'hard' else 900000",
+            "args.timesteps = 500000 if args.curriculum_level == 'hard' else 400000",
             source,
         )
 
