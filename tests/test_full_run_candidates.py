@@ -145,7 +145,7 @@ class TestFullRunCandidates(unittest.TestCase):
             self.assertFalse((root / 'candidate_runs' / 'easy_two_zone' / 'cand_02_seed207').exists())
             self.assertFalse((root / 'candidate_runs' / 'easy_two_zone' / 'cand_03_seed307').exists())
 
-    def test_stage_failure_when_no_candidate_stops_early(self):
+    def test_stage_failure_when_no_candidate_stops_early_preserves_candidate_runs(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             init_checkpoint = root / 'init.pt'
@@ -173,7 +173,10 @@ class TestFullRunCandidates(unittest.TestCase):
                             poll_interval=0.0,
                         )
 
-            self.assertFalse((root / 'candidate_runs' / 'medium' / 'cand_00_seed7').exists())
+            self.assertTrue((root / 'candidate_runs' / 'medium' / 'cand_00_seed7').exists())
+            self.assertTrue((root / 'candidate_runs' / 'medium' / 'cand_01_seed107').exists())
+            self.assertTrue((root / 'candidate_runs' / 'medium' / 'cand_02_seed207').exists())
+            self.assertTrue((root / 'candidate_runs' / 'medium' / 'cand_03_seed307').exists())
 
     def test_keep_candidate_runs_preserves_non_winner_directories(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -315,7 +315,6 @@ def run_candidate_stage(
             time.sleep(poll_interval)
 
     if winner is None:
-        cleanup_candidate_runs(all_candidates, winner=None, keep_candidate_runs=keep_candidate_runs)
         summaries = [candidate.summary() for candidate in all_candidates]
         raise FullRunStageError(f'Stage {stage} had no candidate with stopped_early=True: {summaries}')
 
@@ -410,25 +409,42 @@ def run_full_pipeline_candidates(args: argparse.Namespace) -> dict[str, Any]:
     for stage in stages:
         stage_checkpoint = layout.models_dir / f'td3_{args.model}_{stage}.pt'
         winner_log_dir = layout.logs_dir / 'td3' / stage / 'winner_run'
-        winner, summaries = run_candidate_stage(
-            project_root=project_root,
-            env=env,
-            model=args.model,
-            stage=stage,
-            init_checkpoint=init_checkpoint,
-            stage_checkpoint=stage_checkpoint,
-            stage_candidate_root=ensure_dir(candidate_root / stage),
-            winner_log_dir=winner_log_dir,
-            base_seed=args.seed,
-            candidates=args.candidates,
-            candidate_workers=args.candidate_workers,
-            keep_candidate_runs=args.keep_candidate_runs,
-            device=args.device,
-            snn_backend=args.snn_backend,
-            poll_interval=args.poll_interval,
-            summary_every_episodes=15,
-            early_stop_min_steps=125000,
-        )
+        try:
+            winner, summaries = run_candidate_stage(
+                project_root=project_root,
+                env=env,
+                model=args.model,
+                stage=stage,
+                init_checkpoint=init_checkpoint,
+                stage_checkpoint=stage_checkpoint,
+                stage_candidate_root=ensure_dir(candidate_root / stage),
+                winner_log_dir=winner_log_dir,
+                base_seed=args.seed,
+                candidates=args.candidates,
+                candidate_workers=args.candidate_workers,
+                keep_candidate_runs=args.keep_candidate_runs,
+                device=args.device,
+                snn_backend=args.snn_backend,
+                poll_interval=args.poll_interval,
+                summary_every_episodes=15,
+                early_stop_min_steps=125000,
+            )
+        except FullRunStageError as exc:
+            stage_report = {
+                'stage': stage,
+                'winner_candidate_id': None,
+                'winner_seed': None,
+                'checkpoint': None,
+                'winner_log_dir': None,
+                'metrics_path': None,
+                'stop_reason': str(exc),
+                'status': 'failed_no_candidate_early_stop',
+                'candidate_runs_dir': str(candidate_root / stage),
+            }
+            stage_reports.append(stage_report)
+            report['candidate_stages'] = stage_reports
+            save_json(layout.reports_dir / 'selection_summary.json', report)
+            raise
         stage_report = {
             'stage': stage,
             'winner_candidate_id': winner.candidate_id,
@@ -437,6 +453,7 @@ def run_full_pipeline_candidates(args: argparse.Namespace) -> dict[str, Any]:
             'winner_log_dir': str(winner_log_dir),
             'metrics_path': str(winner.metrics_path) if winner.metrics_path else None,
             'stop_reason': winner.stop_reason,
+            'status': 'winner',
             'candidates': summaries,
         }
         stage_reports.append(stage_report)

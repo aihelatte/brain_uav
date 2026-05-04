@@ -487,7 +487,7 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.timesteps is None:
-        args.timesteps = 500000 if args.curriculum_level == 'hard' else 400000
+        args.timesteps = 1000000 if args.curriculum_level == 'hard' else 750000
 
     cfg = ExperimentConfig()
     resolved_device = configure_training_runtime(
