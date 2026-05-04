@@ -412,7 +412,7 @@ def _run_training(args: argparse.Namespace, run_dir: Path, timestamp: str, conso
 def main() -> None:
     args = build_parser().parse_args()
     timestamp = now_timestamp()
-    run_dir = ensure_dir(args.output / f'{args.target_switch_level}_{timestamp}')
+    run_dir = ensure_dir(args.output / f'{timestamp}_{args.model}_{args.target_switch_level}')
     console_log = run_dir / 'console.log'
     with console_log.open('w', encoding='utf-8') as log_file:
         stdout_tee = _TeeStream(sys.stdout, log_file)
