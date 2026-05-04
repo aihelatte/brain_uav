@@ -98,16 +98,16 @@ class ScenarioConfig:
 class RewardConfig:
     """Reward weights used by reinforcement learning."""
 
-    progress_weight: float = 2.4
+    progress_weight: float = 2.0
     goal_reward: float = 5000.0
     zone_penalty_weight: float = 450.0
     zone_penalty_cap: float = 1200.0
-    boundary_soft_penalty_weight: float = 120.0
-    boundary_soft_penalty_cap: float = 160.0
-    ground_soft_penalty_weight: float = 120.0
-    ground_soft_penalty_cap: float = 200.0
-    descent_trend_penalty_weight: float = 80.0
-    descent_trend_penalty_cap: float = 180.0
+    boundary_soft_penalty_weight: float = 180.0
+    boundary_soft_penalty_cap: float = 240.0
+    ground_soft_penalty_weight: float = 180.0
+    ground_soft_penalty_cap: float = 300.0
+    descent_trend_penalty_weight: float = 120.0
+    descent_trend_penalty_cap: float = 260.0
     inefficiency_penalty_weight: float = 14.0
     inefficiency_penalty_cap: float = 30.0
     progress_window_size: int = 10
@@ -115,9 +115,9 @@ class RewardConfig:
     action_delta_gamma_weight: float = 12.0
     action_delta_psi_weight: float = 8.0
     smoothness_weight: float = 1.0
-    collision_penalty: float = 18000.0
+    collision_penalty: float = 24000.0
     step_penalty: float = 2.5
-    boundary_penalty: float = 10000.0
+    boundary_penalty: float = 24000.0
     timeout_penalty: float = 5000.0
     breakthrough_reward_distance: float = 120.0
     breakthrough_progress_threshold: float = 2.2

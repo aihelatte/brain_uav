@@ -240,11 +240,11 @@ class TestTrainTD3Helpers(unittest.TestCase):
 
                 apply_model_training_overrides(cfg, args)
 
-                self.assertEqual(cfg.rewards.collision_penalty, 18_000.0)
-                self.assertEqual(cfg.rewards.ground_soft_penalty_weight, 120.0)
-                self.assertEqual(cfg.rewards.ground_soft_penalty_cap, 200.0)
-                self.assertEqual(cfg.rewards.descent_trend_penalty_weight, 80.0)
-                self.assertEqual(cfg.rewards.descent_trend_penalty_cap, 180.0)
+                self.assertEqual(cfg.rewards.collision_penalty, 24_000.0)
+                self.assertEqual(cfg.rewards.ground_soft_penalty_weight, 180.0)
+                self.assertEqual(cfg.rewards.ground_soft_penalty_cap, 300.0)
+                self.assertEqual(cfg.rewards.descent_trend_penalty_weight, 120.0)
+                self.assertEqual(cfg.rewards.descent_trend_penalty_cap, 260.0)
 
     def test_snn_easy_two_zone_does_not_use_ann_stability_overrides(self):
         parser = build_parser()
@@ -257,8 +257,8 @@ class TestTrainTD3Helpers(unittest.TestCase):
 
         self.assertEqual(cfg.training.actor_lr, baseline_actor_lr)
         self.assertEqual(cfg.training.critic_lr, baseline_critic_lr)
-        self.assertEqual(cfg.rewards.collision_penalty, 18_000.0)
-        self.assertEqual(cfg.rewards.ground_soft_penalty_weight, 120.0)
+        self.assertEqual(cfg.rewards.collision_penalty, 24_000.0)
+        self.assertEqual(cfg.rewards.ground_soft_penalty_weight, 180.0)
 
     def test_snn_default_learning_rates_remain_unchanged(self):
         parser = build_parser()
