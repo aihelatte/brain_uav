@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -46,6 +47,8 @@ class CandidateRun:
     total_steps: int | None = None
     episodes: int | None = None
     outcomes: dict[str, int] | None = None
+    metrics_payload: dict[str, Any] | None = None
+    selection_reason: str | None = None
     status: str = 'pending'
 
     def summary(self) -> dict[str, Any]:
@@ -63,6 +66,7 @@ class CandidateRun:
             'outcomes': self.outcomes or {},
             'return_code': self.return_code,
             'status': self.status,
+            'selection_reason': self.selection_reason,
         }
 
 
@@ -79,6 +83,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--candidate-workers', type=int, default=4)
     parser.add_argument('--keep-candidate-runs', action='store_true')
     parser.add_argument('--poll-interval', type=float, default=5.0)
+    parser.add_argument('--skip-bc', action='store_true')
+    parser.add_argument('--hard-only', action='store_true')
+    parser.add_argument('--td3-curriculum-mix', type=str, default=None)
+    parser.add_argument('--disable-terminal-guidance', action='store_true')
+    parser.add_argument('--continue-on-stage-failure', action='store_true')
     return parser
 
 
@@ -90,14 +99,16 @@ def build_candidate_command(
     *,
     model: str,
     stage: str,
-    init_checkpoint: Path,
+    init_checkpoint: Path | None,
     candidate: CandidateRun,
     summary_every_episodes: int,
     early_stop_min_steps: int,
     device: str,
     snn_backend: str,
+    td3_curriculum_mix: str | None = None,
+    disable_terminal_guidance: bool = False,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         '-m',
         'brain_uav.scripts.train_td3',
@@ -105,8 +116,6 @@ def build_candidate_command(
         model,
         '--curriculum-level',
         stage,
-        '--init-checkpoint',
-        str(init_checkpoint),
         '--output',
         str(candidate.checkpoint_path),
         '--metrics-out',
@@ -131,6 +140,13 @@ def build_candidate_command(
         '--snn-backend',
         snn_backend,
     ]
+    if init_checkpoint is not None:
+        command[command.index('--output'):command.index('--output')] = ['--init-checkpoint', str(init_checkpoint)]
+    if td3_curriculum_mix is not None:
+        command.extend(['--curriculum-mix', td3_curriculum_mix])
+    if disable_terminal_guidance:
+        command.append('--disable-terminal-guidance')
+    return command
 
 
 def make_candidate_run(
@@ -139,12 +155,14 @@ def make_candidate_run(
     stage: str,
     candidate_id: int,
     base_seed: int,
-    init_checkpoint: Path,
+    init_checkpoint: Path | None,
     stage_candidate_root: Path,
     summary_every_episodes: int,
     early_stop_min_steps: int,
     device: str,
     snn_backend: str,
+    td3_curriculum_mix: str | None = None,
+    disable_terminal_guidance: bool = False,
 ) -> CandidateRun:
     seed = candidate_seed(base_seed, candidate_id)
     run_dir = ensure_dir(stage_candidate_root / f'cand_{candidate_id:02d}_seed{seed}')
@@ -169,16 +187,18 @@ def make_candidate_run(
         early_stop_min_steps=early_stop_min_steps,
         device=device,
         snn_backend=snn_backend,
+        td3_curriculum_mix=td3_curriculum_mix,
+        disable_terminal_guidance=disable_terminal_guidance,
     )
     return candidate
 
 
 def load_candidate_metrics(candidate: CandidateRun) -> dict[str, Any]:
     metrics_path = find_latest_metrics_file(candidate.log_root, candidate.metrics_name)
-    import json
 
     payload = json.loads(metrics_path.read_text(encoding='utf-8'))
     candidate.metrics_path = metrics_path
+    candidate.metrics_payload = payload
     candidate.stopped_early = payload.get('stopped_early') is True
     candidate.stop_reason = payload.get('stop_reason')
     candidate.total_steps = payload.get('steps')
@@ -200,6 +220,58 @@ def finalize_candidate(candidate: CandidateRun) -> None:
         candidate.status = 'winner'
     else:
         candidate.status = 'completed_no_early_stop'
+
+
+def _candidate_fallback_score(candidate: CandidateRun) -> tuple[tuple[int, int, int, int, int, int], str] | None:
+    if candidate.return_code != 0 or candidate.metrics_path is None:
+        return None
+    payload = candidate.metrics_payload
+    if payload is None:
+        try:
+            payload = load_candidate_metrics(candidate)
+        except FileNotFoundError:
+            return None
+    windows = list(payload.get('episode_window_stats') or [])[-4:]
+    last4_goal_count = sum(int(row.get('goal_count', 0)) for row in windows)
+    last4_safety_failures = sum(
+        int(row.get('collision_count', 0)) + int(row.get('boundary_count', 0)) + int(row.get('ground_count', 0))
+        for row in windows
+    )
+    last4_timeout_count = sum(int(row.get('timeout_count', 0)) for row in windows)
+    total_goal_count = int((payload.get('outcomes') or {}).get('goal', 0))
+    total_steps = int(payload.get('steps') or candidate.total_steps or 10**18)
+    key = (
+        -last4_goal_count,
+        last4_safety_failures,
+        last4_timeout_count,
+        -total_goal_count,
+        total_steps,
+        candidate.candidate_id,
+    )
+    reason = (
+        f'fallback_score last4_goal_count={last4_goal_count} '
+        f'last4_safety_failures={last4_safety_failures} '
+        f'last4_timeout_count={last4_timeout_count} total_goal_count={total_goal_count} '
+        f'total_steps={total_steps} candidate_id={candidate.candidate_id}'
+    )
+    return key, reason
+
+
+def select_fallback_candidate(candidates: list[CandidateRun]) -> tuple[CandidateRun, str]:
+    scored: list[tuple[tuple[int, int, int, int, int, int], CandidateRun, str]] = []
+    for candidate in candidates:
+        score = _candidate_fallback_score(candidate)
+        if score is None:
+            continue
+        key, reason = score
+        scored.append((key, candidate, reason))
+    if not scored:
+        raise FullRunStageError('No completed candidate with readable metrics is available for fallback selection.')
+    scored.sort(key=lambda item: item[0])
+    _, selected, reason = scored[0]
+    selected.status = 'fallback_selected_no_early_stop'
+    selected.selection_reason = reason
+    return selected, reason
 
 
 def terminate_candidate(candidate: CandidateRun, *, timeout: float = 20.0) -> None:
@@ -239,7 +311,7 @@ def run_candidate_stage(
     env: dict[str, str],
     model: str,
     stage: str,
-    init_checkpoint: Path,
+    init_checkpoint: Path | None,
     stage_checkpoint: Path,
     stage_candidate_root: Path,
     winner_log_dir: Path,
@@ -252,6 +324,9 @@ def run_candidate_stage(
     poll_interval: float = 5.0,
     summary_every_episodes: int = 15,
     early_stop_min_steps: int = 125000,
+    td3_curriculum_mix: str | None = None,
+    disable_terminal_guidance: bool = False,
+    continue_on_stage_failure: bool = False,
 ) -> tuple[CandidateRun, list[dict[str, Any]]]:
     if candidates < 1:
         raise ValueError('candidates must be at least 1')
@@ -270,6 +345,8 @@ def run_candidate_stage(
             early_stop_min_steps=early_stop_min_steps,
             device=device,
             snn_backend=snn_backend,
+            td3_curriculum_mix=td3_curriculum_mix,
+            disable_terminal_guidance=disable_terminal_guidance,
         )
         for candidate_id in range(candidates)
     ]
@@ -303,6 +380,7 @@ def run_candidate_stage(
             )
             if candidate.stopped_early and return_code == 0:
                 winner = candidate
+                winner.selection_reason = winner.stop_reason
                 pending.clear()
                 for other in list(active):
                     terminate_candidate(other)
@@ -316,7 +394,15 @@ def run_candidate_stage(
 
     if winner is None:
         summaries = [candidate.summary() for candidate in all_candidates]
-        raise FullRunStageError(f'Stage {stage} had no candidate with stopped_early=True: {summaries}')
+        if not continue_on_stage_failure:
+            exc = FullRunStageError(f'Stage {stage} had no candidate with stopped_early=True: {summaries}')
+            setattr(exc, 'candidate_summaries', summaries)
+            raise exc
+        try:
+            winner, _reason = select_fallback_candidate(all_candidates)
+        except FullRunStageError as exc:
+            setattr(exc, 'candidate_summaries', summaries)
+            raise
 
     copy_winner_outputs(winner, final_checkpoint=stage_checkpoint, winner_log_dir=winner_log_dir)
     cleanup_candidate_runs(all_candidates, winner=winner, keep_candidate_runs=keep_candidate_runs)
@@ -330,7 +416,7 @@ def run_full_pipeline_candidates(args: argparse.Namespace) -> dict[str, Any]:
         output_root = project_root / output_root
     layout: FullRunLayout = create_full_run_layout(output_root, args.model, args.tag)
     env = build_subprocess_env(project_root)
-    stages = stage_sequence(args.max_stage)
+    stages = ['hard'] if args.hard_only else stage_sequence(args.max_stage)
     candidate_root = ensure_dir(layout.root / 'candidate_runs')
     report: dict[str, Any] = {
         'model': args.model,
@@ -346,65 +432,74 @@ def run_full_pipeline_candidates(args: argparse.Namespace) -> dict[str, Any]:
         'candidates': args.candidates,
         'candidate_workers': args.candidate_workers,
         'keep_candidate_runs': args.keep_candidate_runs,
+        'skip_bc': args.skip_bc,
+        'hard_only': args.hard_only,
+        'continue_on_stage_failure': args.continue_on_stage_failure,
+        'td3_curriculum_mix': args.td3_curriculum_mix,
+        'disable_terminal_guidance': args.disable_terminal_guidance,
         'candidate_stages': [],
     }
 
     dataset_path = layout.data_dir / f'bc_dataset_easy_{DATASET_VERSION}.npz'
-    print(f'{build_log_prefix(args.model, "data")} starting dataset generation')
-    run_command(
-        [
-            sys.executable,
-            '-m',
-            'brain_uav.scripts.generate_dataset',
-            '--output',
-            str(dataset_path),
-            '--seed',
-            str(args.seed),
-            '--curriculum-level',
-            'easy',
-        ],
-        cwd=project_root,
-        env=env,
-    )
-    report['dataset_path'] = str(dataset_path)
+    if args.skip_bc:
+        report['dataset_path'] = None
+        report['bc'] = {'skipped': True, 'reason': '--skip-bc'}
+        init_checkpoint: Path | None = None
+    else:
+        print(f'{build_log_prefix(args.model, "data")} starting dataset generation')
+        run_command(
+            [
+                sys.executable,
+                '-m',
+                'brain_uav.scripts.generate_dataset',
+                '--output',
+                str(dataset_path),
+                '--seed',
+                str(args.seed),
+                '--curriculum-level',
+                'easy',
+            ],
+            cwd=project_root,
+            env=env,
+        )
+        report['dataset_path'] = str(dataset_path)
 
-    bc_output = layout.models_dir / f'bc_{args.model}_final.pt'
-    bc_best_output = layout.models_dir / f'bc_{args.model}_best.pt'
-    bc_log_root = layout.logs_dir / 'bc'
-    print(f'{build_log_prefix(args.model, "bc")} starting BC training')
-    run_command(
-        [
-            sys.executable,
-            '-m',
-            'brain_uav.scripts.train_bc',
-            '--dataset',
-            str(dataset_path),
-            '--model',
-            args.model,
-            '--output',
-            str(bc_output),
-            '--best-output',
-            str(bc_best_output),
-            '--metrics-out',
-            f'bc_{args.model}_metrics.json',
-            '--log-root',
-            str(bc_log_root),
-            '--device',
-            args.device,
-            '--snn-backend',
-            args.snn_backend,
-        ],
-        cwd=project_root,
-        env=env,
-    )
-    bc_metrics = find_latest_metrics_file(bc_log_root, f'bc_{args.model}_metrics.json')
-    report['bc'] = {
-        'final_checkpoint': str(bc_output),
-        'best_checkpoint': str(bc_best_output),
-        'metrics_path': str(bc_metrics),
-    }
-
-    init_checkpoint = bc_best_output
+        bc_output = layout.models_dir / f'bc_{args.model}_final.pt'
+        bc_best_output = layout.models_dir / f'bc_{args.model}_best.pt'
+        bc_log_root = layout.logs_dir / 'bc'
+        print(f'{build_log_prefix(args.model, "bc")} starting BC training')
+        run_command(
+            [
+                sys.executable,
+                '-m',
+                'brain_uav.scripts.train_bc',
+                '--dataset',
+                str(dataset_path),
+                '--model',
+                args.model,
+                '--output',
+                str(bc_output),
+                '--best-output',
+                str(bc_best_output),
+                '--metrics-out',
+                f'bc_{args.model}_metrics.json',
+                '--log-root',
+                str(bc_log_root),
+                '--device',
+                args.device,
+                '--snn-backend',
+                args.snn_backend,
+            ],
+            cwd=project_root,
+            env=env,
+        )
+        bc_metrics = find_latest_metrics_file(bc_log_root, f'bc_{args.model}_metrics.json')
+        report['bc'] = {
+            'final_checkpoint': str(bc_output),
+            'best_checkpoint': str(bc_best_output),
+            'metrics_path': str(bc_metrics),
+        }
+        init_checkpoint = bc_best_output
     stage_reports: list[dict[str, Any]] = []
     for stage in stages:
         stage_checkpoint = layout.models_dir / f'td3_{args.model}_{stage}.pt'
@@ -428,6 +523,9 @@ def run_full_pipeline_candidates(args: argparse.Namespace) -> dict[str, Any]:
                 poll_interval=args.poll_interval,
                 summary_every_episodes=15,
                 early_stop_min_steps=125000,
+                td3_curriculum_mix=args.td3_curriculum_mix,
+                disable_terminal_guidance=args.disable_terminal_guidance,
+                continue_on_stage_failure=args.continue_on_stage_failure,
             )
         except FullRunStageError as exc:
             stage_report = {
@@ -437,9 +535,11 @@ def run_full_pipeline_candidates(args: argparse.Namespace) -> dict[str, Any]:
                 'checkpoint': None,
                 'winner_log_dir': None,
                 'metrics_path': None,
-                'stop_reason': str(exc),
-                'status': 'failed_no_candidate_early_stop',
+            'stop_reason': str(exc),
+            'status': 'failed_no_candidate_early_stop',
                 'candidate_runs_dir': str(candidate_root / stage),
+                'selection_reason': str(exc),
+                'candidates': getattr(exc, 'candidate_summaries', []),
             }
             stage_reports.append(stage_report)
             report['candidate_stages'] = stage_reports
@@ -453,7 +553,9 @@ def run_full_pipeline_candidates(args: argparse.Namespace) -> dict[str, Any]:
             'winner_log_dir': str(winner_log_dir),
             'metrics_path': str(winner.metrics_path) if winner.metrics_path else None,
             'stop_reason': winner.stop_reason,
-            'status': 'winner',
+            'status': winner.status,
+            'selection_reason': winner.selection_reason,
+            'candidate_runs_dir': str(candidate_root / stage),
             'candidates': summaries,
         }
         stage_reports.append(stage_report)
@@ -469,6 +571,8 @@ def run_full_pipeline_candidates(args: argparse.Namespace) -> dict[str, Any]:
             'stop_reason': row['stop_reason'],
             'winner_candidate_id': row['winner_candidate_id'],
             'winner_seed': row['winner_seed'],
+            'status': row.get('status'),
+            'selection_reason': row.get('selection_reason'),
         }
         for row in stage_reports
     ]

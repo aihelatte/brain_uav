@@ -11,6 +11,7 @@ import torch
 from brain_uav.config import ExperimentConfig, ScenarioConfig
 from brain_uav.scripts.train_td3 import (
     apply_model_training_overrides,
+    apply_terminal_guidance_overrides,
     build_parser,
     export_episode_result,
     make_early_stop_callback,
@@ -171,11 +172,50 @@ class TestTrainTD3Helpers(unittest.TestCase):
         args = parser.parse_args(['--curriculum-level', 'easy', '--device', 'cuda', '--snn-backend', 'cupy'])
         self.assertEqual(args.device, 'cuda')
         self.assertEqual(args.snn_backend, 'cupy')
+        self.assertFalse(args.disable_terminal_guidance)
         self.assertEqual(args.summary_every_episodes, 15)
         self.assertEqual(args.early_stop_windows, 4)
         self.assertEqual(args.early_stop_max_failures_per_window, 1)
         self.assertEqual(args.early_stop_goal_rate, 0.95)
         self.assertEqual(args.early_stop_min_steps, 125000)
+
+    def test_parser_accepts_disable_terminal_guidance(self):
+        parser = build_parser()
+        args = parser.parse_args(['--curriculum-level', 'easy', '--disable-terminal-guidance'])
+
+        self.assertTrue(args.disable_terminal_guidance)
+
+    def test_disable_terminal_guidance_zeroes_terminal_terms(self):
+        parser = build_parser()
+        args = parser.parse_args(['--curriculum-level', 'easy', '--disable-terminal-guidance'])
+        cfg = ExperimentConfig()
+
+        apply_terminal_guidance_overrides(cfg, args)
+
+        self.assertEqual(cfg.rewards.terminal_los_weight, 0.0)
+        self.assertEqual(cfg.rewards.terminal_los_penalty_weight, 0.0)
+        self.assertEqual(cfg.rewards.terminal_radial_weight, 0.0)
+        self.assertEqual(cfg.rewards.terminal_tangential_penalty_weight, 0.0)
+        self.assertFalse(cfg.training.terminal_geo_regularization_enabled)
+        self.assertEqual(cfg.training.terminal_geo_lambda, 0.0)
+
+    def test_terminal_guidance_defaults_remain_enabled(self):
+        parser = build_parser()
+        args = parser.parse_args(['--curriculum-level', 'easy'])
+        cfg = ExperimentConfig()
+        baseline = cfg.to_dict()
+
+        apply_terminal_guidance_overrides(cfg, args)
+
+        self.assertEqual(cfg.rewards.terminal_los_weight, baseline['rewards']['terminal_los_weight'])
+        self.assertEqual(cfg.rewards.terminal_los_penalty_weight, baseline['rewards']['terminal_los_penalty_weight'])
+        self.assertEqual(cfg.rewards.terminal_radial_weight, baseline['rewards']['terminal_radial_weight'])
+        self.assertEqual(
+            cfg.rewards.terminal_tangential_penalty_weight,
+            baseline['rewards']['terminal_tangential_penalty_weight'],
+        )
+        self.assertTrue(cfg.training.terminal_geo_regularization_enabled)
+        self.assertEqual(cfg.training.terminal_geo_lambda, 3000.0)
 
     def test_training_config_defaults_raise_timeout_and_success_bias(self):
         cfg = ExperimentConfig()

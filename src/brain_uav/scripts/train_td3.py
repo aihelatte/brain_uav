@@ -449,6 +449,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--early-stop-min-steps', type=int, default=125000)
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--snn-backend', choices=SNN_BACKEND_CHOICES, default='torch')
+    parser.add_argument('--disable-terminal-guidance', action='store_true')
     return parser
 
 
@@ -482,6 +483,17 @@ def apply_model_training_overrides(cfg: ExperimentConfig, args: argparse.Namespa
         cfg.training.critic_grad_clip_norm = args.critic_grad_clip_norm
 
 
+def apply_terminal_guidance_overrides(cfg: ExperimentConfig, args: argparse.Namespace) -> None:
+    if not getattr(args, 'disable_terminal_guidance', False):
+        return
+    cfg.rewards.terminal_los_weight = 0.0
+    cfg.rewards.terminal_los_penalty_weight = 0.0
+    cfg.rewards.terminal_radial_weight = 0.0
+    cfg.rewards.terminal_tangential_penalty_weight = 0.0
+    cfg.training.terminal_geo_regularization_enabled = False
+    cfg.training.terminal_geo_lambda = 0.0
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -498,6 +510,7 @@ def main() -> None:
     )
     log_prefix = build_log_prefix(args.model, args.curriculum_level)
     apply_model_training_overrides(cfg, args)
+    apply_terminal_guidance_overrides(cfg, args)
 
     set_global_seed(args.seed)
 
@@ -635,6 +648,7 @@ def main() -> None:
     metrics_dict['terminal_geo_lambda'] = trainer.metrics.terminal_geo_lambda
     metrics_dict['terminal_geo_loss_contribution'] = trainer.metrics.terminal_geo_loss_contribution
     metrics_dict['terminal_geo_regularization_enabled'] = cfg.training.terminal_geo_regularization_enabled
+    metrics_dict['terminal_guidance_disabled'] = bool(args.disable_terminal_guidance)
     metrics_dict['terminal_geo_radius'] = cfg.training.terminal_geo_radius
     metrics_dict['terminal_geo_safe_clearance'] = cfg.training.terminal_geo_safe_clearance
     metrics_dict['replay_success_fraction'] = trainer.metrics.replay_success_fraction
