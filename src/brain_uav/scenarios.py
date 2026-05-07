@@ -14,7 +14,7 @@ from typing import Any
 from .config import ScenarioConfig
 
 
-DEFAULT_BENCHMARK_SUITE_NAME = 'fixed_benchmark_suite_v2'
+DEFAULT_BENCHMARK_SUITE_NAME = 'fixed_benchmark_suite_v3'
 DEFAULT_BENCHMARK_SUITE_PATH = Path('outputs/benchmarks') / f'{DEFAULT_BENCHMARK_SUITE_NAME}.json'
 BENCHMARK_CATEGORIES = ('single_detour', 'double_channel', 'boundary_margin', 'wall_pressure')
 
@@ -310,7 +310,7 @@ def _make_wall_pressure(rng, idx: int) -> NamedScenario:
 def generate_benchmark_suite(
     *,
     seed: int = 20260407,
-    count_per_category: int = 100,
+    count_per_category: int = 200,
     suite_name: str = DEFAULT_BENCHMARK_SUITE_NAME,
 ) -> dict[str, Any]:
     import numpy as np

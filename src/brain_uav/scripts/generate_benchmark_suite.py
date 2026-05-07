@@ -15,8 +15,8 @@ from ..scenarios import (
 def main() -> None:
     parser = argparse.ArgumentParser(description='Generate the fixed benchmark suite used for evaluation.')
     parser.add_argument('--seed', type=int, default=20260407)
-    parser.add_argument('--count-per-category', type=int, default=100)
-    parser.add_argument('--suite-name', type=str, default='fixed_benchmark_suite_v2')
+    parser.add_argument('--count-per-category', type=int, default=200)
+    parser.add_argument('--suite-name', type=str, default='fixed_benchmark_suite_v3')
     parser.add_argument('--output', type=Path, default=DEFAULT_BENCHMARK_SUITE_PATH)
     args = parser.parse_args()
 
