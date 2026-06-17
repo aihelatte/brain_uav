@@ -44,13 +44,34 @@ class TestModelUtilities(unittest.TestCase):
         else:
             self.assertTrue(hasattr(actor, '_forward_fallback_action_only'))
 
+    def test_snn_repeated_forward_is_stateless_for_same_input(self):
+        actor = SNNPolicyActor(self.state_dim, 2, 32, 4, self.action_limit, self.scenario)
+        actor.eval()
+        with torch.inference_mode():
+            a1 = actor(self.obs)
+            a2 = actor(self.obs)
+            a3 = actor(self.obs)
+        self.assertTrue(torch.allclose(a1, a2, atol=1e-6, rtol=1e-6))
+        self.assertTrue(torch.allclose(a2, a3, atol=1e-6, rtol=1e-6))
+
+    def test_snn_forward_resets_state_after_different_input(self):
+        actor = SNNPolicyActor(self.state_dim, 2, 32, 4, self.action_limit, self.scenario)
+        actor.eval()
+        obs_a = self.obs
+        obs_b = self.obs.flip(0) * 0.5 + 0.25
+        with torch.inference_mode():
+            a1 = actor(obs_a)
+            _ = actor(obs_b)
+            a2 = actor(obs_a)
+        self.assertTrue(torch.allclose(a1, a2, atol=1e-6, rtol=1e-6))
+
     def test_snn_forward_with_diagnostics_smoke(self):
         actor = SNNPolicyActor(self.state_dim, 2, 32, 4, self.action_limit, self.scenario)
-        action = actor(self.obs)
-        action_repeat = actor(self.obs)
-        action_diag, diagnostics = actor.forward_with_diagnostics(self.obs)
+        actor.eval()
+        with torch.inference_mode():
+            action = actor(self.obs)
+            action_diag, diagnostics = actor.forward_with_diagnostics(self.obs)
         self.assertEqual(action.shape, (4, 2))
-        self.assertTrue(torch.allclose(action, action_repeat))
         self.assertEqual(action_diag.shape, (4, 2))
         self.assertTrue(torch.allclose(action, action_diag, atol=1e-6, rtol=1e-5))
         self.assertTrue(torch.all(torch.abs(action) <= self.action_limit + 1e-6))
@@ -67,6 +88,20 @@ class TestModelUtilities(unittest.TestCase):
         if HAS_SPIKINGJELLY:
             self.assertEqual(actor.lif1.step_mode, 'm')
             self.assertEqual(actor.lif2.step_mode, 'm')
+
+    def test_snn_forward_backward_twice_with_grad_enabled(self):
+        actor = SNNPolicyActor(self.state_dim, 2, 32, 4, self.action_limit, self.scenario)
+        actor.train()
+
+        self.assertTrue(torch.is_grad_enabled())
+        action = actor(self.obs)
+        loss = action.square().mean()
+        loss.backward()
+
+        actor.zero_grad(set_to_none=True)
+        action = actor(self.obs)
+        loss = action.square().mean()
+        loss.backward()
 
     def test_ann_actor_uses_fixed_obs_scaler(self):
         actor = ANNPolicyActor(self.state_dim, 2, 32, self.action_limit, self.scenario)
