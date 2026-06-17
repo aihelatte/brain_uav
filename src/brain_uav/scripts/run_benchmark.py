@@ -483,7 +483,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         while not done:
             if actor is not None:
                 step_start = time.perf_counter()
-                with torch.no_grad():
+                with torch.inference_mode():
                     obs_tensor = torch.tensor(obs[None, :], dtype=torch.float32, device=torch_device)
                     action_tensor = actor(obs_tensor)
                 decision_ms = (time.perf_counter() - step_start) * 1000.0

@@ -31,14 +31,39 @@ class TestModelUtilities(unittest.TestCase):
         action = actor(self.obs)
         self.assertEqual(action.shape, (4, 2))
 
+    def test_snn_forward_uses_action_only_backend_path(self):
+        actor = SNNPolicyActor(self.state_dim, 2, 32, 4, self.action_limit, self.scenario)
+        if HAS_SPIKINGJELLY:
+            self.assertTrue(hasattr(actor, '_forward_spikingjelly_action_only'))
+            expected = torch.full((4, 2), 0.125)
+            actor._forward_spikingjelly = lambda _: (_ for _ in ()).throw(
+                AssertionError('unexpected diagnostics path')
+            )
+            actor._forward_spikingjelly_action_only = lambda _: expected
+            self.assertTrue(torch.equal(actor(self.obs), expected))
+        else:
+            self.assertTrue(hasattr(actor, '_forward_fallback_action_only'))
+
     def test_snn_forward_with_diagnostics_smoke(self):
         actor = SNNPolicyActor(self.state_dim, 2, 32, 4, self.action_limit, self.scenario)
         action = actor(self.obs)
+        action_repeat = actor(self.obs)
         action_diag, diagnostics = actor.forward_with_diagnostics(self.obs)
         self.assertEqual(action.shape, (4, 2))
+        self.assertTrue(torch.allclose(action, action_repeat))
         self.assertEqual(action_diag.shape, (4, 2))
-        self.assertIn('spike_rate_l1', diagnostics)
-        self.assertIn('spike_rate_l2', diagnostics)
+        self.assertTrue(torch.allclose(action, action_diag, atol=1e-6, rtol=1e-5))
+        self.assertTrue(torch.all(torch.abs(action) <= self.action_limit + 1e-6))
+        expected_fields = {
+            'spike_rate_l1',
+            'spike_rate_l2',
+            'dense_macs_estimate',
+            'effective_macs_estimate',
+            'dense_macs_per_timestep',
+            'time_window',
+            'backend',
+        }
+        self.assertTrue(expected_fields.issubset(diagnostics))
         if HAS_SPIKINGJELLY:
             self.assertEqual(actor.lif1.step_mode, 'm')
             self.assertEqual(actor.lif2.step_mode, 'm')

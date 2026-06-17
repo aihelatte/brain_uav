@@ -101,10 +101,8 @@ class SNNPolicyActor(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         if HAS_SPIKINGJELLY:
-            action, _, _ = self._forward_spikingjelly(obs)
-            return action
-        action, _, _ = self._forward_fallback(obs)
-        return action
+            return self._forward_spikingjelly_action_only(obs)
+        return self._forward_fallback_action_only(obs)
 
     def forward_with_diagnostics(self, obs: torch.Tensor) -> tuple[torch.Tensor, dict[str, float]]:
         """Forward pass plus some extra statistics for profiling.
@@ -157,6 +155,21 @@ class SNNPolicyActor(nn.Module):
         functional.reset_net(self)
         return action, spike_sum1, spike_sum2
 
+    def _forward_spikingjelly_action_only(self, obs: torch.Tensor) -> torch.Tensor:
+        functional.reset_net(self)
+        scaled_obs = self.obs_scaler(obs)
+        encoded = self.fc1(scaled_obs)
+        encoded_seq = encoded.unsqueeze(0).expand(self.time_window, -1, -1)
+        spikes1_seq = self.lif1(encoded_seq)
+        hidden_seq = self.fc2(spikes1_seq)
+        spikes2_seq = self.lif2(hidden_seq)
+        membrane = self.lif2.v
+        features = 0.5 * (spikes2_seq.mean(0) + membrane)
+        out = self.fc3(features)
+        action = torch.tanh(out) * self.action_limit
+        functional.reset_net(self)
+        return action
+
     def _forward_fallback(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         encoded = self.fc1(self.obs_scaler(obs))
         spikes1, _, spike_sum1 = self.lif1(encoded, self.time_window)
@@ -165,3 +178,7 @@ class SNNPolicyActor(nn.Module):
         out = self.fc3(0.5 * (spikes2 + membrane))
         action = torch.tanh(out) * self.action_limit
         return action, spike_sum1, spike_sum2
+
+    def _forward_fallback_action_only(self, obs: torch.Tensor) -> torch.Tensor:
+        action, _, _ = self._forward_fallback(obs)
+        return action
