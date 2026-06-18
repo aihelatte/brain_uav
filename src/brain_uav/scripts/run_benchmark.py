@@ -38,6 +38,11 @@ from ..utils.io import ensure_dir, load_checkpoint, now_timestamp, save_json
 from ..utils.seeding import set_global_seed
 
 
+ACTOR_EXECUTION_CHOICES = ('eager', 'cuda-graph')
+CUDA_GRAPH_WARMUP_STEPS = 10
+CUDA_GRAPH_SANITY_ATOL = 1e-6
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='Run the fixed benchmark suite for policies and baselines.')
     parser.add_argument('--method', choices=['ann', 'snn', 'apf', 'heuristic'], required=True)
@@ -51,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--snn-backend', choices=SNN_BACKEND_CHOICES, default='torch')
     parser.add_argument('--episode-artifacts', choices=['json', 'none'], default='json')
     parser.add_argument('--reuse-obs-tensor', action='store_true')
+    parser.add_argument('--actor-execution', choices=ACTOR_EXECUTION_CHOICES, default='eager')
     return parser
 
 
@@ -345,6 +351,77 @@ def _timing_distribution(values: list[float]) -> dict[str, float | int]:
     }
 
 
+def _build_cuda_graph_state(
+    *,
+    actor: torch.nn.Module,
+    device: torch.device,
+    obs_dim: int,
+) -> dict[str, Any]:
+    state: dict[str, Any] = {
+        'available': False,
+        'error': None,
+        'warmup_steps': 0,
+        'sanity_max_abs_diff': None,
+        'diagnostics_sanity_max_abs_diff': None,
+        'graph': None,
+        'static_obs_tensor': None,
+        'static_action_tensor': None,
+    }
+    if device.type != 'cuda':
+        state['error'] = 'CUDA Graph actor execution requires device=cuda; falling back to eager.'
+        return state
+
+    try:
+        static_obs_tensor = torch.zeros((1, obs_dim), dtype=torch.float32, device=device)
+        with torch.inference_mode():
+            eager_action = actor(static_obs_tensor).detach().clone()
+            for _ in range(CUDA_GRAPH_WARMUP_STEPS):
+                _ = actor(static_obs_tensor)
+            torch.cuda.synchronize(device)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                static_action_tensor = actor(static_obs_tensor)
+            graph.replay()
+            torch.cuda.synchronize(device)
+            sanity_max_abs_diff = float((static_action_tensor.detach() - eager_action).abs().max().cpu())
+        if sanity_max_abs_diff > CUDA_GRAPH_SANITY_ATOL:
+            state['error'] = (
+                f'CUDA Graph sanity check failed: max_abs_diff={sanity_max_abs_diff} '
+                f'> {CUDA_GRAPH_SANITY_ATOL}; falling back to eager.'
+            )
+            return state
+        diagnostics_sanity_max_abs_diff = None
+        if hasattr(actor, 'forward_with_diagnostics'):
+            with torch.inference_mode():
+                _diag_action, _diag = actor.forward_with_diagnostics(static_obs_tensor)
+                graph.replay()
+                torch.cuda.synchronize(device)
+                diagnostics_sanity_max_abs_diff = float(
+                    (static_action_tensor.detach() - eager_action).abs().max().cpu()
+                )
+            if diagnostics_sanity_max_abs_diff > CUDA_GRAPH_SANITY_ATOL:
+                state['error'] = (
+                    'CUDA Graph diagnostics sanity check failed: '
+                    f'max_abs_diff={diagnostics_sanity_max_abs_diff} > {CUDA_GRAPH_SANITY_ATOL}; '
+                    'falling back to eager.'
+                )
+                return state
+        state.update(
+            {
+                'available': True,
+                'warmup_steps': CUDA_GRAPH_WARMUP_STEPS,
+                'sanity_max_abs_diff': sanity_max_abs_diff,
+                'diagnostics_sanity_max_abs_diff': diagnostics_sanity_max_abs_diff,
+                'graph': graph,
+                'static_obs_tensor': static_obs_tensor,
+                'static_action_tensor': static_action_tensor,
+            }
+        )
+    except Exception as exc:  # pragma: no cover - CUDA-specific failure path.
+        state['error'] = f'{type(exc).__name__}: {exc}; falling back to eager.'
+    return state
+
+
 def _build_policy_efficiency_summary(
     *,
     method: str,
@@ -357,6 +434,8 @@ def _build_policy_efficiency_summary(
     actor_forward_times_ms: list[float],
     action_to_cpu_times_ms: list[float],
     reuse_obs_tensor: bool,
+    actor_execution: str,
+    cuda_graph_state: dict[str, Any],
     cfg: ExperimentConfig,
     diag_stats: dict[str, float],
 ) -> dict[str, Any]:
@@ -404,6 +483,12 @@ def _build_policy_efficiency_summary(
         'action_to_cpu_time_ms': _timing_distribution(action_to_cpu_times_ms),
         'decision_time_ms': _timing_distribution(decision_times_ms),
         'reuse_obs_tensor': bool(reuse_obs_tensor),
+        'actor_execution': actor_execution,
+        'cuda_graph_available': bool(cuda_graph_state.get('available', False)),
+        'cuda_graph_error': cuda_graph_state.get('error'),
+        'cuda_graph_warmup_steps': int(cuda_graph_state.get('warmup_steps', 0)),
+        'cuda_graph_sanity_max_abs_diff': cuda_graph_state.get('sanity_max_abs_diff'),
+        'cuda_graph_diagnostics_sanity_max_abs_diff': cuda_graph_state.get('diagnostics_sanity_max_abs_diff'),
         'avg_episode_decision_time_s': 0.0 if not episode_decision_times_s else statistics.mean(episode_decision_times_s),
         'max_episode_decision_time_s': 0.0 if not episode_decision_times_s else max(episode_decision_times_s),
         'decision_dt_s': float(cfg.scenario.dt),
@@ -484,12 +569,29 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     else:
         planner = build_planner(args.method, env)
     reuse_obs_tensor = bool(getattr(args, 'reuse_obs_tensor', False))
+    actor_execution = str(getattr(args, 'actor_execution', 'eager'))
+    cuda_graph_state: dict[str, Any] = {
+        'available': False,
+        'error': None,
+        'warmup_steps': 0,
+        'sanity_max_abs_diff': None,
+        'diagnostics_sanity_max_abs_diff': None,
+        'graph': None,
+        'static_obs_tensor': None,
+        'static_action_tensor': None,
+    }
     obs_tensor_buffer: torch.Tensor | None = None
     if actor is not None and reuse_obs_tensor:
         obs_tensor_buffer = torch.empty(
             (1, env.observation_space.shape[0]),
             dtype=torch.float32,
             device=torch_device,
+        )
+    if actor is not None and actor_execution == 'cuda-graph':
+        cuda_graph_state = _build_cuda_graph_state(
+            actor=actor,
+            device=torch_device,
+            obs_dim=env.observation_space.shape[0],
         )
 
     output_dir = _build_output_dir(args)
@@ -517,7 +619,13 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                 step_start = time.perf_counter()
                 with torch.inference_mode():
                     obs_tensor_start = time.perf_counter()
-                    if obs_tensor_buffer is None:
+                    if cuda_graph_state.get('available', False):
+                        static_obs_tensor = cuda_graph_state['static_obs_tensor']
+                        static_obs_tensor.copy_(
+                            torch.as_tensor(obs, dtype=torch.float32, device=torch_device).view(1, -1)
+                        )
+                        obs_tensor = static_obs_tensor
+                    elif obs_tensor_buffer is None:
                         obs_tensor = torch.tensor(obs[None, :], dtype=torch.float32, device=torch_device)
                     else:
                         obs_tensor_buffer.copy_(
@@ -527,7 +635,11 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
                     obs_to_tensor_ms = (time.perf_counter() - obs_tensor_start) * 1000.0
 
                     actor_forward_start = time.perf_counter()
-                    action_tensor = actor(obs_tensor)
+                    if cuda_graph_state.get('available', False):
+                        cuda_graph_state['graph'].replay()
+                        action_tensor = cuda_graph_state['static_action_tensor']
+                    else:
+                        action_tensor = actor(obs_tensor)
                     actor_forward_ms = (time.perf_counter() - actor_forward_start) * 1000.0
 
                     action_to_cpu_start = time.perf_counter()
@@ -628,6 +740,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             actor_forward_times_ms=actor_forward_times_ms,
             action_to_cpu_times_ms=action_to_cpu_times_ms,
             reuse_obs_tensor=reuse_obs_tensor,
+            actor_execution=actor_execution,
+            cuda_graph_state=cuda_graph_state,
             cfg=cfg,
             diag_stats=diag_stats,
         )

@@ -130,6 +130,14 @@ class TestRunBenchmark(unittest.TestCase):
         parser = build_parser()
         args = parser.parse_args(['--method', 'ann', '--checkpoint', 'model.pt'])
         self.assertFalse(args.reuse_obs_tensor)
+        self.assertEqual(args.actor_execution, 'eager')
+
+    def test_parser_accepts_cuda_graph_actor_execution(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ['--method', 'snn', '--checkpoint', 'model.pt', '--actor-execution', 'cuda-graph']
+        )
+        self.assertEqual(args.actor_execution, 'cuda-graph')
 
     def test_benchmark_uses_full_suite_when_episodes_is_none(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -241,6 +249,7 @@ class TestRunBenchmark(unittest.TestCase):
                         device=device,
                         snn_backend='torch',
                         episode_artifacts='json',
+                        actor_execution='cuda-graph',
                     )
                     env = _DummyEnv(['collision'], episode_length=2)
                     scenarios = [_named_scenario(1)]
@@ -255,6 +264,7 @@ class TestRunBenchmark(unittest.TestCase):
                     self.assertIn('zone_count_summary', summary)
                     self.assertEqual(efficiency['planner_energy_pj'], None)
                     self.assertEqual(efficiency['device'], 'cpu')
+                    self.assertNotIn('actor_execution', efficiency)
                     self.assertGreaterEqual(summary['records'][0]['avg_decision_time_ms'], 0.0)
 
     def test_checkpoint_model_config_keeps_benchmark_physics_and_uses_model_fields(self):
@@ -344,6 +354,7 @@ class TestRunBenchmark(unittest.TestCase):
                         snn_backend='torch',
                         episode_artifacts='json',
                         reuse_obs_tensor=False,
+                        actor_execution='eager',
                     )
                     env = _DummyEnv(['goal'], episode_length=2)
                     scenarios = [_named_scenario(1)]
@@ -358,6 +369,12 @@ class TestRunBenchmark(unittest.TestCase):
                     efficiency = json.loads(Path(summary['efficiency_summary_path']).read_text(encoding='utf-8'))
                     self.assertEqual(summary['method'], method)
                     self.assertIn('param_count', efficiency)
+                    self.assertEqual(efficiency['actor_execution'], 'eager')
+                    self.assertFalse(efficiency['cuda_graph_available'])
+                    self.assertEqual(efficiency['cuda_graph_error'], None)
+                    self.assertEqual(efficiency['cuda_graph_warmup_steps'], 0)
+                    self.assertEqual(efficiency['cuda_graph_sanity_max_abs_diff'], None)
+                    self.assertEqual(efficiency['cuda_graph_diagnostics_sanity_max_abs_diff'], None)
                     for key in (
                         'obs_to_tensor_time_ms',
                         'actor_forward_time_ms',
@@ -383,6 +400,7 @@ class TestRunBenchmark(unittest.TestCase):
                 snn_backend='torch',
                 episode_artifacts='json',
                 reuse_obs_tensor=True,
+                actor_execution='eager',
             )
             env = _DummyEnv(['goal'], episode_length=2)
             scenarios = [_named_scenario(1)]
@@ -397,6 +415,39 @@ class TestRunBenchmark(unittest.TestCase):
             efficiency = json.loads(Path(summary['efficiency_summary_path']).read_text(encoding='utf-8'))
             self.assertTrue(efficiency['reuse_obs_tensor'])
             self.assertEqual(efficiency['obs_to_tensor_time_ms']['samples'], 2)
+
+    def test_policy_benchmark_cuda_graph_on_cpu_falls_back_to_eager(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = argparse.Namespace(
+                method='ann',
+                checkpoint=Path('model.pt'),
+                benchmark_suite=Path('suite.json'),
+                episodes=1,
+                seed=7,
+                output_root=Path(tmpdir),
+                run_name='ann_cuda_graph_cpu_run',
+                device='cpu',
+                snn_backend='torch',
+                episode_artifacts='json',
+                reuse_obs_tensor=False,
+                actor_execution='cuda-graph',
+            )
+            env = _DummyEnv(['goal'], episode_length=2)
+            scenarios = [_named_scenario(1)]
+            dummy_actor = _DummyActor()
+            checkpoint_payload = {'state_dict': dummy_actor.state_dict(), 'config': {}}
+            with mock.patch('brain_uav.scripts.run_benchmark.load_benchmark_suite', return_value={'suite_name': 'suite', 'seed': 1, 'count_per_category': 1, 'total_scenarios': 1, 'categories': ['single_detour']}):
+                with mock.patch('brain_uav.scripts.run_benchmark.build_benchmark_scenarios', return_value=scenarios):
+                    with mock.patch('brain_uav.scripts.run_benchmark.make_env', return_value=env):
+                        with mock.patch('brain_uav.scripts.run_benchmark.make_actor', return_value=_DummyActor()):
+                            with mock.patch('brain_uav.scripts.run_benchmark.load_checkpoint', return_value=checkpoint_payload):
+                                summary = run_benchmark(args)
+            efficiency = json.loads(Path(summary['efficiency_summary_path']).read_text(encoding='utf-8'))
+            self.assertEqual(efficiency['actor_execution'], 'cuda-graph')
+            self.assertFalse(efficiency['cuda_graph_available'])
+            self.assertIn('requires device=cuda', efficiency['cuda_graph_error'])
+            self.assertEqual(efficiency['cuda_graph_diagnostics_sanity_max_abs_diff'], None)
+            self.assertEqual(efficiency['actor_forward_time_ms']['samples'], 2)
 
 
 if __name__ == '__main__':
