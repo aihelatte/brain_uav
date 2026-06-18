@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--snn-backend', choices=SNN_BACKEND_CHOICES, default='torch')
     parser.add_argument('--episode-artifacts', choices=['json', 'none'], default='json')
+    parser.add_argument('--reuse-obs-tensor', action='store_true')
     return parser
 
 
@@ -333,6 +334,17 @@ def _build_planner_efficiency_summary(
     }
 
 
+def _timing_distribution(values: list[float]) -> dict[str, float | int]:
+    return {
+        'samples': len(values),
+        'avg': 0.0 if not values else statistics.mean(values),
+        'p50': _percentile(values, 50.0),
+        'p95': _percentile(values, 95.0),
+        'p99': _percentile(values, 99.0),
+        'max': 0.0 if not values else max(values),
+    }
+
+
 def _build_policy_efficiency_summary(
     *,
     method: str,
@@ -341,6 +353,10 @@ def _build_policy_efficiency_summary(
     device: torch.device,
     decision_times_ms: list[float],
     episode_decision_times_s: list[float],
+    obs_to_tensor_times_ms: list[float],
+    actor_forward_times_ms: list[float],
+    action_to_cpu_times_ms: list[float],
+    reuse_obs_tensor: bool,
     cfg: ExperimentConfig,
     diag_stats: dict[str, float],
 ) -> dict[str, Any]:
@@ -383,6 +399,11 @@ def _build_policy_efficiency_summary(
         'p95_decision_time_ms': _percentile(decision_times_ms, 95.0),
         'p99_decision_time_ms': _percentile(decision_times_ms, 99.0),
         'max_decision_time_ms': 0.0 if not decision_times_ms else max(decision_times_ms),
+        'obs_to_tensor_time_ms': _timing_distribution(obs_to_tensor_times_ms),
+        'actor_forward_time_ms': _timing_distribution(actor_forward_times_ms),
+        'action_to_cpu_time_ms': _timing_distribution(action_to_cpu_times_ms),
+        'decision_time_ms': _timing_distribution(decision_times_ms),
+        'reuse_obs_tensor': bool(reuse_obs_tensor),
         'avg_episode_decision_time_s': 0.0 if not episode_decision_times_s else statistics.mean(episode_decision_times_s),
         'max_episode_decision_time_s': 0.0 if not episode_decision_times_s else max(episode_decision_times_s),
         'decision_dt_s': float(cfg.scenario.dt),
@@ -462,12 +483,23 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         actor.eval()
     else:
         planner = build_planner(args.method, env)
+    reuse_obs_tensor = bool(getattr(args, 'reuse_obs_tensor', False))
+    obs_tensor_buffer: torch.Tensor | None = None
+    if actor is not None and reuse_obs_tensor:
+        obs_tensor_buffer = torch.empty(
+            (1, env.observation_space.shape[0]),
+            dtype=torch.float32,
+            device=torch_device,
+        )
 
     output_dir = _build_output_dir(args)
     episodes_dir = ensure_dir(output_dir / 'episodes')
     records: list[dict[str, Any]] = []
     total_steps = 0
     decision_times_ms: list[float] = []
+    obs_to_tensor_times_ms: list[float] = []
+    actor_forward_times_ms: list[float] = []
+    action_to_cpu_times_ms: list[float] = []
     episode_decision_times_s: list[float] = []
 
     for episode_idx in range(episodes):
@@ -484,10 +516,27 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             if actor is not None:
                 step_start = time.perf_counter()
                 with torch.inference_mode():
-                    obs_tensor = torch.tensor(obs[None, :], dtype=torch.float32, device=torch_device)
+                    obs_tensor_start = time.perf_counter()
+                    if obs_tensor_buffer is None:
+                        obs_tensor = torch.tensor(obs[None, :], dtype=torch.float32, device=torch_device)
+                    else:
+                        obs_tensor_buffer.copy_(
+                            torch.as_tensor(obs, dtype=torch.float32, device=torch_device).view(1, -1)
+                        )
+                        obs_tensor = obs_tensor_buffer
+                    obs_to_tensor_ms = (time.perf_counter() - obs_tensor_start) * 1000.0
+
+                    actor_forward_start = time.perf_counter()
                     action_tensor = actor(obs_tensor)
+                    actor_forward_ms = (time.perf_counter() - actor_forward_start) * 1000.0
+
+                    action_to_cpu_start = time.perf_counter()
+                    action = action_tensor.detach().cpu().numpy()[0]
+                    action_to_cpu_ms = (time.perf_counter() - action_to_cpu_start) * 1000.0
                 decision_ms = (time.perf_counter() - step_start) * 1000.0
-                action = action_tensor.detach().cpu().numpy()[0]
+                obs_to_tensor_times_ms.append(obs_to_tensor_ms)
+                actor_forward_times_ms.append(actor_forward_ms)
+                action_to_cpu_times_ms.append(action_to_cpu_ms)
                 if hasattr(actor, 'forward_with_diagnostics') and int(total_steps + len(episode_decisions)) % 10 == 0:
                     with torch.no_grad():
                         _ = action_tensor
@@ -575,6 +624,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             device=torch_device,
             decision_times_ms=decision_times_ms,
             episode_decision_times_s=episode_decision_times_s,
+            obs_to_tensor_times_ms=obs_to_tensor_times_ms,
+            actor_forward_times_ms=actor_forward_times_ms,
+            action_to_cpu_times_ms=action_to_cpu_times_ms,
+            reuse_obs_tensor=reuse_obs_tensor,
             cfg=cfg,
             diag_stats=diag_stats,
         )

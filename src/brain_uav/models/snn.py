@@ -167,8 +167,7 @@ class SNNPolicyActor(nn.Module):
         features = 0.5 * (spikes2_seq.mean(0) + membrane)
         out = self.fc3(features)
         action = torch.tanh(out) * self.action_limit
-        if torch.is_grad_enabled():
-            functional.reset_net(self)
+        functional.reset_net(self)
         return action
 
     def _forward_fallback(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

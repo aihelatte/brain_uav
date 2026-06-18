@@ -126,6 +126,11 @@ class TestRunBenchmark(unittest.TestCase):
         with self.assertRaises(SystemExit):
             validate_args(parser, args)
 
+    def test_parser_defaults_reuse_obs_tensor_to_false(self):
+        parser = build_parser()
+        args = parser.parse_args(['--method', 'ann', '--checkpoint', 'model.pt'])
+        self.assertFalse(args.reuse_obs_tensor)
+
     def test_benchmark_uses_full_suite_when_episodes_is_none(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             args = argparse.Namespace(
@@ -338,6 +343,7 @@ class TestRunBenchmark(unittest.TestCase):
                         device='cpu',
                         snn_backend='torch',
                         episode_artifacts='json',
+                        reuse_obs_tensor=False,
                     )
                     env = _DummyEnv(['goal'], episode_length=2)
                     scenarios = [_named_scenario(1)]
@@ -352,7 +358,45 @@ class TestRunBenchmark(unittest.TestCase):
                     efficiency = json.loads(Path(summary['efficiency_summary_path']).read_text(encoding='utf-8'))
                     self.assertEqual(summary['method'], method)
                     self.assertIn('param_count', efficiency)
+                    for key in (
+                        'obs_to_tensor_time_ms',
+                        'actor_forward_time_ms',
+                        'action_to_cpu_time_ms',
+                        'decision_time_ms',
+                    ):
+                        self.assertIn(key, efficiency)
+                        self.assertEqual(efficiency[key]['samples'], 2)
+                        self.assertGreaterEqual(efficiency[key]['avg'], 0.0)
                     self.assertTrue((Path(summary['output_dir']) / 'summary.json').is_file())
+
+    def test_policy_benchmark_can_reuse_obs_tensor_buffer(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = argparse.Namespace(
+                method='ann',
+                checkpoint=Path('model.pt'),
+                benchmark_suite=Path('suite.json'),
+                episodes=1,
+                seed=7,
+                output_root=Path(tmpdir),
+                run_name='ann_reuse_buffer_run',
+                device='cpu',
+                snn_backend='torch',
+                episode_artifacts='json',
+                reuse_obs_tensor=True,
+            )
+            env = _DummyEnv(['goal'], episode_length=2)
+            scenarios = [_named_scenario(1)]
+            dummy_actor = _DummyActor()
+            checkpoint_payload = {'state_dict': dummy_actor.state_dict(), 'config': {}}
+            with mock.patch('brain_uav.scripts.run_benchmark.load_benchmark_suite', return_value={'suite_name': 'suite', 'seed': 1, 'count_per_category': 1, 'total_scenarios': 1, 'categories': ['single_detour']}):
+                with mock.patch('brain_uav.scripts.run_benchmark.build_benchmark_scenarios', return_value=scenarios):
+                    with mock.patch('brain_uav.scripts.run_benchmark.make_env', return_value=env):
+                        with mock.patch('brain_uav.scripts.run_benchmark.make_actor', return_value=_DummyActor()):
+                            with mock.patch('brain_uav.scripts.run_benchmark.load_checkpoint', return_value=checkpoint_payload):
+                                summary = run_benchmark(args)
+            efficiency = json.loads(Path(summary['efficiency_summary_path']).read_text(encoding='utf-8'))
+            self.assertTrue(efficiency['reuse_obs_tensor'])
+            self.assertEqual(efficiency['obs_to_tensor_time_ms']['samples'], 2)
 
 
 if __name__ == '__main__':
