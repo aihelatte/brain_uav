@@ -422,6 +422,24 @@ def _build_cuda_graph_state(
     return state
 
 
+def _build_actor_execution_metadata(
+    *,
+    actor_execution: str,
+    cuda_graph_state: dict[str, Any],
+) -> dict[str, Any]:
+    requested = actor_execution
+    cuda_graph_available = bool(cuda_graph_state.get('available', False))
+    fallback_occurred = requested == 'cuda-graph' and not cuda_graph_available
+    effective = 'cuda-graph' if requested == 'cuda-graph' and cuda_graph_available else 'eager'
+    return {
+        'actor_execution': requested,
+        'actor_execution_requested': requested,
+        'actor_execution_effective': effective,
+        'cuda_graph_fallback_occurred': fallback_occurred,
+        'cuda_graph_fallback_reason': cuda_graph_state.get('error') if fallback_occurred else None,
+    }
+
+
 def _build_policy_efficiency_summary(
     *,
     method: str,
@@ -434,7 +452,7 @@ def _build_policy_efficiency_summary(
     actor_forward_times_ms: list[float],
     action_to_cpu_times_ms: list[float],
     reuse_obs_tensor: bool,
-    actor_execution: str,
+    actor_execution_metadata: dict[str, Any],
     cuda_graph_state: dict[str, Any],
     cfg: ExperimentConfig,
     diag_stats: dict[str, float],
@@ -483,7 +501,7 @@ def _build_policy_efficiency_summary(
         'action_to_cpu_time_ms': _timing_distribution(action_to_cpu_times_ms),
         'decision_time_ms': _timing_distribution(decision_times_ms),
         'reuse_obs_tensor': bool(reuse_obs_tensor),
-        'actor_execution': actor_execution,
+        **actor_execution_metadata,
         'cuda_graph_available': bool(cuda_graph_state.get('available', False)),
         'cuda_graph_error': cuda_graph_state.get('error'),
         'cuda_graph_warmup_steps': int(cuda_graph_state.get('warmup_steps', 0)),
@@ -593,6 +611,17 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             device=torch_device,
             obs_dim=env.observation_space.shape[0],
         )
+    actor_execution_metadata: dict[str, Any] = {}
+    if actor is not None:
+        actor_execution_metadata = _build_actor_execution_metadata(
+            actor_execution=actor_execution,
+            cuda_graph_state=cuda_graph_state,
+        )
+        if actor_execution_metadata['cuda_graph_fallback_occurred']:
+            print(
+                '[benchmark] CUDA Graph unavailable; falling back to eager: '
+                f"{actor_execution_metadata['cuda_graph_fallback_reason']}"
+            )
 
     output_dir = _build_output_dir(args)
     episodes_dir = ensure_dir(output_dir / 'episodes')
@@ -740,7 +769,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             actor_forward_times_ms=actor_forward_times_ms,
             action_to_cpu_times_ms=action_to_cpu_times_ms,
             reuse_obs_tensor=reuse_obs_tensor,
-            actor_execution=actor_execution,
+            actor_execution_metadata=actor_execution_metadata,
             cuda_graph_state=cuda_graph_state,
             cfg=cfg,
             diag_stats=diag_stats,

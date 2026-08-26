@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -30,6 +32,11 @@ class _DummyActor(torch.nn.Module):
 
     def forward(self, obs):
         return torch.zeros((obs.shape[0], self.linear.out_features), dtype=torch.float32, device=obs.device)
+
+
+class _DummyCudaGraph:
+    def replay(self) -> None:
+        return None
 
 
 class _DummyEnv:
@@ -265,6 +272,10 @@ class TestRunBenchmark(unittest.TestCase):
                     self.assertEqual(efficiency['planner_energy_pj'], None)
                     self.assertEqual(efficiency['device'], 'cpu')
                     self.assertNotIn('actor_execution', efficiency)
+                    self.assertNotIn('actor_execution_requested', efficiency)
+                    self.assertNotIn('actor_execution_effective', efficiency)
+                    self.assertNotIn('cuda_graph_fallback_occurred', efficiency)
+                    self.assertNotIn('cuda_graph_fallback_reason', efficiency)
                     self.assertGreaterEqual(summary['records'][0]['avg_decision_time_ms'], 0.0)
 
     def test_checkpoint_model_config_keeps_benchmark_physics_and_uses_model_fields(self):
@@ -370,6 +381,10 @@ class TestRunBenchmark(unittest.TestCase):
                     self.assertEqual(summary['method'], method)
                     self.assertIn('param_count', efficiency)
                     self.assertEqual(efficiency['actor_execution'], 'eager')
+                    self.assertEqual(efficiency['actor_execution_requested'], 'eager')
+                    self.assertEqual(efficiency['actor_execution_effective'], 'eager')
+                    self.assertFalse(efficiency['cuda_graph_fallback_occurred'])
+                    self.assertIsNone(efficiency['cuda_graph_fallback_reason'])
                     self.assertFalse(efficiency['cuda_graph_available'])
                     self.assertEqual(efficiency['cuda_graph_error'], None)
                     self.assertEqual(efficiency['cuda_graph_warmup_steps'], 0)
@@ -441,13 +456,75 @@ class TestRunBenchmark(unittest.TestCase):
                     with mock.patch('brain_uav.scripts.run_benchmark.make_env', return_value=env):
                         with mock.patch('brain_uav.scripts.run_benchmark.make_actor', return_value=_DummyActor()):
                             with mock.patch('brain_uav.scripts.run_benchmark.load_checkpoint', return_value=checkpoint_payload):
-                                summary = run_benchmark(args)
+                                stdout = io.StringIO()
+                                with redirect_stdout(stdout):
+                                    summary = run_benchmark(args)
             efficiency = json.loads(Path(summary['efficiency_summary_path']).read_text(encoding='utf-8'))
             self.assertEqual(efficiency['actor_execution'], 'cuda-graph')
+            self.assertEqual(efficiency['actor_execution_requested'], 'cuda-graph')
+            self.assertEqual(efficiency['actor_execution_effective'], 'eager')
             self.assertFalse(efficiency['cuda_graph_available'])
             self.assertIn('requires device=cuda', efficiency['cuda_graph_error'])
+            self.assertTrue(efficiency['cuda_graph_fallback_occurred'])
+            self.assertEqual(
+                efficiency['cuda_graph_fallback_reason'],
+                efficiency['cuda_graph_error'],
+            )
+            self.assertIn(
+                '[benchmark] CUDA Graph unavailable; falling back to eager:',
+                stdout.getvalue(),
+            )
             self.assertEqual(efficiency['cuda_graph_diagnostics_sanity_max_abs_diff'], None)
             self.assertEqual(efficiency['actor_forward_time_ms']['samples'], 2)
+
+    def test_policy_benchmark_cuda_graph_success_records_effective_mode(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = argparse.Namespace(
+                method='ann',
+                checkpoint=Path('model.pt'),
+                benchmark_suite=Path('suite.json'),
+                episodes=1,
+                seed=7,
+                output_root=Path(tmpdir),
+                run_name='ann_cuda_graph_success_run',
+                device='cpu',
+                snn_backend='torch',
+                episode_artifacts='json',
+                reuse_obs_tensor=False,
+                actor_execution='cuda-graph',
+            )
+            env = _DummyEnv(['goal'], episode_length=2)
+            scenarios = [_named_scenario(1)]
+            dummy_actor = _DummyActor()
+            checkpoint_payload = {'state_dict': dummy_actor.state_dict(), 'config': {}}
+            cuda_graph_state = {
+                'available': True,
+                'error': None,
+                'warmup_steps': 3,
+                'sanity_max_abs_diff': 0.0,
+                'diagnostics_sanity_max_abs_diff': None,
+                'graph': _DummyCudaGraph(),
+                'static_obs_tensor': torch.zeros((1, 24), dtype=torch.float32),
+                'static_action_tensor': torch.zeros((1, 2), dtype=torch.float32),
+            }
+            with mock.patch('brain_uav.scripts.run_benchmark.load_benchmark_suite', return_value={'suite_name': 'suite', 'seed': 1, 'count_per_category': 1, 'total_scenarios': 1, 'categories': ['single_detour']}):
+                with mock.patch('brain_uav.scripts.run_benchmark.build_benchmark_scenarios', return_value=scenarios):
+                    with mock.patch('brain_uav.scripts.run_benchmark.make_env', return_value=env):
+                        with mock.patch('brain_uav.scripts.run_benchmark.make_actor', return_value=_DummyActor()):
+                            with mock.patch('brain_uav.scripts.run_benchmark.load_checkpoint', return_value=checkpoint_payload):
+                                with mock.patch('brain_uav.scripts.run_benchmark._build_cuda_graph_state', return_value=cuda_graph_state):
+                                    stdout = io.StringIO()
+                                    with redirect_stdout(stdout):
+                                        summary = run_benchmark(args)
+            efficiency = json.loads(Path(summary['efficiency_summary_path']).read_text(encoding='utf-8'))
+            self.assertEqual(efficiency['actor_execution'], 'cuda-graph')
+            self.assertEqual(efficiency['actor_execution_requested'], 'cuda-graph')
+            self.assertEqual(efficiency['actor_execution_effective'], 'cuda-graph')
+            self.assertTrue(efficiency['cuda_graph_available'])
+            self.assertFalse(efficiency['cuda_graph_fallback_occurred'])
+            self.assertIsNone(efficiency['cuda_graph_fallback_reason'])
+            self.assertEqual(efficiency['cuda_graph_sanity_max_abs_diff'], 0.0)
+            self.assertNotIn('falling back to eager', stdout.getvalue())
 
 
 if __name__ == '__main__':
