@@ -71,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--model', choices=['ann', 'snn'], required=True)
     parser.add_argument('--tag', type=str, default='candidates')
     parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--bc-seed', type=int, default=None)
     parser.add_argument('--max-stage', choices=list(CURRICULUM_LEVELS), default='hard')
     parser.add_argument('--output-root', type=Path, default=Path('outputs/full_run'))
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
@@ -336,6 +337,8 @@ def run_full_pipeline_candidates(args: argparse.Namespace) -> dict[str, Any]:
         'model': args.model,
         'tag': sanitize_tag(args.tag),
         'seed': args.seed,
+        'bc_seed_requested': args.bc_seed,
+        'bc_seed_effective': args.bc_seed,
         'max_stage': args.max_stage,
         'stages': stages,
         'run_root': str(layout.root),
@@ -372,31 +375,30 @@ def run_full_pipeline_candidates(args: argparse.Namespace) -> dict[str, Any]:
     bc_best_output = layout.models_dir / f'bc_{args.model}_best.pt'
     bc_log_root = layout.logs_dir / 'bc'
     print(f'{build_log_prefix(args.model, "bc")} starting BC training')
-    run_command(
-        [
-            sys.executable,
-            '-m',
-            'brain_uav.scripts.train_bc',
-            '--dataset',
-            str(dataset_path),
-            '--model',
-            args.model,
-            '--output',
-            str(bc_output),
-            '--best-output',
-            str(bc_best_output),
-            '--metrics-out',
-            f'bc_{args.model}_metrics.json',
-            '--log-root',
-            str(bc_log_root),
-            '--device',
-            args.device,
-            '--snn-backend',
-            args.snn_backend,
-        ],
-        cwd=project_root,
-        env=env,
-    )
+    bc_command = [
+        sys.executable,
+        '-m',
+        'brain_uav.scripts.train_bc',
+        '--dataset',
+        str(dataset_path),
+        '--model',
+        args.model,
+        '--output',
+        str(bc_output),
+        '--best-output',
+        str(bc_best_output),
+        '--metrics-out',
+        f'bc_{args.model}_metrics.json',
+        '--log-root',
+        str(bc_log_root),
+        '--device',
+        args.device,
+        '--snn-backend',
+        args.snn_backend,
+    ]
+    if args.bc_seed is not None:
+        bc_command.extend(['--seed', str(args.bc_seed)])
+    run_command(bc_command, cwd=project_root, env=env)
     bc_metrics = find_latest_metrics_file(bc_log_root, f'bc_{args.model}_metrics.json')
     report['bc'] = {
         'final_checkpoint': str(bc_output),

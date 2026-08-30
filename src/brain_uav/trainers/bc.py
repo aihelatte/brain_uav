@@ -24,13 +24,19 @@ def train_behavior_cloning(
     verbose: bool = True,
     epoch_end_callback: Callable[[int, float, list[float], nn.Module], None] | None = None,
     log_prefix: str = '[BC]',
+    generator: torch.Generator | None = None,
 ) -> list[float]:
     """Train actor by supervised learning on (state, action) pairs."""
 
     payload = np.load(dataset_path)
     obs = torch.tensor(payload["observations"], dtype=torch.float32)
     actions = torch.tensor(payload["actions"], dtype=torch.float32)
-    loader = DataLoader(TensorDataset(obs, actions), batch_size=batch_size, shuffle=True)
+    loader = DataLoader(
+        TensorDataset(obs, actions),
+        batch_size=batch_size,
+        shuffle=True,
+        generator=generator,
+    )
     actor.to(device)
     optimizer = torch.optim.Adam(actor.parameters(), lr=lr)
     criterion = nn.MSELoss()

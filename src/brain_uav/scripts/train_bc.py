@@ -8,6 +8,7 @@ import math
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from ..config import ExperimentConfig
 from ..scripts.common import (
@@ -18,6 +19,7 @@ from ..scripts.common import (
     make_actor,
 )
 from ..trainers import train_behavior_cloning
+from ..utils.seeding import set_global_seed
 from ..utils.io import (
     build_log_paths,
     load_checkpoint,
@@ -42,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--log-root', type=Path, default=None)
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--snn-backend', choices=SNN_BACKEND_CHOICES, default='torch')
+    parser.add_argument('--seed', type=int, default=None)
     return parser
 
 
@@ -62,6 +65,8 @@ def build_bc_checkpoint_payload(
     best_loss: float | None,
     best_epoch: int | None,
     checkpoint_kind: str,
+    bc_seed_requested: int | None,
+    bc_seed_effective: int | None,
 ) -> dict:
     return {
         'model_type': model,
@@ -79,6 +84,8 @@ def build_bc_checkpoint_payload(
         'best_loss': best_loss,
         'best_epoch': best_epoch,
         'checkpoint_kind': checkpoint_kind,
+        'bc_seed_requested': bc_seed_requested,
+        'bc_seed_effective': bc_seed_effective,
     }
 
 
@@ -113,6 +120,15 @@ def main() -> None:
     else:
         best_output = args.best_output
 
+    bc_seed_requested = args.seed
+    bc_seed_effective = None
+    data_loader_generator = None
+    if args.seed is not None:
+        set_global_seed(args.seed)
+        bc_seed_effective = args.seed
+        data_loader_generator = torch.Generator()
+        data_loader_generator.manual_seed(args.seed)
+
     actor = make_actor(cfg, args.model, data['observations'].shape[1], data['actions'].shape[1])
     if args.init_checkpoint is not None:
         actor.load_state_dict(load_checkpoint(args.init_checkpoint)['state_dict'])
@@ -144,6 +160,8 @@ def main() -> None:
                 best_loss=best_loss,
                 best_epoch=best_epoch,
                 checkpoint_kind='best',
+                bc_seed_requested=bc_seed_requested,
+                bc_seed_effective=bc_seed_effective,
             ),
         )
 
@@ -156,6 +174,7 @@ def main() -> None:
         device=cfg.training.device,
         epoch_end_callback=save_best_checkpoint,
         log_prefix=log_prefix,
+        generator=data_loader_generator,
     )
 
     recorded_best_loss = None if best_epoch < 0 else best_loss
@@ -178,6 +197,8 @@ def main() -> None:
             best_loss=recorded_best_loss,
             best_epoch=recorded_best_epoch,
             checkpoint_kind='final',
+            bc_seed_requested=bc_seed_requested,
+            bc_seed_effective=bc_seed_effective,
         ),
     )
     save_json(
@@ -198,6 +219,8 @@ def main() -> None:
             'curriculum_level': curriculum_level,
             'curriculum_mix': curriculum_mix,
             'init_checkpoint': str(args.init_checkpoint) if args.init_checkpoint else None,
+            'bc_seed_requested': bc_seed_requested,
+            'bc_seed_effective': bc_seed_effective,
         },
     )
     print(f'{log_prefix} saved checkpoint to {output}')
