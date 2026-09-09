@@ -1,0 +1,1127 @@
+"""Tests for the standalone structured-observation V2 TD3 update engine."""
+
+from __future__ import annotations
+
+import math
+import unittest
+from copy import deepcopy
+from dataclasses import replace
+from unittest import mock
+
+import numpy as np
+import torch
+
+from brain_uav.models import V2ANNCritic, V2ANNPolicyActor
+from brain_uav.observations import (
+    EGO_FEATURE_DIM,
+    EGO_FEATURE_INDEX,
+    GOAL_FEATURE_DIM,
+    GOAL_FEATURE_INDEX,
+    ZONE_FEATURE_DIM,
+    V2Observation,
+    V2ObservationScales,
+    collate_v2_observations,
+)
+from brain_uav.trainers import (
+    V2ReplayBuffer,
+    V2TD3UpdateEngine,
+    V2TD3UpdateMetrics,
+)
+
+
+def _observation(
+    zone_count: int,
+    *,
+    offset: float = 0.0,
+    goal_forward: float = 20.0,
+    goal_right: float = 5.0,
+    goal_up: float = 3.0,
+    gamma: float = 0.1,
+    scales: V2ObservationScales,
+) -> V2Observation:
+    ego = np.zeros(EGO_FEATURE_DIM, dtype=np.float32)
+    ego[EGO_FEATURE_INDEX['uav_x_norm']] = 0.01 * offset
+    ego[EGO_FEATURE_INDEX['uav_z_fraction']] = 0.4
+    ego[EGO_FEATURE_INDEX['gamma_fraction']] = gamma / scales.gamma_max
+    ego[EGO_FEATURE_INDEX['sin_psi']] = math.sin(0.6)
+    ego[EGO_FEATURE_INDEX['cos_psi']] = math.cos(0.6)
+    distance = math.sqrt(goal_forward**2 + goal_right**2 + goal_up**2)
+    goal = np.zeros(GOAL_FEATURE_DIM, dtype=np.float32)
+    goal[GOAL_FEATURE_INDEX['goal_forward_norm']] = goal_forward / scales.horizontal_span
+    goal[GOAL_FEATURE_INDEX['goal_right_norm']] = goal_right / scales.horizontal_span
+    goal[GOAL_FEATURE_INDEX['goal_up_norm']] = goal_up / scales.vertical_span
+    goal[GOAL_FEATURE_INDEX['goal_distance_norm']] = distance / scales.world_diagonal
+    zones = np.zeros((zone_count, ZONE_FEATURE_DIM), dtype=np.float32)
+    for index in range(zone_count):
+        zones[index, 0] = 1.0
+        zones[index, 5] = -0.2 + 0.05 * index
+        zones[index, 6] = 0.03 * ((-1.0) ** index)
+        zones[index, 7] = 0.02 * index
+        zones[index, 8:11] = np.array([0.05, 0.04, 0.08], dtype=np.float32)
+        zones[index, 11] = 0.01
+        zones[index, 12] = 0.2
+        zones[index, 13] = -1.0
+        zones[index, 16] = 0.5
+        zones[index, 17] = float(index % 2 == 0)
+        zones[index, 18] = 0.2 + 0.01 * index
+    return V2Observation(ego, goal, zones, np.ones(zone_count, dtype=np.bool_))
+
+
+class _OldFlatActor(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.linear = torch.nn.Linear(24, 2)
+
+    def forward(self, observation):
+        return self.linear(observation)
+
+
+class _DeviceTrackingV2Actor(V2ANNPolicyActor):
+    """V2 actor that records device-migration calls on each object copy."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.to_call_count = 0
+
+    def to(self, *args, **kwargs):
+        self.to_call_count += 1
+        return super().to(*args, **kwargs)
+
+
+class TestV2TD3(unittest.TestCase):
+    def setUp(self):
+        self.scales = V2ObservationScales(100.0, 0.0, 50.0, math.pi / 4.0)
+
+    def make_engine(
+        self,
+        *,
+        policy_delay=2,
+        actor_freeze_steps=0,
+        gamma=0.99,
+        tau=0.25,
+        terminal_enabled=False,
+        bc_reference_actor=None,
+        batch_size=2,
+        action_limit=None,
+        action_low=None,
+        action_high=None,
+        actor_grad_clip_norm=1.0,
+        critic_grad_clip_norm=1.0,
+    ):
+        if action_limit is None:
+            action_limit = torch.tensor([0.2, 0.3], dtype=torch.float32)
+        if action_low is None:
+            action_low = np.array([-0.2, -0.3], dtype=np.float32)
+        if action_high is None:
+            action_high = np.array([0.2, 0.3], dtype=np.float32)
+        actor = V2ANNPolicyActor(
+            self.scales,
+            2,
+            16,
+            action_limit,
+        )
+        critic1 = V2ANNCritic(self.scales, 2, 16)
+        critic2 = V2ANNCritic(self.scales, 2, 16)
+        replay = V2ReplayBuffer(32, 2, 10, success_replay_fraction=0.25)
+        return V2TD3UpdateEngine(
+            actor=actor,
+            critic1=critic1,
+            critic2=critic2,
+            replay=replay,
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=gamma,
+            tau=tau,
+            policy_noise=0.1,
+            noise_clip=0.05,
+            policy_delay=policy_delay,
+            batch_size=batch_size,
+            action_low=action_low,
+            action_high=action_high,
+            actor_freeze_steps=actor_freeze_steps,
+            actor_grad_clip_norm=actor_grad_clip_norm,
+            critic_grad_clip_norm=critic_grad_clip_norm,
+            terminal_geo_regularization_enabled=terminal_enabled,
+            bc_reference_actor=bc_reference_actor,
+            device='cpu',
+        )
+
+    def fill_replay(self, engine, counts=(2, 3), next_counts=None):
+        if next_counts is None:
+            next_counts = counts
+        for index, (count, next_count) in enumerate(zip(counts, next_counts)):
+            engine.replay.add(
+                _observation(count, offset=float(index), scales=self.scales),
+                np.array([0.01 * index, -0.02 * index], dtype=np.float32),
+                1.0 + index,
+                _observation(next_count, offset=float(index) + 0.5, scales=self.scales),
+                index == len(counts) - 1,
+                success=index == 0,
+                near_goal=True,
+                line_to_goal_safe=index % 2 == 0,
+            )
+
+    def make_bc_reference(self, value):
+        reference = V2ANNPolicyActor(
+            self.scales,
+            2,
+            16,
+            torch.tensor([0.2, 0.3], dtype=torch.float32),
+        )
+        with torch.no_grad():
+            for parameter in reference.parameters():
+                parameter.fill_(value)
+        return reference
+
+    def assert_state_dict_equal(self, actual, expected):
+        self.assertEqual(actual.keys(), expected.keys())
+        for name in expected:
+            torch.testing.assert_close(actual[name], expected[name])
+
+    def test_targets_are_equal_but_independent_frozen_and_not_optimized(self):
+        engine = self.make_engine()
+        pairs = (
+            (engine.actor, engine.actor_target),
+            (engine.critic1, engine.critic1_target),
+            (engine.critic2, engine.critic2_target),
+        )
+        for online, target in pairs:
+            online_parameters = dict(online.named_parameters())
+            target_parameters = dict(target.named_parameters())
+            self.assertEqual(online_parameters.keys(), target_parameters.keys())
+            for name in online_parameters:
+                self.assertIsNot(online_parameters[name], target_parameters[name])
+                torch.testing.assert_close(online_parameters[name], target_parameters[name])
+                self.assertFalse(target_parameters[name].requires_grad)
+
+        actor_optimizer_ids = {
+            id(parameter)
+            for group in engine.actor_optimizer.param_groups
+            for parameter in group['params']
+        }
+        critic_optimizer_ids = {
+            id(parameter)
+            for group in engine.critic_optimizer.param_groups
+            for parameter in group['params']
+        }
+        self.assertEqual(actor_optimizer_ids, {id(p) for p in engine.actor.parameters()})
+        self.assertEqual(
+            critic_optimizer_ids,
+            {id(p) for p in engine.critic1.parameters()} | {id(p) for p in engine.critic2.parameters()},
+        )
+        target_ids = {
+            id(p)
+            for model in (engine.actor_target, engine.critic1_target, engine.critic2_target)
+            for p in model.parameters()
+        }
+        self.assertTrue(actor_optimizer_ids.isdisjoint(target_ids))
+        self.assertTrue(critic_optimizer_ids.isdisjoint(target_ids))
+
+    def test_constructor_rejects_shared_parameters_and_old_bc_actor(self):
+        actor = V2ANNPolicyActor(
+            self.scales, 2, 16, torch.tensor([0.2, 0.3], dtype=torch.float32)
+        )
+        critic = V2ANNCritic(self.scales, 2, 16)
+        replay = V2ReplayBuffer(8, 2, 10)
+        common = dict(
+            actor=actor,
+            critic1=critic,
+            critic2=critic,
+            replay=replay,
+            actor_lr=1e-3,
+            critic_lr=1e-3,
+            gamma=0.99,
+            tau=0.1,
+            policy_noise=0.1,
+            noise_clip=0.05,
+            policy_delay=2,
+            batch_size=2,
+            action_low=np.array([-0.2, -0.3], dtype=np.float32),
+            action_high=np.array([0.2, 0.3], dtype=np.float32),
+        )
+        with self.assertRaisesRegex(ValueError, 'share'):
+            V2TD3UpdateEngine(**common)
+
+        common['critic2'] = V2ANNCritic(self.scales, 2, 16)
+        common['bc_reference_actor'] = _OldFlatActor()
+        with self.assertRaisesRegex(TypeError, 'V2'):
+            V2TD3UpdateEngine(**common)
+
+    def test_constructor_requires_action_bounds_to_match_actor_limit(self):
+        with self.assertRaisesRegex(ValueError, 'action_high.*action_limit'):
+            self.make_engine(
+                action_high=np.array([0.2, 0.25], dtype=np.float32)
+            )
+        with self.assertRaisesRegex(ValueError, 'action_low.*action_limit'):
+            self.make_engine(
+                action_low=np.array([-0.2, -0.25], dtype=np.float32)
+            )
+
+        engine = self.make_engine()
+        torch.testing.assert_close(engine.action_high, engine.actor.action_limit)
+        torch.testing.assert_close(engine.action_low, -engine.actor.action_limit)
+
+    def test_constructor_rejects_bc_reference_with_different_action_limit(self):
+        reference = V2ANNPolicyActor(
+            self.scales,
+            2,
+            16,
+            torch.tensor([0.2, 0.4], dtype=torch.float32),
+        )
+        with self.assertRaisesRegex(ValueError, 'bc_reference_actor.*action_limit'):
+            self.make_engine(bc_reference_actor=reference)
+
+    def test_critic_updates_on_non_delay_step_while_actor_stays_fixed(self):
+        engine = self.make_engine(policy_delay=2)
+        self.fill_replay(engine)
+        actor_before = {name: p.detach().clone() for name, p in engine.actor.named_parameters()}
+        critic_before = {name: p.detach().clone() for name, p in engine.critic1.named_parameters()}
+
+        metrics = engine.update_once(total_steps=1)
+
+        self.assertIsInstance(metrics, V2TD3UpdateMetrics)
+        self.assertTrue(math.isfinite(metrics.critic_loss))
+        self.assertTrue(metrics.critic_updated)
+        self.assertFalse(metrics.actor_updated)
+        self.assertFalse(metrics.critic_targets_updated)
+        self.assertTrue(any(not torch.equal(critic_before[name], p) for name, p in engine.critic1.named_parameters()))
+        self.assertTrue(all(torch.equal(actor_before[name], p) for name, p in engine.actor.named_parameters()))
+        self.assertTrue(any(p.grad is not None for p in engine.critic1.parameters()))
+        self.assertTrue(any(p.grad is not None for p in engine.critic2.parameters()))
+
+    def test_actor_freeze_blocks_actor_but_not_delayed_critic_targets(self):
+        engine = self.make_engine(policy_delay=1, actor_freeze_steps=10)
+        self.fill_replay(engine)
+        actor_before = {name: p.detach().clone() for name, p in engine.actor.named_parameters()}
+        target_before = {
+            name: p.detach().clone() for name, p in engine.critic1_target.named_parameters()
+        }
+
+        metrics = engine.update_once(total_steps=5)
+
+        self.assertFalse(metrics.actor_updated)
+        self.assertTrue(metrics.critic_targets_updated)
+        self.assertTrue(all(torch.equal(actor_before[name], p) for name, p in engine.actor.named_parameters()))
+        self.assertTrue(any(not torch.equal(target_before[name], p) for name, p in engine.critic1_target.named_parameters()))
+
+    def test_formal_actor_freeze_boundary_includes_step_25000(self):
+        frozen = self.make_engine(policy_delay=1, actor_freeze_steps=25_000)
+        self.fill_replay(frozen)
+        self.assertFalse(frozen.update_once(total_steps=25_000, bc_lambda=0.0).actor_updated)
+
+        released = self.make_engine(policy_delay=1, actor_freeze_steps=25_000)
+        self.fill_replay(released)
+        self.assertTrue(released.update_once(total_steps=25_001, bc_lambda=0.0).actor_updated)
+
+    def test_eligible_actor_update_changes_actor_encoder_and_target(self):
+        engine = self.make_engine(policy_delay=1, actor_freeze_steps=0)
+        self.fill_replay(engine, counts=(3, 4))
+        encoder_before = {
+            name: p.detach().clone()
+            for name, p in engine.actor.zone_set_encoder.named_parameters()
+        }
+        target_before = {
+            name: p.detach().clone() for name, p in engine.actor_target.named_parameters()
+        }
+
+        metrics = engine.update_once(total_steps=1)
+
+        self.assertTrue(metrics.actor_updated)
+        self.assertTrue(math.isfinite(metrics.actor_loss))
+        self.assertTrue(
+            any(
+                not torch.equal(encoder_before[name], parameter)
+                for name, parameter in engine.actor.zone_set_encoder.named_parameters()
+            )
+        )
+        self.assertTrue(
+            any(parameter.grad is not None for parameter in engine.actor.zone_set_encoder.parameters())
+        )
+        self.assertTrue(any(not torch.equal(target_before[name], p) for name, p in engine.actor_target.named_parameters()))
+
+    def test_nonfinite_critic_loss_fails_before_backward_and_optimizer_step(self):
+        for clip_norm in (1.0, None):
+            with self.subTest(critic_grad_clip_norm=clip_norm):
+                engine = self.make_engine(
+                    policy_delay=2,
+                    critic_grad_clip_norm=clip_norm,
+                )
+                self.fill_replay(engine)
+
+                def nonfinite_loss(current, target):
+                    del target
+                    return current.sum() * torch.as_tensor(float('nan'))
+
+                with mock.patch(
+                    'brain_uav.trainers.v2_td3.F.mse_loss',
+                    side_effect=nonfinite_loss,
+                ), mock.patch.object(
+                    engine.critic_optimizer, 'step', wraps=engine.critic_optimizer.step
+                ) as optimizer_step:
+                    with self.assertRaisesRegex(
+                        FloatingPointError, 'critic loss.*total_steps=1'
+                    ):
+                        engine.update_once(total_steps=1)
+                optimizer_step.assert_not_called()
+                self.assertTrue(
+                    all(parameter.grad is None for parameter in engine.critic1.parameters())
+                )
+
+    def test_nonfinite_critic_gradient_fails_before_step_with_and_without_clipping(self):
+        for clip_norm in (1.0, None):
+            with self.subTest(critic_grad_clip_norm=clip_norm):
+                engine = self.make_engine(
+                    policy_delay=2,
+                    critic_grad_clip_norm=clip_norm,
+                )
+                self.fill_replay(engine)
+                parameter = next(engine.critic1.parameters())
+                handle = parameter.register_hook(
+                    lambda gradient: torch.full_like(gradient, float('inf'))
+                )
+                try:
+                    with mock.patch.object(
+                        engine.critic_optimizer,
+                        'step',
+                        wraps=engine.critic_optimizer.step,
+                    ) as optimizer_step:
+                        with self.assertRaisesRegex(
+                            FloatingPointError, 'critic gradient.*total_steps=1'
+                        ):
+                            engine.update_once(total_steps=1)
+                    optimizer_step.assert_not_called()
+                finally:
+                    handle.remove()
+
+    def test_nonfinite_actor_loss_and_gradient_fail_before_actor_step(self):
+        for failure_kind in ('loss', 'gradient'):
+            for clip_norm in (1.0, None):
+                with self.subTest(
+                    failure_kind=failure_kind,
+                    actor_grad_clip_norm=clip_norm,
+                ):
+                    engine = self.make_engine(
+                        policy_delay=1,
+                        actor_grad_clip_norm=clip_norm,
+                    )
+                    self.fill_replay(engine)
+                    original_compute = engine._compute_actor_loss_terms
+                    context = mock.patch.object(
+                        engine.actor_optimizer,
+                        'step',
+                        wraps=engine.actor_optimizer.step,
+                    )
+                    gradient_handle = None
+                    if failure_kind == 'loss':
+                        def nonfinite_actor_terms(*args, **kwargs):
+                            terms = original_compute(*args, **kwargs)
+                            return replace(
+                                terms,
+                                actor_loss=(
+                                    terms.actor_loss
+                                    * torch.as_tensor(float('nan'))
+                                ),
+                            )
+
+                        failure_context = mock.patch.object(
+                            engine,
+                            '_compute_actor_loss_terms',
+                            side_effect=nonfinite_actor_terms,
+                        )
+                        expected = 'actor loss.*total_steps=1'
+                    else:
+                        parameter = next(engine.actor.parameters())
+                        gradient_handle = parameter.register_hook(
+                            lambda gradient: torch.full_like(
+                                gradient, float('inf')
+                            )
+                        )
+                        failure_context = mock.patch.object(
+                            engine,
+                            '_compute_actor_loss_terms',
+                            wraps=original_compute,
+                        )
+                        expected = 'actor gradient.*total_steps=1'
+                    try:
+                        with failure_context, context as optimizer_step:
+                            with self.assertRaisesRegex(
+                                FloatingPointError, expected
+                            ):
+                                engine.update_once(total_steps=1)
+                        optimizer_step.assert_not_called()
+                    finally:
+                        if gradient_handle is not None:
+                            gradient_handle.remove()
+
+    def test_actor_loss_preserves_action_gradient_without_critic_parameter_grads(self):
+        engine = self.make_engine(policy_delay=1)
+        observation = collate_v2_observations([
+            _observation(2, scales=self.scales),
+            _observation(3, offset=1.0, scales=self.scales),
+        ])
+        safe = torch.ones((2, 1), dtype=torch.float32)
+
+        engine.actor_optimizer.zero_grad(set_to_none=True)
+        engine.critic_optimizer.zero_grad(set_to_none=True)
+        baseline = engine._compute_actor_loss_terms(
+            observation, safe, bc_lambda=0.0
+        )
+        baseline.actor_loss.backward()
+        expected_actor_grads = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in engine.actor.named_parameters()
+            if parameter.grad is not None
+        }
+        self.assertTrue(expected_actor_grads)
+
+        engine.actor_optimizer.zero_grad(set_to_none=True)
+        engine.critic_optimizer.zero_grad(set_to_none=True)
+        original_states = [
+            parameter.requires_grad for parameter in engine.critic1.parameters()
+        ]
+        try:
+            for parameter in engine.critic1.parameters():
+                parameter.requires_grad_(False)
+            frozen = engine._compute_actor_loss_terms(
+                observation, safe, bc_lambda=0.0
+            )
+            frozen.actor_loss.backward()
+        finally:
+            for parameter, original in zip(
+                engine.critic1.parameters(), original_states
+            ):
+                parameter.requires_grad_(original)
+
+        for name, expected in expected_actor_grads.items():
+            torch.testing.assert_close(
+                dict(engine.actor.named_parameters())[name].grad,
+                expected,
+                rtol=1e-6,
+                atol=1e-7,
+            )
+        self.assertTrue(
+            all(parameter.grad is None for parameter in engine.critic1.parameters())
+        )
+
+    def test_actor_update_restores_critic_requires_grad_on_success_and_failure(self):
+        successful = self.make_engine(policy_delay=1)
+        self.fill_replay(successful)
+        success_states = [
+            parameter.requires_grad for parameter in successful.critic1.parameters()
+        ]
+        successful.update_once(total_steps=1)
+        self.assertEqual(
+            [parameter.requires_grad for parameter in successful.critic1.parameters()],
+            success_states,
+        )
+
+        failing = self.make_engine(policy_delay=1)
+        self.fill_replay(failing)
+        failure_states = [
+            parameter.requires_grad for parameter in failing.critic1.parameters()
+        ]
+        with mock.patch.object(
+            failing,
+            '_compute_actor_loss_terms',
+            side_effect=RuntimeError('controlled actor failure'),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'controlled actor failure'):
+                failing.update_once(total_steps=1)
+        self.assertEqual(
+            [parameter.requires_grad for parameter in failing.critic1.parameters()],
+            failure_states,
+        )
+
+    def test_named_soft_update_covers_parameters_without_rechecking_fixed_buffers(self):
+        engine = self.make_engine(tau=0.25)
+        names = (
+            'zone_set_encoder.empty_scene_token',
+            'zone_set_encoder.layers.0.attention.relation_bias.weight',
+            'zone_set_encoder.layers.0.attention.relation_value.weight',
+            'head.0.weight',
+        )
+        online = dict(engine.actor.named_parameters())
+        target = dict(engine.actor_target.named_parameters())
+        before = {name: target[name].detach().clone() for name in names}
+        with torch.no_grad():
+            for name in names:
+                online[name].add_(2.0)
+
+        with mock.patch.object(
+            torch,
+            'equal',
+            side_effect=AssertionError('soft update must not compare fixed buffers'),
+        ):
+            engine._soft_update(engine.actor, engine.actor_target)
+
+        for name in names:
+            expected = before[name] * 0.75 + online[name] * 0.25
+            torch.testing.assert_close(target[name], expected)
+
+    def test_fixed_buffers_are_validated_at_engine_and_checkpoint_boundaries(self):
+        action_limit = torch.tensor([0.2, 0.3], dtype=torch.float32)
+        actor = V2ANNPolicyActor(self.scales, 2, 16, action_limit)
+        critic1 = V2ANNCritic(self.scales, 2, 16)
+        critic2 = V2ANNCritic(self.scales, 2, 16)
+        with torch.no_grad():
+            actor.zone_set_encoder.pair_relation_builder.horizontal_span.add_(1.0)
+        with self.assertRaisesRegex(ValueError, 'fixed buffer.*horizontal_span'):
+            V2TD3UpdateEngine(
+                actor,
+                critic1,
+                critic2,
+                V2ReplayBuffer(8, 2, 2),
+                actor_lr=1e-3,
+                critic_lr=1e-3,
+                gamma=0.99,
+                tau=0.25,
+                policy_noise=0.1,
+                noise_clip=0.05,
+                policy_delay=2,
+                batch_size=2,
+                action_low=np.array([-0.2, -0.3], dtype=np.float32),
+                action_high=np.array([0.2, 0.3], dtype=np.float32),
+                terminal_geo_regularization_enabled=False,
+            )
+
+        engine = self.make_engine()
+        payload = deepcopy(engine.checkpoint_state_dict())
+        for state_name in ('actor_state_dict', 'actor_target_state_dict'):
+            payload[state_name]['action_limit'] = torch.tensor(
+                [0.25, 0.35], dtype=torch.float32
+            )
+        with self.assertRaisesRegex(ValueError, 'fixed buffer.*action_limit'):
+            engine.load_network_state_dicts(payload)
+
+    def test_target_noise_and_target_action_are_both_clipped(self):
+        engine = self.make_engine(policy_delay=2)
+        self.fill_replay(engine)
+        captured_actions = []
+        original_forward = engine.critic1_target.forward
+
+        def capture(observation, action):
+            captured_actions.append(action.detach().clone())
+            return original_forward(observation, action)
+
+        actor_output = torch.tensor(
+            [[0.19, -0.29], [0.19, -0.29]], dtype=torch.float32
+        )
+        raw_noise = torch.tensor(
+            [[10.0, -10.0], [10.0, -10.0]], dtype=torch.float32
+        )
+        with (
+            mock.patch.object(engine.actor_target, 'forward', return_value=actor_output),
+            mock.patch.object(engine.critic1_target, 'forward', side_effect=capture),
+            mock.patch('torch.randn_like', return_value=raw_noise),
+        ):
+            engine.update_once(total_steps=1)
+
+        self.assertEqual(len(captured_actions), 1)
+        torch.testing.assert_close(
+            captured_actions[0],
+            torch.tensor([[0.2, -0.3], [0.2, -0.3]], dtype=torch.float32),
+        )
+
+    def test_updates_support_empty_large_and_different_next_zone_axes(self):
+        cases = (
+            ((0, 0), (0, 0)),
+            ((1, 0), (6, 5)),
+            ((6, 10), (10, 6)),
+        )
+        for counts, next_counts in cases:
+            with self.subTest(counts=counts, next_counts=next_counts):
+                engine = self.make_engine(policy_delay=2)
+                self.fill_replay(engine, counts=counts, next_counts=next_counts)
+                metrics = engine.update_once(total_steps=1)
+                self.assertTrue(math.isfinite(metrics.critic_loss))
+
+    def test_actor_rl_scale_uses_detached_old_formula(self):
+        engine = self.make_engine(terminal_enabled=False)
+        observation = collate_v2_observations([
+            _observation(1, scales=self.scales),
+            _observation(2, scales=self.scales),
+        ])
+        safe = torch.ones((2, 1), dtype=torch.float32)
+
+        def constant_q(obs, action):
+            del obs
+            return action[:, :1] * 0.0 + 10.0
+
+        with mock.patch.object(engine.critic1, 'forward', side_effect=constant_q):
+            terms = engine._compute_actor_loss_terms(observation, safe, bc_lambda=0.0)
+
+        self.assertAlmostEqual(terms.rl_actor_loss.item(), -10.0)
+        self.assertAlmostEqual(terms.actor_rl_scale.item(), 0.25)
+        self.assertAlmostEqual(terms.scaled_rl_actor_loss.item(), -2.5)
+        self.assertFalse(terms.actor_rl_scale.requires_grad)
+
+    def test_terminal_geometry_local_formula_matches_world_reference(self):
+        engine = self.make_engine(terminal_enabled=True)
+        forward, right, up, gamma, psi = 20.0, 5.0, 3.0, 0.1, 0.6
+        observation = _observation(
+            0,
+            goal_forward=forward,
+            goal_right=right,
+            goal_up=up,
+            gamma=gamma,
+            scales=self.scales,
+        )
+        batch = collate_v2_observations([observation])
+        actor_actions = torch.tensor([[0.02, -0.04]], dtype=torch.float32, requires_grad=True)
+        safe = torch.ones((1, 1), dtype=torch.float32)
+
+        loss = engine._terminal_geo_loss(batch, actor_actions, safe)
+
+        dx = forward * math.cos(psi) - right * math.sin(psi)
+        dy = forward * math.sin(psi) + right * math.cos(psi)
+        target_gamma = math.atan2(up, math.sqrt(dx * dx + dy * dy))
+        target_psi = math.atan2(dy, dx)
+        delta_gamma = float(np.clip(target_gamma - gamma, -0.2, 0.2))
+        delta_psi = (target_psi - psi + math.pi) % (2.0 * math.pi) - math.pi
+        delta_psi = float(np.clip(delta_psi, -0.3, 0.3))
+        expected = ((0.02 - delta_gamma) ** 2 + (-0.04 - delta_psi) ** 2) / 2.0
+        self.assertAlmostEqual(loss.item(), expected, places=6)
+        self.assertTrue(engine.terminal_geo_regularization_enabled)
+        self.assertEqual(engine.terminal_geo_radius, 250.0)
+        self.assertEqual(engine.terminal_geo_lambda, 3000.0)
+
+    def test_no_terminal_eligible_sample_returns_graph_connected_zero(self):
+        engine = self.make_engine(terminal_enabled=True)
+        batch = collate_v2_observations([
+            _observation(0, goal_forward=400.0, scales=self.scales),
+            _observation(1, goal_forward=20.0, scales=self.scales),
+        ])
+        actions = torch.zeros((2, 2), dtype=torch.float32, requires_grad=True)
+        safe = torch.zeros((2, 1), dtype=torch.float32)
+
+        loss = engine._terminal_geo_loss(batch, actions, safe)
+        loss.backward()
+
+        self.assertEqual(loss.item(), 0.0)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIsNotNone(actions.grad)
+        torch.testing.assert_close(actions.grad, torch.zeros_like(actions.grad))
+
+    def test_bc_reference_is_copied_frozen_and_contributes_only_when_requested(self):
+        reference = _DeviceTrackingV2Actor(
+            self.scales, 2, 16, torch.tensor([0.2, 0.3], dtype=torch.float32)
+        )
+        reference.train()
+        original_devices = {parameter.device for parameter in reference.parameters()}
+        original_requires_grad = [
+            parameter.requires_grad for parameter in reference.parameters()
+        ]
+        engine = self.make_engine(
+            policy_delay=1,
+            bc_reference_actor=reference,
+            terminal_enabled=False,
+        )
+        self.fill_replay(engine)
+
+        self.assertIsNot(engine.bc_reference_actor, reference)
+        self.assertEqual(reference.to_call_count, 0)
+        self.assertTrue(reference.training)
+        self.assertEqual(
+            {parameter.device for parameter in reference.parameters()},
+            original_devices,
+        )
+        self.assertEqual(
+            [parameter.requires_grad for parameter in reference.parameters()],
+            original_requires_grad,
+        )
+        self.assertFalse(engine.bc_reference_actor.training)
+        self.assertTrue(all(not p.requires_grad for p in engine.bc_reference_actor.parameters()))
+        metrics = engine.update_once(total_steps=1, bc_lambda=2.0)
+        self.assertTrue(metrics.actor_updated)
+        self.assertEqual(metrics.bc_lambda, 2.0)
+        self.assertGreaterEqual(metrics.bc_loss, 0.0)
+
+        no_reference = self.make_engine(policy_delay=1)
+        self.fill_replay(no_reference)
+        with self.assertRaisesRegex(ValueError, 'bc_lambda'):
+            no_reference.update_once(total_steps=1, bc_lambda=1.0)
+
+    def test_checkpoint_round_trip_restores_networks_optimizers_and_counts(self):
+        engine = self.make_engine(policy_delay=1)
+        self.fill_replay(engine)
+        engine.update_once(total_steps=1)
+        observation = collate_v2_observations([_observation(3, scales=self.scales)])
+        action = torch.tensor([[0.01, -0.02]], dtype=torch.float32)
+        actor_before = engine.actor(observation).detach().clone()
+        critic_before = engine.critic1(observation, action).detach().clone()
+        target_before = engine.actor_target(observation).detach().clone()
+
+        payload = engine.checkpoint_state_dict()
+        self.assertEqual(payload['format'], 'v2_td3_dynamic_set')
+        self.assertEqual(payload['format_version'], 3)
+        self.assertIn('observation_contract', payload)
+        self.assertIs(payload['bc_reference_present'], False)
+        self.assertIsNone(payload['bc_reference_actor_state_dict'])
+        self.assertEqual(
+            payload['algorithm_config'],
+            {
+                'gamma': 0.99,
+                'tau': 0.25,
+                'policy_noise': 0.1,
+                'noise_clip': 0.05,
+                'policy_delay': 1,
+                'batch_size': 2,
+                'actor_freeze_steps': 0,
+                'actor_grad_clip_norm': 1.0,
+                'critic_grad_clip_norm': 1.0,
+                'actor_rl_scale_alpha': 2.5,
+                'terminal_geo_regularization_enabled': False,
+                'terminal_geo_radius': 250.0,
+                'terminal_geo_lambda': 3000.0,
+            },
+        )
+
+        torch.manual_seed(999)
+        restored = self.make_engine(policy_delay=1)
+        restored.load_checkpoint_state_dict(payload)
+
+        torch.testing.assert_close(restored.actor(observation), actor_before)
+        torch.testing.assert_close(restored.critic1(observation, action), critic_before)
+        torch.testing.assert_close(restored.actor_target(observation), target_before)
+        self.assertEqual(restored.update_count, engine.update_count)
+        self.assertEqual(restored.actor_update_count, engine.actor_update_count)
+        self.assertTrue(restored.actor_optimizer.state_dict()['state'])
+        self.assertTrue(restored.critic_optimizer.state_dict()['state'])
+
+        with self.assertRaisesRegex(ValueError, 'format'):
+            restored.load_checkpoint_state_dict({'state_dict': engine.actor.state_dict()})
+        incompatible = deepcopy(payload)
+        incompatible['action_dim'] = 3
+        with self.assertRaisesRegex(ValueError, 'action_dim'):
+            restored.load_checkpoint_state_dict(incompatible)
+
+    def test_checkpoint_rejects_algorithm_mismatch_missing_config_and_version_two(self):
+        source = self.make_engine(policy_delay=2, tau=0.25, gamma=0.99)
+        payload = source.checkpoint_state_dict()
+
+        for name, restored in (
+            ('tau', self.make_engine(policy_delay=2, tau=0.1, gamma=0.99)),
+            ('gamma', self.make_engine(policy_delay=2, tau=0.25, gamma=0.95)),
+            ('policy_delay', self.make_engine(policy_delay=1, tau=0.25, gamma=0.99)),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, 'algorithm_config'):
+                    restored.load_checkpoint_state_dict(payload)
+
+        missing = deepcopy(payload)
+        missing.pop('algorithm_config', None)
+        with self.assertRaisesRegex(ValueError, 'algorithm_config'):
+            source.load_checkpoint_state_dict(missing)
+
+        version_two = deepcopy(payload)
+        version_two['format_version'] = 2
+        with self.assertRaisesRegex(ValueError, 'format_version'):
+            source.load_checkpoint_state_dict(version_two)
+
+    def test_checkpoint_restores_bc_reference_into_engine_without_one(self):
+        reference_a = self.make_bc_reference(0.125)
+        source = self.make_engine(bc_reference_actor=reference_a)
+        payload = source.checkpoint_state_dict()
+        expected_state = {
+            name: value.detach().clone()
+            for name, value in source.bc_reference_actor.state_dict().items()
+        }
+        self.assertIs(payload.get('bc_reference_present'), True)
+        self.assertIsInstance(payload['bc_reference_actor_state_dict'], dict)
+
+        restored = self.make_engine()
+        self.assertIsNone(restored.bc_reference_actor)
+        restored.load_checkpoint_state_dict(payload)
+
+        self.assertIsNotNone(restored.bc_reference_actor)
+        self.assert_state_dict_equal(
+            restored.bc_reference_actor.state_dict(),
+            expected_state,
+        )
+        self.assertFalse(restored.bc_reference_actor.training)
+        self.assertTrue(
+            all(
+                not parameter.requires_grad
+                for parameter in restored.bc_reference_actor.parameters()
+            )
+        )
+        bc_ids = {id(parameter) for parameter in restored.bc_reference_actor.parameters()}
+        online_and_target_ids = {
+            id(parameter)
+            for model in (restored.actor, restored.actor_target)
+            for parameter in model.parameters()
+        }
+        self.assertTrue(bc_ids.isdisjoint(online_and_target_ids))
+        self.assertEqual(
+            {parameter.device for parameter in restored.bc_reference_actor.parameters()},
+            {restored.device},
+        )
+
+    def test_checkpoint_bc_reference_overwrites_existing_reference(self):
+        reference_a = self.make_bc_reference(0.125)
+        reference_b = self.make_bc_reference(-0.25)
+        source = self.make_engine(bc_reference_actor=reference_a)
+        restored = self.make_engine(bc_reference_actor=reference_b)
+        state_b_before = {
+            name: value.detach().clone()
+            for name, value in restored.bc_reference_actor.state_dict().items()
+        }
+
+        restored.load_checkpoint_state_dict(source.checkpoint_state_dict())
+
+        self.assert_state_dict_equal(
+            restored.bc_reference_actor.state_dict(),
+            source.bc_reference_actor.state_dict(),
+        )
+        self.assertTrue(
+            any(
+                not torch.equal(state_b_before[name], value)
+                for name, value in restored.bc_reference_actor.state_dict().items()
+            )
+        )
+
+    def test_checkpoint_without_bc_reference_clears_existing_reference(self):
+        source = self.make_engine()
+        restored = self.make_engine(
+            bc_reference_actor=self.make_bc_reference(-0.25)
+        )
+        self.assertIsNotNone(restored.bc_reference_actor)
+
+        restored.load_checkpoint_state_dict(source.checkpoint_state_dict())
+
+        self.assertIsNone(restored.bc_reference_actor)
+
+    def test_checkpoint_rejects_invalid_bc_fields_before_mutating_networks(self):
+        source = self.make_engine(
+            bc_reference_actor=self.make_bc_reference(0.125)
+        )
+        payload = source.checkpoint_state_dict()
+        restored = self.make_engine()
+
+        missing_present = deepcopy(payload)
+        missing_present.pop('bc_reference_present', None)
+        with self.assertRaisesRegex(ValueError, 'bc_reference_present'):
+            restored.load_checkpoint_state_dict(missing_present)
+
+        missing_state = deepcopy(payload)
+        missing_state.pop('bc_reference_actor_state_dict', None)
+        with self.assertRaisesRegex(ValueError, 'bc_reference_actor_state_dict'):
+            restored.load_checkpoint_state_dict(missing_state)
+
+        malformed = deepcopy(payload)
+        state_dict = malformed['bc_reference_actor_state_dict']
+        first_name = next(iter(state_dict))
+        state_dict[first_name] = torch.zeros((1,), dtype=state_dict[first_name].dtype)
+        actor_before = {
+            name: parameter.detach().clone()
+            for name, parameter in restored.actor.named_parameters()
+        }
+        with self.assertRaisesRegex(ValueError, 'bc_reference_actor_state_dict'):
+            restored.load_checkpoint_state_dict(malformed)
+        for name, parameter in restored.actor.named_parameters():
+            torch.testing.assert_close(parameter, actor_before[name])
+
+        version_two = deepcopy(payload)
+        version_two['format_version'] = 2
+        with self.assertRaisesRegex(ValueError, 'format_version'):
+            restored.load_checkpoint_state_dict(version_two)
+
+    def test_checkpoint_rejects_inconsistent_bc_presence_contract(self):
+        source = self.make_engine(
+            bc_reference_actor=self.make_bc_reference(0.125)
+        )
+        payload = source.checkpoint_state_dict()
+        cases = []
+
+        non_boolean = deepcopy(payload)
+        non_boolean['bc_reference_present'] = 1
+        cases.append(('non_boolean', non_boolean))
+
+        present_without_state = deepcopy(payload)
+        present_without_state['bc_reference_present'] = True
+        present_without_state['bc_reference_actor_state_dict'] = None
+        cases.append(('present_without_state', present_without_state))
+
+        absent_with_state = deepcopy(payload)
+        absent_with_state['bc_reference_present'] = False
+        cases.append(('absent_with_state', absent_with_state))
+
+        for name, invalid in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, 'bc_reference'):
+                    self.make_engine().load_checkpoint_state_dict(invalid)
+
+    def test_select_action_supports_zero_six_and_ten_zones(self):
+        engine = self.make_engine()
+        for count in (0, 6, 10):
+            with self.subTest(count=count):
+                action = engine.select_action(
+                    _observation(count, scales=self.scales),
+                    exploration_noise=0.0,
+                )
+                self.assertEqual(action.shape, (2,))
+                self.assertEqual(action.dtype, np.float32)
+                self.assertTrue(np.all(action >= np.array([-0.2, -0.3], dtype=np.float32)))
+                self.assertTrue(np.all(action <= np.array([0.2, 0.3], dtype=np.float32)))
+
+    def test_select_action_uses_independent_precomputed_cpu_action_bounds(self):
+        action_low = np.array([-0.2, -0.3], dtype=np.float32)
+        action_high = np.array([0.2, 0.3], dtype=np.float32)
+        engine = self.make_engine(action_low=action_low, action_high=action_high)
+        action_low[:] = -9.0
+        action_high[:] = 9.0
+        bound_storage = {
+            engine.action_low.untyped_storage().data_ptr(),
+            engine.action_high.untyped_storage().data_ptr(),
+        }
+        cpu_bound_transfers = []
+        original_cpu = torch.Tensor.cpu
+
+        def track_cpu(tensor, *args, **kwargs):
+            if tensor.untyped_storage().data_ptr() in bound_storage:
+                cpu_bound_transfers.append(tensor)
+            return original_cpu(tensor, *args, **kwargs)
+
+        with mock.patch.object(
+            engine.actor,
+            'forward',
+            return_value=torch.tensor([[1.0, -1.0]], dtype=torch.float32),
+        ), mock.patch.object(torch.Tensor, 'cpu', new=track_cpu):
+            action = engine.select_action(
+                _observation(1, scales=self.scales),
+                exploration_noise=0.0,
+            )
+
+        np.testing.assert_array_equal(
+            action,
+            np.array([0.2, -0.3], dtype=np.float32),
+        )
+        self.assertEqual(cpu_bound_transfers, [])
+
+    def test_target_noise_has_strict_runtime_schedule_interface(self):
+        engine = self.make_engine()
+        engine.set_target_noise(policy_noise=0.015, noise_clip=0.03)
+        self.assertEqual(engine.policy_noise, 0.015)
+        self.assertEqual(engine.noise_clip, 0.03)
+        for policy_noise, noise_clip in (
+            (-0.1, 0.1),
+            (0.1, -0.1),
+            (float('nan'), 0.1),
+            (0.1, float('inf')),
+        ):
+            with self.subTest(policy_noise=policy_noise, noise_clip=noise_clip):
+                with self.assertRaises(ValueError):
+                    engine.set_target_noise(
+                        policy_noise=policy_noise,
+                        noise_clip=noise_clip,
+                    )
+
+    def test_select_action_uses_explicit_exploration_rng_when_supplied(self):
+        engine = self.make_engine()
+        observation = _observation(1, scales=self.scales)
+        np.random.seed(1)
+        first = engine.select_action(
+            observation,
+            exploration_noise=0.02,
+            exploration_rng=np.random.default_rng(314),
+        )
+        np.random.seed(999)
+        second = engine.select_action(
+            observation,
+            exploration_noise=0.02,
+            exploration_rng=np.random.default_rng(314),
+        )
+        self.assertTrue(np.array_equal(first, second))
+        with self.assertRaisesRegex(TypeError, 'exploration_rng'):
+            engine.select_action(
+                observation,
+                exploration_noise=0.02,
+                exploration_rng=object(),
+            )
+
+    def test_network_only_stage_handoff_preserves_fresh_optimizer_and_reference(self):
+        source = self.make_engine(policy_delay=1, tau=0.25)
+        self.fill_replay(source)
+        source.update_once(total_steps=1)
+        payload = source.checkpoint_state_dict()
+
+        new_reference = self.make_bc_reference(-0.125)
+        target = self.make_engine(
+            policy_delay=2,
+            tau=0.1,
+            bc_reference_actor=new_reference,
+        )
+        self.assertFalse(target.actor_optimizer.state_dict()['state'])
+        self.assertFalse(target.critic_optimizer.state_dict()['state'])
+        reference_before = {
+            name: value.detach().clone()
+            for name, value in target.bc_reference_actor.state_dict().items()
+        }
+
+        target.load_network_state_dicts(payload)
+
+        for name in (
+            'actor',
+            'critic1',
+            'critic2',
+            'actor_target',
+            'critic1_target',
+            'critic2_target',
+        ):
+            self.assert_state_dict_equal(
+                getattr(target, name).state_dict(),
+                getattr(source, name).state_dict(),
+            )
+        self.assertFalse(target.actor_optimizer.state_dict()['state'])
+        self.assertFalse(target.critic_optimizer.state_dict()['state'])
+        self.assert_state_dict_equal(
+            target.bc_reference_actor.state_dict(),
+            reference_before,
+        )
+        self.assertEqual(target.update_count, 0)
+
+        malformed = deepcopy(payload)
+        malformed['actor_state_dict'].pop(next(iter(malformed['actor_state_dict'])))
+        actor_before = {
+            name: value.detach().clone()
+            for name, value in target.actor.state_dict().items()
+        }
+        with self.assertRaisesRegex(ValueError, 'actor_state_dict'):
+            target.load_network_state_dicts(malformed)
+        self.assert_state_dict_equal(target.actor.state_dict(), actor_before)
+
+    def test_engine_construction_does_not_reset_torch_rng(self):
+        actor = V2ANNPolicyActor(
+            self.scales, 2, 16, torch.tensor([0.2, 0.3], dtype=torch.float32)
+        )
+        critic1 = V2ANNCritic(self.scales, 2, 16)
+        critic2 = V2ANNCritic(self.scales, 2, 16)
+        replay = V2ReplayBuffer(8, 2, 10)
+        torch.manual_seed(12345)
+        expected = torch.rand(4)
+        torch.manual_seed(12345)
+
+        V2TD3UpdateEngine(
+            actor,
+            critic1,
+            critic2,
+            replay,
+            1e-3,
+            1e-3,
+            0.99,
+            0.1,
+            0.1,
+            0.05,
+            2,
+            2,
+            np.array([-0.2, -0.3], dtype=np.float32),
+            np.array([0.2, 0.3], dtype=np.float32),
+            terminal_geo_regularization_enabled=False,
+        )
+        actual = torch.rand(4)
+
+        torch.testing.assert_close(actual, expected)
+
+
+if __name__ == '__main__':
+    unittest.main()

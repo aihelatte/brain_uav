@@ -9,5 +9,13 @@
 from .apf import ArtificialPotentialFieldPlanner
 from .astar import AStarPlanner
 from .heuristic import HeuristicPlanner
+from .v2_apf import V2ArtificialPotentialFieldPlanner
+from .v2_heuristic import V2HeuristicPlanner
 
-__all__ = ["ArtificialPotentialFieldPlanner", "AStarPlanner", "HeuristicPlanner"]
+__all__ = [
+    "ArtificialPotentialFieldPlanner",
+    "AStarPlanner",
+    "HeuristicPlanner",
+    "V2ArtificialPotentialFieldPlanner",
+    "V2HeuristicPlanner",
+]

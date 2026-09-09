@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from math import isfinite
 from pathlib import Path
 
 
@@ -102,6 +103,7 @@ class RewardConfig:
     goal_reward: float = 5000.0
     zone_penalty_weight: float = 450.0
     zone_penalty_cap: float = 1200.0
+    zone_secondary_penalty_ratio: float = 0.2
     boundary_soft_penalty_weight: float = 180.0
     boundary_soft_penalty_cap: float = 240.0
     ground_soft_penalty_weight: float = 180.0
@@ -131,6 +133,19 @@ class RewardConfig:
     terminal_radial_weight: float = 45.0
     terminal_tangential_penalty_weight: float = 60.0
     terminal_tangential_penalty_cap: float = 80.0
+
+    def __post_init__(self) -> None:
+        try:
+            ratio = float(self.zone_secondary_penalty_ratio)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError(
+                'zone_secondary_penalty_ratio must be finite and in [0, 1].'
+            ) from exc
+        if not isfinite(ratio) or ratio < 0.0 or ratio > 1.0:
+            raise ValueError(
+                'zone_secondary_penalty_ratio must be finite and in [0, 1].'
+            )
+        self.zone_secondary_penalty_ratio = ratio
 
 
 @dataclass(slots=True)
