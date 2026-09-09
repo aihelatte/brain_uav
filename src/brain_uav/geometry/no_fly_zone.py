@@ -6,7 +6,9 @@ from copy import deepcopy
 from math import isfinite
 from typing import Any
 
-from .base import GEOMETRY_TOLERANCE, GeometryShape, nonnegative_scalar
+import numpy as np
+
+from .base import GEOMETRY_TOLERANCE, GeometryShape, as_point3, nonnegative_scalar
 
 
 def _copy_json_value(value: Any, *, path: str, active_containers: set[int]) -> Any:
@@ -104,7 +106,20 @@ class NoFlyZone:
         return float(self.shape.segment_clearance(start, end) - self.safety_margin - radius)
 
     def violates_segment(self, start: Any, end: Any, uav_radius: float = 0.0) -> bool:
-        return bool(self.segment_clearance(start, end, uav_radius=uav_radius) <= GEOMETRY_TOLERANCE)
+        first = as_point3(start, name='start')
+        second = as_point3(end, name='end')
+        radius = nonnegative_scalar(uav_radius, name='uav_radius')
+        bounds = self.shape.bounding_box()
+        # A disjoint segment AABB proves safety; overlapping bounds prove nothing.
+        # Include the existing collision tolerance plus an outward rounding guard.
+        scale = max(1.0, float(np.max(np.abs(bounds.min_corner))),
+                    float(np.max(np.abs(bounds.max_corner))), self.safety_margin, radius)
+        expansion = (self.safety_margin + radius + 2.0 * GEOMETRY_TOLERANCE
+                     + 8.0 * np.finfo(np.float64).eps * scale)
+        if (np.any(np.maximum(first, second) < bounds.min_corner - expansion)
+                or np.any(np.minimum(first, second) > bounds.max_corner + expansion)):
+            return False
+        return bool(self.segment_clearance(first, second, uav_radius=radius) <= GEOMETRY_TOLERANCE)
 
     def to_dict(self) -> dict[str, Any]:
         from .serialization import no_fly_zone_to_dict

@@ -14,6 +14,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass, fields
 from math import isfinite
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Protocol
 
 import numpy as np
@@ -747,6 +748,7 @@ def generate_v2_trajectory_clusters(
         for planner_spec in specs:
             trajectory_id = f'trajectory_{next_trajectory_number:08d}'
             next_trajectory_number += 1
+            rollout_started = perf_counter()
             result = collect_v2_planner_rollout(
                 deepcopy(payload),
                 scenario_id=item['scenario_id'],
@@ -757,6 +759,12 @@ def generate_v2_trajectory_clusters(
                 uav_collision_radius=collision_radius,
             )
             _record_rollout(statistics, payload, result)
+            print(
+                f"[scenario {index + 1}/{count}] {item['scenario_id']} "
+                f"{planner_spec.name}: outcome={result.outcome} "
+                f"steps={result.step_count} elapsed={perf_counter() - rollout_started:.2f}s",
+                flush=True,
+            )
             if result.trajectory is not None:
                 shard_buffer.add(result.trajectory)
         if (index + 1) % per_shard == 0:

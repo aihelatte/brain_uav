@@ -4,13 +4,49 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from brain_uav.geometry import GEOMETRY_TOLERANCE, NoFlyZone, Sphere, no_fly_zone_from_dict
+from brain_uav.geometry import (GEOMETRY_TOLERANCE, NoFlyZone, Sphere, Ellipsoid, Box,
+    TriangularPyramid, QuadrangularPyramid, no_fly_zone_from_dict)
 
 
 class TestNoFlyZone(unittest.TestCase):
+    def test_distant_segment_skips_exact_ellipsoid_solver(self):
+        zone = NoFlyZone('far', Ellipsoid([0, 0, 150], 180, 140, 100), 5)
+        with patch.object(Ellipsoid, 'segment_clearance', wraps=zone.shape.segment_clearance) as exact:
+            self.assertFalse(zone.violates_segment([-600, 350, 150], [600, 350, 150], 2))
+            self.assertEqual(exact.call_count, 0)
+
+    def test_segment_broad_phase_matches_exact_geometry(self):
+        shapes = [Sphere([0, 0, 3], 2), Ellipsoid([0, 0, 3], 2, 1.5, 1),
+                  Box([0, 0, 3], 4, 4, 4),
+                  TriangularPyramid([0, 0, 0], 4, 4, 4),
+                  QuadrangularPyramid([0, 0, 0], 4, 4, 4)]
+        rng = np.random.default_rng(47)
+        segments = [(rng.uniform(-6, 6, 3), rng.uniform(-6, 6, 3)) for _ in range(12)]
+        segments += [([-5, 0, 2], [5, 0, 2]), ([0, 0, 2], [0, 0, 2]),
+                     ([-5, 8, 2], [5, 8, 2])]
+        for shape in shapes:
+            for margin, radius in ((0, 0), (0.5, 0.25), (0.5, 40)):
+                zone = NoFlyZone('reference', shape, margin)
+                for start, end in segments:
+                    with self.subTest(shape=type(shape).__name__, margin=margin, radius=radius):
+                        expected = zone.segment_clearance(start, end, radius) <= GEOMETRY_TOLERANCE
+                        self.assertEqual(zone.violates_segment(start, end, radius), expected)
+
+    def test_segment_tolerance_and_overlapping_bounds_keep_exact_semantics(self):
+        zone = NoFlyZone('boundary', Sphere([0, 0, 3], 1), 0.5)
+        for offset, expected in ((0, True), (0.5e-9, True), (2e-9, False)):
+            y = 1.75 + offset
+            self.assertEqual(zone.violates_segment([-3, y, 3], [3, y, 3], 0.25), expected)
+        self.assertFalse(zone.violates_segment([1.6, 1.6, 3], [1.6, 1.6, 3], 0.25))
+        for start, end, radius in (([0, float('nan'), 0], [8, 8, 8], 0),
+                                   ([8, 8, 8], [9, 9], 0), ([8, 8, 8], [9, 9, 9], -1)):
+            with self.assertRaises(ValueError):
+                zone.violates_segment(start, end, radius)
+
     def setUp(self) -> None:
         self.shape = Sphere(center=[0.0, 0.0, 2.0], radius=1.0)
         self.zone = NoFlyZone(
