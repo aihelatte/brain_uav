@@ -45,6 +45,7 @@ from brain_uav.v2_curriculum import (
 )
 
 from .v2_replay_buffer import V2ReplayBuffer
+from .v2_reporting import V2ExperimentReporter
 from .v2_td3 import (
     V2_TD3_CHECKPOINT_FORMAT,
     V2_TD3_CHECKPOINT_VERSION,
@@ -1155,6 +1156,7 @@ class V2FormalStageTrainer:
         exploration_rng: np.random.Generator | None = None,
         global_steps_start: int = 0,
         uav_collision_radius: float = 0.0,
+        reporter: V2ExperimentReporter | None = None,
     ) -> None:
         if not isinstance(scenario, ScenarioConfig) or not isinstance(rewards, RewardConfig):
             raise TypeError('scenario and rewards must use project config classes.')
@@ -1164,6 +1166,8 @@ class V2FormalStageTrainer:
             raise TypeError('engine must be V2TD3UpdateEngine.')
         if not callable(validation_runner):
             raise TypeError('validation_runner must be callable.')
+        if reporter is not None and not isinstance(reporter, V2ExperimentReporter):
+            raise TypeError('reporter must be a V2ExperimentReporter when provided.')
         if set(scenario_sources) != set(config.curriculum_mix):
             raise ValueError('scenario_sources must exactly match curriculum_mix levels.')
         for level, source in scenario_sources.items():
@@ -1184,6 +1188,7 @@ class V2FormalStageTrainer:
         self.engine = engine
         self.scenario_sources = dict(scenario_sources)
         self.validation_runner = validation_runner
+        self.reporter = reporter
         self.selector = selector or V2CurriculumSelector(
             config.curriculum_mix,
             seed=derive_v2_component_seed(config.seed, config.stage, 'curriculum'),
@@ -1225,11 +1230,14 @@ class V2FormalStageTrainer:
         return bool(info.get('goal_reached_by_segment', False)) or min(values) <= self.config.near_goal_radius
 
     def run(self) -> V2FormalTrainingResult:
+        if self.reporter is not None:
+            self.reporter.begin_episode()
         observation, episode_level = self._new_episode()
         episode_return = 0.0
         episode_length = 0
         episode_warmup_steps = 0
         transitions: list[_EpisodeTransition] = []
+        episode_actions: list[np.ndarray] = []
         slot_refs: list[tuple[int, int]] = []
         update_metrics: list[V2TD3UpdateMetrics] = []
         self.engine.actor.train()
@@ -1253,6 +1261,8 @@ class V2FormalStageTrainer:
             if in_warmup:
                 episode_warmup_steps += 1
             next_observation, reward, terminated, truncated, info = self.env.step(action)
+            if self.reporter is not None:
+                episode_actions.append(self.env.prev_action.copy())
             done = bool(terminated or truncated)
             near_goal = self._near_goal(info)
             slot_ref = self.engine.replay.add(
@@ -1295,6 +1305,14 @@ class V2FormalStageTrainer:
                 update_metrics.append(metrics)
                 self.result.update_count += 1
             observation = next_observation
+
+            if self.reporter is not None:
+                self.reporter.maybe_report_progress(
+                    stage_steps=self.result.stage_steps,
+                    completed_episodes=len(self.result.episodes),
+                    current_episode_steps=episode_length,
+                    actor_active=self.result.stage_steps > self.config.actor_freeze_steps,
+                )
 
             if done:
                 outcome = str(info.get('outcome', ''))
@@ -1339,6 +1357,25 @@ class V2FormalStageTrainer:
                     'batch_success_fraction': update_metrics[-1].sample_success_fraction if update_metrics else 0.0,
                 }
                 self.result.episodes.append(episode_record)
+                if self.reporter is not None:
+                    reporting_record = dict(episode_record)
+                    reporting_record['actor_updated'] = bool(actor_updates)
+                    reporting_record['actor_update_status'] = (
+                        'updated'
+                        if actor_updates
+                        else (
+                            'frozen'
+                            if self.result.stage_steps <= self.config.actor_freeze_steps
+                            else 'not_updated'
+                        )
+                    )
+                    self.reporter.record_episode(
+                        reporting_record,
+                        scenario_payload=self.env.export_scenario(),
+                        trajectory=[point.tolist() for point in self.env.trajectory],
+                        actions=[value.tolist() for value in episode_actions],
+                        terminal_state=self.env.state.copy().tolist(),
+                    )
                 window = self.controller.add_episode(outcome, stage_steps=self.result.stage_steps)
                 if window is not None:
                     window_episodes = self.result.episodes[-self.config.window_episode_count:]
@@ -1352,12 +1389,20 @@ class V2FormalStageTrainer:
                         'bc_lambda': current_bc_lambda,
                         'average_bc_loss': mean(value['bc_loss'] for value in window_episodes),
                         'average_weighted_bc_contribution': mean(value['weighted_bc_contribution'] for value in window_episodes),
+                        'global_steps': self.result.global_steps_end,
                         'exploration_noise': exploration_noise,
                         'policy_noise': policy_noise,
                         'noise_clip': noise_clip,
                     })
                     self.result.windows.append(window)
+                    if self.reporter is not None:
+                        self.reporter.record_window(window)
                     if window['candidate']:
+                        if self.reporter is not None:
+                            self.reporter.prepare_validation_candidate(
+                                self.controller.candidate_count,
+                                global_steps=self.result.global_steps_end,
+                            )
                         before_updates = (
                             self.engine.update_count,
                             len(self.engine.replay),
@@ -1386,11 +1431,14 @@ class V2FormalStageTrainer:
                             break
                 if self.result.stage_steps >= self.config.max_steps:
                     break
+                if self.reporter is not None:
+                    self.reporter.begin_episode()
                 observation, episode_level = self._new_episode()
                 episode_return = 0.0
                 episode_length = 0
                 episode_warmup_steps = 0
                 transitions = []
+                episode_actions = []
                 slot_refs = []
                 update_metrics = []
 

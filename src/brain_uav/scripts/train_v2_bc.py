@@ -28,6 +28,7 @@ from brain_uav.trainers.v2_bc import (
     split_v2_bc_scenarios,
     train_v2_bc_actor,
 )
+from brain_uav.trainers.v2_reporting import V2BCTrainingReporter
 from brain_uav.utils.seeding import set_global_seed
 
 
@@ -196,76 +197,87 @@ def train_v2_behavior_cloning(
         model=model,
         snn_time_window=snn_time_window,
     )
-    result = train_v2_bc_actor(actor, cluster, split, run_config)
-    finished_at = datetime.now(timezone.utc).isoformat()
-    payload_builder = (
-        build_v2_bc_checkpoint_payload
-        if model == 'ann'
-        else build_v2_snn_bc_checkpoint_payload
-    )
-    best_payload = payload_builder(
-        checkpoint_kind='best',
-        actor=actor,
-        actor_state_dict=result.best_state_dict,
-        cluster=cluster,
-        split=split,
-        config=run_config,
-        result=result,
-        finished_at=finished_at,
-    )
-    final_payload = payload_builder(
-        checkpoint_kind='final',
-        actor=actor,
-        actor_state_dict=result.final_state_dict,
-        cluster=cluster,
-        split=split,
-        config=run_config,
-        result=result,
-        finished_at=finished_at,
-    )
-    best_path = output / f'bc_v2_{model}_best.pt'
-    final_path = output / f'bc_v2_{model}_final.pt'
-    metrics_path = output / 'metrics.json'
-    split_path = output / 'split.json'
-    _save_checkpoint(best_path, best_payload)
-    _save_checkpoint(final_path, final_payload)
-    split_payload = split.to_dict()
-    _write_strict_json(split_path, split_payload)
-    metrics = {
-        'format': (
-            'v2_bc_training_metrics'
+    reporter = V2BCTrainingReporter(output)
+    try:
+        result = train_v2_bc_actor(
+            actor,
+            cluster,
+            split,
+            run_config,
+            epoch_callback=reporter.record_epoch,
+        )
+        finished_at = datetime.now(timezone.utc).isoformat()
+        payload_builder = (
+            build_v2_bc_checkpoint_payload
             if model == 'ann'
-            else 'v2_snn_bc_training_metrics'
-        ),
-        'format_version': 1,
-        'model': f'v2_{model}',
-        'seed': run_config.seed,
-        'epochs': run_config.epochs,
-        'batch_size': run_config.batch_size,
-        'learning_rate': run_config.learning_rate,
-        'validation_fraction': run_config.validation_fraction,
-        'requested_device': requested_device,
-        'resolved_device': resolved_device,
-        'train_loss_history': list(result.train_loss_history),
-        'validation_loss_history': list(result.validation_loss_history),
-        'best_epoch': result.best_epoch,
-        'best_validation_loss': result.best_validation_loss,
-        'best_checkpoint': best_path.name,
-        'final_checkpoint': final_path.name,
-        'split_file': split_path.name,
-        'train_statistics': split_payload['train_statistics'],
-        'validation_statistics': split_payload['validation_statistics'],
-        'finished_at': finished_at,
-    }
-    if model == 'snn':
-        metrics['snn'] = {
-            'time_window': actor.time_window,
-            'tau': actor.tau,
-            'surrogate': actor.surrogate_name,
-            'backend': actor.backend,
+            else build_v2_snn_bc_checkpoint_payload
+        )
+        best_payload = payload_builder(
+            checkpoint_kind='best',
+            actor=actor,
+            actor_state_dict=result.best_state_dict,
+            cluster=cluster,
+            split=split,
+            config=run_config,
+            result=result,
+            finished_at=finished_at,
+        )
+        final_payload = payload_builder(
+            checkpoint_kind='final',
+            actor=actor,
+            actor_state_dict=result.final_state_dict,
+            cluster=cluster,
+            split=split,
+            config=run_config,
+            result=result,
+            finished_at=finished_at,
+        )
+        best_path = output / f'bc_v2_{model}_best.pt'
+        final_path = output / f'bc_v2_{model}_final.pt'
+        metrics_path = output / 'metrics.json'
+        split_path = output / 'split.json'
+        _save_checkpoint(best_path, best_payload)
+        _save_checkpoint(final_path, final_payload)
+        split_payload = split.to_dict()
+        _write_strict_json(split_path, split_payload)
+        metrics = {
+            'format': (
+                'v2_bc_training_metrics'
+                if model == 'ann'
+                else 'v2_snn_bc_training_metrics'
+            ),
+            'format_version': 1,
+            'model': f'v2_{model}',
+            'seed': run_config.seed,
+            'epochs': run_config.epochs,
+            'batch_size': run_config.batch_size,
+            'learning_rate': run_config.learning_rate,
+            'validation_fraction': run_config.validation_fraction,
+            'requested_device': requested_device,
+            'resolved_device': resolved_device,
+            'train_loss_history': list(result.train_loss_history),
+            'validation_loss_history': list(result.validation_loss_history),
+            'best_epoch': result.best_epoch,
+            'best_validation_loss': result.best_validation_loss,
+            'best_checkpoint': best_path.name,
+            'final_checkpoint': final_path.name,
+            'split_file': split_path.name,
+            'train_statistics': split_payload['train_statistics'],
+            'validation_statistics': split_payload['validation_statistics'],
+            'finished_at': finished_at,
         }
-    _write_strict_json(metrics_path, metrics)
-    return metrics
+        if model == 'snn':
+            metrics['snn'] = {
+                'time_window': actor.time_window,
+                'tau': actor.tau,
+                'surrogate': actor.surrogate_name,
+                'backend': actor.backend,
+            }
+        _write_strict_json(metrics_path, metrics)
+        reporter.finish()
+        return metrics
+    finally:
+        reporter.close()
 
 
 def build_parser() -> argparse.ArgumentParser:

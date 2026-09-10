@@ -27,6 +27,7 @@ from brain_uav.trainers.v2_bc import (
     load_v2_bc_trajectory_cluster,
 )
 from brain_uav.trainers.v2_replay_buffer import V2ReplayBuffer
+from brain_uav.trainers.v2_reporting import V2BCTrainingReporter
 from brain_uav.trainers.v2_td3 import V2TD3UpdateEngine
 from brain_uav.utils.seeding import set_global_seed
 
@@ -34,6 +35,74 @@ from test_v2_bc import make_observation, write_cluster
 
 
 class TestTrainV2BCScript(unittest.TestCase):
+    def test_report_finish_failure_preserves_core_bc_artifacts_and_closes_reporter(self) -> None:
+        def fake_train(actor, cluster, split, config, *, epoch_callback=None):
+            state = {
+                name: value.detach().cpu().clone()
+                for name, value in actor.state_dict().items()
+            }
+            return V2BCTrainingResult(
+                train_loss_history=(0.25,),
+                validation_loss_history=(0.5,),
+                best_epoch=1,
+                best_validation_loss=0.5,
+                best_state_dict=state,
+                final_state_dict=state,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cluster_path = write_cluster(root / 'cluster', zone_counts=(0, 1, 2, 0))
+            output = root / 'output'
+            core_paths = (
+                output / 'bc_v2_ann_best.pt',
+                output / 'bc_v2_ann_final.pt',
+                output / 'metrics.json',
+                output / 'split.json',
+            )
+            finish_observations = []
+            closed = []
+            original_close = V2BCTrainingReporter.close
+
+            def fail_finish(reporter):
+                finish_observations.append(all(path.is_file() for path in core_paths))
+                raise RuntimeError('injected BC report finish failure')
+
+            def tracking_close(reporter):
+                original_close(reporter)
+                closed.append(reporter._closed)
+
+            with mock.patch(
+                'brain_uav.scripts.train_v2_bc.train_v2_bc_actor',
+                side_effect=fake_train,
+            ), mock.patch.object(
+                V2BCTrainingReporter,
+                'finish',
+                new=fail_finish,
+            ), mock.patch.object(
+                V2BCTrainingReporter,
+                'close',
+                new=tracking_close,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, 'injected BC report finish failure'
+                ):
+                    train_v2_behavior_cloning(
+                        trajectory_cluster=cluster_path,
+                        output_dir=output,
+                        seed=7,
+                        validation_fraction=0.25,
+                        epochs=1,
+                        batch_size=2,
+                        learning_rate=1e-3,
+                        training_config=TrainingConfig(hidden_dim=8),
+                        device='cpu',
+                    )
+
+            self.assertEqual(finish_observations, [True])
+            self.assertTrue(all(path.is_file() for path in core_paths))
+            self.assertEqual(closed, [True])
+
     def test_parser_supports_ann_and_strict_torch_snn_options(self) -> None:
         parser = build_parser()
         args = parser.parse_args([
@@ -71,13 +140,13 @@ class TestTrainV2BCScript(unittest.TestCase):
     def test_auto_device_is_resolved_before_training_and_recorded(self) -> None:
         captured_configs = []
 
-        def fake_train(actor, cluster, split, config):
+        def fake_train(actor, cluster, split, config, *, epoch_callback=None):
             captured_configs.append(config)
             state = {
                 name: value.detach().cpu().clone()
                 for name, value in actor.state_dict().items()
             }
-            return V2BCTrainingResult(
+            result = V2BCTrainingResult(
                 train_loss_history=(0.25,),
                 validation_loss_history=(0.5,),
                 best_epoch=1,
@@ -85,6 +154,17 @@ class TestTrainV2BCScript(unittest.TestCase):
                 best_state_dict=state,
                 final_state_dict=state,
             )
+            if epoch_callback is not None:
+                epoch_callback({
+                    'epoch': 1,
+                    'epochs': 1,
+                    'train_loss': 0.25,
+                    'validation_loss': 0.5,
+                    'best_epoch': 1,
+                    'best_validation_loss': 0.5,
+                    'refreshed_best': True,
+                })
+            return result
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -345,6 +425,12 @@ class TestTrainV2BCScript(unittest.TestCase):
             self.assertTrue((output / 'bc_v2_ann_final.pt').is_file())
             self.assertTrue((output / 'metrics.json').is_file())
             self.assertTrue((output / 'split.json').is_file())
+            self.assertEqual(
+                len((output / 'epochs.jsonl').read_text(encoding='utf-8').splitlines()),
+                1,
+            )
+            self.assertTrue((output / 'epochs.csv').is_file())
+            self.assertTrue((output / 'mse_curve.png').is_file())
             self.assertEqual(len(metrics['train_loss_history']), 1)
             self.assertEqual(len(metrics['validation_loss_history']), 1)
             self.assertEqual(metrics['best_epoch'], 1)

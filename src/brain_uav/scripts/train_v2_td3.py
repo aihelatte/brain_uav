@@ -27,6 +27,7 @@ from brain_uav.trainers.v2_validation import (
     load_v2_validation_pool,
     scenario_config_snapshot,
 )
+from brain_uav.trainers.v2_reporting import V2ExperimentReporter
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -92,6 +93,7 @@ def run_v2_td3_stage(
     model: str = 'ann',
     snn_time_window: int = 4,
     prepared_initialization: V2PreparedStageInitialization | None = None,
+    reporting: bool = True,
 ) -> dict[str, Any]:
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
@@ -99,6 +101,8 @@ def run_v2_td3_stage(
         raise ValueError('model must be "ann" or "snn".')
     if type(snn_time_window) is not int or snn_time_window <= 0:
         raise ValueError('snn_time_window must be a positive integer.')
+    if type(reporting) is not bool:
+        raise ValueError('reporting must be bool.')
     if model == 'snn':
         require_v2_spikingjelly()
     config = V2FormalTrainingConfig(
@@ -140,7 +144,9 @@ def run_v2_td3_stage(
     output_path = Path(output)
     metrics_path = Path(metrics_out)
     failed_output_path = _failed_checkpoint_path(output_path)
-    if output_path.exists() or failed_output_path.exists() or metrics_path.exists():
+    report_path = metrics_path.with_name(f'{metrics_path.stem}_reports')
+    if (output_path.exists() or failed_output_path.exists() or metrics_path.exists()
+            or (reporting and report_path.exists())):
         raise FileExistsError('Formal V2 stage outputs already exist.')
     pool_path = Path(validation_pool)
     pool = load_v2_validation_pool(
@@ -167,6 +173,43 @@ def run_v2_td3_stage(
         snn_time_window=snn_time_window,
         prepared_initialization=prepared_initialization,
     )
+    reporter = (
+        V2ExperimentReporter(
+            report_path,
+            stage=stage,
+            model_type=model,
+            scenario=scenario_config,
+            rewards=reward_config,
+            uav_collision_radius=effective_uav_collision_radius,
+            max_steps=config.max_steps,
+        )
+        if reporting
+        else None
+    )
+    if reporter is not None:
+        actor = components.engine.actor
+        snn_metadata = (
+            {
+                'time_window': actor.time_window,
+                'tau': actor.tau,
+                'surrogate': actor.surrogate_name,
+                'backend': actor.backend,
+            }
+            if isinstance(actor, V2SNNPolicyActor)
+            else None
+        )
+        reporter.start_stage({
+            'requested_device': requested_device,
+            'resolved_device': resolved_device,
+            'initialization_source': dict(components.initialization_source),
+            'seed': seed,
+            'max_steps': config.max_steps,
+            'formal_config': config.to_dict(),
+            'checkpoint_output': str(output_path),
+            'failed_checkpoint_output': str(failed_output_path),
+            'metrics_output': str(metrics_path),
+            'snn': snn_metadata,
+        })
 
     def validate(actor):
         return evaluate_v2_fixed_validation(
@@ -175,6 +218,7 @@ def run_v2_td3_stage(
             reward_config,
             max_failures=config.validation_max_failures,
             device=resolved_device,
+            reporter=reporter,
         )
 
     trainer = V2FormalStageTrainer(
@@ -188,88 +232,97 @@ def run_v2_td3_stage(
         exploration_rng=components.exploration_rng,
         global_steps_start=global_steps_start,
         uav_collision_radius=effective_uav_collision_radius,
+        reporter=reporter,
     )
-    result = trainer.run()
-    validation_metadata = {
-        'path': str(pool_path),
-        'format_version': V2_VALIDATION_POOL_VERSION,
-        'curriculum_level': pool.curriculum_level,
-        'master_seed': pool.master_seed,
-        'stage_seed': pool.stage_seed,
-        'scenario_count': pool.scenario_count,
-        'content_digest': pool.content_digest,
-    }
-    checkpoint_payload = build_v2_formal_checkpoint(
-        components.engine,
-        result,
-        config,
-        scenario=scenario_config,
-        rewards=reward_config,
-        uav_collision_radius=effective_uav_collision_radius,
-        seed_manifest=components.seed_manifest,
-        validation_pool_metadata=validation_metadata,
-        initialization_source=components.initialization_source,
-    )
-    checkpoint_path = output_path if result.passed_validation else failed_output_path
-    if checkpoint_path.exists():
-        raise FileExistsError(f'Formal V2 checkpoint already exists: {checkpoint_path}')
-    save_v2_formal_checkpoint(checkpoint_path, checkpoint_payload)
-    actor = components.engine.actor
-    metrics_payload = {
-        'format': f'v2_formal_{model}_td3_metrics',
-        'format_version': 1,
-        'model_type': model,
-        'actor_trainable_parameter_count': sum(
-            parameter.numel()
-            for parameter in actor.parameters()
-            if parameter.requires_grad
-        ),
-        'critic_trainable_parameter_count': sum(
-            parameter.numel()
-            for critic in (components.engine.critic1, components.engine.critic2)
-            for parameter in critic.parameters()
-            if parameter.requires_grad
-        ),
-        'scenario_config': scenario_config_snapshot(scenario_config),
-        'reward_config': asdict(reward_config),
-        'formal_config': config.to_dict(),
-        'seed_manifest': dict(components.seed_manifest),
-        'validation_pool': validation_metadata,
-        'initialization_source': dict(components.initialization_source),
-        'requested_device': requested_device,
-        'resolved_device': resolved_device,
-        'replay_sampling_implementation': (
-            components.engine.replay.sampling_implementation
-        ),
-        'result': result.to_dict(),
-        'checkpoint': str(checkpoint_path),
-    }
-    if isinstance(actor, V2SNNPolicyActor):
-        metrics_payload['snn'] = {
-            'time_window': actor.time_window,
-            'tau': actor.tau,
-            'surrogate': actor.surrogate_name,
-            'backend': actor.backend,
+    try:
+        result = trainer.run()
+        validation_metadata = {
+            'path': str(pool_path),
+            'format_version': V2_VALIDATION_POOL_VERSION,
+            'curriculum_level': pool.curriculum_level,
+            'master_seed': pool.master_seed,
+            'stage_seed': pool.stage_seed,
+            'scenario_count': pool.scenario_count,
+            'content_digest': pool.content_digest,
         }
-    _write_strict_json(metrics_path, metrics_payload)
-    summary = {
-        'stage': stage,
-        'model_type': model,
-        'passed': result.passed_validation,
-        'checkpoint': str(checkpoint_path),
-        'metrics': str(metrics_path),
-        'steps': result.stage_steps,
-        'global_steps_end': result.global_steps_end,
-        'outcome_counts': dict(result.outcome_counts),
-        'validation_result': result.validation_records[-1] if result.validation_records else None,
-        'stop_reason': result.stop_reason,
-        'requested_device': requested_device,
-        'resolved_device': resolved_device,
-        'replay_sampling_implementation': (
-            components.engine.replay.sampling_implementation
-        ),
-    }
-    return summary
+        checkpoint_payload = build_v2_formal_checkpoint(
+            components.engine,
+            result,
+            config,
+            scenario=scenario_config,
+            rewards=reward_config,
+            uav_collision_radius=effective_uav_collision_radius,
+            seed_manifest=components.seed_manifest,
+            validation_pool_metadata=validation_metadata,
+            initialization_source=components.initialization_source,
+        )
+        checkpoint_path = output_path if result.passed_validation else failed_output_path
+        if checkpoint_path.exists():
+            raise FileExistsError(f'Formal V2 checkpoint already exists: {checkpoint_path}')
+        save_v2_formal_checkpoint(checkpoint_path, checkpoint_payload)
+        actor = components.engine.actor
+        metrics_payload = {
+            'format': f'v2_formal_{model}_td3_metrics',
+            'format_version': 1,
+            'model_type': model,
+            'actor_trainable_parameter_count': sum(
+                parameter.numel()
+                for parameter in actor.parameters()
+                if parameter.requires_grad
+            ),
+            'critic_trainable_parameter_count': sum(
+                parameter.numel()
+                for critic in (components.engine.critic1, components.engine.critic2)
+                for parameter in critic.parameters()
+                if parameter.requires_grad
+            ),
+            'scenario_config': scenario_config_snapshot(scenario_config),
+            'reward_config': asdict(reward_config),
+            'formal_config': config.to_dict(),
+            'seed_manifest': dict(components.seed_manifest),
+            'validation_pool': validation_metadata,
+            'initialization_source': dict(components.initialization_source),
+            'requested_device': requested_device,
+            'resolved_device': resolved_device,
+            'replay_sampling_implementation': (
+                components.engine.replay.sampling_implementation
+            ),
+            'result': result.to_dict(),
+            'checkpoint': str(checkpoint_path),
+            'report_directory': str(report_path) if reporter is not None else None,
+        }
+        if isinstance(actor, V2SNNPolicyActor):
+            metrics_payload['snn'] = {
+                'time_window': actor.time_window,
+                'tau': actor.tau,
+                'surrogate': actor.surrogate_name,
+                'backend': actor.backend,
+            }
+        _write_strict_json(metrics_path, metrics_payload)
+        if reporter is not None:
+            reporter.finish_stage(result.to_dict())
+        summary = {
+            'stage': stage,
+            'model_type': model,
+            'passed': result.passed_validation,
+            'checkpoint': str(checkpoint_path),
+            'metrics': str(metrics_path),
+            'steps': result.stage_steps,
+            'global_steps_end': result.global_steps_end,
+            'outcome_counts': dict(result.outcome_counts),
+            'validation_result': result.validation_records[-1] if result.validation_records else None,
+            'stop_reason': result.stop_reason,
+            'requested_device': requested_device,
+            'resolved_device': resolved_device,
+            'replay_sampling_implementation': (
+                components.engine.replay.sampling_implementation
+            ),
+            'report_directory': str(report_path) if reporter is not None else None,
+        }
+        return summary
+    finally:
+        if reporter is not None:
+            reporter.close()
 
 
 def main(argv: list[str] | None = None) -> int:

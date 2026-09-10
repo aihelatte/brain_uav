@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from copy import deepcopy
@@ -33,6 +34,7 @@ from brain_uav.trainers.v2_formal_training import (
     save_v2_formal_checkpoint,
 )
 from brain_uav.trainers.v2_validation import V2ValidationResult
+from brain_uav.trainers.v2_reporting import V2ExperimentReporter
 from brain_uav.trainers.v2_bc import (
     V2_BC_CHECKPOINT_FORMAT,
     V2_BC_CHECKPOINT_VERSION,
@@ -500,6 +502,173 @@ class TestV2FormalTraining(unittest.TestCase):
             self.assertTrue(torch.equal(first_actor[name], second_actor[name]))
         for name in first_critic:
             self.assertTrue(torch.equal(first_critic[name], second_critic[name]))
+
+    def test_reporting_does_not_change_training_or_owned_random_state(self):
+        scenario = ScenarioConfig(max_steps=1)
+        config = V2FormalTrainingConfig(
+            stage='easy', seed=43, max_steps=3, replay_capacity=16,
+            batch_size=2, window_episode_count=2,
+            consecutive_qualified_windows=2, early_stop_min_steps=99,
+        )
+
+        def run_once(report_directory: Path | None):
+            engine = _engine(scenario, seed=43)
+            reporter = None
+            if report_directory is not None:
+                reporter = V2ExperimentReporter(
+                    report_directory,
+                    stage='easy',
+                    model_type='ann',
+                    scenario=scenario,
+                    rewards=RewardConfig(),
+                    uav_collision_radius=0.0,
+                    max_steps=config.max_steps,
+                )
+            trainer = V2FormalStageTrainer(
+                scenario,
+                RewardConfig(),
+                config,
+                engine,
+                scenario_sources={'easy': _Source(_scenario_payload(2))},
+                validation_runner=lambda actor: _validation_result(False),
+                reporter=reporter,
+            )
+            try:
+                result = trainer.run()
+                if reporter is not None:
+                    reporter.finish_stage(result.to_dict())
+            finally:
+                if reporter is not None:
+                    reporter.close()
+            return (
+                result.to_dict(),
+                {name: value.detach().clone() for name, value in engine.actor.state_dict().items()},
+                {name: value.detach().clone() for name, value in engine.critic1.state_dict().items()},
+                engine.replay.action.copy(),
+                deepcopy(trainer.exploration_rng.bit_generator.state),
+                deepcopy(engine.replay.rng.bit_generator.state),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            without = run_once(None)
+            with_report = run_once(Path(directory) / 'report')
+        self.assertEqual(without[0], with_report[0])
+        for first, second in zip(without[1:3], with_report[1:3]):
+            for name in first:
+                self.assertTrue(torch.equal(first[name], second[name]), name)
+        np.testing.assert_array_equal(without[3], with_report[3])
+        self.assertEqual(without[4], with_report[4])
+        self.assertEqual(without[5], with_report[5])
+
+    def test_reported_training_time_excludes_plotting_and_validation_but_stage_time_includes_them(self):
+        class Clock:
+            value = 0.0
+
+            def __call__(self):
+                return self.value
+
+        class TimedSource(_Source):
+            def __init__(self, payload, clock):
+                super().__init__(payload)
+                self.clock = clock
+
+            def generate(self):
+                self.clock.value += 2.0
+                return super().generate()
+
+        clock = Clock()
+        scenario = ScenarioConfig(max_steps=1)
+        config = V2FormalTrainingConfig(
+            stage='easy',
+            seed=47,
+            max_steps=2,
+            replay_capacity=16,
+            batch_size=2,
+            window_episode_count=1,
+            max_failures_per_window=0,
+            consecutive_qualified_windows=1,
+            early_stop_min_steps=1,
+        )
+        engine = _engine(scenario, seed=47)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reporter = V2ExperimentReporter(
+                root / 'report',
+                stage='easy',
+                model_type='ann',
+                scenario=scenario,
+                rewards=RewardConfig(),
+                uav_collision_radius=0.0,
+                max_steps=config.max_steps,
+                clock=clock,
+            )
+
+            def validation(actor):
+                reporter.begin_validation(curriculum_level='easy', scenario_count=1)
+                clock.value += 20.0
+                result = _validation_result(False)
+                reporter.finish_validation(result.to_dict())
+                return result
+
+            trainer = V2FormalStageTrainer(
+                scenario,
+                RewardConfig(),
+                config,
+                engine,
+                scenario_sources={
+                    'easy': TimedSource(_scenario_payload(0, goal=True), clock)
+                },
+                validation_runner=validation,
+                reporter=reporter,
+            )
+            original_step = trainer.env.step
+
+            def timed_step(action):
+                result = original_step(action)
+                clock.value += 3.0
+                return result
+
+            trainer.env.step = timed_step
+
+            def timed_plot(*args, **kwargs):
+                clock.value += 10.0
+                return {'json': 'unused.json', 'png': 'unused.png'}
+
+            try:
+                with mock.patch(
+                    'brain_uav.trainers.v2_reporting.export_v2_trajectory_views',
+                    side_effect=timed_plot,
+                ):
+                    result = trainer.run()
+                    reporter.finish_stage(result.to_dict())
+            finally:
+                reporter.close()
+
+            episode_rows = [
+                json.loads(line)
+                for line in (root / 'report' / 'episodes.jsonl')
+                .read_text(encoding='utf-8')
+                .splitlines()
+            ]
+            window_rows = [
+                json.loads(line)
+                for line in (root / 'report' / 'windows.jsonl')
+                .read_text(encoding='utf-8')
+                .splitlines()
+            ]
+            stage_end = json.loads(
+                (root / 'report' / 'stage_end.json').read_text(encoding='utf-8')
+            )
+
+        self.assertEqual(
+            [row['episode_elapsed_seconds'] for row in episode_rows],
+            [5.0, 5.0],
+        )
+        self.assertEqual(
+            [row['window_elapsed_seconds'] for row in window_rows],
+            [5.0, 5.0],
+        )
+        self.assertEqual(stage_end['stage_elapsed_seconds'], 70.0)
 
     def test_candidate_validation_failure_continues_and_success_stops(self):
         scenario = ScenarioConfig(max_steps=1)

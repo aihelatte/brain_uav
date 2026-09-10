@@ -28,6 +28,7 @@ from brain_uav.geometry import no_fly_zone_from_dict
 from brain_uav.models.v2_ann import V2ANNPolicyActor
 from brain_uav.models.v2_snn import V2SNNPolicyActor
 from brain_uav.observations import V2ObservationScales, collate_v2_observations
+from brain_uav.trainers.v2_reporting import V2ExperimentReporter
 
 
 V2_VALIDATION_POOL_FORMAT = 'v2_td3_fixed_validation_pool'
@@ -499,6 +500,7 @@ def evaluate_v2_fixed_validation(
     *,
     max_failures: int = 6,
     device: str | torch.device = 'cpu',
+    reporter: V2ExperimentReporter | None = None,
 ) -> V2ValidationResult:
     if not isinstance(actor, (V2ANNPolicyActor, V2SNNPolicyActor)):
         raise TypeError('actor must be a V2ANNPolicyActor or V2SNNPolicyActor.')
@@ -506,6 +508,8 @@ def evaluate_v2_fixed_validation(
         raise TypeError('pool must be a V2ValidationPool.')
     if not isinstance(rewards, RewardConfig):
         raise TypeError('rewards must be a RewardConfig.')
+    if reporter is not None and not isinstance(reporter, V2ExperimentReporter):
+        raise TypeError('reporter must be a V2ExperimentReporter when provided.')
     maximum_failures = _nonnegative_int(max_failures, name='max_failures')
     scenario = scenario_config_from_snapshot(pool.scenario_config)
     expected_scales = V2ObservationScales(
@@ -542,17 +546,25 @@ def evaluate_v2_fixed_validation(
     actor.eval()
     counts = {name: 0 for name in ('goal', 'ground', 'boundary', 'collision', 'timeout')}
     details: list[dict[str, Any]] = []
+    if reporter is not None:
+        reporter.begin_validation(
+            curriculum_level=pool.curriculum_level,
+            scenario_count=pool.scenario_count,
+        )
     try:
         for record in pool.scenarios:
             observation, _ = env.reset()
             episode_return = 0.0
             outcome = 'running'
             episode_length = 0
+            actions: list[list[float]] = []
             while outcome == 'running':
                 batch = collate_v2_observations([observation], device=target_device)
                 with torch.inference_mode():
                     action = actor(batch)[0].detach().cpu().numpy().astype(np.float32)
                 observation, reward, terminated, truncated, info = env.step(action)
+                if reporter is not None:
+                    actions.append(env.prev_action.copy().tolist())
                 episode_return += float(reward)
                 episode_length += 1
                 if terminated or truncated:
@@ -560,17 +572,30 @@ def evaluate_v2_fixed_validation(
                     if outcome not in counts:
                         raise RuntimeError('Validation environment returned an invalid outcome.')
             counts[outcome] += 1
-            details.append({
+            detail = {
                 'scenario_id': record['scenario_id'],
                 'outcome': outcome,
                 'episode_length': episode_length,
                 'episode_return': episode_return,
-            })
+            }
+            details.append(detail)
+            if reporter is not None:
+                reporter.record_validation_scenario(
+                    detail,
+                    scenario_payload=record['payload'],
+                    trajectory=[point.tolist() for point in env.trajectory],
+                    actions=actions,
+                    terminal_state=env.state.copy().tolist(),
+                )
+    except Exception:
+        if reporter is not None:
+            reporter.abort_validation()
+        raise
     finally:
         actor.train(was_training)
     goal_count = counts['goal']
     failure_count = pool.scenario_count - goal_count
-    return V2ValidationResult(
+    result = V2ValidationResult(
         curriculum_level=pool.curriculum_level,
         scenario_count=pool.scenario_count,
         goal_count=goal_count,
@@ -580,6 +605,9 @@ def evaluate_v2_fixed_validation(
         max_failures=maximum_failures,
         passed=validation_passes(failure_count, max_failures=maximum_failures),
     )
+    if reporter is not None:
+        reporter.finish_validation(result.to_dict())
+    return result
 
 
 __all__ = [

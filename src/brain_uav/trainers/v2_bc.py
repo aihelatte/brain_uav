@@ -7,7 +7,7 @@ metadata, and reopens each shard once when streaming an epoch.
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 import json
@@ -704,6 +704,8 @@ def train_v2_bc_actor(
     cluster: V2BCTrajectoryCluster,
     split: V2BCScenarioSplit,
     config: V2BCTrainingConfig,
+    *,
+    epoch_callback: Callable[[Mapping[str, Any]], None] | None = None,
 ) -> V2BCTrainingResult:
     """Train a strict V2 ANN or SNN actor for fixed epochs using MSE."""
 
@@ -715,6 +717,8 @@ def train_v2_bc_actor(
         raise TypeError('split must be a V2BCScenarioSplit.')
     if not isinstance(config, V2BCTrainingConfig):
         raise TypeError('config must be a V2BCTrainingConfig.')
+    if epoch_callback is not None and not callable(epoch_callback):
+        raise TypeError('epoch_callback must be callable when provided.')
     device = torch.device(config.device)
     actor.to(device)
     optimizer = torch.optim.Adam(actor.parameters(), lr=config.learning_rate)
@@ -743,7 +747,21 @@ def train_v2_bc_actor(
         )
         train_history.append(train_loss)
         validation_history.append(validation_loss)
-        best.consider(epoch=epoch, validation_loss=validation_loss, actor=actor)
+        refreshed_best = best.consider(
+            epoch=epoch,
+            validation_loss=validation_loss,
+            actor=actor,
+        )
+        if epoch_callback is not None:
+            epoch_callback({
+                'epoch': epoch,
+                'epochs': config.epochs,
+                'train_loss': train_loss,
+                'validation_loss': validation_loss,
+                'best_epoch': best.best_epoch,
+                'best_validation_loss': best.best_validation_loss,
+                'refreshed_best': refreshed_best,
+            })
     actor.train()
     if best.best_epoch is None:
         raise RuntimeError('V2 BC training did not produce a finite best checkpoint.')

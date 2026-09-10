@@ -25,6 +25,7 @@ from brain_uav.envs.v2_scenario_generator import (
 )
 from brain_uav.models import V2ANNPolicyActor, V2SNNPolicyActor
 from brain_uav.observations import V2ObservationScales
+from brain_uav.trainers.v2_reporting import V2ExperimentReporter
 from brain_uav.trainers.v2_validation import (
     V2_VALIDATION_POOL_FORMAT,
     V2_VALIDATION_POOL_VERSION,
@@ -282,6 +283,64 @@ class TestV2Validation(unittest.TestCase):
         self.assertEqual(result.outcome_counts['timeout'], 1)
         self.assertEqual(tuple(item['outcome'] for item in result.scenarios), ('goal', 'timeout'))
         self.assertTrue(math.isfinite(result.scenarios[0]['episode_return']))
+
+    def test_fixed_validation_streams_all_scenarios_and_sparse_trajectory_views(self):
+        scales = V2ObservationScales(
+            self.scenario.world_xy,
+            self.scenario.world_z_min,
+            self.scenario.world_z_max,
+            self.scenario.gamma_max,
+        )
+        actor = V2ANNPolicyActor(
+            scales,
+            2,
+            8,
+            torch.tensor(
+                [self.scenario.delta_gamma_max, self.scenario.delta_psi_max],
+                dtype=torch.float32,
+            ),
+        )
+        for parameter in actor.parameters():
+            parameter.data.zero_()
+        actor.train()
+        actor_state = {
+            name: value.detach().clone()
+            for name, value in actor.state_dict().items()
+        }
+        pool = _pool('easy', self.scenario, (1.0, 100.0))
+        with tempfile.TemporaryDirectory() as directory:
+            report = V2ExperimentReporter(
+                Path(directory) / 'report',
+                stage='easy',
+                model_type='ann',
+                scenario=self.scenario,
+                rewards=RewardConfig(),
+                uav_collision_radius=0.0,
+                max_steps=10,
+            )
+            report.prepare_validation_candidate(1, global_steps=17)
+            try:
+                result = evaluate_v2_fixed_validation(
+                    actor,
+                    pool,
+                    RewardConfig(),
+                    max_failures=1,
+                    device='cpu',
+                    reporter=report,
+                )
+            finally:
+                report.close()
+            candidate = Path(directory) / 'report' / 'validation' / 'candidate_0001'
+            rows = (candidate / 'scenarios.jsonl').read_text(encoding='utf-8').splitlines()
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all(json.loads(row)['global_steps'] == 17 for row in rows))
+            summary = json.loads((candidate / 'summary.json').read_text(encoding='utf-8'))
+            self.assertEqual(summary['passed'], result.passed)
+            self.assertEqual(summary['global_steps'], 17)
+            self.assertEqual(len(list((candidate / 'trajectories').glob('*.png'))), 2)
+            self.assertTrue(actor.training)
+            for name, value in actor.state_dict().items():
+                self.assertTrue(torch.equal(value, actor_state[name]), name)
 
     def test_unindexed_cuda_request_uses_current_nonzero_device(self):
         scales = V2ObservationScales(
