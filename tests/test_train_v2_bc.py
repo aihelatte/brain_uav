@@ -122,6 +122,8 @@ class TestTrainV2BCScript(unittest.TestCase):
         self.assertEqual(args.model, 'ann')
         self.assertEqual(args.snn_time_window, 4)
         self.assertEqual(args.device, 'auto')
+        self.assertEqual(args.shard_cache_mb, 256.0)
+        self.assertFalse(args.deduplicate_identical_trajectories)
         with self.assertRaises(SystemExit):
             parser.parse_args([
                 '--trajectory-cluster', 'cluster',
@@ -136,6 +138,61 @@ class TestTrainV2BCScript(unittest.TestCase):
         ])
         self.assertEqual(snn_args.model, 'snn')
         self.assertEqual(snn_args.snn_time_window, 3)
+
+    def test_cache_and_deduplication_options_are_visible_in_metrics_and_split(self) -> None:
+        def fake_train(actor, cluster, split, config, *, epoch_callback=None):
+            state = {
+                name: value.detach().cpu().clone()
+                for name, value in actor.state_dict().items()
+            }
+            return V2BCTrainingResult(
+                train_loss_history=(0.25,),
+                validation_loss_history=(0.5,),
+                best_epoch=1,
+                best_validation_loss=0.5,
+                best_state_dict=state,
+                final_state_dict=state,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cluster_path = write_cluster(
+                root / 'cluster', zone_counts=(0, 1, 2, 0),
+                trajectories_per_scenario=2,
+            )
+            with mock.patch(
+                'brain_uav.scripts.train_v2_bc.train_v2_bc_actor',
+                side_effect=fake_train,
+            ):
+                metrics = train_v2_behavior_cloning(
+                    trajectory_cluster=cluster_path,
+                    output_dir=root / 'output',
+                    seed=7,
+                    validation_fraction=0.25,
+                    epochs=1,
+                    batch_size=128,
+                    learning_rate=1e-3,
+                    training_config=TrainingConfig(hidden_dim=8),
+                    device='cpu',
+                    shard_cache_mb=3.5,
+                    deduplicate_identical_trajectories=True,
+                )
+            split = json.loads(
+                (root / 'output' / 'split.json').read_text(encoding='utf-8')
+            )
+
+        self.assertEqual(metrics['batch_size'], 128)
+        self.assertEqual(metrics['shard_cache_mb'], 3.5)
+        self.assertTrue(metrics['deduplicate_identical_trajectories'])
+        provenance = metrics['dataset_provenance']
+        self.assertEqual(provenance['trajectory_count_before_deduplication'], 8)
+        self.assertEqual(provenance['trajectory_count_after_deduplication'], 4)
+        self.assertEqual(len(provenance['duplicate_trajectory_mappings']), 4)
+        removed = sum(
+            split[name]['deduplication']['removed_trajectory_count']
+            for name in ('train_statistics', 'validation_statistics')
+        )
+        self.assertEqual(removed, 4)
 
     def test_auto_device_is_resolved_before_training_and_recorded(self) -> None:
         captured_configs = []
@@ -282,6 +339,8 @@ class TestTrainV2BCScript(unittest.TestCase):
                 learning_rate=1e-3,
                 training_config=TrainingConfig(hidden_dim=8, bc_epochs=1, batch_size=2),
                 device='cpu',
+                shard_cache_mb=1.0,
+                deduplicate_identical_trajectories=True,
             )
             train_v2_behavior_cloning(output_dir=root / 'ann', model='ann', **common)
             train_v2_behavior_cloning(

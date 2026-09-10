@@ -150,6 +150,8 @@ def train_v2_behavior_cloning(
     training_config: TrainingConfig | None = None,
     model: str = 'ann',
     snn_time_window: int = 4,
+    shard_cache_mb: float = 256.0,
+    deduplicate_identical_trajectories: bool = False,
 ) -> dict[str, Any]:
     """Run independent V2 ANN or SNN BC and write strict artifacts."""
 
@@ -178,7 +180,20 @@ def train_v2_behavior_cloning(
         raise ValueError('snn_time_window must be a positive integer.')
     if model == 'snn':
         require_v2_spikingjelly()
-    cluster = load_v2_bc_trajectory_cluster(trajectory_cluster)
+    print(json.dumps({
+        'event': 'v2_bc_start',
+        'model': model,
+        'batch_size': run_config.batch_size,
+        'shard_cache_mb': shard_cache_mb,
+        'deduplicate_identical_trajectories': deduplicate_identical_trajectories,
+        'requested_device': requested_device,
+        'resolved_device': resolved_device,
+    }, allow_nan=False, ensure_ascii=False), flush=True)
+    cluster = load_v2_bc_trajectory_cluster(
+        trajectory_cluster,
+        shard_cache_mb=shard_cache_mb,
+        deduplicate_identical_trajectories=deduplicate_identical_trajectories,
+    )
     split = split_v2_bc_scenarios(
         cluster,
         validation_fraction=run_config.validation_fraction,
@@ -255,6 +270,22 @@ def train_v2_behavior_cloning(
             'validation_fraction': run_config.validation_fraction,
             'requested_device': requested_device,
             'resolved_device': resolved_device,
+            'shard_cache_mb': float(shard_cache_mb),
+            'deduplicate_identical_trajectories': (
+                deduplicate_identical_trajectories
+            ),
+            'dataset_provenance': {
+                'trajectory_cluster': str(cluster.root),
+                'trajectory_count_before_deduplication': (
+                    cluster.source_trajectory_count
+                ),
+                'trajectory_count_after_deduplication': cluster.trajectory_count,
+                'step_count_before_deduplication': cluster.source_step_count,
+                'step_count_after_deduplication': cluster.step_count,
+                'duplicate_trajectory_mappings': list(
+                    cluster.duplicate_trajectory_mappings
+                ),
+            },
             'train_loss_history': list(result.train_loss_history),
             'validation_loss_history': list(result.validation_loss_history),
             'best_epoch': result.best_epoch,
@@ -295,6 +326,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--model', choices=('ann', 'snn'), default='ann')
     parser.add_argument('--snn-time-window', type=int, default=4)
+    parser.add_argument('--shard-cache-mb', type=float, default=256.0)
+    parser.add_argument(
+        '--deduplicate-identical-trajectories',
+        action='store_true',
+    )
     return parser
 
 
@@ -311,6 +347,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         device=args.device,
         model=args.model,
         snn_time_window=args.snn_time_window,
+        shard_cache_mb=args.shard_cache_mb,
+        deduplicate_identical_trajectories=(
+            args.deduplicate_identical_trajectories
+        ),
     )
     print(json.dumps({
         'output_dir': str(args.output_dir),

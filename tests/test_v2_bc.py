@@ -37,7 +37,9 @@ from brain_uav.scripts.v2_trajectory_io import (
     load_v2_trajectory_shard,
 )
 from brain_uav.trainers.v2_bc import (
+    V2ShardArrayCache,
     ValidationBestTracker,
+    assemble_v2_bc_batch,
     iter_v2_bc_batches,
     load_v2_bc_trajectory_cluster,
     restore_v2_observation,
@@ -216,6 +218,196 @@ def rewrite_shard(path: Path, mutator) -> None:
 
 
 class TestV2BCClusterLoading(unittest.TestCase):
+    def test_exact_same_scenario_expert_trajectories_are_optionally_deduplicated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = write_cluster(
+                Path(directory), zone_counts=(0, 1, 2, 0),
+                trajectories_per_scenario=2, shard_scenario_count=2,
+            )
+            original = load_v2_bc_trajectory_cluster(root)
+            deduplicated = load_v2_bc_trajectory_cluster(
+                root,
+                deduplicate_identical_trajectories=True,
+                shard_cache_mb=16,
+            )
+            split = split_v2_bc_scenarios(
+                deduplicated, validation_fraction=0.25, seed=11
+            )
+            original_split = split_v2_bc_scenarios(
+                original, validation_fraction=0.25, seed=11
+            )
+            effective_batches = list(iter_v2_bc_batches(
+                deduplicated,
+                deduplicated.scenario_ids,
+                batch_size=3,
+                shuffle=False,
+                rng=None,
+            ))
+
+        self.assertEqual(original.trajectory_count, 8)
+        self.assertEqual(deduplicated.source_trajectory_count, 8)
+        self.assertEqual(deduplicated.trajectory_count, 4)
+        self.assertEqual(
+            deduplicated.scenario_ids,
+            original.scenario_ids,
+        )
+        self.assertEqual(
+            split.train_scenario_ids,
+            original_split.train_scenario_ids,
+        )
+        self.assertEqual(
+            split.validation_scenario_ids,
+            original_split.validation_scenario_ids,
+        )
+        self.assertEqual(len(deduplicated.duplicate_trajectory_mappings), 4)
+        self.assertEqual(
+            sum(batch.batch_size for batch, _ in effective_batches),
+            deduplicated.step_count,
+        )
+        self.assertTrue(all(
+            record.planner_name == 'v2_heuristic'
+            for record in deduplicated.trajectories
+        ))
+        combined = (
+            split.train_statistics['deduplication']['removed_trajectory_count']
+            + split.validation_statistics['deduplication']['removed_trajectory_count']
+        )
+        self.assertEqual(combined, 4)
+
+    def test_one_different_field_keeps_both_experts_and_never_deduplicates_across_scenarios(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = write_cluster(
+                Path(directory), zone_counts=(0, 0),
+                trajectories_per_scenario=2, shard_scenario_count=2,
+            )
+            rewrite_shard(
+                root / 'shard_0001.npz',
+                lambda arrays: arrays['actions'].__setitem__(
+                    (int(arrays['trajectory_offsets'][1]), 0), np.float32(0.011)
+                ),
+            )
+            cluster = load_v2_bc_trajectory_cluster(
+                root, deduplicate_identical_trajectories=True
+            )
+
+            cross_root = Path(directory) / 'cross'
+            write_cluster(
+                cross_root, zone_counts=(0, 0),
+                trajectories_per_scenario=1, shard_scenario_count=2,
+            )
+            cross = load_v2_bc_trajectory_cluster(
+                cross_root, deduplicate_identical_trajectories=True
+            )
+
+        self.assertEqual(cluster.source_trajectory_count, 4)
+        self.assertEqual(cluster.trajectory_count, 3)
+        first_scenario = cluster.scenario_ids[0]
+        self.assertEqual(
+            sum(record.scenario_id == first_scenario for record in cluster.trajectories),
+            2,
+        )
+        self.assertEqual(cross.source_trajectory_count, 2)
+        self.assertEqual(cross.trajectory_count, 2)
+        self.assertEqual(cross.duplicate_trajectory_mappings, ())
+
+    def test_shard_cache_hits_respects_budget_and_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = write_cluster(
+                Path(directory), zone_counts=(0, 1, 2, 0), shard_scenario_count=2
+            )
+            paths = (root / 'shard_0001.npz', root / 'shard_0002.npz')
+            loaded = [load_v2_trajectory_shard(path) for path in paths]
+            sizes = [sum(array.nbytes for array in arrays.values()) for arrays in loaded]
+
+            with mock.patch(
+                'brain_uav.trainers.v2_bc.load_v2_trajectory_shard',
+                wraps=load_v2_trajectory_shard,
+            ) as loader:
+                cache = V2ShardArrayCache(max_bytes=max(sizes))
+                first = cache.load(paths[0])
+                again = cache.load(paths[0])
+                self.assertIs(first, again)
+                self.assertEqual(loader.call_count, 1)
+                cache.load(paths[1])
+                self.assertLessEqual(cache.cached_bytes, cache.max_bytes)
+                self.assertEqual(cache.entry_count, 1)
+
+            with mock.patch(
+                'brain_uav.trainers.v2_bc.load_v2_trajectory_shard',
+                wraps=load_v2_trajectory_shard,
+            ) as loader:
+                disabled = V2ShardArrayCache(max_bytes=0)
+                first = disabled.load(paths[0])
+                second = disabled.load(paths[0])
+                self.assertEqual(loader.call_count, 2)
+                self.assertEqual(disabled.entry_count, 0)
+                for name in first:
+                    np.testing.assert_array_equal(first[name], second[name])
+
+    def test_validated_cache_is_shared_by_index_training_and_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = write_cluster(
+                Path(directory), zone_counts=(0, 1, 2, 0), shard_scenario_count=2
+            )
+            with mock.patch(
+                'brain_uav.trainers.v2_bc.load_v2_trajectory_shard',
+                wraps=load_v2_trajectory_shard,
+            ) as loader:
+                cluster = load_v2_bc_trajectory_cluster(root, shard_cache_mb=16)
+                initial_loads = loader.call_count
+                split = split_v2_bc_scenarios(
+                    cluster, validation_fraction=0.25, seed=3
+                )
+                list(iter_v2_bc_batches(
+                    cluster, split.train_scenario_ids, batch_size=2,
+                    shuffle=False, rng=None,
+                ))
+                list(iter_v2_bc_batches(
+                    cluster, split.validation_scenario_ids, batch_size=2,
+                    shuffle=False, rng=None,
+                ))
+        self.assertEqual(initial_loads, len(cluster.shards))
+        self.assertEqual(loader.call_count, initial_loads)
+
+    def test_direct_batch_assembly_matches_observation_collator_exactly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = write_cluster(
+                Path(directory), zone_counts=(0, 1, 2),
+                trajectories_per_scenario=1, shard_scenario_count=3,
+            )
+            arrays = load_v2_trajectory_shard(root / 'shard_0001.npz')
+            indices = np.arange(arrays['ego_features'].shape[0], dtype=np.int64)
+            reference = collate_v2_observations([
+                restore_v2_observation(arrays, int(index)) for index in indices
+            ])
+            actual, actions = assemble_v2_bc_batch(arrays, indices, device='cpu')
+
+        self.assertTrue(torch.equal(actual.ego_features, reference.ego_features))
+        self.assertTrue(torch.equal(actual.goal_features, reference.goal_features))
+        self.assertTrue(torch.equal(actual.zone_features, reference.zone_features))
+        self.assertTrue(torch.equal(actual.presence_mask, reference.presence_mask))
+        self.assertTrue(torch.equal(actions, torch.from_numpy(arrays['actions'][indices])))
+
+    def test_direct_batch_assembly_supports_large_batches_and_ten_zones(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'ten_zones.npz'
+            buffer = V2TrajectoryShardBuffer()
+            buffer.add(make_trajectory(
+                'trajectory-ten', 'scenario-ten', 'v2_heuristic', 9, 10, 1
+            ))
+            buffer.flush(path)
+            arrays = load_v2_trajectory_shard(path)
+            for batch_size in (128, 256, 512):
+                with self.subTest(batch_size=batch_size):
+                    indices = np.zeros(batch_size, dtype=np.int64)
+                    batch, actions = assemble_v2_bc_batch(
+                        arrays, indices, device='cpu'
+                    )
+                    self.assertEqual(batch.zone_features.shape, (batch_size, 10, 19))
+                    self.assertEqual(batch.presence_mask.shape, (batch_size, 10))
+                    self.assertTrue(batch.presence_mask.all())
+                    self.assertEqual(actions.shape, (batch_size, 2))
+
     def test_ragged_steps_restore_zero_one_and_two_zones(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cluster = load_v2_bc_trajectory_cluster(write_cluster(Path(directory), zone_counts=(0, 1, 2)))
@@ -250,7 +442,7 @@ class TestV2BCClusterLoading(unittest.TestCase):
             torch.zeros_like(observations.zone_features[~observations.presence_mask]),
         ))
 
-    def test_stream_collates_on_cpu_before_moving_whole_batch(self) -> None:
+    def test_stream_assembles_on_cpu_before_moving_whole_batch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             cluster = load_v2_bc_trajectory_cluster(write_cluster(
                 Path(directory), zone_counts=(0, 1, 2),
@@ -269,10 +461,7 @@ class TestV2BCClusterLoading(unittest.TestCase):
                 ))
                 return original_to(batch, device)
 
-            with mock.patch(
-                'brain_uav.trainers.v2_bc.collate_v2_observations',
-                wraps=collate_v2_observations,
-            ) as collator, mock.patch.object(
+            with mock.patch.object(
                 V2ObservationBatch,
                 'to',
                 autospec=True,
@@ -288,8 +477,6 @@ class TestV2BCClusterLoading(unittest.TestCase):
                 ))
 
         self.assertEqual(len(batches), 1)
-        self.assertEqual(collator.call_count, 1)
-        self.assertNotIn('device', collator.call_args.kwargs)
         self.assertEqual(
             transfer_sources,
             [('cpu', 'cpu', 'cpu', 'cpu', 'cpu')],

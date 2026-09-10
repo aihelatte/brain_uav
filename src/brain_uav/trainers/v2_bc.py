@@ -2,11 +2,12 @@
 
 This module is independent from the legacy flat-observation BC path.  It
 validates one trajectory shard at a time, retains only trajectory-level index
-metadata, and reopens each shard once when streaming an epoch.
+metadata, and optionally reuses strictly loaded arrays through a bounded LRU.
 """
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -30,7 +31,6 @@ from brain_uav.observations import (
     V2Observation,
     V2ObservationBatch,
     V2ObservationScales,
-    collate_v2_observations,
 )
 from brain_uav.scripts.generate_v2_trajectory_clusters import (
     V2_TRAJECTORY_CLUSTER_FORMAT,
@@ -154,6 +154,46 @@ def _scenario_config_from_snapshot(value: Any) -> ScenarioConfig:
     return scenario
 
 
+class V2ShardArrayCache:
+    """Process-local LRU of strictly loaded shard arrays, bounded by nbytes."""
+
+    def __init__(self, *, max_bytes: int) -> None:
+        if type(max_bytes) is not int or max_bytes < 0:
+            raise ValueError('max_bytes must be a non-negative integer.')
+        self.max_bytes = max_bytes
+        self._cached_bytes = 0
+        self._entries: OrderedDict[
+            Path, tuple[dict[str, np.ndarray], int]
+        ] = OrderedDict()
+
+    @property
+    def cached_bytes(self) -> int:
+        return self._cached_bytes
+
+    @property
+    def entry_count(self) -> int:
+        return len(self._entries)
+
+    def load(self, path: str | Path) -> dict[str, np.ndarray]:
+        key = Path(path).resolve()
+        cached = self._entries.get(key)
+        if cached is not None:
+            self._entries.move_to_end(key)
+            return cached[0]
+        arrays = load_v2_trajectory_shard(key)
+        for array in arrays.values():
+            array.setflags(write=False)
+        size = sum(array.nbytes for array in arrays.values())
+        if self.max_bytes == 0 or size > self.max_bytes:
+            return arrays
+        while self._entries and self._cached_bytes + size > self.max_bytes:
+            _, (_, removed_size) = self._entries.popitem(last=False)
+            self._cached_bytes -= removed_size
+        self._entries[key] = (arrays, size)
+        self._cached_bytes += size
+        return arrays
+
+
 @dataclass(frozen=True, slots=True)
 class V2BCShardRecord:
     """Validated summary of one shard kept without its step arrays."""
@@ -193,20 +233,113 @@ class V2BCTrajectoryCluster:
     scenario_config: ScenarioConfig
     uav_collision_radius: float
     shards: tuple[V2BCShardRecord, ...]
+    source_trajectories: tuple[V2BCTrajectoryRecord, ...]
     trajectories: tuple[V2BCTrajectoryRecord, ...]
     scenario_ids: tuple[str, ...]
+    deduplicate_identical_trajectories: bool
+    duplicate_trajectory_mappings: tuple[dict[str, str], ...]
+    shard_cache: V2ShardArrayCache
 
     @property
     def trajectory_count(self) -> int:
         return len(self.trajectories)
 
     @property
+    def source_trajectory_count(self) -> int:
+        return len(self.source_trajectories)
+
+    @property
     def step_count(self) -> int:
         return sum(record.step_count for record in self.trajectories)
 
     @property
+    def source_step_count(self) -> int:
+        return sum(record.step_count for record in self.source_trajectories)
+
+    @property
     def zone_token_count(self) -> int:
         return sum(shard.zone_token_count for shard in self.shards)
+
+
+def _trajectory_arrays_equal(
+    first: V2BCTrajectoryRecord,
+    second: V2BCTrajectoryRecord,
+    cache: V2ShardArrayCache,
+    shards: Sequence[V2BCShardRecord],
+) -> bool:
+    if first.scenario_id != second.scenario_id or first.step_count != second.step_count:
+        return False
+    first_arrays = cache.load(shards[first.shard_index].path)
+    second_arrays = (
+        first_arrays
+        if first.shard_index == second.shard_index
+        else cache.load(shards[second.shard_index].path)
+    )
+    first_slice = slice(first.step_start, first.step_end)
+    second_slice = slice(second.step_start, second.step_end)
+    for name in ('ego_features', 'goal_features', 'actions', 'states_before_action'):
+        if not np.array_equal(first_arrays[name][first_slice], second_arrays[name][second_slice]):
+            return False
+    for name in ('terminal_states', 'outcomes', 'step_counts', 'scenario_seeds'):
+        if not np.array_equal(
+            first_arrays[name][first.trajectory_index],
+            second_arrays[name][second.trajectory_index],
+        ):
+            return False
+    first_offsets = first_arrays['zone_offsets'][first.step_start : first.step_end + 1]
+    second_offsets = second_arrays['zone_offsets'][second.step_start : second.step_end + 1]
+    first_relative = first_offsets - first_offsets[0]
+    second_relative = second_offsets - second_offsets[0]
+    if not np.array_equal(first_relative, second_relative):
+        return False
+    first_zones = first_arrays['zone_features'][int(first_offsets[0]) : int(first_offsets[-1])]
+    second_zones = second_arrays['zone_features'][int(second_offsets[0]) : int(second_offsets[-1])]
+    return np.array_equal(first_zones, second_zones)
+
+
+def _deduplicate_expert_trajectories(
+    records: Sequence[V2BCTrajectoryRecord],
+    cache: V2ShardArrayCache,
+    shards: Sequence[V2BCShardRecord],
+) -> tuple[tuple[V2BCTrajectoryRecord, ...], tuple[dict[str, str], ...]]:
+    by_scenario: dict[str, list[V2BCTrajectoryRecord]] = {}
+    for record in records:
+        by_scenario.setdefault(record.scenario_id, []).append(record)
+    removed: set[str] = set()
+    mappings: list[dict[str, str]] = []
+    for scenario_id in sorted(by_scenario):
+        scenario_records = by_scenario[scenario_id]
+        heuristics = [
+            record for record in scenario_records
+            if record.planner_name == 'v2_heuristic'
+        ]
+        apf_records = [
+            record for record in scenario_records
+            if record.planner_name == 'v2_apf'
+        ]
+        for apf_record in apf_records:
+            identical = next(
+                (
+                    heuristic
+                    for heuristic in heuristics
+                    if _trajectory_arrays_equal(heuristic, apf_record, cache, shards)
+                ),
+                None,
+            )
+            if identical is None:
+                continue
+            removed.add(apf_record.trajectory_id)
+            mappings.append({
+                'scenario_id': scenario_id,
+                'kept_trajectory_id': identical.trajectory_id,
+                'kept_planner_name': identical.planner_name,
+                'removed_trajectory_id': apf_record.trajectory_id,
+                'removed_planner_name': apf_record.planner_name,
+            })
+    effective = tuple(
+        record for record in records if record.trajectory_id not in removed
+    )
+    return effective, tuple(mappings)
 
 
 def _validate_manifest(manifest: dict[str, Any]) -> None:
@@ -235,8 +368,19 @@ def _validate_manifest(manifest: dict[str, Any]) -> None:
         raise ValueError('manifest successful_trajectories must be greater than zero.')
 
 
-def load_v2_bc_trajectory_cluster(path: str | Path) -> V2BCTrajectoryCluster:
+def load_v2_bc_trajectory_cluster(
+    path: str | Path,
+    *,
+    shard_cache_mb: float = 0.0,
+    deduplicate_identical_trajectories: bool = False,
+) -> V2BCTrajectoryCluster:
     """Strictly validate a complete cluster while holding one shard at a time."""
+
+    cache_megabytes = _nonnegative_float(shard_cache_mb, name='shard_cache_mb')
+    if type(deduplicate_identical_trajectories) is not bool:
+        raise TypeError('deduplicate_identical_trajectories must be a bool.')
+    cache_bytes = int(cache_megabytes * 1024 * 1024)
+    cache = V2ShardArrayCache(max_bytes=cache_bytes)
 
     root = Path(path)
     if not root.is_dir():
@@ -306,7 +450,7 @@ def load_v2_bc_trajectory_cluster(path: str | Path) -> V2BCTrajectoryCluster:
         if start_sequence > end_sequence or end_sequence >= manifest['requested_scenarios']:
             raise ValueError(f'manifest shard {shard_index} has invalid scenario bounds.')
 
-        arrays = load_v2_trajectory_shard(shard_path)
+        arrays = cache.load(shard_path)
         actual_summary = (
             int(arrays['trajectory_ids'].shape[0]),
             int(arrays['ego_features'].shape[0]),
@@ -372,7 +516,17 @@ def load_v2_bc_trajectory_cluster(path: str | Path) -> V2BCTrajectoryCluster:
         raise ValueError('manifest successful_trajectories does not match shard totals.')
     if not trajectory_records:
         raise ValueError('V2 BC trajectory cluster contains no successful data.')
-    effective_scenarios = tuple(sorted({record.scenario_id for record in trajectory_records}))
+    source_records = tuple(trajectory_records)
+    if deduplicate_identical_trajectories:
+        effective_records, duplicate_mappings = _deduplicate_expert_trajectories(
+            source_records,
+            cache,
+            shard_records,
+        )
+    else:
+        effective_records = source_records
+        duplicate_mappings = ()
+    effective_scenarios = tuple(sorted({record.scenario_id for record in effective_records}))
     return V2BCTrajectoryCluster(
         root=root,
         manifest=manifest,
@@ -380,8 +534,12 @@ def load_v2_bc_trajectory_cluster(path: str | Path) -> V2BCTrajectoryCluster:
         scenario_config=scenario_config,
         uav_collision_radius=collision_radius,
         shards=tuple(shard_records),
-        trajectories=tuple(trajectory_records),
+        source_trajectories=source_records,
+        trajectories=effective_records,
         scenario_ids=effective_scenarios,
+        deduplicate_identical_trajectories=deduplicate_identical_trajectories,
+        duplicate_trajectory_mappings=duplicate_mappings,
+        shard_cache=cache,
     )
 
 
@@ -415,10 +573,16 @@ def restore_v2_observation(
 def _selected_step_indices(
     arrays: Mapping[str, np.ndarray],
     scenario_ids: set[str],
+    trajectory_indices: set[int] | None = None,
 ) -> np.ndarray:
     selected: list[np.ndarray] = []
     offsets = arrays['trajectory_offsets']
     for trajectory_index, raw_scenario_id in enumerate(arrays['scenario_ids']):
+        if (
+            trajectory_indices is not None
+            and trajectory_index not in trajectory_indices
+        ):
+            continue
         if str(raw_scenario_id) not in scenario_ids:
             continue
         start = int(offsets[trajectory_index])
@@ -427,6 +591,67 @@ def _selected_step_indices(
     if not selected:
         return np.empty((0,), dtype=np.int64)
     return np.concatenate(selected)
+
+
+def assemble_v2_bc_batch(
+    arrays: Mapping[str, np.ndarray],
+    step_indices: np.ndarray,
+    *,
+    device: torch.device | str = 'cpu',
+) -> tuple[V2ObservationBatch, torch.Tensor]:
+    """Assemble one validated shard slice on CPU, then transfer whole tensors."""
+
+    if not isinstance(arrays, Mapping):
+        raise TypeError('arrays must be a validated shard mapping.')
+    required = (
+        'ego_features',
+        'goal_features',
+        'zone_features',
+        'zone_offsets',
+        'actions',
+    )
+    if any(name not in arrays for name in required):
+        raise ValueError('arrays is missing V2 BC batch data.')
+    indices = np.asarray(step_indices)
+    if indices.ndim != 1 or indices.size == 0 or indices.dtype.kind not in 'iu':
+        raise ValueError('step_indices must be a non-empty integer vector.')
+    indices = indices.astype(np.int64, copy=False)
+    total_steps = int(arrays['ego_features'].shape[0])
+    if np.any(indices < 0) or np.any(indices >= total_steps):
+        raise IndexError('step_indices contains an out-of-range step.')
+    starts = arrays['zone_offsets'][indices].astype(np.int64, copy=False)
+    ends = arrays['zone_offsets'][indices + 1].astype(np.int64, copy=False)
+    counts = ends - starts
+    max_zone_count = int(counts.max(initial=0))
+    batch_size = int(indices.size)
+    zone_rows = np.zeros(
+        (batch_size, max_zone_count, ZONE_FEATURE_DIM), dtype=np.float32
+    )
+    for row, (zone_start, zone_end) in enumerate(zip(starts, ends)):
+        zone_count = int(zone_end - zone_start)
+        if zone_count:
+            zone_rows[row, :zone_count] = arrays['zone_features'][zone_start:zone_end]
+    presence_mask = (
+        np.arange(max_zone_count, dtype=np.int64)[None, :] < counts[:, None]
+    )
+    cpu_batch = V2ObservationBatch(
+        ego_features=torch.from_numpy(
+            np.ascontiguousarray(arrays['ego_features'][indices], dtype=np.float32)
+        ),
+        goal_features=torch.from_numpy(
+            np.ascontiguousarray(arrays['goal_features'][indices], dtype=np.float32)
+        ),
+        zone_features=torch.from_numpy(zone_rows),
+        presence_mask=torch.from_numpy(presence_mask),
+    )
+    actions = torch.from_numpy(
+        np.ascontiguousarray(arrays['actions'][indices], dtype=np.float32)
+    )
+    target_device = torch.device(device)
+    return (
+        cpu_batch.to(target_device),
+        actions.to(device=target_device, dtype=torch.float32),
+    )
 
 
 def iter_v2_bc_batches(
@@ -438,10 +663,11 @@ def iter_v2_bc_batches(
     rng: np.random.Generator | None,
     device: torch.device | str = 'cpu',
 ) -> Iterator[tuple[V2ObservationBatch, torch.Tensor]]:
-    """Stream batches while opening each selected shard exactly once per call.
+    """Stream batches from validated shard arrays.
 
     This intentionally uses no DataLoader workers.  Padding is performed only
-    for each yielded batch by the existing V2 observation collator.
+    to the largest real zone count in each yielded batch.  A cluster-level
+    bounded cache may reuse the same strict shard load across epochs and splits.
     """
 
     if not isinstance(cluster, V2BCTrajectoryCluster):
@@ -469,26 +695,29 @@ def iter_v2_bc_batches(
     )
     selected_set = set(selected_ids)
     for shard_index in shard_order:
-        arrays = load_v2_trajectory_shard(cluster.shards[shard_index].path)
-        step_indices = _selected_step_indices(arrays, selected_set)
+        arrays = cluster.shard_cache.load(cluster.shards[shard_index].path)
+        selected_trajectory_indices = {
+            record.trajectory_index
+            for record in cluster.trajectories
+            if record.shard_index == shard_index
+            and record.scenario_id in selected_set
+        }
+        step_indices = _selected_step_indices(
+            arrays,
+            selected_set,
+            selected_trajectory_indices,
+        )
         if shuffle and step_indices.size:
             step_indices = step_indices[rng.permutation(step_indices.size)]
         for start in range(0, int(step_indices.size), size):
             batch_indices = step_indices[start : start + size]
-            observations = [
-                restore_v2_observation(arrays, int(step_index))
-                for step_index in batch_indices
-            ]
-            if not observations:
+            if not batch_indices.size:
                 continue
-            observation_batch = collate_v2_observations(
-                observations,
+            observation_batch, actions = assemble_v2_bc_batch(
+                arrays,
+                batch_indices,
+                device=target_device,
             )
-            actions = torch.from_numpy(
-                arrays['actions'][batch_indices].copy()
-            )
-            observation_batch = observation_batch.to(target_device)
-            actions = actions.to(device=target_device, dtype=torch.float32)
             yield observation_batch, actions
         del arrays
 
@@ -499,6 +728,15 @@ def _split_statistics(
 ) -> dict[str, Any]:
     selected = set(scenario_ids)
     records = [record for record in cluster.trajectories if record.scenario_id in selected]
+    source_records = [
+        record for record in cluster.source_trajectories
+        if record.scenario_id in selected
+    ]
+    mappings = [
+        _strict_json_copy(mapping)
+        for mapping in cluster.duplicate_trajectory_mappings
+        if mapping['scenario_id'] in selected
+    ]
     planners = {
         name: {'trajectory_count': 0, 'step_count': 0}
         for name in V2_BC_PLANNER_NAMES
@@ -517,6 +755,15 @@ def _split_statistics(
         'step_count': sum(record.step_count for record in records),
         'planners': planners,
         'zone_count_steps': zone_count_steps,
+        'deduplication': {
+            'enabled': cluster.deduplicate_identical_trajectories,
+            'trajectory_count_before': len(source_records),
+            'trajectory_count_after': len(records),
+            'step_count_before': sum(record.step_count for record in source_records),
+            'step_count_after': sum(record.step_count for record in records),
+            'removed_trajectory_count': len(source_records) - len(records),
+            'duplicate_trajectory_mappings': mappings,
+        },
     }
 
 
@@ -1418,7 +1665,9 @@ __all__ = [
     'V2BCTrainingResult',
     'V2BCTrajectoryCluster',
     'V2BCTrajectoryRecord',
+    'V2ShardArrayCache',
     'ValidationBestTracker',
+    'assemble_v2_bc_batch',
     'build_v2_bc_checkpoint_payload',
     'build_v2_snn_bc_checkpoint_payload',
     'iter_v2_bc_batches',
