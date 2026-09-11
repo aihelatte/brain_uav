@@ -18,7 +18,9 @@ from brain_uav.scripts.profile_v2_td3 import (
     UPDATE_TIMING_SECTION_NAMES,
     _UpdateTimingSummary,
     _DetailedUpdateProfiler,
+    _compare_compiled_numeric_tensors,
     _prepare_diagnostic_pools,
+    _run_compiled_numerics_check,
     _run_diagnostic_level,
     build_parser,
     run_v2_td3_timing_diagnostic,
@@ -44,6 +46,7 @@ class TestProfileV2TD3(unittest.TestCase):
                         device='cpu', suppress_measured_actor=False,
                         detailed_profiler_updates=0, profiler_output_dir=None,
                         compile_critic_encoder=False,
+                        compile_target_encoders=False,
                         dynamo_graph_counts=(10, 10)):
         # Real environment and replay; only network work and CUDA are test doubles.
         scenario = make_scenario_config()
@@ -64,6 +67,8 @@ class TestProfileV2TD3(unittest.TestCase):
         submitted = []
         compile_calls = []
         compile_warmup_shapes = []
+        target_compile_calls = []
+        target_warmup_shapes = []
 
         def select_action(observation, **kwargs):
             submitted.append(observation)
@@ -105,6 +110,20 @@ class TestProfileV2TD3(unittest.TestCase):
                 for batch in batches
             )
         )
+        engine.enable_target_encoder_compile = lambda **kwargs: (
+            target_compile_calls.append(kwargs)
+            or (
+                'actor_target.zone_set_encoder',
+                'critic1_target.zone_set_encoder',
+                'critic2_target.zone_set_encoder',
+            )
+        )
+        engine.warmup_target_encoder_compile = lambda batches: (
+            target_warmup_shapes.extend(
+                (batch.batch_size, int(batch.zone_features.shape[1]))
+                for batch in batches
+            )
+        )
         synchronization_points = []
         event = mock.Mock()
         event.elapsed_time.return_value = 1.0
@@ -136,6 +155,7 @@ class TestProfileV2TD3(unittest.TestCase):
                 detailed_profiler_updates=detailed_profiler_updates,
                 profiler_output_dir=profiler_output_dir,
                 compile_critic_encoder=compile_critic_encoder,
+                compile_target_encoders=compile_target_encoders,
             )
         return result, replay, synchronization_points
 
@@ -354,6 +374,8 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertEqual(args.snn_time_window, 4)
         self.assertEqual(args.detailed_profiler_updates, 0)
         self.assertFalse(args.compile_critic_encoder)
+        self.assertFalse(args.compile_target_encoders)
+        self.assertFalse(args.check_compiled_numerics)
         enabled = build_parser().parse_args([
             '--model', 'ann', '--bc-checkpoint', 'bc.pt',
             '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
@@ -366,6 +388,14 @@ class TestProfileV2TD3(unittest.TestCase):
             '--compile-critic-encoder',
         ])
         self.assertTrue(compiled.compile_critic_encoder)
+        extended = build_parser().parse_args([
+            '--model', 'ann', '--bc-checkpoint', 'bc.pt',
+            '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
+            '--compile-critic-encoder', '--compile-target-encoders',
+            '--check-compiled-numerics',
+        ])
+        self.assertTrue(extended.compile_target_encoders)
+        self.assertTrue(extended.check_compiled_numerics)
 
     def test_compiled_critic_encoder_reports_separate_warmup_and_stable_timing(self) -> None:
         result, replay, _ = self.run_small_level(
@@ -411,6 +441,151 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertIsNone(
             result['timing']['throughput_environment_steps_per_second']
         )
+
+    def test_target_encoder_compile_extends_objects_and_reuses_warmup_shapes(self) -> None:
+        result, replay, _ = self.run_small_level(
+            warmup=0,
+            steps=5,
+            compile_critic_encoder=True,
+            compile_target_encoders=True,
+        )
+        compile_info = result['critic_encoder_compile']
+
+        self.assertEqual(compile_info['enabled_objects'], [
+            'critic1.zone_set_encoder',
+            'critic2.zone_set_encoder',
+            'actor_target.zone_set_encoder',
+            'critic1_target.zone_set_encoder',
+            'critic2_target.zone_set_encoder',
+        ])
+        self.assertTrue(compile_info['target_encoders_requested'])
+        self.assertEqual(
+            {tuple(shape) for shape in compile_info['target_warmup_batch_shapes']},
+            {(4, 0), (4, 1), (4, 2)},
+        )
+        self.assertEqual(compile_info['target_registration_wall_seconds'], 0.0)
+        self.assertEqual(compile_info['target_warmup_wall_seconds'], 0.0)
+        self.assertEqual(len(replay), result['warmup_steps'] + result['measured_steps'])
+
+    def test_compiled_numeric_comparison_accepts_tolerance_and_rejects_mismatch(self) -> None:
+        reference = {
+            'critic_loss': torch.tensor(1.0),
+            'critic1.weight': torch.tensor([1.0, -2.0]),
+        }
+        close = {
+            'critic_loss': torch.tensor(1.0 + 1e-6),
+            'critic1.weight': torch.tensor([1.0, -2.0 + 1e-6]),
+        }
+        result = _compare_compiled_numeric_tensors(
+            reference,
+            close,
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        self.assertEqual(result['tensor_count'], 2)
+        self.assertLessEqual(result['maximum_absolute_error'], 1e-5)
+        self.assertEqual(result['rtol'], 1e-4)
+        self.assertEqual(result['atol'], 1e-5)
+
+        mismatched = dict(close)
+        mismatched['critic1.weight'] = torch.tensor([1.0, -1.9])
+        with self.assertRaisesRegex(AssertionError, 'critic1.weight'):
+            _compare_compiled_numeric_tensors(
+                reference,
+                mismatched,
+                rtol=1e-4,
+                atol=1e-5,
+            )
+
+    def test_compiled_numeric_check_runs_isolated_fixed_updates(self) -> None:
+        fixture = v2_td3_tests.TestV2TD3()
+        fixture.setUp()
+        reference = fixture.make_engine(
+            policy_delay=2,
+            bc_reference_actor=fixture.make_bc_reference(0.01),
+        )
+        compiled = fixture.make_engine(
+            policy_delay=2,
+            bc_reference_actor=fixture.make_bc_reference(0.01),
+        )
+        batch = v2_td3_tests.collate_v2_observations([
+            v2_td3_tests._observation(0, scales=fixture.scales),
+            v2_td3_tests._observation(7, scales=fixture.scales),
+        ])
+        torch.manual_seed(1357)
+        np.random.seed(2468)
+        torch_rng_before = torch.random.get_rng_state().clone()
+        numpy_rng_before = np.random.get_state()
+
+        with mock.patch(
+            'brain_uav.scripts.profile_v2_td3.build_v2_stage_engine',
+            side_effect=(
+                SimpleNamespace(engine=reference),
+                SimpleNamespace(engine=compiled),
+            ),
+        ), mock.patch(
+            'brain_uav.scripts.profile_v2_td3._compile_warmup_batches',
+            return_value=(batch,),
+        ), mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            result = _run_compiled_numerics_check(
+                pool=SimpleNamespace(),
+                prepared=SimpleNamespace(),
+                formal_config=V2FormalTrainingConfig(
+                    stage='easy',
+                    replay_capacity=32,
+                    batch_size=2,
+                    actor_freeze_steps=0,
+                ),
+                bc_checkpoint=Path('unused.pt'),
+                device=torch.device('cpu'),
+                snn_time_window=4,
+            )
+
+        self.assertTrue(result['passed'])
+        self.assertEqual(tuple(result['updates']), (
+            'critic_only', 'actor_and_target_updated',
+        ))
+        self.assertFalse(compiled.actor.zone_set_encoder.compiled_tensor_forward_enabled)
+        self.assertTrue(
+            compiled.actor_target.zone_set_encoder.compiled_tensor_forward_enabled
+        )
+        self.assertEqual(reference.update_count, 2)
+        self.assertEqual(compiled.update_count, 2)
+        torch.testing.assert_close(torch.random.get_rng_state(), torch_rng_before)
+        numpy_rng_after = np.random.get_state()
+        self.assertEqual(numpy_rng_after[0], numpy_rng_before[0])
+        np.testing.assert_array_equal(numpy_rng_after[1], numpy_rng_before[1])
+        self.assertEqual(numpy_rng_after[2:], numpy_rng_before[2:])
+
+    def test_compile_extension_rejects_unsupported_flag_combinations(self) -> None:
+        common = {
+            'model': 'ann',
+            'bc_checkpoint': Path('missing.pt'),
+            'output_dir': Path('unused-output'),
+            'scenario_pool_dir': Path('missing-pools'),
+            'device': 'cpu',
+        }
+        with self.assertRaisesRegex(ValueError, 'requires compile_critic_encoder'):
+            run_v2_td3_timing_diagnostic(
+                **common,
+                compile_target_encoders=True,
+            )
+        with self.assertRaisesRegex(ValueError, 'requires compile_target_encoders'):
+            run_v2_td3_timing_diagnostic(
+                **common,
+                compile_critic_encoder=True,
+                check_compiled_numerics=True,
+            )
+        with self.assertRaisesRegex(ValueError, 'requires a CUDA diagnostic'):
+            run_v2_td3_timing_diagnostic(
+                **common,
+                compile_critic_encoder=True,
+                compile_target_encoders=True,
+                check_compiled_numerics=True,
+            )
 
     def test_compile_and_detailed_profiler_combination_is_rejected_before_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

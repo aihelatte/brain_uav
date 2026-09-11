@@ -683,6 +683,124 @@ class V2TD3UpdateEngine:
         if counts_after != counts_before:
             raise RuntimeError('Compile warmup must not change TD3 update counters.')
 
+    def enable_target_encoder_compile(
+        self,
+        *,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> tuple[str, str, str]:
+        enabled: list[str] = []
+        for name, target in (
+            ('actor_target.zone_set_encoder', self.actor_target),
+            ('critic1_target.zone_set_encoder', self.critic1_target),
+            ('critic2_target.zone_set_encoder', self.critic2_target),
+        ):
+            target.zone_set_encoder.enable_compiled_tensor_forward(
+                backend=backend,
+                mode=mode,
+                fullgraph=fullgraph,
+                dynamic=dynamic,
+            )
+            enabled.append(name)
+        return enabled[0], enabled[1], enabled[2]
+
+    def warmup_target_encoder_compile(
+        self,
+        batches: Sequence[V2ObservationBatch],
+    ) -> None:
+        warmup_batches = tuple(batches)
+        if not warmup_batches:
+            raise ValueError('At least one compile warmup batch is required.')
+        targets = (
+            self.actor_target,
+            self.critic1_target,
+            self.critic2_target,
+        )
+        if not all(
+            target.zone_set_encoder.compiled_tensor_forward_enabled
+            for target in targets
+        ):
+            raise RuntimeError('All target encoders must be compiled first.')
+        if any(not isinstance(batch, V2ObservationBatch) for batch in warmup_batches):
+            raise TypeError('Compile warmup batches must be V2ObservationBatch values.')
+
+        target_parameters = tuple(
+            parameter for target in targets for parameter in target.parameters()
+        )
+        requires_grad = tuple(
+            parameter.requires_grad for parameter in target_parameters
+        )
+        gradient_state = tuple(
+            (
+                parameter.grad,
+                None if parameter.grad is None else parameter.grad.detach().clone(),
+            )
+            for parameter in target_parameters
+        )
+        training_modes = tuple(target.training for target in targets)
+        torch_rng_state = torch.random.get_rng_state()
+        numpy_rng_state = np.random.get_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state_all() if self.device.type == 'cuda' else None
+        )
+        counts_before = (
+            self.update_count,
+            self.critic_update_count,
+            self.critic_target_update_count,
+            self.actor_update_count,
+            self.last_total_steps,
+        )
+        try:
+            for target in targets:
+                target.eval()
+            with torch.no_grad():
+                for batch in warmup_batches:
+                    device_batch = batch.to(self.device)
+                    shared_relations = self._build_shared_relations(device_batch)
+                    action = self.actor_target(
+                        device_batch,
+                        shared_relations=shared_relations,
+                    )
+                    self.critic1_target(
+                        device_batch,
+                        action,
+                        shared_relations=shared_relations,
+                    )
+                    self.critic2_target(
+                        device_batch,
+                        action,
+                        shared_relations=shared_relations,
+                    )
+        finally:
+            for target, training in zip(targets, training_modes):
+                target.train(training)
+            for parameter, required, (original_grad, saved_grad) in zip(
+                target_parameters,
+                requires_grad,
+                gradient_state,
+            ):
+                parameter.requires_grad_(required)
+                if original_grad is None:
+                    parameter.grad = None
+                else:
+                    original_grad.copy_(saved_grad)
+                    parameter.grad = original_grad
+            torch.random.set_rng_state(torch_rng_state)
+            np.random.set_state(numpy_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
+        counts_after = (
+            self.update_count,
+            self.critic_update_count,
+            self.critic_target_update_count,
+            self.actor_update_count,
+            self.last_total_steps,
+        )
+        if counts_after != counts_before:
+            raise RuntimeError('Compile warmup must not change TD3 update counters.')
+
     @staticmethod
     def _require_finite_loss(
         loss: torch.Tensor,

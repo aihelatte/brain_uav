@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from dataclasses import asdict
+import gc
 import json
 from math import isfinite
 from pathlib import Path
@@ -24,6 +25,7 @@ from brain_uav.trainers.v2_formal_training import (
     prepare_v2_stage_initialization,
     v2_bc_lambda,
 )
+from brain_uav.trainers.v2_replay_buffer import V2ReplayBatch
 from brain_uav.trainers.v2_td3 import V2_TD3_UPDATE_TIMING_SECTIONS
 from brain_uav.trainers.v2_validation import (
     V2ValidationPool,
@@ -35,9 +37,11 @@ from brain_uav.trainers.v2_validation import (
 
 
 DIAGNOSTIC_FORMAT = 'v2_td3_timing_diagnostic'
-DIAGNOSTIC_VERSION = 4
+DIAGNOSTIC_VERSION = 5
 DIAGNOSTIC_LEVELS = ('easy', 'medium', 'hard')
 UPDATE_TIMING_SECTION_NAMES = V2_TD3_UPDATE_TIMING_SECTIONS
+COMPILED_NUMERIC_RTOL = 1e-4
+COMPILED_NUMERIC_ATOL = 1e-5
 
 
 def _positive_int(value: Any, *, name: str) -> int:
@@ -374,6 +378,264 @@ def _compile_warmup_batches(
     return tuple(batches)
 
 
+def _compare_compiled_numeric_tensors(
+    reference: Mapping[str, torch.Tensor],
+    compiled: Mapping[str, torch.Tensor],
+    *,
+    rtol: float,
+    atol: float,
+) -> dict[str, Any]:
+    if reference.keys() != compiled.keys():
+        raise AssertionError('Compiled numeric snapshot keys do not match reference.')
+    if not reference:
+        raise ValueError('Compiled numeric snapshots must not be empty.')
+    maximum_absolute_error = 0.0
+    maximum_relative_error = 0.0
+    for name, expected in reference.items():
+        actual = compiled[name]
+        if expected.shape != actual.shape:
+            raise AssertionError(
+                f'Compiled numeric mismatch for {name}: shapes differ.'
+            )
+        if expected.dtype != actual.dtype:
+            raise AssertionError(
+                f'Compiled numeric mismatch for {name}: dtypes differ.'
+            )
+        difference = (actual - expected).abs()
+        if difference.numel():
+            maximum_absolute_error = max(
+                maximum_absolute_error,
+                float(difference.max().item()),
+            )
+            denominator = expected.abs().clamp_min(atol)
+            maximum_relative_error = max(
+                maximum_relative_error,
+                float((difference / denominator).max().item()),
+            )
+        try:
+            torch.testing.assert_close(actual, expected, rtol=rtol, atol=atol)
+        except AssertionError as exc:
+            raise AssertionError(
+                f'Compiled numeric mismatch for {name}: {exc}'
+            ) from exc
+    return {
+        'tensor_count': len(reference),
+        'maximum_absolute_error': maximum_absolute_error,
+        'maximum_relative_error': maximum_relative_error,
+        'rtol': rtol,
+        'atol': atol,
+    }
+
+
+def _fixed_numeric_replay_batch(
+    batches: Sequence[Any],
+    *,
+    action_dim: int,
+    device: torch.device,
+) -> V2ReplayBatch:
+    if not batches:
+        raise ValueError('Numeric checking requires compile warmup batches.')
+    observation = batches[-1].to(device)
+    next_observation = batches[0].to(device)
+    batch_size = observation.batch_size
+    zeros = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
+    return V2ReplayBatch(
+        obs=observation,
+        action=torch.zeros(
+            (batch_size, action_dim), dtype=torch.float32, device=device
+        ),
+        reward=torch.linspace(
+            0.25, 0.75, batch_size, dtype=torch.float32, device=device
+        ).unsqueeze(-1),
+        next_obs=next_observation,
+        done=zeros.clone(),
+        success=zeros.clone(),
+        near_goal=torch.ones_like(zeros),
+        line_to_goal_safe=torch.ones_like(zeros),
+    )
+
+
+def _numeric_update_snapshot(engine, batch: V2ReplayBatch, metrics) -> dict[str, torch.Tensor]:
+    snapshot = {
+        f'metrics.{name}': torch.as_tensor(value, dtype=torch.float32).cpu()
+        for name, value in asdict(metrics).items()
+    }
+    for model_name in (
+        'actor', 'critic1', 'critic2',
+        'actor_target', 'critic1_target', 'critic2_target',
+    ):
+        model = getattr(engine, model_name)
+        for parameter_name, parameter in model.named_parameters():
+            snapshot[f'parameters.{model_name}.{parameter_name}'] = (
+                parameter.detach().cpu().clone()
+            )
+    for critic_name in ('critic1', 'critic2'):
+        critic = getattr(engine, critic_name)
+        for parameter_name, parameter in critic.named_parameters():
+            if parameter.grad is None:
+                raise AssertionError(
+                    f'Numeric check expected gradient for {critic_name}.{parameter_name}.'
+                )
+            snapshot[f'gradients.{critic_name}.{parameter_name}'] = (
+                parameter.grad.detach().cpu().clone()
+            )
+    with torch.no_grad():
+        next_observation = batch.next_obs.to(engine.device)
+        shared_relations = engine._build_shared_relations(next_observation)
+        target_action = engine.actor_target(
+            next_observation,
+            shared_relations=shared_relations,
+        )
+        target_q1 = engine.critic1_target(
+            next_observation,
+            target_action,
+            shared_relations=shared_relations,
+        )
+        target_q2 = engine.critic2_target(
+            next_observation,
+            target_action,
+            shared_relations=shared_relations,
+        )
+    snapshot['forward.actor_target'] = target_action.detach().cpu().clone()
+    snapshot['forward.critic1_target'] = target_q1.detach().cpu().clone()
+    snapshot['forward.critic2_target'] = target_q2.detach().cpu().clone()
+    return snapshot
+
+
+def _run_compiled_numerics_check(
+    *,
+    pool: V2ValidationPool,
+    prepared,
+    formal_config: V2FormalTrainingConfig,
+    bc_checkpoint: Path,
+    device: torch.device,
+    snn_time_window: int,
+) -> dict[str, Any]:
+    torch_rng_state = torch.random.get_rng_state()
+    numpy_rng_state = np.random.get_state()
+    cuda_rng_state = torch.cuda.get_rng_state_all()
+    started = perf_counter()
+    reference_components = None
+    compiled_components = None
+    reference = None
+    compiled = None
+    fixed_batch = None
+    try:
+        reference_components = build_v2_stage_engine(
+            None,
+            formal_config,
+            init_checkpoint=bc_checkpoint,
+            rewards=None,
+            uav_collision_radius=None,
+            device=device,
+            model_type='ann',
+            snn_time_window=snn_time_window,
+            prepared_initialization=prepared,
+        )
+        compiled_components = build_v2_stage_engine(
+            None,
+            formal_config,
+            init_checkpoint=bc_checkpoint,
+            rewards=None,
+            uav_collision_radius=None,
+            device=device,
+            model_type='ann',
+            snn_time_window=snn_time_window,
+            prepared_initialization=prepared,
+        )
+        reference = reference_components.engine
+        compiled = compiled_components.engine
+        compiled.load_checkpoint_state_dict(reference.checkpoint_state_dict())
+        compiled.enable_online_critic_encoder_compile(
+            backend='inductor', mode='default', fullgraph=True, dynamic=True,
+        )
+        compiled.enable_target_encoder_compile(
+            backend='inductor', mode='default', fullgraph=True, dynamic=True,
+        )
+        warmup_batches = _compile_warmup_batches(
+            pool=pool,
+            prepared=prepared,
+            batch_size=reference.batch_size,
+            device=device,
+        )
+        compiled.warmup_online_critic_encoder_compile(warmup_batches)
+        compiled.warmup_target_encoder_compile(warmup_batches)
+        fixed_batch = _fixed_numeric_replay_batch(
+            warmup_batches,
+            action_dim=reference.action_dim,
+            device=device,
+        )
+        reference.replay.sample = lambda batch_size: fixed_batch
+        compiled.replay.sample = lambda batch_size: fixed_batch
+        update_results: dict[str, Any] = {}
+        maximum_absolute_error = 0.0
+        maximum_relative_error = 0.0
+        for label, total_steps in (
+            ('critic_only', 1),
+            ('actor_and_target_updated', formal_config.policy_delay),
+        ):
+            update_rng_state = torch.random.get_rng_state()
+            update_cuda_rng_state = torch.cuda.get_rng_state_all()
+            reference_metrics = reference.update_once(
+                total_steps=total_steps,
+                bc_lambda=v2_bc_lambda(total_steps - 1),
+            )
+            torch.random.set_rng_state(update_rng_state)
+            torch.cuda.set_rng_state_all(update_cuda_rng_state)
+            compiled_metrics = compiled.update_once(
+                total_steps=total_steps,
+                bc_lambda=v2_bc_lambda(total_steps - 1),
+            )
+            if label == 'critic_only' and (
+                reference_metrics.actor_updated or compiled_metrics.actor_updated
+            ):
+                raise AssertionError('Numeric critic-only update unexpectedly updated actor.')
+            if label == 'actor_and_target_updated' and not (
+                reference_metrics.actor_updated and compiled_metrics.actor_updated
+                and reference_metrics.critic_targets_updated
+                and compiled_metrics.critic_targets_updated
+            ):
+                raise AssertionError('Numeric actor/target update did not execute fully.')
+            comparison = _compare_compiled_numeric_tensors(
+                _numeric_update_snapshot(reference, fixed_batch, reference_metrics),
+                _numeric_update_snapshot(compiled, fixed_batch, compiled_metrics),
+                rtol=COMPILED_NUMERIC_RTOL,
+                atol=COMPILED_NUMERIC_ATOL,
+            )
+            update_results[label] = comparison
+            maximum_absolute_error = max(
+                maximum_absolute_error, comparison['maximum_absolute_error']
+            )
+            maximum_relative_error = max(
+                maximum_relative_error, comparison['maximum_relative_error']
+            )
+        return {
+            'requested': True,
+            'passed': True,
+            'device': str(device),
+            'rtol': COMPILED_NUMERIC_RTOL,
+            'atol': COMPILED_NUMERIC_ATOL,
+            'maximum_absolute_error': maximum_absolute_error,
+            'maximum_relative_error': maximum_relative_error,
+            'updates': update_results,
+            'wall_seconds': perf_counter() - started,
+            'measurement_note': (
+                'Uses independent eager and compiled engines before timed diagnosis; '
+                'this check time is excluded from compile warmup and stable timing.'
+            ),
+        }
+    finally:
+        fixed_batch = None
+        reference = None
+        compiled = None
+        reference_components = None
+        compiled_components = None
+        gc.collect()
+        torch.random.set_rng_state(torch_rng_state)
+        np.random.set_state(numpy_rng_state)
+        torch.cuda.set_rng_state_all(cuda_rng_state)
+
+
 def _run_diagnostic_level(
     *,
     level: str,
@@ -389,6 +651,7 @@ def _run_diagnostic_level(
     detailed_profiler_updates: int = 0,
     profiler_output_dir: Path | None = None,
     compile_critic_encoder: bool = False,
+    compile_target_encoders: bool = False,
 ) -> dict[str, Any]:
     scenario_count = len(pool.scenarios)
     if scenario_count == 0 or measured_steps < scenario_count:
@@ -426,6 +689,7 @@ def _run_diagnostic_level(
     )
     compile_metadata: dict[str, Any] = {
         'requested': bool(compile_critic_encoder),
+        'target_encoders_requested': bool(compile_target_encoders),
         'enabled_objects': [],
         'backend': 'inductor',
         'mode': 'default',
@@ -433,7 +697,12 @@ def _run_diagnostic_level(
         'dynamic': True,
         'registration_wall_seconds': 0.0,
         'warmup_wall_seconds': 0.0,
+        'online_registration_wall_seconds': 0.0,
+        'online_warmup_wall_seconds': 0.0,
+        'target_registration_wall_seconds': 0.0,
+        'target_warmup_wall_seconds': 0.0,
         'warmup_batch_shapes': [],
+        'target_warmup_batch_shapes': [],
         'measurement_graph_count_before': None,
         'measurement_graph_count_after': None,
         'measurement_new_graph_count': None,
@@ -449,10 +718,32 @@ def _run_diagnostic_level(
             fullgraph=True,
             dynamic=True,
         )
-        compile_metadata['registration_wall_seconds'] = (
+        online_registration_seconds = (
             perf_counter() - registration_started
         )
-        compile_metadata['enabled_objects'] = list(enabled_objects)
+        compile_metadata['online_registration_wall_seconds'] = (
+            online_registration_seconds
+        )
+        compile_metadata['registration_wall_seconds'] += online_registration_seconds
+        compile_metadata['enabled_objects'].extend(enabled_objects)
+        if compile_target_encoders:
+            target_registration_started = perf_counter()
+            target_objects = engine.enable_target_encoder_compile(
+                backend='inductor',
+                mode='default',
+                fullgraph=True,
+                dynamic=True,
+            )
+            target_registration_seconds = (
+                perf_counter() - target_registration_started
+            )
+            compile_metadata['target_registration_wall_seconds'] = (
+                target_registration_seconds
+            )
+            compile_metadata['registration_wall_seconds'] += (
+                target_registration_seconds
+            )
+            compile_metadata['enabled_objects'].extend(target_objects)
         warmup_batches = _compile_warmup_batches(
             pool=pool,
             prepared=prepared,
@@ -465,7 +756,19 @@ def _run_diagnostic_level(
         ]
         warmup_started = perf_counter()
         engine.warmup_online_critic_encoder_compile(warmup_batches)
-        compile_metadata['warmup_wall_seconds'] = perf_counter() - warmup_started
+        online_warmup_seconds = perf_counter() - warmup_started
+        compile_metadata['online_warmup_wall_seconds'] = online_warmup_seconds
+        compile_metadata['warmup_wall_seconds'] += online_warmup_seconds
+        if compile_target_encoders:
+            compile_metadata['target_warmup_batch_shapes'] = [
+                [batch.batch_size, int(batch.zone_features.shape[1])]
+                for batch in warmup_batches
+            ]
+            target_warmup_started = perf_counter()
+            engine.warmup_target_encoder_compile(warmup_batches)
+            target_warmup_seconds = perf_counter() - target_warmup_started
+            compile_metadata['target_warmup_wall_seconds'] = target_warmup_seconds
+            compile_metadata['warmup_wall_seconds'] += target_warmup_seconds
         compile_metadata['measurement_note'] = (
             'Registration and compile-triggering pure-compute warmup are excluded '
             'from measured update wall time. Measurement is valid for speed '
@@ -785,6 +1088,8 @@ def run_v2_td3_timing_diagnostic(
     scenario_count: int = 3,
     detailed_profiler_updates: int = 0,
     compile_critic_encoder: bool = False,
+    compile_target_encoders: bool = False,
+    check_compiled_numerics: bool = False,
 ) -> dict[str, Any]:
     if model not in ('ann', 'snn'):
         raise ValueError('model must be ann or snn.')
@@ -801,6 +1106,18 @@ def run_v2_td3_timing_diagnostic(
     )
     if type(compile_critic_encoder) is not bool:
         raise TypeError('compile_critic_encoder must be a bool.')
+    if type(compile_target_encoders) is not bool:
+        raise TypeError('compile_target_encoders must be a bool.')
+    if type(check_compiled_numerics) is not bool:
+        raise TypeError('check_compiled_numerics must be a bool.')
+    if compile_target_encoders and not compile_critic_encoder:
+        raise ValueError(
+            'compile_target_encoders requires compile_critic_encoder.'
+        )
+    if check_compiled_numerics and not compile_target_encoders:
+        raise ValueError(
+            'check_compiled_numerics requires compile_target_encoders.'
+        )
     if compile_critic_encoder and profiler_updates:
         raise ValueError(
             'compile_critic_encoder cannot be combined with detailed profiler.'
@@ -816,6 +1133,8 @@ def run_v2_td3_timing_diagnostic(
     requested_device = device
     resolved_device = resolve_training_device(device)
     target_device = torch.device(resolved_device)
+    if check_compiled_numerics and target_device.type != 'cuda':
+        raise ValueError('check_compiled_numerics requires a CUDA diagnostic.')
     output = Path(output_dir)
     if output.exists():
         raise FileExistsError(f'Use a fresh diagnostic output directory: {output}')
@@ -857,6 +1176,27 @@ def run_v2_td3_timing_diagnostic(
         uav_collision_radius=prepared.uav_collision_radius,
     )
     pool_prepare_seconds = perf_counter() - pool_started
+    compiled_numerics = {
+        'requested': False,
+        'passed': None,
+        'device': None,
+        'rtol': COMPILED_NUMERIC_RTOL,
+        'atol': COMPILED_NUMERIC_ATOL,
+        'maximum_absolute_error': None,
+        'maximum_relative_error': None,
+        'updates': {},
+        'wall_seconds': 0.0,
+        'measurement_note': 'Compiled numeric checking is disabled.',
+    }
+    if check_compiled_numerics:
+        compiled_numerics = _run_compiled_numerics_check(
+            pool=pools['easy'],
+            prepared=prepared,
+            formal_config=config,
+            bc_checkpoint=checkpoint,
+            device=target_device,
+            snn_time_window=snn_time_window,
+        )
     output.mkdir(parents=True, exist_ok=False)
     level_results: dict[str, Any] = {}
     for level in DIAGNOSTIC_LEVELS:
@@ -878,6 +1218,7 @@ def run_v2_td3_timing_diagnostic(
                 output / 'profiler' / level if profiler_updates else None
             ),
             compile_critic_encoder=compile_critic_encoder,
+            compile_target_encoders=compile_target_encoders,
         )
         level_results[level] = result
         print(json.dumps({
@@ -922,6 +1263,7 @@ def run_v2_td3_timing_diagnostic(
         'bc_checkpoint': str(checkpoint.resolve()),
         'scenario_pool_directory': str(Path(scenario_pool_dir).resolve()),
         'scenario_pool_prepare_wall_seconds': pool_prepare_seconds,
+        'compiled_numerics': compiled_numerics,
         'scenario_config': asdict(prepared.scenario_config),
         'uav_collision_radius': prepared.uav_collision_radius,
         'diagnostic_config': {
@@ -935,6 +1277,8 @@ def run_v2_td3_timing_diagnostic(
             'scenario_count_per_level': pool_count,
             'detailed_profiler_updates_per_level': profiler_updates,
             'compile_critic_encoder_requested': compile_critic_encoder,
+            'compile_target_encoders_requested': compile_target_encoders,
+            'check_compiled_numerics_requested': check_compiled_numerics,
             'compile_critic_encoder_backend': (
                 'inductor' if compile_critic_encoder else None
             ),
@@ -1011,6 +1355,16 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Compile only critic1/critic2 ZoneSetEncoder tensor computation.',
     )
+    parser.add_argument(
+        '--compile-target-encoders',
+        action='store_true',
+        help='Also compile actor/critic target ZoneSetEncoder tensor computation.',
+    )
+    parser.add_argument(
+        '--check-compiled-numerics',
+        action='store_true',
+        help='Run an isolated CUDA eager-versus-compiled TD3 numeric check.',
+    )
     return parser
 
 
@@ -1032,6 +1386,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         scenario_count=args.scenario_count,
         detailed_profiler_updates=args.detailed_profiler_updates,
         compile_critic_encoder=args.compile_critic_encoder,
+        compile_target_encoders=args.compile_target_encoders,
+        check_compiled_numerics=args.check_compiled_numerics,
     )
 
 

@@ -719,6 +719,145 @@ class TestV2TD3(unittest.TestCase):
         self.assertFalse(engine.critic1.zone_set_encoder.compiled_tensor_forward_enabled)
         self.assertFalse(engine.critic2.zone_set_encoder.compiled_tensor_forward_enabled)
 
+    def test_target_encoder_compile_scope_and_warmup_preserve_engine_state(self):
+        engine = self.make_engine(
+            bc_reference_actor=self.make_bc_reference(0.01),
+        )
+        batch = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        modules = {
+            name: getattr(engine, name)
+            for name in (
+                'actor', 'actor_target', 'critic1', 'critic2',
+                'critic1_target', 'critic2_target', 'bc_reference_actor',
+            )
+        }
+        state_before = {
+            name: deepcopy(module.state_dict()) for name, module in modules.items()
+        }
+        parameter_ids = {
+            name: tuple(id(parameter) for parameter in module.parameters())
+            for name, module in modules.items()
+        }
+        state_keys = {
+            name: tuple(module.state_dict()) for name, module in modules.items()
+        }
+        modes_before = {name: module.training for name, module in modules.items()}
+        requires_grad_before = {
+            name: tuple(parameter.requires_grad for parameter in module.parameters())
+            for name, module in modules.items()
+        }
+        counts_before = (
+            engine.update_count,
+            engine.critic_update_count,
+            engine.critic_target_update_count,
+            engine.actor_update_count,
+            engine.last_total_steps,
+        )
+        torch.manual_seed(1234)
+        np.random.seed(5678)
+        torch_rng_before = torch.random.get_rng_state().clone()
+        numpy_rng_before = np.random.get_state()
+        target_grad_modes = []
+        target_hooks = [
+            target.register_forward_pre_hook(
+                lambda _module, _args: target_grad_modes.append(
+                    torch.is_grad_enabled()
+                )
+            )
+            for target in (
+                engine.actor_target, engine.critic1_target, engine.critic2_target,
+            )
+        ]
+
+        try:
+            engine.enable_online_critic_encoder_compile(backend='eager')
+            enabled = engine.enable_target_encoder_compile(backend='eager')
+            engine.warmup_online_critic_encoder_compile((batch,))
+            engine.warmup_target_encoder_compile((batch,))
+        finally:
+            for hook in target_hooks:
+                hook.remove()
+
+        self.assertEqual(enabled, (
+            'actor_target.zone_set_encoder',
+            'critic1_target.zone_set_encoder',
+            'critic2_target.zone_set_encoder',
+        ))
+        for name in ('critic1', 'critic2', 'actor_target',
+                     'critic1_target', 'critic2_target'):
+            self.assertTrue(
+                modules[name].zone_set_encoder.compiled_tensor_forward_enabled
+            )
+        self.assertFalse(engine.actor.zone_set_encoder.compiled_tensor_forward_enabled)
+        self.assertFalse(
+            engine.bc_reference_actor.zone_set_encoder.compiled_tensor_forward_enabled
+        )
+        for name, module in modules.items():
+            self.assertEqual(tuple(module.state_dict()), state_keys[name])
+            self.assertEqual(
+                tuple(id(parameter) for parameter in module.parameters()),
+                parameter_ids[name],
+            )
+            self.assertEqual(module.training, modes_before[name])
+            self.assertEqual(
+                tuple(parameter.requires_grad for parameter in module.parameters()),
+                requires_grad_before[name],
+            )
+            self.assert_state_dict_equal(module.state_dict(), state_before[name])
+        self.assertFalse(engine.actor_target.training)
+        self.assertTrue(target_grad_modes)
+        self.assertFalse(any(target_grad_modes))
+        self.assertTrue(all(
+            not parameter.requires_grad
+            for target in (
+                engine.actor_target, engine.critic1_target, engine.critic2_target,
+            )
+            for parameter in target.parameters()
+        ))
+        self.assertEqual(counts_before, (
+            engine.update_count,
+            engine.critic_update_count,
+            engine.critic_target_update_count,
+            engine.actor_update_count,
+            engine.last_total_steps,
+        ))
+        torch.testing.assert_close(torch.random.get_rng_state(), torch_rng_before)
+        numpy_rng_after = np.random.get_state()
+        self.assertEqual(numpy_rng_after[0], numpy_rng_before[0])
+        np.testing.assert_array_equal(numpy_rng_after[1], numpy_rng_before[1])
+        self.assertEqual(numpy_rng_after[2:], numpy_rng_before[2:])
+
+    def test_compiled_target_encoder_reads_parameters_after_soft_update(self):
+        torch.manual_seed(2468)
+        eager = self.make_engine(tau=0.5)
+        compiled = self.make_engine(tau=0.5)
+        compiled.load_checkpoint_state_dict(eager.checkpoint_state_dict())
+        compiled.enable_online_critic_encoder_compile(backend='eager')
+        compiled.enable_target_encoder_compile(backend='eager')
+        observation = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        compiled.warmup_online_critic_encoder_compile((observation,))
+        compiled.warmup_target_encoder_compile((observation,))
+        with torch.no_grad():
+            before = compiled.actor_target(observation)
+            for eager_parameter, compiled_parameter in zip(
+                eager.actor.parameters(), compiled.actor.parameters()
+            ):
+                eager_parameter.add_(0.125)
+                compiled_parameter.add_(0.125)
+            eager._soft_update(eager.actor, eager.actor_target)
+            compiled._soft_update(compiled.actor, compiled.actor_target)
+            expected = eager.actor_target(observation)
+            actual = compiled.actor_target(observation)
+
+        self.assertFalse(torch.equal(actual, before))
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+
     def test_reused_relations_match_original_td3_update_for_both_delay_paths(self):
         for total_steps in (1, 2):
             with self.subTest(total_steps=total_steps):
