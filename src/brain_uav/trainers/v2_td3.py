@@ -13,9 +13,11 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.profiler import record_function
 
 from brain_uav.models.v2_ann import V2ANNCritic, V2ANNPolicyActor
 from brain_uav.models.v2_snn import V2SNNPolicyActor
+from brain_uav.models.zone_set_encoder import ZoneSetSharedRelations
 from brain_uav.observations import (
     EGO_FEATURE_DIM,
     EGO_FEATURE_INDEX,
@@ -40,7 +42,9 @@ V2_TD3_UPDATE_TIMING_SECTIONS = (
     'batch_preparation',
     'target_forward_and_td_target',
     'online_critic_forward_and_loss',
-    'critic_backward_and_step',
+    'critic_backward',
+    'critic_gradient_check_and_clip',
+    'critic_optimizer_step',
     'actor_update',
     'target_soft_update',
 )
@@ -287,6 +291,7 @@ class V2TD3UpdateEngine:
         self.critic1_target = self._frozen_target(self.critic1)
         self.critic2_target = self._frozen_target(self.critic2)
         self._validate_all_live_fixed_buffers()
+        self._soft_update_parameter_pairs = self._bind_soft_update_parameter_pairs()
         self.actor_optimizer = torch.optim.Adam(
             self.actor.parameters(), lr=actor_lr_value
         )
@@ -472,6 +477,52 @@ class V2TD3UpdateEngine:
         ):
             raise ValueError(f'{name} encoder architecture does not match actor.')
 
+    def _bind_soft_update_parameter_pairs(
+        self,
+    ) -> dict[tuple[int, int], tuple[list[nn.Parameter], list[nn.Parameter]]]:
+        bound: dict[
+            tuple[int, int], tuple[list[nn.Parameter], list[nn.Parameter]]
+        ] = {}
+        for online, target in (
+            (self.actor, self.actor_target),
+            (self.critic1, self.critic1_target),
+            (self.critic2, self.critic2_target),
+        ):
+            online_named = tuple(online.named_parameters())
+            target_named = tuple(target.named_parameters())
+            if tuple(name for name, _ in online_named) != tuple(
+                name for name, _ in target_named
+            ):
+                raise ValueError('Online and target parameter names do not match.')
+            online_parameters: list[nn.Parameter] = []
+            target_parameters: list[nn.Parameter] = []
+            for (name, source), (_, destination) in zip(
+                online_named, target_named
+            ):
+                if source is destination:
+                    raise ValueError(
+                        f'Online and target parameter {name!r} must be independent.'
+                    )
+                if source.shape != destination.shape:
+                    raise ValueError(
+                        f'Online and target parameter {name!r} shapes do not match.'
+                    )
+                if source.dtype != destination.dtype:
+                    raise ValueError(
+                        f'Online and target parameter {name!r} dtypes do not match.'
+                    )
+                if source.device != destination.device:
+                    raise ValueError(
+                        f'Online and target parameter {name!r} devices do not match.'
+                    )
+                online_parameters.append(source)
+                target_parameters.append(destination)
+            bound[(id(online), id(target))] = (
+                online_parameters,
+                target_parameters,
+            )
+        return bound
+
     @staticmethod
     def _frozen_target(
         model: nn.Module,
@@ -558,6 +609,8 @@ class V2TD3UpdateEngine:
         total_steps: int,
         bc_lambda: float = 0.0,
         timing_recorder: Callable[[dict[str, float]], None] | None = None,
+        reuse_shared_relations: bool = True,
+        profile_sections: bool = False,
     ) -> V2TD3UpdateMetrics:
         update_timing = _OptionalUpdateWallTimer(timing_recorder)
         total_steps_value = _nonnegative_int(total_steps, name='total_steps')
@@ -573,17 +626,39 @@ class V2TD3UpdateEngine:
             batch = batch.to(self.device)
         with update_timing.section('target_forward_and_td_target'):
             with torch.no_grad():
+                next_shared_relations = (
+                    self._build_shared_relations(
+                        batch.next_obs,
+                        profile_sections=profile_sections,
+                    )
+                    if reuse_shared_relations
+                    else None
+                )
                 noise = (torch.randn_like(batch.action) * self.policy_noise).clamp(
                     -self.noise_clip,
                     self.noise_clip,
                 )
-                next_action = self.actor_target(batch.next_obs) + noise
+                next_action = self.actor_target(
+                    batch.next_obs,
+                    shared_relations=next_shared_relations,
+                    profile_sections=profile_sections,
+                ) + noise
                 next_action = torch.maximum(
                     torch.minimum(next_action, self.action_high),
                     self.action_low,
                 )
-                target_q1 = self.critic1_target(batch.next_obs, next_action)
-                target_q2 = self.critic2_target(batch.next_obs, next_action)
+                target_q1 = self.critic1_target(
+                    batch.next_obs,
+                    next_action,
+                    shared_relations=next_shared_relations,
+                    profile_sections=profile_sections,
+                )
+                target_q2 = self.critic2_target(
+                    batch.next_obs,
+                    next_action,
+                    shared_relations=next_shared_relations,
+                    profile_sections=profile_sections,
+                )
                 target_q = batch.reward + (
                     (1.0 - batch.done)
                     * self.gamma
@@ -591,8 +666,26 @@ class V2TD3UpdateEngine:
                 )
 
         with update_timing.section('online_critic_forward_and_loss'):
-            current_q1 = self.critic1(batch.obs, batch.action)
-            current_q2 = self.critic2(batch.obs, batch.action)
+            current_shared_relations = (
+                self._build_shared_relations(
+                    batch.obs,
+                    profile_sections=profile_sections,
+                )
+                if reuse_shared_relations
+                else None
+            )
+            current_q1 = self.critic1(
+                batch.obs,
+                batch.action,
+                shared_relations=current_shared_relations,
+                profile_sections=profile_sections,
+            )
+            current_q2 = self.critic2(
+                batch.obs,
+                batch.action,
+                shared_relations=current_shared_relations,
+                profile_sections=profile_sections,
+            )
             critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(
                 current_q2, target_q
             )
@@ -601,19 +694,39 @@ class V2TD3UpdateEngine:
                 component='critic',
                 total_steps=total_steps_value,
             )
-        with update_timing.section('critic_backward_and_step'):
-            self.critic_optimizer.zero_grad(set_to_none=True)
-            critic_loss.backward()
+        with update_timing.section('critic_backward'):
+            if profile_sections:
+                with record_function('v2_td3.critic_backward'):
+                    self.critic_optimizer.zero_grad(set_to_none=True)
+                    critic_loss.backward()
+            else:
+                self.critic_optimizer.zero_grad(set_to_none=True)
+                critic_loss.backward()
+        with update_timing.section('critic_gradient_check_and_clip'):
             critic_parameters = list(self.critic1.parameters()) + list(
                 self.critic2.parameters()
             )
-            self._validate_and_clip_gradients(
-                critic_parameters,
-                max_norm=self.critic_grad_clip_norm,
-                component='critic',
-                total_steps=total_steps_value,
-            )
-            self.critic_optimizer.step()
+            if profile_sections:
+                with record_function('v2_td3.critic_gradient_check_and_clip'):
+                    self._validate_and_clip_gradients(
+                        critic_parameters,
+                        max_norm=self.critic_grad_clip_norm,
+                        component='critic',
+                        total_steps=total_steps_value,
+                    )
+            else:
+                self._validate_and_clip_gradients(
+                    critic_parameters,
+                    max_norm=self.critic_grad_clip_norm,
+                    component='critic',
+                    total_steps=total_steps_value,
+                )
+        with update_timing.section('critic_optimizer_step'):
+            if profile_sections:
+                with record_function('v2_td3.critic_optimizer_step'):
+                    self.critic_optimizer.step()
+            else:
+                self.critic_optimizer.step()
 
         critic_targets_updated = total_steps_value % self.policy_delay == 0
         actor_updated = (
@@ -641,6 +754,8 @@ class V2TD3UpdateEngine:
                         batch.obs,
                         batch.line_to_goal_safe,
                         bc_lambda=bc_lambda_value,
+                        shared_relations=current_shared_relations,
+                        profile_sections=profile_sections,
                     )
                     self._require_finite_loss(
                         actor_terms.actor_loss,
@@ -712,9 +827,20 @@ class V2TD3UpdateEngine:
         line_to_goal_safe: torch.Tensor,
         *,
         bc_lambda: float,
+        shared_relations: ZoneSetSharedRelations | None = None,
+        profile_sections: bool = False,
     ) -> _ActorLossTerms:
-        actor_actions = self.actor(observation)
-        q_values = self.critic1(observation, actor_actions)
+        actor_actions = self.actor(
+            observation,
+            shared_relations=shared_relations,
+            profile_sections=profile_sections,
+        )
+        q_values = self.critic1(
+            observation,
+            actor_actions,
+            shared_relations=shared_relations,
+            profile_sections=profile_sections,
+        )
         rl_actor_loss = -q_values.mean()
         q_scale = q_values.detach().abs().mean().clamp(min=1.0)
         actor_rl_scale = torch.as_tensor(
@@ -726,7 +852,11 @@ class V2TD3UpdateEngine:
         bc_loss = actor_actions.sum() * 0.0
         if self.bc_reference_actor is not None:
             with torch.no_grad():
-                reference_actions = self.bc_reference_actor(observation)
+                reference_actions = self.bc_reference_actor(
+                    observation,
+                    shared_relations=shared_relations,
+                    profile_sections=profile_sections,
+                )
             bc_loss = F.mse_loss(actor_actions, reference_actions)
         terminal_geo_loss = self._terminal_geo_loss(
             observation,
@@ -750,6 +880,20 @@ class V2TD3UpdateEngine:
             actor_rl_scale=actor_rl_scale,
             bc_loss=bc_loss,
             terminal_geo_loss=terminal_geo_loss,
+        )
+
+    def _build_shared_relations(
+        self,
+        observation: V2ObservationBatch,
+        *,
+        profile_sections: bool = False,
+    ) -> ZoneSetSharedRelations:
+        return self.actor.zone_set_encoder.build_shared_relations(
+            observation.ego_features,
+            observation.goal_features,
+            observation.zone_features,
+            observation.presence_mask,
+            profile_sections=profile_sections,
         )
 
     def _terminal_geo_loss(
@@ -812,14 +956,17 @@ class V2TD3UpdateEngine:
         return torch.remainder(value + pi, 2.0 * pi) - pi
 
     def _soft_update(self, online: nn.Module, target: nn.Module) -> None:
-        online_parameters = dict(online.named_parameters())
-        target_parameters = dict(target.named_parameters())
-        if online_parameters.keys() != target_parameters.keys():
-            raise ValueError('Online and target parameter names do not match.')
+        try:
+            online_parameters, target_parameters = (
+                self._soft_update_parameter_pairs[(id(online), id(target))]
+            )
+        except KeyError as exc:
+            raise ValueError(
+                'Online and target modules are not a bound soft-update pair.'
+            ) from exc
         with torch.no_grad():
-            for name, source in online_parameters.items():
-                destination = target_parameters[name]
-                destination.mul_(1.0 - self.tau).add_(source, alpha=self.tau)
+            torch._foreach_mul_(target_parameters, 1.0 - self.tau)
+            torch._foreach_add_(target_parameters, online_parameters, alpha=self.tau)
 
     def select_action(
         self,

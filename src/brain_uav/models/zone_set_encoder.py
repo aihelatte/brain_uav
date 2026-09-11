@@ -8,6 +8,7 @@ from math import isfinite, sqrt
 import torch
 from torch import nn
 from torch.nn import functional as F
+from torch.profiler import record_function
 
 from brain_uav.observations import (
     EGO_FEATURE_DIM,
@@ -339,6 +340,23 @@ class ZoneSetEncoderDiagnostics:
     valid_token_mask: torch.Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class ZoneSetSharedRelations:
+    """Parameter-free relation tensors bound to one exact observation batch."""
+
+    scales: V2ObservationScales
+    uav_radius: float
+    ego_features: torch.Tensor
+    goal_features: torch.Tensor
+    zone_features: torch.Tensor
+    presence_mask: torch.Tensor
+    clean_zone_features: torch.Tensor
+    pair_relations: torch.Tensor
+    valid_token_mask: torch.Tensor
+    token_pair_relations: torch.Tensor
+    relation_pair_mask: torch.Tensor
+
+
 class ZoneSetEncoder(nn.Module):
     """Convert a dynamic V2 no-fly-zone set into a fixed policy context."""
 
@@ -356,6 +374,8 @@ class ZoneSetEncoder(nn.Module):
             config = ZoneSetEncoderConfig()
         if not isinstance(config, ZoneSetEncoderConfig):
             raise TypeError('config must be a ZoneSetEncoderConfig.')
+        self.scales = scales
+        self.uav_radius = float(uav_radius)
         self.config = config
         self.pair_relation_builder = PairRelationBuilder(
             scales,
@@ -458,50 +478,31 @@ class ZoneSetEncoder(nn.Module):
             if not bool(torch.isfinite(value).all()):
                 raise ValueError(f'{name} must contain only finite values.')
 
-    def _forward_impl(
+    def _build_shared_relations_validated(
         self,
         ego_features: torch.Tensor,
         goal_features: torch.Tensor,
         zone_features: torch.Tensor,
         presence_mask: torch.Tensor,
         *,
-        diagnostics: bool,
-    ) -> torch.Tensor | ZoneSetEncoderDiagnostics:
-        batch_size, zone_count = self._validate_inputs(
-            ego_features,
-            goal_features,
-            zone_features,
-            presence_mask,
-        )
+        batch_size: int,
+        zone_count: int,
+    ) -> ZoneSetSharedRelations:
         clean_zone_features = torch.where(
             presence_mask.unsqueeze(-1),
             zone_features,
             torch.zeros_like(zone_features),
         )
-        zone_tokens = self.zone_encoder(clean_zone_features)
-        zone_tokens = zone_tokens * presence_mask.unsqueeze(-1).to(
-            zone_tokens.dtype
-        )
-        task_embedding = self.task_encoder(ego_features, goal_features)
         pair_relations = self.pair_relation_builder(
             ego_features,
             clean_zone_features,
             presence_mask,
         )
-
         empty_valid = ~presence_mask.any(dim=1)
         valid_token_mask = torch.cat(
             (empty_valid.unsqueeze(1), presence_mask),
             dim=1,
         )
-        empty_tokens = self.empty_scene_token.expand(
-            batch_size,
-            -1,
-            -1,
-        )
-        tokens = torch.cat((empty_tokens, zone_tokens), dim=1)
-        tokens = tokens * valid_token_mask.unsqueeze(-1).to(tokens.dtype)
-
         token_pair_relations = F.pad(
             pair_relations,
             (0, 0, 1, 0, 1, 0),
@@ -521,34 +522,239 @@ class ZoneSetEncoder(nn.Module):
             (1, 0, 1, 0),
             value=False,
         )
+        return ZoneSetSharedRelations(
+            scales=self.scales,
+            uav_radius=self.uav_radius,
+            ego_features=ego_features,
+            goal_features=goal_features,
+            zone_features=zone_features,
+            presence_mask=presence_mask,
+            clean_zone_features=clean_zone_features,
+            pair_relations=pair_relations,
+            valid_token_mask=valid_token_mask,
+            token_pair_relations=token_pair_relations,
+            relation_pair_mask=relation_pair_mask,
+        )
+
+    def build_shared_relations(
+        self,
+        ego_features: torch.Tensor,
+        goal_features: torch.Tensor,
+        zone_features: torch.Tensor,
+        presence_mask: torch.Tensor,
+        *,
+        profile_sections: bool = False,
+    ) -> ZoneSetSharedRelations:
+        batch_size, zone_count = self._validate_inputs(
+            ego_features,
+            goal_features,
+            zone_features,
+            presence_mask,
+        )
+        if profile_sections:
+            with record_function('v2_encoder.shared_relation_build'):
+                return self._build_shared_relations_validated(
+                    ego_features,
+                    goal_features,
+                    zone_features,
+                    presence_mask,
+                    batch_size=batch_size,
+                    zone_count=zone_count,
+                )
+        return self._build_shared_relations_validated(
+            ego_features,
+            goal_features,
+            zone_features,
+            presence_mask,
+            batch_size=batch_size,
+            zone_count=zone_count,
+        )
+
+    def _validate_shared_relations(
+        self,
+        shared: ZoneSetSharedRelations,
+        ego_features: torch.Tensor,
+        goal_features: torch.Tensor,
+        zone_features: torch.Tensor,
+        presence_mask: torch.Tensor,
+    ) -> None:
+        if not isinstance(shared, ZoneSetSharedRelations):
+            raise TypeError('shared_relations must be a ZoneSetSharedRelations.')
+        if shared.scales != self.scales or shared.uav_radius != self.uav_radius:
+            raise ValueError('shared_relations fixed geometry configuration is incompatible.')
+        expected_inputs = (
+            ego_features,
+            goal_features,
+            zone_features,
+            presence_mask,
+        )
+        actual_inputs = (
+            shared.ego_features,
+            shared.goal_features,
+            shared.zone_features,
+            shared.presence_mask,
+        )
+        if any(actual is not expected for actual, expected in zip(
+            actual_inputs, expected_inputs
+        )):
+            raise ValueError('shared_relations belongs to a different observation batch.')
+        batch_size = int(ego_features.shape[0])
+        zone_count = int(zone_features.shape[1])
+        expected = (
+            (shared.clean_zone_features, zone_features.shape, torch.float32),
+            (
+                shared.pair_relations,
+                (batch_size, zone_count, zone_count, self.config.relation_dim),
+                torch.float32,
+            ),
+            (shared.valid_token_mask, (batch_size, zone_count + 1), torch.bool),
+            (
+                shared.token_pair_relations,
+                (batch_size, zone_count + 1, zone_count + 1, self.config.relation_dim),
+                torch.float32,
+            ),
+            (
+                shared.relation_pair_mask,
+                (batch_size, zone_count + 1, zone_count + 1),
+                torch.bool,
+            ),
+        )
+        for value, shape, dtype in expected:
+            if value.shape != shape or value.dtype != dtype:
+                raise ValueError('shared_relations tensor contract is incompatible.')
+            if value.device != ego_features.device:
+                raise ValueError('shared_relations tensors must share the input device.')
+
+    def _forward_impl(
+        self,
+        ego_features: torch.Tensor,
+        goal_features: torch.Tensor,
+        zone_features: torch.Tensor,
+        presence_mask: torch.Tensor,
+        *,
+        diagnostics: bool,
+        shared_relations: ZoneSetSharedRelations | None = None,
+        profile_sections: bool = False,
+    ) -> torch.Tensor | ZoneSetEncoderDiagnostics:
+        batch_size, zone_count = self._validate_inputs(
+            ego_features,
+            goal_features,
+            zone_features,
+            presence_mask,
+        )
+        if shared_relations is None:
+            if profile_sections:
+                with record_function('v2_encoder.shared_relation_build'):
+                    shared_relations = self._build_shared_relations_validated(
+                        ego_features,
+                        goal_features,
+                        zone_features,
+                        presence_mask,
+                        batch_size=batch_size,
+                        zone_count=zone_count,
+                    )
+            else:
+                shared_relations = self._build_shared_relations_validated(
+                    ego_features,
+                    goal_features,
+                    zone_features,
+                    presence_mask,
+                    batch_size=batch_size,
+                    zone_count=zone_count,
+                )
+        else:
+            self._validate_shared_relations(
+                shared_relations,
+                ego_features,
+                goal_features,
+                zone_features,
+                presence_mask,
+            )
+        clean_zone_features = shared_relations.clean_zone_features
+        if profile_sections:
+            with record_function('v2_encoder.zone_task_encoding'):
+                zone_tokens = self.zone_encoder(clean_zone_features)
+                zone_tokens = zone_tokens * presence_mask.unsqueeze(-1).to(
+                    zone_tokens.dtype
+                )
+                task_embedding = self.task_encoder(ego_features, goal_features)
+        else:
+            zone_tokens = self.zone_encoder(clean_zone_features)
+            zone_tokens = zone_tokens * presence_mask.unsqueeze(-1).to(
+                zone_tokens.dtype
+            )
+            task_embedding = self.task_encoder(ego_features, goal_features)
+        pair_relations = shared_relations.pair_relations
+        valid_token_mask = shared_relations.valid_token_mask
+        empty_tokens = self.empty_scene_token.expand(
+            batch_size,
+            -1,
+            -1,
+        )
+        tokens = torch.cat((empty_tokens, zone_tokens), dim=1)
+        tokens = tokens * valid_token_mask.unsqueeze(-1).to(tokens.dtype)
+
+        token_pair_relations = shared_relations.token_pair_relations
+        relation_pair_mask = shared_relations.relation_pair_mask
 
         attention_weights: list[torch.Tensor] = []
-        for layer in self.layers:
-            layer_result = layer(
+        if profile_sections:
+            with record_function('v2_encoder.relation_attention'):
+                for layer in self.layers:
+                    layer_result = layer(
+                        tokens,
+                        valid_token_mask,
+                        token_pair_relations,
+                        relation_pair_mask,
+                        return_attention_weights=diagnostics,
+                    )
+                    if diagnostics:
+                        tokens, weights = layer_result
+                        attention_weights.append(weights)
+                    else:
+                        tokens = layer_result
+        else:
+            for layer in self.layers:
+                layer_result = layer(
+                    tokens,
+                    valid_token_mask,
+                    token_pair_relations,
+                    relation_pair_mask,
+                    return_attention_weights=diagnostics,
+                )
+                if diagnostics:
+                    tokens, weights = layer_result
+                    attention_weights.append(weights)
+                else:
+                    tokens = layer_result
+
+        if profile_sections:
+            with record_function('v2_encoder.task_conditioned_pooling'):
+                pooling_result = self.pooling(
+                    task_embedding,
+                    tokens,
+                    valid_token_mask,
+                    return_attention_weights=diagnostics,
+                )
+                if diagnostics:
+                    zone_summary, pooling_weights = pooling_result
+                else:
+                    zone_summary = pooling_result
+                    pooling_weights = None
+                policy_context = torch.cat((task_embedding, zone_summary), dim=-1)
+        else:
+            pooling_result = self.pooling(
+                task_embedding,
                 tokens,
                 valid_token_mask,
-                token_pair_relations,
-                relation_pair_mask,
                 return_attention_weights=diagnostics,
             )
             if diagnostics:
-                tokens, weights = layer_result
-                attention_weights.append(weights)
+                zone_summary, pooling_weights = pooling_result
             else:
-                tokens = layer_result
-
-        pooling_result = self.pooling(
-            task_embedding,
-            tokens,
-            valid_token_mask,
-            return_attention_weights=diagnostics,
-        )
-        if diagnostics:
-            zone_summary, pooling_weights = pooling_result
-        else:
-            zone_summary = pooling_result
-            pooling_weights = None
-        policy_context = torch.cat((task_embedding, zone_summary), dim=-1)
+                zone_summary = pooling_result
+                pooling_weights = None
+            policy_context = torch.cat((task_embedding, zone_summary), dim=-1)
         if not diagnostics:
             return policy_context
         return ZoneSetEncoderDiagnostics(
@@ -566,6 +772,9 @@ class ZoneSetEncoder(nn.Module):
         goal_features: torch.Tensor,
         zone_features: torch.Tensor,
         presence_mask: torch.Tensor,
+        *,
+        shared_relations: ZoneSetSharedRelations | None = None,
+        profile_sections: bool = False,
     ) -> torch.Tensor:
         return self._forward_impl(
             ego_features,
@@ -573,6 +782,8 @@ class ZoneSetEncoder(nn.Module):
             zone_features,
             presence_mask,
             diagnostics=False,
+            shared_relations=shared_relations,
+            profile_sections=profile_sections,
         )
 
     def forward_checked(

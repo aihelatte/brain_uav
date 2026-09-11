@@ -104,6 +104,52 @@ class TestV2SNNTD3(unittest.TestCase):
         self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
         self.assertEqual(engine.actor_target.snn_head.lif2.v, 0.0)
 
+    def test_snn_actor_target_uses_batched_soft_update_reference_formula(self) -> None:
+        engine = self.make_engine()
+        before = {
+            name: parameter.detach().clone()
+            for name, parameter in engine.actor_target.named_parameters()
+        }
+        with torch.no_grad():
+            for parameter in engine.actor.parameters():
+                parameter.add_(0.25)
+        expected = {
+            name: before[name] * 0.75 + parameter.detach() * 0.25
+            for name, parameter in engine.actor.named_parameters()
+        }
+
+        engine._soft_update(engine.actor, engine.actor_target)
+
+        for name, parameter in engine.actor_target.named_parameters():
+            torch.testing.assert_close(parameter, expected[name])
+
+    def test_snn_update_with_reused_relations_matches_original_path(self) -> None:
+        torch.manual_seed(8642)
+        original = self.make_engine()
+        torch.manual_seed(8642)
+        reused = self.make_engine()
+        torch.manual_seed(7531)
+        original_metrics = original.update_once(
+            total_steps=1,
+            reuse_shared_relations=False,
+        )
+        torch.manual_seed(7531)
+        reused_metrics = reused.update_once(total_steps=1)
+
+        self.assertEqual(reused_metrics, original_metrics)
+        for reused_model, original_model in (
+            (reused.actor, original.actor),
+            (reused.critic1, original.critic1),
+            (reused.critic2, original.critic2),
+            (reused.actor_target, original.actor_target),
+            (reused.critic1_target, original.critic1_target),
+            (reused.critic2_target, original.critic2_target),
+        ):
+            for name, value in reused_model.state_dict().items():
+                torch.testing.assert_close(
+                    value, original_model.state_dict()[name]
+                )
+
     def test_snn_fixed_buffers_are_validated_before_training(self) -> None:
         actor = self.make_actor()
         with torch.no_grad():

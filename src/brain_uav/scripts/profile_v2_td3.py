@@ -34,7 +34,7 @@ from brain_uav.trainers.v2_validation import (
 
 
 DIAGNOSTIC_FORMAT = 'v2_td3_timing_diagnostic'
-DIAGNOSTIC_VERSION = 2
+DIAGNOSTIC_VERSION = 3
 DIAGNOSTIC_LEVELS = ('easy', 'medium', 'hard')
 UPDATE_TIMING_SECTION_NAMES = V2_TD3_UPDATE_TIMING_SECTIONS
 
@@ -174,6 +174,104 @@ class _UpdateTimingSummary:
         }
 
 
+class _DetailedUpdateProfiler:
+    """Bounded profiler collection for measured TD3 updates only."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        *,
+        requested_updates: int,
+        output_dir: Path | None,
+    ) -> None:
+        self.device = device
+        self.requested_updates = _nonnegative_int(
+            requested_updates,
+            name='detailed_profiler_updates',
+        )
+        if self.requested_updates and output_dir is None:
+            raise ValueError('profiler_output_dir is required when profiling is enabled.')
+        self.output_dir = output_dir
+        self.captured_updates = 0
+        self._profiler = None
+        self._activities = [torch.profiler.ProfilerActivity.CPU]
+        if device.type == 'cuda':
+            self._activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+    @property
+    def enabled(self) -> bool:
+        return self.requested_updates > 0
+
+    def _ensure_started(self) -> None:
+        if self._profiler is not None:
+            return
+        assert self.output_dir is not None
+        self.output_dir.mkdir(parents=True, exist_ok=False)
+        self._profiler = torch.profiler.profile(
+            activities=self._activities,
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        )
+        self._profiler.__enter__()
+        self._profiler.toggle_collection_dynamic(False, self._activities)
+
+    def run(self, operation: Callable[[bool], Any]) -> Any:
+        if not self.enabled or self.captured_updates >= self.requested_updates:
+            return operation(False)
+        self._ensure_started()
+        self._profiler.toggle_collection_dynamic(True, self._activities)
+        try:
+            result = operation(True)
+        finally:
+            self._profiler.toggle_collection_dynamic(False, self._activities)
+        self.captured_updates += 1
+        self._profiler.step()
+        return result
+
+    def finish(self) -> dict[str, Any]:
+        output_paths: dict[str, str] = {}
+        if self._profiler is not None:
+            self._profiler.__exit__(None, None, None)
+            assert self.output_dir is not None
+            averages = self._profiler.key_averages()
+            cpu_path = self.output_dir / 'operators_cpu.txt'
+            cuda_path = self.output_dir / 'operators_cuda.txt'
+            trace_path = self.output_dir / 'trace.json'
+            cpu_path.write_text(
+                averages.table(sort_by='self_cpu_time_total', row_limit=50),
+                encoding='utf-8',
+            )
+            if self.device.type == 'cuda':
+                cuda_text = averages.table(
+                    sort_by='self_cuda_time_total',
+                    row_limit=50,
+                )
+            else:
+                cuda_text = 'CUDA activity was not collected for this CPU diagnostic.\n'
+            cuda_path.write_text(cuda_text, encoding='utf-8')
+            self._profiler.export_chrome_trace(str(trace_path))
+            output_paths = {
+                'cpu_operator_table': str(cpu_path.resolve()),
+                'cuda_operator_table': str(cuda_path.resolve()),
+                'trace': str(trace_path.resolve()),
+            }
+        return {
+            'enabled': self.enabled,
+            'requested_updates': self.requested_updates,
+            'captured_updates': self.captured_updates,
+            'output_paths': output_paths,
+            'measurement_note': (
+                'The profiler adds overhead. Its sampled updates are separately '
+                'identified and excluded from the ordinary update breakdown. CPU '
+                'region time is not pure GPU compute time; CUDA synchronization waits '
+                'may appear in later regions such as gradient checks. Parent and child '
+                'regions must not be added together, and no per-region CUDA '
+                'synchronization is introduced.'
+            ),
+        }
+
+
 def _load_diagnostic_initialization(
     config: V2FormalTrainingConfig,
     *,
@@ -252,6 +350,8 @@ def _run_diagnostic_level(
     device: torch.device,
     warmup_steps: int,
     measured_steps: int,
+    detailed_profiler_updates: int = 0,
+    profiler_output_dir: Path | None = None,
 ) -> dict[str, Any]:
     scenario_count = len(pool.scenarios)
     if scenario_count == 0 or measured_steps < scenario_count:
@@ -289,6 +389,11 @@ def _run_diagnostic_level(
     )
     timing = _TimingBook(device)
     update_timing = _UpdateTimingSummary()
+    detailed_profiler = _DetailedUpdateProfiler(
+        device,
+        requested_updates=detailed_profiler_updates,
+        output_dir=profiler_output_dir,
+    )
     observation = None
     episode_transitions: list[tuple[Any, ...]] = []
     slot_refs: list[tuple[int, int]] = []
@@ -302,6 +407,7 @@ def _run_diagnostic_level(
     measured_count = 0
     actual_warmup_steps = 0
     scenario_index = 0
+    profiled_update_active = False
     # Bound failure if the expected update cadence cannot reach the warmup gate.
     warmup_limit = max(
         warmup_steps, engine.batch_size - 1, formal_config.actor_freeze_steps,
@@ -311,7 +417,11 @@ def _run_diagnostic_level(
         if not measured_phase:
             return original_sample(batch_size)
         return timing.call(
-            'replay_sample_wall_seconds',
+            (
+                'profiled_replay_sample_wall_seconds'
+                if profiled_update_active
+                else 'replay_sample_wall_seconds'
+            ),
             lambda: original_sample(batch_size),
         )
 
@@ -410,18 +520,36 @@ def _run_diagnostic_level(
                         sections=update_sections,
                     )
 
-                call(
-                    'td3_update_wall_seconds',
-                    lambda: engine.update_once(
-                        total_steps=step_number,
-                        bc_lambda=v2_bc_lambda(step_number - 1),
-                        timing_recorder=(
-                            capture_update_sections if measured_phase else None
-                        ),
-                    ),
-                    cuda_event=True,
-                    on_complete=record_update,
-                )
+                def perform_update(profile_sections: bool):
+                    nonlocal profiled_update_active
+                    profiled_update_active = profile_sections
+                    try:
+                        return call(
+                            (
+                                'td3_profiled_update_wall_seconds'
+                                if profile_sections
+                                else 'td3_update_wall_seconds'
+                            ),
+                            lambda: engine.update_once(
+                                total_steps=step_number,
+                                bc_lambda=v2_bc_lambda(step_number - 1),
+                                timing_recorder=(
+                                    capture_update_sections
+                                    if measured_phase and not profile_sections
+                                    else None
+                                ),
+                                profile_sections=profile_sections,
+                            ),
+                            cuda_event=True,
+                            on_complete=(None if profile_sections else record_update),
+                        )
+                    finally:
+                        profiled_update_active = False
+
+                if measured_phase:
+                    detailed_profiler.run(perform_update)
+                else:
+                    perform_update(False)
             observation = next_observation
             if done:
                 outcome = str(info.get('outcome', ''))
@@ -452,6 +580,7 @@ def _run_diagnostic_level(
         measured_total = perf_counter() - measured_started
     finally:
         engine.replay.sample = original_sample
+        profiler_metadata = detailed_profiler.finish()
 
     update_seconds = timing.wall_seconds['td3_update_wall_seconds']
     sample_seconds = timing.wall_seconds['replay_sample_wall_seconds']
@@ -462,6 +591,15 @@ def _run_diagnostic_level(
     critic_updates = engine.critic_update_count - critic_updates_before
     if critic_updates == 0 or actor_updates == 0:
         raise RuntimeError('Diagnostic measurement must include both critic and actor updates.')
+    profiler_overhead_included = bool(profiler_metadata['enabled'])
+    total_wall_seconds_note = (
+        'This is wall time for the diagnostic run including detailed profiler '
+        'collection, startup, and activity-switching overhead. It must not be used '
+        'as normal training throughput or for optimization speedup comparisons.'
+        if profiler_overhead_included
+        else 'Detailed profiler is disabled; throughput is calculated from this '
+        'ordinary short-diagnostic wall time.'
+    )
     return {
         'curriculum_level': level,
         'requested_minimum_warmup_steps': warmup_steps,
@@ -474,10 +612,17 @@ def _run_diagnostic_level(
         'actor_updates': actor_updates,
         'critic_updates': critic_updates,
         'actor_target_updates': actor_updates,
+        'detailed_profiler': profiler_metadata,
         'timing': {
             'total_wall_seconds': measured_total,
+            'total_wall_seconds_includes_detailed_profiler_overhead': (
+                profiler_overhead_included
+            ),
+            'total_wall_seconds_note': total_wall_seconds_note,
             'throughput_environment_steps_per_second': (
-                measured_steps / measured_total if measured_total > 0.0 else None
+                measured_steps / measured_total
+                if not profiler_overhead_included and measured_total > 0.0
+                else None
             ),
             'scenario_reset_wall_seconds': timing.wall_seconds['scenario_reset_wall_seconds'],
             'action_inference_wall_seconds': timing.wall_seconds['action_inference_wall_seconds'],
@@ -485,6 +630,9 @@ def _run_diagnostic_level(
             'environment_step_wall_seconds': timing.wall_seconds['environment_step_wall_seconds'],
             'replay_write_wall_seconds': timing.wall_seconds['replay_write_wall_seconds'],
             'td3_update_wall_seconds': update_seconds,
+            'td3_profiled_update_wall_seconds': timing.wall_seconds[
+                'td3_profiled_update_wall_seconds'
+            ],
             'td3_update_breakdown': update_timing.to_dict(),
             'replay_sample_wall_seconds': sample_seconds,
             'replay_sample_relation': 'within_td3_update',
@@ -527,6 +675,7 @@ def run_v2_td3_timing_diagnostic(
     batch_size: int = 64,
     replay_capacity: int = 2048,
     scenario_count: int = 3,
+    detailed_profiler_updates: int = 0,
 ) -> dict[str, Any]:
     if model not in ('ann', 'snn'):
         raise ValueError('model must be ann or snn.')
@@ -537,6 +686,10 @@ def run_v2_td3_timing_diagnostic(
     if capacity < batch:
         raise ValueError('replay_capacity must be at least batch_size.')
     pool_count = _positive_int(scenario_count, name='scenario_count')
+    profiler_updates = _nonnegative_int(
+        detailed_profiler_updates,
+        name='detailed_profiler_updates',
+    )
     if steps < pool_count:
         raise ValueError('steps_per_level must be at least scenario_count.')
     run_seed = _nonnegative_int(seed, name='seed')
@@ -603,6 +756,10 @@ def run_v2_td3_timing_diagnostic(
             device=target_device,
             warmup_steps=warmup,
             measured_steps=steps,
+            detailed_profiler_updates=profiler_updates,
+            profiler_output_dir=(
+                output / 'profiler' / level if profiler_updates else None
+            ),
         )
         level_results[level] = result
         print(json.dumps({
@@ -611,6 +768,9 @@ def run_v2_td3_timing_diagnostic(
             'wall_seconds': result['timing']['total_wall_seconds'],
             'actor_updates': result['actor_updates'],
             'critic_updates': result['critic_updates'],
+            'detailed_profiler_updates': result['detailed_profiler'][
+                'captured_updates'
+            ],
             'update_breakdown_average_ms': {
                 name: {
                     'count': bucket['update_count'],
@@ -655,6 +815,11 @@ def run_v2_td3_timing_diagnostic(
             'replay_capacity': capacity,
             'actor_freeze_steps': 0,
             'scenario_count_per_level': pool_count,
+            'detailed_profiler_updates_per_level': profiler_updates,
+            'detailed_profiler_scope': (
+                'first measured TD3 updates after warmup; excluded from ordinary '
+                'update timing breakdown'
+            ),
             'bc_lambda_schedule': 'formal_v2_stage_local_schedule',
             'exploration_noise': config.noise_schedule.exploration_initial,
             'policy_noise': config.noise_schedule.policy_initial,
@@ -701,6 +866,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--replay-capacity', type=int, default=2048)
     parser.add_argument('--scenario-count', type=int, default=3)
+    parser.add_argument(
+        '--detailed-profiler-updates',
+        type=int,
+        nargs='?',
+        const=16,
+        default=0,
+        metavar='N',
+        help='Profile at most N post-warmup TD3 updates per level (bare flag: 16).',
+    )
     return parser
 
 
@@ -720,6 +894,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         batch_size=args.batch_size,
         replay_capacity=args.replay_capacity,
         scenario_count=args.scenario_count,
+        detailed_profiler_updates=args.detailed_profiler_updates,
     )
 
 

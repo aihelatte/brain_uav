@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import math
 import unittest
 from unittest import mock
@@ -220,6 +221,75 @@ class TestZoneSetEncoder(unittest.TestCase):
                 fast = self.model(*inputs)
                 checked = self.model.forward_checked(*inputs)
                 torch.testing.assert_close(checked, fast)
+
+    def test_precomputed_relations_match_original_outputs_and_gradients(self):
+        for counts in ([0], [0, 3, 7]):
+            with self.subTest(counts=counts):
+                model = ZoneSetEncoder(self.scales).train()
+                baseline_inputs = tuple(
+                    value.clone().requires_grad_(value.dtype == torch.float32)
+                    for value in self.inputs(counts)
+                )
+                baseline = model(*baseline_inputs)
+                baseline.square().sum().backward()
+                baseline_parameter_grads = {
+                    name: parameter.grad.detach().clone()
+                    for name, parameter in model.named_parameters()
+                }
+                baseline_input_grads = tuple(
+                    value.grad.detach().clone()
+                    for value in baseline_inputs[:3]
+                )
+
+                model.zero_grad(set_to_none=True)
+                shared_inputs = tuple(
+                    value.detach().clone().requires_grad_(value.dtype == torch.float32)
+                    for value in baseline_inputs
+                )
+                shared = model.build_shared_relations(*shared_inputs)
+                reused = model(*shared_inputs, shared_relations=shared)
+                reused.square().sum().backward()
+
+                torch.testing.assert_close(reused, baseline)
+                for name, parameter in model.named_parameters():
+                    torch.testing.assert_close(
+                        parameter.grad,
+                        baseline_parameter_grads[name],
+                    )
+                for actual, expected in zip(shared_inputs[:3], baseline_input_grads):
+                    torch.testing.assert_close(actual.grad, expected)
+
+    def test_profiled_forward_marks_only_major_encoder_sections(self):
+        inputs = self.inputs([0, 3, 7])
+        expected = self.model(*inputs)
+        labels = []
+
+        @contextmanager
+        def record(label):
+            labels.append(label)
+            yield
+
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.record_function',
+            side_effect=record,
+        ):
+            shared = self.model.build_shared_relations(
+                *inputs,
+                profile_sections=True,
+            )
+            actual = self.model(
+                *inputs,
+                shared_relations=shared,
+                profile_sections=True,
+            )
+
+        torch.testing.assert_close(actual, expected)
+        self.assertEqual(labels, [
+            'v2_encoder.shared_relation_build',
+            'v2_encoder.zone_task_encoding',
+            'v2_encoder.relation_attention',
+            'v2_encoder.task_conditioned_pooling',
+        ])
 
     def test_checked_forward_rejects_nonfinite_inputs_and_output(self):
         ego, goal, zones, mask = self.inputs([2])

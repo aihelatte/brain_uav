@@ -14,6 +14,7 @@ from .zone_set_encoder import (
     ZoneSetEncoder,
     ZoneSetEncoderConfig,
     ZoneSetEncoderDiagnostics,
+    ZoneSetSharedRelations,
 )
 
 __all__ = [
@@ -33,5 +34,6 @@ __all__ = [
     'ZoneSetEncoder',
     'ZoneSetEncoderConfig',
     'ZoneSetEncoderDiagnostics',
+    'ZoneSetSharedRelations',
     'require_v2_spikingjelly',
 ]

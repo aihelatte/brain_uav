@@ -10,7 +10,11 @@ from torch import nn
 
 from brain_uav.observations import V2ObservationBatch, V2ObservationScales
 
-from .zone_set_encoder import ZoneSetEncoder, ZoneSetEncoderConfig
+from .zone_set_encoder import (
+    ZoneSetEncoder,
+    ZoneSetEncoderConfig,
+    ZoneSetSharedRelations,
+)
 
 try:
     from spikingjelly.activation_based import functional, neuron, surrogate
@@ -195,7 +199,13 @@ class V2SNNPolicyActor(nn.Module):
         )
         self.register_buffer('action_limit', limit)
 
-    def forward(self, observation: V2ObservationBatch) -> torch.Tensor:
+    def forward(
+        self,
+        observation: V2ObservationBatch,
+        *,
+        shared_relations: ZoneSetSharedRelations | None = None,
+        profile_sections: bool = False,
+    ) -> torch.Tensor:
         if not isinstance(observation, V2ObservationBatch):
             raise TypeError('observation must be a V2ObservationBatch.')
         functional.reset_net(self.snn_head)
@@ -205,6 +215,8 @@ class V2SNNPolicyActor(nn.Module):
                 observation.goal_features,
                 observation.zone_features,
                 observation.presence_mask,
+                shared_relations=shared_relations,
+                profile_sections=profile_sections,
             )
             return torch.tanh(self.snn_head(context)) * self.action_limit
         finally:

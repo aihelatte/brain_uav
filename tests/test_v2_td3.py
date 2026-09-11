@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from contextlib import ExitStack
+from contextlib import contextmanager
 import math
 import unittest
 from copy import deepcopy
@@ -558,6 +560,139 @@ class TestV2TD3(unittest.TestCase):
             expected = before[name] * 0.75 + online[name] * 0.25
             torch.testing.assert_close(target[name], expected)
 
+    def test_soft_update_batches_cached_parameter_pairs_and_survives_checkpoint_load(self):
+        engine = self.make_engine(tau=0.25)
+
+        def expected_after_update(online, target):
+            before = {
+                name: parameter.detach().clone()
+                for name, parameter in target.named_parameters()
+            }
+            with torch.no_grad():
+                for parameter in online.parameters():
+                    parameter.add_(0.5)
+            return {
+                name: before[name] * 0.75 + parameter.detach() * 0.25
+                for name, parameter in online.named_parameters()
+            }
+
+        expected = []
+        pairs = (
+            (engine.actor, engine.actor_target),
+            (engine.critic1, engine.critic1_target),
+            (engine.critic2, engine.critic2_target),
+        )
+        for online, target in pairs:
+            expected.append(expected_after_update(online, target))
+        with mock.patch.object(
+            torch, '_foreach_mul_', wraps=torch._foreach_mul_,
+        ) as multiply, mock.patch.object(
+            torch, '_foreach_add_', wraps=torch._foreach_add_,
+        ) as add:
+            for online, target in pairs:
+                engine._soft_update(online, target)
+        self.assertEqual(multiply.call_count, 3)
+        self.assertEqual(add.call_count, 3)
+        for (_, target), reference in zip(pairs, expected):
+            for name, parameter in target.named_parameters():
+                torch.testing.assert_close(parameter, reference[name])
+
+        restored = self.make_engine(tau=0.25)
+        restored.load_checkpoint_state_dict(engine.checkpoint_state_dict())
+        reference = expected_after_update(restored.actor, restored.actor_target)
+        restored._soft_update(restored.actor, restored.actor_target)
+        for name, parameter in restored.actor_target.named_parameters():
+            torch.testing.assert_close(parameter, reference[name])
+
+    def test_update_reuses_current_and_next_relations_once_each(self):
+        engine = self.make_engine(policy_delay=1)
+        self.fill_replay(engine)
+        encoders = (
+            engine.actor.zone_set_encoder,
+            engine.actor_target.zone_set_encoder,
+            engine.critic1.zone_set_encoder,
+            engine.critic2.zone_set_encoder,
+            engine.critic1_target.zone_set_encoder,
+            engine.critic2_target.zone_set_encoder,
+        )
+        with ExitStack() as stack:
+            shared_builder = stack.enter_context(mock.patch.object(
+                encoders[0].pair_relation_builder,
+                'forward',
+                wraps=encoders[0].pair_relation_builder.forward,
+            ))
+            other_builders = [
+                stack.enter_context(mock.patch.object(
+                    encoder.pair_relation_builder,
+                    'forward',
+                    wraps=encoder.pair_relation_builder.forward,
+                ))
+                for encoder in encoders[1:]
+            ]
+            engine.update_once(total_steps=1)
+
+        self.assertEqual(shared_builder.call_count, 2)
+        self.assertEqual(sum(spy.call_count for spy in other_builders), 0)
+
+    def test_reused_relations_match_original_td3_update_for_both_delay_paths(self):
+        for total_steps in (1, 2):
+            with self.subTest(total_steps=total_steps):
+                def make_seeded_engine():
+                    torch.manual_seed(2468)
+                    engine = self.make_engine(policy_delay=2)
+                    self.fill_replay(engine, counts=(0, 7), next_counts=(7, 0))
+                    engine.replay.rng = np.random.default_rng(1357)
+                    return engine
+
+                original = make_seeded_engine()
+                reused = make_seeded_engine()
+                torch.manual_seed(9753)
+                original_metrics = original.update_once(
+                    total_steps=total_steps,
+                    reuse_shared_relations=False,
+                )
+                torch.manual_seed(9753)
+                reused_metrics = reused.update_once(total_steps=total_steps)
+
+                self.assertEqual(reused_metrics, original_metrics)
+                for reused_model, original_model in (
+                    (reused.actor, original.actor),
+                    (reused.critic1, original.critic1),
+                    (reused.critic2, original.critic2),
+                    (reused.actor_target, original.actor_target),
+                    (reused.critic1_target, original.critic1_target),
+                    (reused.critic2_target, original.critic2_target),
+                ):
+                    self.assert_state_dict_equal(
+                        reused_model.state_dict(), original_model.state_dict()
+                    )
+                self.assertEqual(reused.update_count, original.update_count)
+                self.assertEqual(
+                    reused.actor_update_count, original.actor_update_count
+                )
+
+    def test_profiled_update_marks_critic_backward_gradient_and_optimizer(self):
+        engine = self.make_engine(policy_delay=2)
+        self.fill_replay(engine)
+        labels = []
+
+        @contextmanager
+        def record(label):
+            labels.append(label)
+            yield
+
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.record_function',
+            side_effect=record,
+        ):
+            engine.update_once(total_steps=1, profile_sections=True)
+
+        self.assertEqual(labels, [
+            'v2_td3.critic_backward',
+            'v2_td3.critic_gradient_check_and_clip',
+            'v2_td3.critic_optimizer_step',
+        ])
+
     def test_fixed_buffers_are_validated_at_engine_and_checkpoint_boundaries(self):
         action_limit = torch.tensor([0.2, 0.3], dtype=torch.float32)
         actor = V2ANNPolicyActor(self.scales, 2, 16, action_limit)
@@ -599,9 +734,9 @@ class TestV2TD3(unittest.TestCase):
         captured_actions = []
         original_forward = engine.critic1_target.forward
 
-        def capture(observation, action):
+        def capture(observation, action, **kwargs):
             captured_actions.append(action.detach().clone())
-            return original_forward(observation, action)
+            return original_forward(observation, action, **kwargs)
 
         actor_output = torch.tensor(
             [[0.19, -0.29], [0.19, -0.29]], dtype=torch.float32
@@ -643,7 +778,7 @@ class TestV2TD3(unittest.TestCase):
         ])
         safe = torch.ones((2, 1), dtype=torch.float32)
 
-        def constant_q(obs, action):
+        def constant_q(obs, action, **_kwargs):
             del obs
             return action[:, :1] * 0.0 + 10.0
 

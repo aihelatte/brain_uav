@@ -9,7 +9,11 @@ from torch import nn
 
 from brain_uav.observations import V2ObservationBatch, V2ObservationScales
 
-from .zone_set_encoder import ZoneSetEncoder, ZoneSetEncoderConfig
+from .zone_set_encoder import (
+    ZoneSetEncoder,
+    ZoneSetEncoderConfig,
+    ZoneSetSharedRelations,
+)
 
 
 def _positive_int(value: Any, *, name: str) -> int:
@@ -86,7 +90,13 @@ class V2ANNPolicyActor(nn.Module):
         nn.init.uniform_(final_linear.weight, -1e-3, 1e-3)
         nn.init.uniform_(final_linear.bias, -1e-3, 1e-3)
 
-    def forward(self, observation: V2ObservationBatch) -> torch.Tensor:
+    def forward(
+        self,
+        observation: V2ObservationBatch,
+        *,
+        shared_relations: ZoneSetSharedRelations | None = None,
+        profile_sections: bool = False,
+    ) -> torch.Tensor:
         if not isinstance(observation, V2ObservationBatch):
             raise TypeError('observation must be a V2ObservationBatch.')
         context = self.zone_set_encoder(
@@ -94,6 +104,8 @@ class V2ANNPolicyActor(nn.Module):
             observation.goal_features,
             observation.zone_features,
             observation.presence_mask,
+            shared_relations=shared_relations,
+            profile_sections=profile_sections,
         )
         return self.head(context) * self.action_limit
 
@@ -144,6 +156,9 @@ class V2ANNCritic(nn.Module):
         self,
         observation: V2ObservationBatch,
         action: torch.Tensor,
+        *,
+        shared_relations: ZoneSetSharedRelations | None = None,
+        profile_sections: bool = False,
     ) -> torch.Tensor:
         if not isinstance(observation, V2ObservationBatch):
             raise TypeError('observation must be a V2ObservationBatch.')
@@ -163,5 +178,7 @@ class V2ANNCritic(nn.Module):
             observation.goal_features,
             observation.zone_features,
             observation.presence_mask,
+            shared_relations=shared_relations,
+            profile_sections=profile_sections,
         )
         return self.head(torch.cat((context, action), dim=-1))

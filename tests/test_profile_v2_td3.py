@@ -17,6 +17,7 @@ from brain_uav.scripts.profile_v2_td3 import (
     DIAGNOSTIC_FORMAT,
     UPDATE_TIMING_SECTION_NAMES,
     _UpdateTimingSummary,
+    _DetailedUpdateProfiler,
     _prepare_diagnostic_pools,
     _run_diagnostic_level,
     build_parser,
@@ -40,7 +41,8 @@ import test_v2_td3 as v2_td3_tests
 
 class TestProfileV2TD3(unittest.TestCase):
     def run_small_level(self, *, warmup=0, steps=5, early_goal=False,
-                        device='cpu', suppress_measured_actor=False):
+                        device='cpu', suppress_measured_actor=False,
+                        detailed_profiler_updates=0, profiler_output_dir=None):
         # Real environment and replay; only network work and CUDA are test doubles.
         scenario = make_scenario_config()
         scenario.max_steps = 100
@@ -63,7 +65,9 @@ class TestProfileV2TD3(unittest.TestCase):
             submitted.append(observation)
             return np.zeros(2, dtype=np.float32)
 
-        def update_once(*, total_steps, bc_lambda, timing_recorder=None):
+        def update_once(*, total_steps, bc_lambda, timing_recorder=None,
+                        profile_sections=False, reuse_shared_relations=True):
+            del reuse_shared_relations
             replay.sample(4)
             engine.critic_update_count += 1
             actor_updated = total_steps % 2 == 0 and not (
@@ -77,7 +81,9 @@ class TestProfileV2TD3(unittest.TestCase):
                     'batch_preparation': 0.02,
                     'target_forward_and_td_target': 0.03,
                     'online_critic_forward_and_loss': 0.04,
-                    'critic_backward_and_step': 0.05,
+                    'critic_backward': 0.02,
+                    'critic_gradient_check_and_clip': 0.01,
+                    'critic_optimizer_step': 0.02,
                     'actor_update': 0.06 if actor_updated else 0.0,
                     'target_soft_update': 0.07 if actor_updated else 0.02,
                 })
@@ -110,6 +116,8 @@ class TestProfileV2TD3(unittest.TestCase):
                 ),
                 bc_checkpoint=Path('unused.pt'), model='ann', snn_time_window=4,
                 device=torch.device(device), warmup_steps=warmup, measured_steps=steps,
+                detailed_profiler_updates=detailed_profiler_updates,
+                profiler_output_dir=profiler_output_dir,
             )
         return result, replay, synchronization_points
 
@@ -122,6 +130,15 @@ class TestProfileV2TD3(unittest.TestCase):
                 self.assertEqual(result['warmup_actor_updates'], actor)
                 self.assertEqual(result['critic_updates'], 5)
                 self.assertEqual(result['timing']['total_wall_seconds'], 5.0)
+                self.assertFalse(
+                    result['timing'][
+                        'total_wall_seconds_includes_detailed_profiler_overhead'
+                    ]
+                )
+                self.assertEqual(
+                    result['timing']['throughput_environment_steps_per_second'],
+                    1.0,
+                )
                 self.assertEqual(result['actor_updates'], 3 if actual == 7 else 2)
                 self.assertEqual(result['timing']['calls']['environment_step_wall_seconds'], 5)
                 self.assertEqual(result['timing']['calls']['td3_update_wall_seconds'], 5)
@@ -156,7 +173,7 @@ class TestProfileV2TD3(unittest.TestCase):
             total_wall_seconds=20.0,
             sections=dict(zip(
                 UPDATE_TIMING_SECTION_NAMES,
-                (1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0),
+                (1.0, 2.0, 3.0, 4.0, 2.0, 1.0, 2.0, 0.0, 1.0),
             )),
         )
         for multiplier in (1.0, 2.0):
@@ -165,7 +182,10 @@ class TestProfileV2TD3(unittest.TestCase):
                 total_wall_seconds=40.0 * multiplier,
                 sections=dict(zip(
                     UPDATE_TIMING_SECTION_NAMES,
-                    tuple(value * multiplier for value in (2, 3, 4, 5, 6, 7, 3)),
+                    tuple(
+                        value * multiplier
+                        for value in (2, 3, 4, 5, 2, 1, 3, 7, 3)
+                    ),
                 )),
             )
 
@@ -225,7 +245,9 @@ class TestProfileV2TD3(unittest.TestCase):
             'batch_preparation': 1.0,
             'target_forward_and_td_target': 1.0,
             'online_critic_forward_and_loss': 1.0,
-            'critic_backward_and_step': 1.0,
+            'critic_backward': 1.0,
+            'critic_gradient_check_and_clip': 1.0,
+            'critic_optimizer_step': 1.0,
             'actor_update': 3.0,
             'target_soft_update': 2.0,
         })
@@ -312,6 +334,69 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertEqual(args.batch_size, 64)
         self.assertEqual(args.device, 'auto')
         self.assertEqual(args.snn_time_window, 4)
+        self.assertEqual(args.detailed_profiler_updates, 0)
+        enabled = build_parser().parse_args([
+            '--model', 'ann', '--bc-checkpoint', 'bc.pt',
+            '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
+            '--detailed-profiler-updates',
+        ])
+        self.assertEqual(enabled.detailed_profiler_updates, 16)
+
+    def test_detailed_profiler_excludes_warmup_caps_updates_and_isolates_outputs(self) -> None:
+        class FakeAverages:
+            def table(self, *, sort_by, row_limit):
+                return f'{sort_by}:{row_limit}'
+
+        class FakeProfiler:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def toggle_collection_dynamic(self, enabled, activities):
+                pass
+
+            def step(self):
+                pass
+
+            def key_averages(self):
+                return FakeAverages()
+
+            def export_chrome_trace(self, path):
+                Path(path).write_text('{}', encoding='utf-8')
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            'brain_uav.scripts.profile_v2_td3.torch.profiler.profile',
+            return_value=FakeProfiler(),
+        ):
+            output = Path(directory) / 'profiler' / 'easy'
+            result, _, _ = self.run_small_level(
+                warmup=0,
+                steps=5,
+                device='cuda',
+                detailed_profiler_updates=2,
+                profiler_output_dir=output,
+            )
+            details = result['detailed_profiler']
+            self.assertTrue(details['enabled'])
+            self.assertEqual(details['requested_updates'], 2)
+            self.assertEqual(details['captured_updates'], 2)
+            self.assertGreater(result['warmup_critic_updates'], 0)
+            self.assertIn('profiler adds overhead', details['measurement_note'])
+            timing = result['timing']
+            self.assertEqual(timing['total_wall_seconds'], 5.0)
+            self.assertTrue(
+                timing['total_wall_seconds_includes_detailed_profiler_overhead']
+            )
+            self.assertIsNone(timing['throughput_environment_steps_per_second'])
+            self.assertIn('detailed profiler', timing['total_wall_seconds_note'])
+            self.assertIn('normal training throughput', timing['total_wall_seconds_note'])
+            self.assertIn('optimization speedup comparisons', timing['total_wall_seconds_note'])
+            for path in details['output_paths'].values():
+                resolved = Path(path).resolve()
+                self.assertTrue(resolved.is_file())
+                self.assertTrue(resolved.is_relative_to(output.resolve()))
 
     def test_unavailable_explicit_cuda_fails_without_output_or_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -368,7 +453,7 @@ class TestProfileV2TD3(unittest.TestCase):
             total_wall_seconds=0.15,
             sections=dict(zip(
                 UPDATE_TIMING_SECTION_NAMES,
-                (0.01, 0.01, 0.02, 0.03, 0.04, 0.0, 0.01),
+                (0.01, 0.01, 0.02, 0.03, 0.02, 0.01, 0.01, 0.0, 0.01),
             )),
         )
         update_breakdown.record(
@@ -376,7 +461,7 @@ class TestProfileV2TD3(unittest.TestCase):
             total_wall_seconds=0.25,
             sections=dict(zip(
                 UPDATE_TIMING_SECTION_NAMES,
-                (0.01, 0.01, 0.03, 0.04, 0.05, 0.07, 0.02),
+                (0.01, 0.01, 0.03, 0.04, 0.02, 0.01, 0.02, 0.07, 0.02),
             )),
         )
         level_result = {
@@ -392,6 +477,13 @@ class TestProfileV2TD3(unittest.TestCase):
             'episodes_completed': 1,
             'actor_updates': 1,
             'critic_updates': 2,
+            'detailed_profiler': {
+                'enabled': False,
+                'requested_updates': 0,
+                'captured_updates': 0,
+                'output_paths': {},
+                'measurement_note': 'profiler adds overhead',
+            },
             'timing': {
                 'total_wall_seconds': 1.0,
                 'replay_sample_wall_seconds': 0.1,
