@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import isfinite, sqrt
+from typing import Callable
 
 import torch
 from torch import nn
@@ -392,10 +393,47 @@ class ZoneSetEncoder(nn.Module):
             torch.empty(1, 1, config.hidden_dim)
         )
         nn.init.normal_(self.empty_scene_token, mean=0.0, std=0.02)
+        self._compiled_tensor_forward: Callable[..., torch.Tensor] | None = None
+        self._compiled_tensor_forward_config: dict[str, object] | None = None
 
     @property
     def output_dim(self) -> int:
         return 2 * self.config.hidden_dim
+
+    @property
+    def compiled_tensor_forward_enabled(self) -> bool:
+        return self._compiled_tensor_forward is not None
+
+    @property
+    def compiled_tensor_forward_config(self) -> dict[str, object] | None:
+        if self._compiled_tensor_forward_config is None:
+            return None
+        return dict(self._compiled_tensor_forward_config)
+
+    def enable_compiled_tensor_forward(
+        self,
+        *,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> None:
+        if self.compiled_tensor_forward_enabled:
+            raise RuntimeError('ZoneSetEncoder tensor forward is already compiled.')
+        compiled = torch.compile(
+            self._compute_policy_context_tensors,
+            backend=backend,
+            mode=mode,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+        )
+        self._compiled_tensor_forward = compiled
+        self._compiled_tensor_forward_config = {
+            'backend': backend,
+            'mode': mode,
+            'fullgraph': bool(fullgraph),
+            'dynamic': bool(dynamic),
+        }
 
     def _validate_inputs(
         self,
@@ -625,6 +663,106 @@ class ZoneSetEncoder(nn.Module):
             if value.device != ego_features.device:
                 raise ValueError('shared_relations tensors must share the input device.')
 
+    def _encode_zone_task_tensors(
+        self,
+        ego_features: torch.Tensor,
+        goal_features: torch.Tensor,
+        clean_zone_features: torch.Tensor,
+        presence_mask: torch.Tensor,
+        valid_token_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        zone_tokens = self.zone_encoder(clean_zone_features)
+        zone_tokens = zone_tokens * presence_mask.unsqueeze(-1).to(
+            zone_tokens.dtype
+        )
+        task_embedding = self.task_encoder(ego_features, goal_features)
+        empty_tokens = self.empty_scene_token.expand(
+            ego_features.shape[0],
+            -1,
+            -1,
+        )
+        tokens = torch.cat((empty_tokens, zone_tokens), dim=1)
+        tokens = tokens * valid_token_mask.unsqueeze(-1).to(tokens.dtype)
+        return tokens, task_embedding
+
+    def _apply_relation_attention_tensors(
+        self,
+        tokens: torch.Tensor,
+        valid_token_mask: torch.Tensor,
+        token_pair_relations: torch.Tensor,
+        relation_pair_mask: torch.Tensor,
+        *,
+        diagnostics: bool,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+        attention_weights: list[torch.Tensor] = []
+        for layer in self.layers:
+            layer_result = layer(
+                tokens,
+                valid_token_mask,
+                token_pair_relations,
+                relation_pair_mask,
+                return_attention_weights=diagnostics,
+            )
+            if diagnostics:
+                tokens, weights = layer_result
+                attention_weights.append(weights)
+            else:
+                tokens = layer_result
+        return tokens, tuple(attention_weights)
+
+    def _pool_policy_context_tensors(
+        self,
+        task_embedding: torch.Tensor,
+        tokens: torch.Tensor,
+        valid_token_mask: torch.Tensor,
+        *,
+        diagnostics: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        pooling_result = self.pooling(
+            task_embedding,
+            tokens,
+            valid_token_mask,
+            return_attention_weights=diagnostics,
+        )
+        if diagnostics:
+            zone_summary, pooling_weights = pooling_result
+        else:
+            zone_summary = pooling_result
+            pooling_weights = None
+        return torch.cat((task_embedding, zone_summary), dim=-1), pooling_weights
+
+    def _compute_policy_context_tensors(
+        self,
+        ego_features: torch.Tensor,
+        goal_features: torch.Tensor,
+        clean_zone_features: torch.Tensor,
+        presence_mask: torch.Tensor,
+        valid_token_mask: torch.Tensor,
+        token_pair_relations: torch.Tensor,
+        relation_pair_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        tokens, task_embedding = self._encode_zone_task_tensors(
+            ego_features,
+            goal_features,
+            clean_zone_features,
+            presence_mask,
+            valid_token_mask,
+        )
+        tokens, _ = self._apply_relation_attention_tensors(
+            tokens,
+            valid_token_mask,
+            token_pair_relations,
+            relation_pair_mask,
+            diagnostics=False,
+        )
+        policy_context, _ = self._pool_policy_context_tensors(
+            task_embedding,
+            tokens,
+            valid_token_mask,
+            diagnostics=False,
+        )
+        return policy_context
+
     def _forward_impl(
         self,
         ego_features: torch.Tensor,
@@ -670,98 +808,86 @@ class ZoneSetEncoder(nn.Module):
                 zone_features,
                 presence_mask,
             )
-        clean_zone_features = shared_relations.clean_zone_features
-        if profile_sections:
-            with record_function('v2_encoder.zone_task_encoding'):
-                zone_tokens = self.zone_encoder(clean_zone_features)
-                zone_tokens = zone_tokens * presence_mask.unsqueeze(-1).to(
-                    zone_tokens.dtype
-                )
-                task_embedding = self.task_encoder(ego_features, goal_features)
-        else:
-            zone_tokens = self.zone_encoder(clean_zone_features)
-            zone_tokens = zone_tokens * presence_mask.unsqueeze(-1).to(
-                zone_tokens.dtype
-            )
-            task_embedding = self.task_encoder(ego_features, goal_features)
         pair_relations = shared_relations.pair_relations
         valid_token_mask = shared_relations.valid_token_mask
-        empty_tokens = self.empty_scene_token.expand(
-            batch_size,
-            -1,
-            -1,
-        )
-        tokens = torch.cat((empty_tokens, zone_tokens), dim=1)
-        tokens = tokens * valid_token_mask.unsqueeze(-1).to(tokens.dtype)
-
         token_pair_relations = shared_relations.token_pair_relations
         relation_pair_mask = shared_relations.relation_pair_mask
 
-        attention_weights: list[torch.Tensor] = []
+        tensor_arguments = (
+            ego_features,
+            goal_features,
+            shared_relations.clean_zone_features,
+            presence_mask,
+            valid_token_mask,
+            token_pair_relations,
+            relation_pair_mask,
+        )
+        if not diagnostics and not profile_sections:
+            tensor_forward = (
+                self._compiled_tensor_forward
+                if self._compiled_tensor_forward is not None
+                else self._compute_policy_context_tensors
+            )
+            return tensor_forward(*tensor_arguments)
+
+        if profile_sections:
+            with record_function('v2_encoder.zone_task_encoding'):
+                tokens, task_embedding = self._encode_zone_task_tensors(
+                    ego_features,
+                    goal_features,
+                    shared_relations.clean_zone_features,
+                    presence_mask,
+                    valid_token_mask,
+                )
+        else:
+            tokens, task_embedding = self._encode_zone_task_tensors(
+                ego_features,
+                goal_features,
+                shared_relations.clean_zone_features,
+                presence_mask,
+                valid_token_mask,
+            )
+
         if profile_sections:
             with record_function('v2_encoder.relation_attention'):
-                for layer in self.layers:
-                    layer_result = layer(
-                        tokens,
-                        valid_token_mask,
-                        token_pair_relations,
-                        relation_pair_mask,
-                        return_attention_weights=diagnostics,
-                    )
-                    if diagnostics:
-                        tokens, weights = layer_result
-                        attention_weights.append(weights)
-                    else:
-                        tokens = layer_result
-        else:
-            for layer in self.layers:
-                layer_result = layer(
+                tokens, attention_weights = self._apply_relation_attention_tensors(
                     tokens,
                     valid_token_mask,
                     token_pair_relations,
                     relation_pair_mask,
-                    return_attention_weights=diagnostics,
+                    diagnostics=diagnostics,
                 )
-                if diagnostics:
-                    tokens, weights = layer_result
-                    attention_weights.append(weights)
-                else:
-                    tokens = layer_result
+        else:
+            tokens, attention_weights = self._apply_relation_attention_tensors(
+                tokens,
+                valid_token_mask,
+                token_pair_relations,
+                relation_pair_mask,
+                diagnostics=diagnostics,
+            )
 
         if profile_sections:
             with record_function('v2_encoder.task_conditioned_pooling'):
-                pooling_result = self.pooling(
+                policy_context, pooling_weights = self._pool_policy_context_tensors(
                     task_embedding,
                     tokens,
                     valid_token_mask,
-                    return_attention_weights=diagnostics,
+                    diagnostics=diagnostics,
                 )
-                if diagnostics:
-                    zone_summary, pooling_weights = pooling_result
-                else:
-                    zone_summary = pooling_result
-                    pooling_weights = None
-                policy_context = torch.cat((task_embedding, zone_summary), dim=-1)
         else:
-            pooling_result = self.pooling(
+            policy_context, pooling_weights = self._pool_policy_context_tensors(
                 task_embedding,
                 tokens,
                 valid_token_mask,
-                return_attention_weights=diagnostics,
+                diagnostics=diagnostics,
             )
-            if diagnostics:
-                zone_summary, pooling_weights = pooling_result
-            else:
-                zone_summary = pooling_result
-                pooling_weights = None
-            policy_context = torch.cat((task_embedding, zone_summary), dim=-1)
         if not diagnostics:
             return policy_context
         return ZoneSetEncoderDiagnostics(
             policy_context=policy_context,
             pair_relations=pair_relations,
             contextual_zone_tokens=tokens[:, 1:],
-            self_attention_weights=tuple(attention_weights),
+            self_attention_weights=attention_weights,
             pooling_weights=pooling_weights,
             valid_token_mask=valid_token_mask,
         )

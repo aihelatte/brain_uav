@@ -42,7 +42,9 @@ import test_v2_td3 as v2_td3_tests
 class TestProfileV2TD3(unittest.TestCase):
     def run_small_level(self, *, warmup=0, steps=5, early_goal=False,
                         device='cpu', suppress_measured_actor=False,
-                        detailed_profiler_updates=0, profiler_output_dir=None):
+                        detailed_profiler_updates=0, profiler_output_dir=None,
+                        compile_critic_encoder=False,
+                        dynamo_graph_counts=(10, 10)):
         # Real environment and replay; only network work and CUDA are test doubles.
         scenario = make_scenario_config()
         scenario.max_steps = 100
@@ -60,6 +62,8 @@ class TestProfileV2TD3(unittest.TestCase):
             set_target_noise=lambda **kwargs: None,
         )
         submitted = []
+        compile_calls = []
+        compile_warmup_shapes = []
 
         def select_action(observation, **kwargs):
             submitted.append(observation)
@@ -91,6 +95,16 @@ class TestProfileV2TD3(unittest.TestCase):
 
         engine.select_action = select_action
         engine.update_once = update_once
+        engine.enable_online_critic_encoder_compile = lambda **kwargs: (
+            compile_calls.append(kwargs)
+            or ('critic1.zone_set_encoder', 'critic2.zone_set_encoder')
+        )
+        engine.warmup_online_critic_encoder_compile = lambda batches: (
+            compile_warmup_shapes.extend(
+                (batch.batch_size, int(batch.zone_features.shape[1]))
+                for batch in batches
+            )
+        )
         synchronization_points = []
         event = mock.Mock()
         event.elapsed_time.return_value = 1.0
@@ -103,6 +117,9 @@ class TestProfileV2TD3(unittest.TestCase):
         ), mock.patch('torch.cuda.Event', return_value=event), mock.patch(
             'torch.cuda.synchronize',
             side_effect=lambda *args: synchronization_points.append(len(submitted)),
+        ), mock.patch(
+            'brain_uav.scripts.profile_v2_td3._dynamo_unique_graph_count',
+            side_effect=dynamo_graph_counts,
         ):
             result = _run_diagnostic_level(
                 level='easy',
@@ -118,6 +135,7 @@ class TestProfileV2TD3(unittest.TestCase):
                 device=torch.device(device), warmup_steps=warmup, measured_steps=steps,
                 detailed_profiler_updates=detailed_profiler_updates,
                 profiler_output_dir=profiler_output_dir,
+                compile_critic_encoder=compile_critic_encoder,
             )
         return result, replay, synchronization_points
 
@@ -335,12 +353,79 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertEqual(args.device, 'auto')
         self.assertEqual(args.snn_time_window, 4)
         self.assertEqual(args.detailed_profiler_updates, 0)
+        self.assertFalse(args.compile_critic_encoder)
         enabled = build_parser().parse_args([
             '--model', 'ann', '--bc-checkpoint', 'bc.pt',
             '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
             '--detailed-profiler-updates',
         ])
         self.assertEqual(enabled.detailed_profiler_updates, 16)
+        compiled = build_parser().parse_args([
+            '--model', 'ann', '--bc-checkpoint', 'bc.pt',
+            '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
+            '--compile-critic-encoder',
+        ])
+        self.assertTrue(compiled.compile_critic_encoder)
+
+    def test_compiled_critic_encoder_reports_separate_warmup_and_stable_timing(self) -> None:
+        result, replay, _ = self.run_small_level(
+            warmup=0,
+            steps=5,
+            compile_critic_encoder=True,
+        )
+        compile_info = result['critic_encoder_compile']
+
+        self.assertTrue(compile_info['requested'])
+        self.assertEqual(compile_info['enabled_objects'], [
+            'critic1.zone_set_encoder',
+            'critic2.zone_set_encoder',
+        ])
+        self.assertEqual(compile_info['backend'], 'inductor')
+        self.assertEqual(compile_info['mode'], 'default')
+        self.assertTrue(compile_info['fullgraph'])
+        self.assertTrue(compile_info['dynamic'])
+        self.assertEqual(compile_info['registration_wall_seconds'], 0.0)
+        self.assertEqual(compile_info['warmup_wall_seconds'], 0.0)
+        self.assertEqual(
+            {tuple(shape) for shape in compile_info['warmup_batch_shapes']},
+            {(4, 0), (4, 1), (4, 2)},
+        )
+        self.assertEqual(compile_info['measurement_new_graph_count'], 0)
+        self.assertTrue(compile_info['stable_timing'])
+        self.assertTrue(compile_info['valid_for_speed_comparison'])
+        self.assertEqual(len(replay), result['warmup_steps'] + result['measured_steps'])
+
+    def test_measurement_recompile_marks_compiled_timing_invalid(self) -> None:
+        result, _, _ = self.run_small_level(
+            warmup=0,
+            steps=5,
+            compile_critic_encoder=True,
+            dynamo_graph_counts=(10, 12),
+        )
+        compile_info = result['critic_encoder_compile']
+
+        self.assertEqual(compile_info['measurement_new_graph_count'], 2)
+        self.assertFalse(compile_info['stable_timing'])
+        self.assertFalse(compile_info['valid_for_speed_comparison'])
+        self.assertIn('not stable timing', compile_info['measurement_note'])
+        self.assertIsNone(
+            result['timing']['throughput_environment_steps_per_second']
+        )
+
+    def test_compile_and_detailed_profiler_combination_is_rejected_before_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'output'
+            with self.assertRaisesRegex(ValueError, 'cannot be combined'):
+                run_v2_td3_timing_diagnostic(
+                    model='ann',
+                    bc_checkpoint=Path(directory) / 'missing.pt',
+                    output_dir=output,
+                    scenario_pool_dir=Path(directory) / 'pools',
+                    device='cpu',
+                    detailed_profiler_updates=1,
+                    compile_critic_encoder=True,
+                )
+            self.assertFalse(output.exists())
 
     def test_detailed_profiler_excludes_warmup_caps_updates_and_isolates_outputs(self) -> None:
         class FakeAverages:

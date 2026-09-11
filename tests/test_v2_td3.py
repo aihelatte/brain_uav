@@ -634,6 +634,91 @@ class TestV2TD3(unittest.TestCase):
         self.assertEqual(shared_builder.call_count, 2)
         self.assertEqual(sum(spy.call_count for spy in other_builders), 0)
 
+    def test_compile_enables_only_online_critic_encoders_and_preserves_training_bindings(self):
+        engine = self.make_engine(policy_delay=1)
+        self.fill_replay(engine)
+        modules = {
+            name: getattr(engine, name)
+            for name in (
+                'actor', 'actor_target', 'critic1', 'critic2',
+                'critic1_target', 'critic2_target',
+            )
+        }
+        parameter_ids = {
+            name: tuple(id(parameter) for parameter in module.parameters())
+            for name, module in modules.items()
+        }
+        state_keys = {
+            name: tuple(module.state_dict()) for name, module in modules.items()
+        }
+        soft_update_binding_ids = {
+            key: (
+                tuple(id(parameter) for parameter in online),
+                tuple(id(parameter) for parameter in target),
+            )
+            for key, (online, target) in engine._soft_update_parameter_pairs.items()
+        }
+        batch = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        counts_before = (
+            engine.update_count,
+            engine.critic_update_count,
+            engine.critic_target_update_count,
+            engine.actor_update_count,
+        )
+
+        enabled = engine.enable_online_critic_encoder_compile(backend='eager')
+        engine.warmup_online_critic_encoder_compile((batch,))
+
+        self.assertEqual(enabled, (
+            'critic1.zone_set_encoder',
+            'critic2.zone_set_encoder',
+        ))
+        self.assertTrue(engine.critic1.zone_set_encoder.compiled_tensor_forward_enabled)
+        self.assertTrue(engine.critic2.zone_set_encoder.compiled_tensor_forward_enabled)
+        self.assertFalse(engine.actor.zone_set_encoder.compiled_tensor_forward_enabled)
+        self.assertFalse(engine.actor_target.zone_set_encoder.compiled_tensor_forward_enabled)
+        self.assertFalse(engine.critic1_target.zone_set_encoder.compiled_tensor_forward_enabled)
+        self.assertFalse(engine.critic2_target.zone_set_encoder.compiled_tensor_forward_enabled)
+        self.assertEqual(counts_before, (
+            engine.update_count,
+            engine.critic_update_count,
+            engine.critic_target_update_count,
+            engine.actor_update_count,
+        ))
+        for name, module in modules.items():
+            self.assertEqual(
+                tuple(id(parameter) for parameter in module.parameters()),
+                parameter_ids[name],
+            )
+            self.assertEqual(tuple(module.state_dict()), state_keys[name])
+        self.assertEqual({
+            key: (
+                tuple(id(parameter) for parameter in online),
+                tuple(id(parameter) for parameter in target),
+            )
+            for key, (online, target) in engine._soft_update_parameter_pairs.items()
+        }, soft_update_binding_ids)
+        self.assertTrue(all(parameter.requires_grad for parameter in engine.critic1.parameters()))
+
+        metrics = engine.update_once(total_steps=1)
+        self.assertTrue(metrics.actor_updated)
+        self.assertTrue(all(parameter.requires_grad for parameter in engine.critic1.parameters()))
+        engine.update_once(total_steps=2)
+
+    def test_compile_error_propagates_without_enabling_fallback(self):
+        engine = self.make_engine()
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=RuntimeError('compile failed'),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'compile failed'):
+                engine.enable_online_critic_encoder_compile()
+        self.assertFalse(engine.critic1.zone_set_encoder.compiled_tensor_forward_enabled)
+        self.assertFalse(engine.critic2.zone_set_encoder.compiled_tensor_forward_enabled)
+
     def test_reused_relations_match_original_td3_update_for_both_delay_paths(self):
         for total_steps in (1, 2):
             with self.subTest(total_steps=total_steps):

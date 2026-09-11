@@ -16,6 +16,7 @@ import torch
 
 from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
 from brain_uav.models import V2SNNPolicyActor
+from brain_uav.observations import collate_v2_observations
 from brain_uav.scripts.common import DEVICE_CHOICES, resolve_training_device
 from brain_uav.trainers.v2_formal_training import (
     V2FormalTrainingConfig,
@@ -34,7 +35,7 @@ from brain_uav.trainers.v2_validation import (
 
 
 DIAGNOSTIC_FORMAT = 'v2_td3_timing_diagnostic'
-DIAGNOSTIC_VERSION = 3
+DIAGNOSTIC_VERSION = 4
 DIAGNOSTIC_LEVELS = ('easy', 'medium', 'hard')
 UPDATE_TIMING_SECTION_NAMES = V2_TD3_UPDATE_TIMING_SECTIONS
 
@@ -338,6 +339,41 @@ def _near_goal(info: dict[str, Any], *, radius: float) -> bool:
     return bool(info.get('goal_reached_by_segment', False)) or min(values) <= radius
 
 
+def _dynamo_unique_graph_count() -> int:
+    return int(torch._dynamo.utils.counters['stats'].get('unique_graphs', 0))
+
+
+def _compile_warmup_batches(
+    *,
+    pool: V2ValidationPool,
+    prepared,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[Any, ...]:
+    warmup_env = V2StaticNoFlyTrajectoryEnv(
+        prepared.scenario_config,
+        prepared.reward_config,
+        seed=pool.stage_seed,
+        fixed_scenarios=[record['payload'] for record in pool.scenarios],
+        uav_collision_radius=prepared.uav_collision_radius,
+    )
+    observations = tuple(
+        warmup_env.reset(options={'scenario': record['payload']})[0]
+        for record in pool.scenarios
+    )
+    batches = [
+        collate_v2_observations([observation] * batch_size).to(device)
+        for observation in observations
+    ]
+    if len(observations) > 1:
+        mixed = [
+            observations[index % len(observations)]
+            for index in range(batch_size)
+        ]
+        batches.append(collate_v2_observations(mixed).to(device))
+    return tuple(batches)
+
+
 def _run_diagnostic_level(
     *,
     level: str,
@@ -352,6 +388,7 @@ def _run_diagnostic_level(
     measured_steps: int,
     detailed_profiler_updates: int = 0,
     profiler_output_dir: Path | None = None,
+    compile_critic_encoder: bool = False,
 ) -> dict[str, Any]:
     scenario_count = len(pool.scenarios)
     if scenario_count == 0 or measured_steps < scenario_count:
@@ -387,6 +424,53 @@ def _run_diagnostic_level(
         fixed_scenarios=[record['payload'] for record in pool.scenarios],
         uav_collision_radius=prepared.uav_collision_radius,
     )
+    compile_metadata: dict[str, Any] = {
+        'requested': bool(compile_critic_encoder),
+        'enabled_objects': [],
+        'backend': 'inductor',
+        'mode': 'default',
+        'fullgraph': True,
+        'dynamic': True,
+        'registration_wall_seconds': 0.0,
+        'warmup_wall_seconds': 0.0,
+        'warmup_batch_shapes': [],
+        'measurement_graph_count_before': None,
+        'measurement_graph_count_after': None,
+        'measurement_new_graph_count': None,
+        'stable_timing': None,
+        'valid_for_speed_comparison': None,
+        'measurement_note': 'Critic encoder compilation is disabled.',
+    }
+    if compile_critic_encoder:
+        registration_started = perf_counter()
+        enabled_objects = engine.enable_online_critic_encoder_compile(
+            backend='inductor',
+            mode='default',
+            fullgraph=True,
+            dynamic=True,
+        )
+        compile_metadata['registration_wall_seconds'] = (
+            perf_counter() - registration_started
+        )
+        compile_metadata['enabled_objects'] = list(enabled_objects)
+        warmup_batches = _compile_warmup_batches(
+            pool=pool,
+            prepared=prepared,
+            batch_size=engine.batch_size,
+            device=device,
+        )
+        compile_metadata['warmup_batch_shapes'] = [
+            [batch.batch_size, int(batch.zone_features.shape[1])]
+            for batch in warmup_batches
+        ]
+        warmup_started = perf_counter()
+        engine.warmup_online_critic_encoder_compile(warmup_batches)
+        compile_metadata['warmup_wall_seconds'] = perf_counter() - warmup_started
+        compile_metadata['measurement_note'] = (
+            'Registration and compile-triggering pure-compute warmup are excluded '
+            'from measured update wall time. Measurement is valid for speed '
+            'comparison only if no new Dynamo graphs appear after the warmup boundary.'
+        )
     timing = _TimingBook(device)
     update_timing = _UpdateTimingSummary()
     detailed_profiler = _DetailedUpdateProfiler(
@@ -443,6 +527,10 @@ def _run_diagnostic_level(
                 measured_started = perf_counter()
                 actor_updates_before = engine.actor_update_count
                 critic_updates_before = engine.critic_update_count
+                if compile_critic_encoder:
+                    compile_metadata['measurement_graph_count_before'] = (
+                        _dynamo_unique_graph_count()
+                    )
                 measured_phase = True
             if not measured_phase and step_number >= warmup_limit:
                 raise RuntimeError('Diagnostic warmup did not reach critic/actor update minima.')
@@ -591,7 +679,22 @@ def _run_diagnostic_level(
     critic_updates = engine.critic_update_count - critic_updates_before
     if critic_updates == 0 or actor_updates == 0:
         raise RuntimeError('Diagnostic measurement must include both critic and actor updates.')
+    if compile_critic_encoder:
+        graph_count_after = _dynamo_unique_graph_count()
+        graph_count_before = compile_metadata['measurement_graph_count_before']
+        new_graph_count = graph_count_after - graph_count_before
+        stable_timing = new_graph_count == 0
+        compile_metadata['measurement_graph_count_after'] = graph_count_after
+        compile_metadata['measurement_new_graph_count'] = new_graph_count
+        compile_metadata['stable_timing'] = stable_timing
+        compile_metadata['valid_for_speed_comparison'] = stable_timing
+        if not stable_timing:
+            compile_metadata['measurement_note'] = (
+                'New Dynamo graphs were compiled during measurement. This level is '
+                'not stable timing and must not be used for speedup comparison.'
+            )
     profiler_overhead_included = bool(profiler_metadata['enabled'])
+    compile_timing_valid = compile_metadata['valid_for_speed_comparison'] is not False
     total_wall_seconds_note = (
         'This is wall time for the diagnostic run including detailed profiler '
         'collection, startup, and activity-switching overhead. It must not be used '
@@ -613,6 +716,7 @@ def _run_diagnostic_level(
         'critic_updates': critic_updates,
         'actor_target_updates': actor_updates,
         'detailed_profiler': profiler_metadata,
+        'critic_encoder_compile': compile_metadata,
         'timing': {
             'total_wall_seconds': measured_total,
             'total_wall_seconds_includes_detailed_profiler_overhead': (
@@ -621,7 +725,11 @@ def _run_diagnostic_level(
             'total_wall_seconds_note': total_wall_seconds_note,
             'throughput_environment_steps_per_second': (
                 measured_steps / measured_total
-                if not profiler_overhead_included and measured_total > 0.0
+                if (
+                    not profiler_overhead_included
+                    and compile_timing_valid
+                    and measured_total > 0.0
+                )
                 else None
             ),
             'scenario_reset_wall_seconds': timing.wall_seconds['scenario_reset_wall_seconds'],
@@ -676,6 +784,7 @@ def run_v2_td3_timing_diagnostic(
     replay_capacity: int = 2048,
     scenario_count: int = 3,
     detailed_profiler_updates: int = 0,
+    compile_critic_encoder: bool = False,
 ) -> dict[str, Any]:
     if model not in ('ann', 'snn'):
         raise ValueError('model must be ann or snn.')
@@ -690,6 +799,14 @@ def run_v2_td3_timing_diagnostic(
         detailed_profiler_updates,
         name='detailed_profiler_updates',
     )
+    if type(compile_critic_encoder) is not bool:
+        raise TypeError('compile_critic_encoder must be a bool.')
+    if compile_critic_encoder and profiler_updates:
+        raise ValueError(
+            'compile_critic_encoder cannot be combined with detailed profiler.'
+        )
+    if compile_critic_encoder and model != 'ann':
+        raise ValueError('compile_critic_encoder is limited to the ANN diagnostic.')
     if steps < pool_count:
         raise ValueError('steps_per_level must be at least scenario_count.')
     run_seed = _nonnegative_int(seed, name='seed')
@@ -760,6 +877,7 @@ def run_v2_td3_timing_diagnostic(
             profiler_output_dir=(
                 output / 'profiler' / level if profiler_updates else None
             ),
+            compile_critic_encoder=compile_critic_encoder,
         )
         level_results[level] = result
         print(json.dumps({
@@ -816,6 +934,19 @@ def run_v2_td3_timing_diagnostic(
             'actor_freeze_steps': 0,
             'scenario_count_per_level': pool_count,
             'detailed_profiler_updates_per_level': profiler_updates,
+            'compile_critic_encoder_requested': compile_critic_encoder,
+            'compile_critic_encoder_backend': (
+                'inductor' if compile_critic_encoder else None
+            ),
+            'compile_critic_encoder_mode': (
+                'default' if compile_critic_encoder else None
+            ),
+            'compile_critic_encoder_fullgraph': (
+                True if compile_critic_encoder else None
+            ),
+            'compile_critic_encoder_dynamic': (
+                True if compile_critic_encoder else None
+            ),
             'detailed_profiler_scope': (
                 'first measured TD3 updates after warmup; excluded from ordinary '
                 'update timing breakdown'
@@ -875,6 +1006,11 @@ def build_parser() -> argparse.ArgumentParser:
         metavar='N',
         help='Profile at most N post-warmup TD3 updates per level (bare flag: 16).',
     )
+    parser.add_argument(
+        '--compile-critic-encoder',
+        action='store_true',
+        help='Compile only critic1/critic2 ZoneSetEncoder tensor computation.',
+    )
     return parser
 
 
@@ -895,6 +1031,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         replay_capacity=args.replay_capacity,
         scenario_count=args.scenario_count,
         detailed_profiler_updates=args.detailed_profiler_updates,
+        compile_critic_encoder=args.compile_critic_encoder,
     )
 
 

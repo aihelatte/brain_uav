@@ -7,7 +7,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from math import isfinite, pi
 from time import perf_counter
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Sequence
 
 import numpy as np
 import torch
@@ -554,6 +554,134 @@ class V2TD3UpdateEngine:
             raise ValueError('policy_noise and noise_clip must be non-negative.')
         self.policy_noise = policy_noise_value
         self.noise_clip = noise_clip_value
+
+    def enable_online_critic_encoder_compile(
+        self,
+        *,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> tuple[str, str]:
+        enabled: list[str] = []
+        for name, critic in (
+            ('critic1.zone_set_encoder', self.critic1),
+            ('critic2.zone_set_encoder', self.critic2),
+        ):
+            critic.zone_set_encoder.enable_compiled_tensor_forward(
+                backend=backend,
+                mode=mode,
+                fullgraph=fullgraph,
+                dynamic=dynamic,
+            )
+            enabled.append(name)
+        return enabled[0], enabled[1]
+
+    def warmup_online_critic_encoder_compile(
+        self,
+        batches: Sequence[V2ObservationBatch],
+    ) -> None:
+        warmup_batches = tuple(batches)
+        if not warmup_batches:
+            raise ValueError('At least one compile warmup batch is required.')
+        if not (
+            self.critic1.zone_set_encoder.compiled_tensor_forward_enabled
+            and self.critic2.zone_set_encoder.compiled_tensor_forward_enabled
+        ):
+            raise RuntimeError('Both online critic encoders must be compiled first.')
+        if any(not isinstance(batch, V2ObservationBatch) for batch in warmup_batches):
+            raise TypeError('Compile warmup batches must be V2ObservationBatch values.')
+
+        critic_parameters = tuple(self.critic1.parameters()) + tuple(
+            self.critic2.parameters()
+        )
+        requires_grad = tuple(
+            parameter.requires_grad for parameter in critic_parameters
+        )
+        gradient_state = tuple(
+            (
+                parameter.grad,
+                None if parameter.grad is None else parameter.grad.detach().clone(),
+            )
+            for parameter in critic_parameters
+        )
+        torch_rng_state = torch.random.get_rng_state()
+        numpy_rng_state = np.random.get_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state_all() if self.device.type == 'cuda' else None
+        )
+        counts_before = (
+            self.update_count,
+            self.critic_update_count,
+            self.critic_target_update_count,
+            self.actor_update_count,
+            self.last_total_steps,
+        )
+        try:
+            for batch in warmup_batches:
+                device_batch = batch.to(self.device)
+                shared_relations = self._build_shared_relations(device_batch)
+                action = torch.zeros(
+                    (device_batch.batch_size, self.action_dim),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                self.critic_optimizer.zero_grad(set_to_none=True)
+                critic_sum = self.critic1(
+                    device_batch,
+                    action,
+                    shared_relations=shared_relations,
+                ).sum() + self.critic2(
+                    device_batch,
+                    action,
+                    shared_relations=shared_relations,
+                ).sum()
+                critic_sum.backward()
+                self.critic_optimizer.zero_grad(set_to_none=True)
+
+                critic1_parameters = tuple(self.critic1.parameters())
+                for parameter in critic1_parameters:
+                    parameter.requires_grad_(False)
+                frozen_action = action.detach().clone().requires_grad_(True)
+                try:
+                    frozen_q = self.critic1(
+                        device_batch,
+                        frozen_action,
+                        shared_relations=shared_relations,
+                    )
+                    frozen_q.sum().backward()
+                    if frozen_action.grad is None:
+                        raise RuntimeError(
+                            'Compiled frozen critic warmup did not preserve action gradients.'
+                        )
+                finally:
+                    for parameter in critic1_parameters:
+                        parameter.requires_grad_(True)
+        finally:
+            for parameter, required, (original_grad, saved_grad) in zip(
+                critic_parameters,
+                requires_grad,
+                gradient_state,
+            ):
+                parameter.requires_grad_(required)
+                if original_grad is None:
+                    parameter.grad = None
+                else:
+                    original_grad.copy_(saved_grad)
+                    parameter.grad = original_grad
+            torch.random.set_rng_state(torch_rng_state)
+            np.random.set_state(numpy_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
+        counts_after = (
+            self.update_count,
+            self.critic_update_count,
+            self.critic_target_update_count,
+            self.actor_update_count,
+            self.last_total_steps,
+        )
+        if counts_after != counts_before:
+            raise RuntimeError('Compile warmup must not change TD3 update counters.')
 
     @staticmethod
     def _require_finite_loss(

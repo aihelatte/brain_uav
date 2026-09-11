@@ -259,6 +259,56 @@ class TestZoneSetEncoder(unittest.TestCase):
                 for actual, expected in zip(shared_inputs[:3], baseline_input_grads):
                     torch.testing.assert_close(actual.grad, expected)
 
+    def test_compiled_tensor_forward_matches_eager_outputs_and_gradients(self):
+        for counts in ([0], [0, 3, 7]):
+            with self.subTest(counts=counts):
+                model = ZoneSetEncoder(self.scales).train()
+                self.assertFalse(model.compiled_tensor_forward_enabled)
+                parameter_ids = tuple(id(parameter) for parameter in model.parameters())
+                state_keys = tuple(model.state_dict())
+                eager_inputs = tuple(
+                    value.clone().requires_grad_(value.dtype == torch.float32)
+                    for value in self.inputs(counts)
+                )
+                eager_shared = model.build_shared_relations(*eager_inputs)
+                eager = model(*eager_inputs, shared_relations=eager_shared)
+                eager.square().sum().backward()
+                eager_parameter_grads = {
+                    name: parameter.grad.detach().clone()
+                    for name, parameter in model.named_parameters()
+                }
+                eager_input_grads = tuple(
+                    value.grad.detach().clone() for value in eager_inputs[:3]
+                )
+
+                model.zero_grad(set_to_none=True)
+                model.enable_compiled_tensor_forward(backend='eager')
+                compiled_inputs = tuple(
+                    value.detach().clone().requires_grad_(value.dtype == torch.float32)
+                    for value in eager_inputs
+                )
+                compiled_shared = model.build_shared_relations(*compiled_inputs)
+                compiled = model(
+                    *compiled_inputs,
+                    shared_relations=compiled_shared,
+                )
+                compiled.square().sum().backward()
+
+                torch.testing.assert_close(compiled, eager)
+                for name, parameter in model.named_parameters():
+                    torch.testing.assert_close(
+                        parameter.grad,
+                        eager_parameter_grads[name],
+                    )
+                for actual, expected in zip(compiled_inputs[:3], eager_input_grads):
+                    torch.testing.assert_close(actual.grad, expected)
+
+                self.assertEqual(
+                    tuple(id(parameter) for parameter in model.parameters()),
+                    parameter_ids,
+                )
+                self.assertEqual(tuple(model.state_dict()), state_keys)
+
     def test_profiled_forward_marks_only_major_encoder_sections(self):
         inputs = self.inputs([0, 3, 7])
         expected = self.model(*inputs)
