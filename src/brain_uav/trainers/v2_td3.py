@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from math import isfinite, pi
-from typing import Any
+from time import perf_counter
+from typing import Any, Callable, Iterator
 
 import numpy as np
 import torch
@@ -33,6 +35,15 @@ V2_TD3_CHECKPOINT_VERSION = 3
 V2_SNN_TD3_CHECKPOINT_FORMAT = 'v2_snn_td3_dynamic_set'
 V2_SNN_TD3_CHECKPOINT_VERSION = 1
 V2_OBSERVATION_CONTRACT_ID = 'v2_dynamic_zone_set_observation_v1'
+V2_TD3_UPDATE_TIMING_SECTIONS = (
+    'replay_sample',
+    'batch_preparation',
+    'target_forward_and_td_target',
+    'online_critic_forward_and_loss',
+    'critic_backward_and_step',
+    'actor_update',
+    'target_soft_update',
+)
 
 V2PolicyActor = V2ANNPolicyActor | V2SNNPolicyActor
 
@@ -107,6 +118,36 @@ class _ActorLossTerms:
     actor_rl_scale: torch.Tensor
     bc_loss: torch.Tensor
     terminal_geo_loss: torch.Tensor
+
+
+class _OptionalUpdateWallTimer:
+    """Collect diagnostic-only wall intervals without synchronizing CUDA."""
+
+    def __init__(
+        self,
+        recorder: Callable[[dict[str, float]], None] | None,
+    ) -> None:
+        if recorder is not None and not callable(recorder):
+            raise TypeError('timing_recorder must be callable when provided.')
+        self.recorder = recorder
+        self.values = {
+            name: 0.0 for name in V2_TD3_UPDATE_TIMING_SECTIONS
+        }
+
+    @contextmanager
+    def section(self, name: str) -> Iterator[None]:
+        if self.recorder is None:
+            yield
+            return
+        started = perf_counter()
+        try:
+            yield
+        finally:
+            self.values[name] += perf_counter() - started
+
+    def finish(self) -> None:
+        if self.recorder is not None:
+            self.recorder(dict(self.values))
 
 
 class V2TD3UpdateEngine:
@@ -516,7 +557,9 @@ class V2TD3UpdateEngine:
         *,
         total_steps: int,
         bc_lambda: float = 0.0,
+        timing_recorder: Callable[[dict[str, float]], None] | None = None,
     ) -> V2TD3UpdateMetrics:
+        update_timing = _OptionalUpdateWallTimer(timing_recorder)
         total_steps_value = _nonnegative_int(total_steps, name='total_steps')
         bc_lambda_value = _finite_float(bc_lambda, name='bc_lambda')
         if bc_lambda_value < 0.0:
@@ -524,47 +567,53 @@ class V2TD3UpdateEngine:
         if self.bc_reference_actor is None and bc_lambda_value != 0.0:
             raise ValueError('bc_lambda must be 0 when no V2 BC reference actor exists.')
 
-        batch = self.replay.sample(self.batch_size).to(self.device)
-        with torch.no_grad():
-            noise = (torch.randn_like(batch.action) * self.policy_noise).clamp(
-                -self.noise_clip,
-                self.noise_clip,
-            )
-            next_action = self.actor_target(batch.next_obs) + noise
-            next_action = torch.maximum(
-                torch.minimum(next_action, self.action_high),
-                self.action_low,
-            )
-            target_q1 = self.critic1_target(batch.next_obs, next_action)
-            target_q2 = self.critic2_target(batch.next_obs, next_action)
-            target_q = batch.reward + (
-                (1.0 - batch.done)
-                * self.gamma
-                * torch.minimum(target_q1, target_q2)
-            )
+        with update_timing.section('replay_sample'):
+            batch = self.replay.sample(self.batch_size)
+        with update_timing.section('batch_preparation'):
+            batch = batch.to(self.device)
+        with update_timing.section('target_forward_and_td_target'):
+            with torch.no_grad():
+                noise = (torch.randn_like(batch.action) * self.policy_noise).clamp(
+                    -self.noise_clip,
+                    self.noise_clip,
+                )
+                next_action = self.actor_target(batch.next_obs) + noise
+                next_action = torch.maximum(
+                    torch.minimum(next_action, self.action_high),
+                    self.action_low,
+                )
+                target_q1 = self.critic1_target(batch.next_obs, next_action)
+                target_q2 = self.critic2_target(batch.next_obs, next_action)
+                target_q = batch.reward + (
+                    (1.0 - batch.done)
+                    * self.gamma
+                    * torch.minimum(target_q1, target_q2)
+                )
 
-        current_q1 = self.critic1(batch.obs, batch.action)
-        current_q2 = self.critic2(batch.obs, batch.action)
-        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(
-            current_q2, target_q
-        )
-        self._require_finite_loss(
-            critic_loss,
-            component='critic',
-            total_steps=total_steps_value,
-        )
-        self.critic_optimizer.zero_grad(set_to_none=True)
-        critic_loss.backward()
-        critic_parameters = list(self.critic1.parameters()) + list(
-            self.critic2.parameters()
-        )
-        self._validate_and_clip_gradients(
-            critic_parameters,
-            max_norm=self.critic_grad_clip_norm,
-            component='critic',
-            total_steps=total_steps_value,
-        )
-        self.critic_optimizer.step()
+        with update_timing.section('online_critic_forward_and_loss'):
+            current_q1 = self.critic1(batch.obs, batch.action)
+            current_q2 = self.critic2(batch.obs, batch.action)
+            critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(
+                current_q2, target_q
+            )
+            self._require_finite_loss(
+                critic_loss,
+                component='critic',
+                total_steps=total_steps_value,
+            )
+        with update_timing.section('critic_backward_and_step'):
+            self.critic_optimizer.zero_grad(set_to_none=True)
+            critic_loss.backward()
+            critic_parameters = list(self.critic1.parameters()) + list(
+                self.critic2.parameters()
+            )
+            self._validate_and_clip_gradients(
+                critic_parameters,
+                max_norm=self.critic_grad_clip_norm,
+                component='critic',
+                total_steps=total_steps_value,
+            )
+            self.critic_optimizer.step()
 
         critic_targets_updated = total_steps_value % self.policy_delay == 0
         actor_updated = (
@@ -572,53 +621,58 @@ class V2TD3UpdateEngine:
             and total_steps_value > self.actor_freeze_steps
         )
         if critic_targets_updated:
-            self._soft_update(self.critic1, self.critic1_target)
-            self._soft_update(self.critic2, self.critic2_target)
-            self.critic_target_update_count += 1
+            with update_timing.section('target_soft_update'):
+                self._soft_update(self.critic1, self.critic1_target)
+                self._soft_update(self.critic2, self.critic2_target)
+                self.critic_target_update_count += 1
 
         actor_terms: _ActorLossTerms | None = None
         if actor_updated:
-            critic1_parameters = list(self.critic1.parameters())
-            critic1_requires_grad = [
-                parameter.requires_grad for parameter in critic1_parameters
-            ]
+            with update_timing.section('actor_update'):
+                critic1_parameters = list(self.critic1.parameters())
+                critic1_requires_grad = [
+                    parameter.requires_grad for parameter in critic1_parameters
+                ]
             try:
-                for parameter in critic1_parameters:
-                    parameter.requires_grad_(False)
-                actor_terms = self._compute_actor_loss_terms(
-                    batch.obs,
-                    batch.line_to_goal_safe,
-                    bc_lambda=bc_lambda_value,
-                )
-                self._require_finite_loss(
-                    actor_terms.actor_loss,
-                    component='actor',
-                    total_steps=total_steps_value,
-                )
-                self.actor_optimizer.zero_grad(set_to_none=True)
-                actor_terms.actor_loss.backward()
-                actor_parameters = list(self.actor.parameters())
-                self._validate_and_clip_gradients(
-                    actor_parameters,
-                    max_norm=self.actor_grad_clip_norm,
-                    component='actor',
-                    total_steps=total_steps_value,
-                )
-                self.actor_optimizer.step()
-                self._soft_update(self.actor, self.actor_target)
-                self.actor_update_count += 1
+                with update_timing.section('actor_update'):
+                    for parameter in critic1_parameters:
+                        parameter.requires_grad_(False)
+                    actor_terms = self._compute_actor_loss_terms(
+                        batch.obs,
+                        batch.line_to_goal_safe,
+                        bc_lambda=bc_lambda_value,
+                    )
+                    self._require_finite_loss(
+                        actor_terms.actor_loss,
+                        component='actor',
+                        total_steps=total_steps_value,
+                    )
+                    self.actor_optimizer.zero_grad(set_to_none=True)
+                    actor_terms.actor_loss.backward()
+                    actor_parameters = list(self.actor.parameters())
+                    self._validate_and_clip_gradients(
+                        actor_parameters,
+                        max_norm=self.actor_grad_clip_norm,
+                        component='actor',
+                        total_steps=total_steps_value,
+                    )
+                    self.actor_optimizer.step()
+                with update_timing.section('target_soft_update'):
+                    self._soft_update(self.actor, self.actor_target)
+                    self.actor_update_count += 1
             finally:
-                for parameter, requires_grad in zip(
-                    critic1_parameters,
-                    critic1_requires_grad,
-                ):
-                    parameter.requires_grad_(requires_grad)
+                with update_timing.section('actor_update'):
+                    for parameter, requires_grad in zip(
+                        critic1_parameters,
+                        critic1_requires_grad,
+                    ):
+                        parameter.requires_grad_(requires_grad)
 
         self.update_count += 1
         self.critic_update_count += 1
         self.last_total_steps = total_steps_value
         if actor_terms is None:
-            return V2TD3UpdateMetrics(
+            metrics = V2TD3UpdateMetrics(
                 critic_loss=float(critic_loss.item()),
                 sample_success_fraction=float(batch.success.mean().item()),
                 sample_near_goal_fraction=float(batch.near_goal.mean().item()),
@@ -626,28 +680,31 @@ class V2TD3UpdateEngine:
                 critic_targets_updated=critic_targets_updated,
                 actor_updated=False,
             )
-        return V2TD3UpdateMetrics(
-            critic_loss=float(critic_loss.item()),
-            actor_loss=float(actor_terms.actor_loss.item()),
-            rl_actor_loss=float(actor_terms.rl_actor_loss.item()),
-            scaled_rl_actor_loss=float(
-                actor_terms.scaled_rl_actor_loss.item()
-            ),
-            actor_rl_scale=float(actor_terms.actor_rl_scale.item()),
-            bc_loss=float(actor_terms.bc_loss.item()),
-            bc_lambda=bc_lambda_value,
-            terminal_geo_loss=float(actor_terms.terminal_geo_loss.item()),
-            terminal_geo_lambda=(
-                self.terminal_geo_lambda
-                if self.terminal_geo_regularization_enabled
-                else 0.0
-            ),
-            sample_success_fraction=float(batch.success.mean().item()),
-            sample_near_goal_fraction=float(batch.near_goal.mean().item()),
-            critic_updated=True,
-            critic_targets_updated=critic_targets_updated,
-            actor_updated=True,
-        )
+        else:
+            metrics = V2TD3UpdateMetrics(
+                critic_loss=float(critic_loss.item()),
+                actor_loss=float(actor_terms.actor_loss.item()),
+                rl_actor_loss=float(actor_terms.rl_actor_loss.item()),
+                scaled_rl_actor_loss=float(
+                    actor_terms.scaled_rl_actor_loss.item()
+                ),
+                actor_rl_scale=float(actor_terms.actor_rl_scale.item()),
+                bc_loss=float(actor_terms.bc_loss.item()),
+                bc_lambda=bc_lambda_value,
+                terminal_geo_loss=float(actor_terms.terminal_geo_loss.item()),
+                terminal_geo_lambda=(
+                    self.terminal_geo_lambda
+                    if self.terminal_geo_regularization_enabled
+                    else 0.0
+                ),
+                sample_success_fraction=float(batch.success.mean().item()),
+                sample_near_goal_fraction=float(batch.near_goal.mean().item()),
+                critic_updated=True,
+                critic_targets_updated=critic_targets_updated,
+                actor_updated=True,
+            )
+        update_timing.finish()
+        return metrics
 
     def _compute_actor_loss_terms(
         self,

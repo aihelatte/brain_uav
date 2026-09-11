@@ -15,6 +15,8 @@ from brain_uav.models import V2ANNPolicyActor
 from brain_uav.observations import V2ObservationScales
 from brain_uav.scripts.profile_v2_td3 import (
     DIAGNOSTIC_FORMAT,
+    UPDATE_TIMING_SECTION_NAMES,
+    _UpdateTimingSummary,
     _prepare_diagnostic_pools,
     _run_diagnostic_level,
     build_parser,
@@ -33,6 +35,7 @@ from brain_uav.trainers.v2_formal_training import V2FormalTrainingConfig
 from brain_uav.trainers.v2_replay_buffer import V2ReplayBuffer
 
 from test_v2_bc import make_scenario_config, make_scenario_payload, write_cluster
+import test_v2_td3 as v2_td3_tests
 
 
 class TestProfileV2TD3(unittest.TestCase):
@@ -60,13 +63,25 @@ class TestProfileV2TD3(unittest.TestCase):
             submitted.append(observation)
             return np.zeros(2, dtype=np.float32)
 
-        def update_once(*, total_steps, bc_lambda):
+        def update_once(*, total_steps, bc_lambda, timing_recorder=None):
             replay.sample(4)
             engine.critic_update_count += 1
-            if total_steps % 2 == 0 and not (
+            actor_updated = total_steps % 2 == 0 and not (
                 suppress_measured_actor and total_steps > 7
-            ):
+            )
+            if actor_updated:
                 engine.actor_update_count += 1
+            if timing_recorder is not None:
+                timing_recorder({
+                    'replay_sample': 0.01,
+                    'batch_preparation': 0.02,
+                    'target_forward_and_td_target': 0.03,
+                    'online_critic_forward_and_loss': 0.04,
+                    'critic_backward_and_step': 0.05,
+                    'actor_update': 0.06 if actor_updated else 0.0,
+                    'target_soft_update': 0.07 if actor_updated else 0.02,
+                })
+            return SimpleNamespace(actor_updated=actor_updated)
 
         engine.select_action = select_action
         engine.update_once = update_once
@@ -113,6 +128,126 @@ class TestProfileV2TD3(unittest.TestCase):
                 self.assertEqual(result['timing']['calls']['replay_sample_wall_seconds'], 5)
                 self.assertEqual(len(replay), actual + 5)
                 self.assertEqual(syncs, [])
+
+    def test_update_breakdown_classifies_actual_actor_result_and_excludes_warmup(self) -> None:
+        result, _, _ = self.run_small_level(warmup=0)
+        breakdown = result['timing']['td3_update_breakdown']
+
+        self.assertEqual(breakdown['critic_only']['update_count'], 2)
+        self.assertEqual(breakdown['actor_updated']['update_count'], 3)
+        self.assertEqual(breakdown['overall_weighted']['update_count'], 5)
+        self.assertEqual(
+            breakdown['critic_only']['sections']['actor_update']['total_wall_seconds'],
+            0.0,
+        )
+        self.assertAlmostEqual(
+            breakdown['actor_updated']['sections']['actor_update']['total_wall_seconds'],
+            0.18,
+        )
+        self.assertEqual(
+            breakdown['overall_weighted']['update_count'],
+            result['critic_updates'],
+        )
+
+    def test_update_summary_has_nonoverlapping_sections_and_weighted_overall(self) -> None:
+        summary = _UpdateTimingSummary()
+        summary.record(
+            actor_updated=False,
+            total_wall_seconds=20.0,
+            sections=dict(zip(
+                UPDATE_TIMING_SECTION_NAMES,
+                (1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 1.0),
+            )),
+        )
+        for multiplier in (1.0, 2.0):
+            summary.record(
+                actor_updated=True,
+                total_wall_seconds=40.0 * multiplier,
+                sections=dict(zip(
+                    UPDATE_TIMING_SECTION_NAMES,
+                    tuple(value * multiplier for value in (2, 3, 4, 5, 6, 7, 3)),
+                )),
+            )
+
+        payload = summary.to_dict()
+        self.assertEqual(payload['critic_only']['update_count'], 1)
+        self.assertEqual(payload['actor_updated']['update_count'], 2)
+        self.assertEqual(payload['overall_weighted']['update_count'], 3)
+        self.assertEqual(payload['overall_weighted']['total_wall_seconds'], 140.0)
+        self.assertAlmostEqual(
+            payload['overall_weighted']['average_wall_seconds'], 140.0 / 3.0,
+        )
+        overall_sections = payload['overall_weighted']['sections']
+        self.assertEqual(overall_sections['replay_sample']['total_wall_seconds'], 7.0)
+        self.assertEqual(overall_sections['other_uncovered']['total_wall_seconds'], 34.0)
+        self.assertAlmostEqual(
+            overall_sections['replay_sample']['percent_of_update_wall_seconds'],
+            5.0,
+        )
+        self.assertAlmostEqual(
+            sum(
+                section['total_wall_seconds']
+                for section in overall_sections.values()
+            ),
+            payload['overall_weighted']['total_wall_seconds'],
+        )
+
+    def test_real_cpu_update_is_identical_with_internal_timing_enabled(self) -> None:
+        fixture = v2_td3_tests.TestV2TD3(methodName='runTest')
+        fixture.setUp()
+
+        def make_engine():
+            torch.manual_seed(1234)
+            engine = fixture.make_engine(policy_delay=1, terminal_enabled=False)
+            fixture.fill_replay(engine)
+            engine.replay.rng = np.random.default_rng(4321)
+            return engine
+
+        untimed = make_engine()
+        timed = make_engine()
+        torch.manual_seed(9876)
+        untimed_metrics = untimed.update_once(total_steps=1)
+        captured = []
+        torch.manual_seed(9876)
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.perf_counter',
+            side_effect=(float(index) for index in range(100)),
+        ):
+            timed_metrics = timed.update_once(
+                total_steps=1,
+                timing_recorder=captured.append,
+            )
+
+        self.assertEqual(timed_metrics, untimed_metrics)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0], {
+            'replay_sample': 1.0,
+            'batch_preparation': 1.0,
+            'target_forward_and_td_target': 1.0,
+            'online_critic_forward_and_loss': 1.0,
+            'critic_backward_and_step': 1.0,
+            'actor_update': 3.0,
+            'target_soft_update': 2.0,
+        })
+        for timed_model, untimed_model in (
+            (timed.actor, untimed.actor),
+            (timed.critic1, untimed.critic1),
+            (timed.critic2, untimed.critic2),
+            (timed.actor_target, untimed.actor_target),
+            (timed.critic1_target, untimed.critic1_target),
+            (timed.critic2_target, untimed.critic2_target),
+        ):
+            fixture.assert_state_dict_equal(
+                timed_model.state_dict(),
+                untimed_model.state_dict(),
+            )
+        self.assertEqual(timed.update_count, untimed.update_count)
+        self.assertEqual(timed.critic_update_count, untimed.critic_update_count)
+        self.assertEqual(timed.actor_update_count, untimed.actor_update_count)
+        self.assertEqual(
+            timed.critic_target_update_count,
+            untimed.critic_target_update_count,
+        )
 
     def test_fixed_scenario_fragments_cover_pool_without_fabricated_done_or_success(self) -> None:
         result, replay, _ = self.run_small_level()
@@ -227,6 +362,23 @@ class TestProfileV2TD3(unittest.TestCase):
             )
             for index, level in enumerate(('easy', 'medium', 'hard'))
         }
+        update_breakdown = _UpdateTimingSummary()
+        update_breakdown.record(
+            actor_updated=False,
+            total_wall_seconds=0.15,
+            sections=dict(zip(
+                UPDATE_TIMING_SECTION_NAMES,
+                (0.01, 0.01, 0.02, 0.03, 0.04, 0.0, 0.01),
+            )),
+        )
+        update_breakdown.record(
+            actor_updated=True,
+            total_wall_seconds=0.25,
+            sections=dict(zip(
+                UPDATE_TIMING_SECTION_NAMES,
+                (0.01, 0.01, 0.03, 0.04, 0.05, 0.07, 0.02),
+            )),
+        )
         level_result = {
             'requested_minimum_warmup_steps': 2,
             'warmup_steps': 6,
@@ -244,6 +396,7 @@ class TestProfileV2TD3(unittest.TestCase):
                 'total_wall_seconds': 1.0,
                 'replay_sample_wall_seconds': 0.1,
                 'td3_update_wall_seconds': 0.4,
+                'td3_update_breakdown': update_breakdown.to_dict(),
                 'replay_sample_relation': 'within_td3_update',
                 'cuda_stream_interval_seconds': None,
             },
@@ -285,6 +438,10 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertEqual(
             summary['levels']['easy']['timing']['replay_sample_relation'],
             'within_td3_update',
+        )
+        self.assertEqual(
+            summary['levels']['easy']['timing']['td3_update_breakdown'],
+            update_breakdown.to_dict(),
         )
         self.assertEqual(pool_preparer.call_count, 1)
         self.assertEqual(level_runner.call_count, 3)

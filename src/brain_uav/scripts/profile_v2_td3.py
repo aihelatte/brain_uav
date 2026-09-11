@@ -9,7 +9,7 @@ import json
 from math import isfinite
 from pathlib import Path
 from time import perf_counter
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -23,6 +23,7 @@ from brain_uav.trainers.v2_formal_training import (
     prepare_v2_stage_initialization,
     v2_bc_lambda,
 )
+from brain_uav.trainers.v2_td3 import V2_TD3_UPDATE_TIMING_SECTIONS
 from brain_uav.trainers.v2_validation import (
     V2ValidationPool,
     derive_validation_stage_seed,
@@ -33,8 +34,9 @@ from brain_uav.trainers.v2_validation import (
 
 
 DIAGNOSTIC_FORMAT = 'v2_td3_timing_diagnostic'
-DIAGNOSTIC_VERSION = 1
+DIAGNOSTIC_VERSION = 2
 DIAGNOSTIC_LEVELS = ('easy', 'medium', 'hard')
+UPDATE_TIMING_SECTION_NAMES = V2_TD3_UPDATE_TIMING_SECTIONS
 
 
 def _positive_int(value: Any, *, name: str) -> int:
@@ -74,6 +76,7 @@ class _TimingBook:
         operation: Callable[[], Any],
         *,
         cuda_event: bool = False,
+        on_complete: Callable[[Any, float], None] | None = None,
     ) -> Any:
         event_pair = None
         if cuda_event and self.device.type == 'cuda':
@@ -84,13 +87,17 @@ class _TimingBook:
             event_pair[0].record()
         started = perf_counter()
         try:
-            return operation()
+            result = operation()
         finally:
-            self.wall_seconds[name] += perf_counter() - started
+            elapsed = perf_counter() - started
+            self.wall_seconds[name] += elapsed
             self.calls[name] += 1
             if event_pair is not None:
                 event_pair[1].record()
                 self._cuda_pairs[name].append(event_pair)
+        if on_complete is not None:
+            on_complete(result, elapsed)
+        return result
 
     def cuda_stream_interval_seconds(self) -> dict[str, float] | None:
         if self.device.type != 'cuda':
@@ -99,6 +106,71 @@ class _TimingBook:
         return {
             name: sum(start.elapsed_time(end) for start, end in pairs) / 1000.0
             for name, pairs in self._cuda_pairs.items()
+        }
+
+
+class _UpdateTimingSummary:
+    """Aggregate mutually exclusive update sections by actual update result."""
+
+    def __init__(self) -> None:
+        self._buckets = {
+            name: {
+                'update_count': 0,
+                'total_wall_seconds': 0.0,
+                'sections': {section: 0.0 for section in UPDATE_TIMING_SECTION_NAMES},
+            }
+            for name in ('critic_only', 'actor_updated', 'overall_weighted')
+        }
+
+    def record(
+        self,
+        *,
+        actor_updated: bool,
+        total_wall_seconds: float,
+        sections: Mapping[str, float],
+    ) -> None:
+        if set(sections) != set(UPDATE_TIMING_SECTION_NAMES):
+            raise RuntimeError('TD3 update timing sections are missing or unknown.')
+        total = float(total_wall_seconds)
+        values = {name: float(sections[name]) for name in UPDATE_TIMING_SECTION_NAMES}
+        if not isfinite(total) or total < 0.0:
+            raise RuntimeError('TD3 update wall time must be finite and non-negative.')
+        if any(not isfinite(value) or value < 0.0 for value in values.values()):
+            raise RuntimeError('TD3 update section times must be finite and non-negative.')
+        classification = 'actor_updated' if actor_updated else 'critic_only'
+        for name in (classification, 'overall_weighted'):
+            bucket = self._buckets[name]
+            bucket['update_count'] += 1
+            bucket['total_wall_seconds'] += total
+            for section, value in values.items():
+                bucket['sections'][section] += value
+
+    @staticmethod
+    def _bucket_payload(bucket: dict[str, Any]) -> dict[str, Any]:
+        count = int(bucket['update_count'])
+        total = float(bucket['total_wall_seconds'])
+        section_totals = dict(bucket['sections'])
+        section_totals['other_uncovered'] = total - sum(section_totals.values())
+        return {
+            'update_count': count,
+            'total_wall_seconds': total,
+            'average_wall_seconds': total / count if count else None,
+            'sections': {
+                name: {
+                    'total_wall_seconds': value,
+                    'average_wall_seconds': value / count if count else None,
+                    'percent_of_update_wall_seconds': (
+                        100.0 * value / total if total > 0.0 else None
+                    ),
+                }
+                for name, value in section_totals.items()
+            },
+        }
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            name: self._bucket_payload(bucket)
+            for name, bucket in self._buckets.items()
         }
 
 
@@ -216,6 +288,7 @@ def _run_diagnostic_level(
         uav_collision_radius=prepared.uav_collision_radius,
     )
     timing = _TimingBook(device)
+    update_timing = _UpdateTimingSummary()
     observation = None
     episode_transitions: list[tuple[Any, ...]] = []
     slot_refs: list[tuple[int, int]] = []
@@ -325,13 +398,29 @@ def _run_diagnostic_level(
                     policy_noise=formal_config.noise_schedule.policy_initial,
                     noise_clip=formal_config.noise_schedule.clip_initial,
                 )
+                update_sections: dict[str, float] = {}
+
+                def capture_update_sections(sections: Mapping[str, float]) -> None:
+                    update_sections.update(sections)
+
+                def record_update(result: Any, elapsed: float) -> None:
+                    update_timing.record(
+                        actor_updated=bool(result.actor_updated),
+                        total_wall_seconds=elapsed,
+                        sections=update_sections,
+                    )
+
                 call(
                     'td3_update_wall_seconds',
                     lambda: engine.update_once(
                         total_steps=step_number,
                         bc_lambda=v2_bc_lambda(step_number - 1),
+                        timing_recorder=(
+                            capture_update_sections if measured_phase else None
+                        ),
                     ),
                     cuda_event=True,
+                    on_complete=record_update,
                 )
             observation = next_observation
             if done:
@@ -396,6 +485,7 @@ def _run_diagnostic_level(
             'environment_step_wall_seconds': timing.wall_seconds['environment_step_wall_seconds'],
             'replay_write_wall_seconds': timing.wall_seconds['replay_write_wall_seconds'],
             'td3_update_wall_seconds': update_seconds,
+            'td3_update_breakdown': update_timing.to_dict(),
             'replay_sample_wall_seconds': sample_seconds,
             'replay_sample_relation': 'within_td3_update',
             'td3_update_excluding_replay_sample_wall_seconds': network_update_seconds,
@@ -411,6 +501,10 @@ def _run_diagnostic_level(
             'measurement_note': (
                 'Instrumented wall sections include measurement overhead; '
                 'replay sample is nested within TD3 update and is not additive. '
+                'Update sub-sections use CPU wall time without per-section CUDA '
+                'synchronization; asynchronous work or waits may therefore appear '
+                'in a later section. The uncovered value is the outer update_once '
+                'wall time minus measured sections and is not clamped. '
                 'This is load measurement of short fixed-scenario fragments, '
                 'not coverage of all flight positions or formal full-episode curriculum throughput.'
             ),
@@ -517,6 +611,24 @@ def run_v2_td3_timing_diagnostic(
             'wall_seconds': result['timing']['total_wall_seconds'],
             'actor_updates': result['actor_updates'],
             'critic_updates': result['critic_updates'],
+            'update_breakdown_average_ms': {
+                name: {
+                    'count': bucket['update_count'],
+                    'update_total': (
+                        None if bucket['average_wall_seconds'] is None
+                        else 1000.0 * bucket['average_wall_seconds']
+                    ),
+                    'sections': {
+                        section: (
+                            None if values['average_wall_seconds'] is None
+                            else 1000.0 * values['average_wall_seconds']
+                        )
+                        for section, values in bucket['sections'].items()
+                    },
+                }
+                for name, bucket in result['timing']['td3_update_breakdown'].items()
+                if name != 'overall_weighted'
+            },
         }, allow_nan=False, ensure_ascii=False), flush=True)
     summary = {
         'format': DIAGNOSTIC_FORMAT,
@@ -618,6 +730,7 @@ if __name__ == '__main__':
 __all__ = [
     'DIAGNOSTIC_FORMAT',
     'DIAGNOSTIC_VERSION',
+    'UPDATE_TIMING_SECTION_NAMES',
     'build_parser',
     'main',
     'run_v2_td3_timing_diagnostic',
