@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
+from io import StringIO
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,8 +21,13 @@ from brain_uav.scripts.profile_v2_td3 import (
     _UpdateTimingSummary,
     _DetailedUpdateProfiler,
     _compare_compiled_numeric_tensors,
+    _compare_optional_numeric_tensor,
+    _fixed_numeric_replay_batch,
+    _gradient_diagnostic_summary,
     _prepare_diagnostic_pools,
     _run_compiled_numerics_check,
+    _report_and_validate_empty_token_update,
+    _zero_zone_sample_count,
     _run_diagnostic_level,
     build_parser,
     run_v2_td3_timing_diagnostic,
@@ -497,6 +504,109 @@ class TestProfileV2TD3(unittest.TestCase):
                 atol=1e-5,
             )
 
+    def test_zero_zone_count_and_gradient_diagnostic_states(self) -> None:
+        fixture = v2_td3_tests.TestV2TD3()
+        fixture.setUp()
+        observation = v2_td3_tests.collate_v2_observations([
+            v2_td3_tests._observation(0, scales=fixture.scales),
+            v2_td3_tests._observation(3, scales=fixture.scales),
+            v2_td3_tests._observation(0, scales=fixture.scales),
+        ])
+
+        self.assertEqual(_zero_zone_sample_count(observation), 2)
+        self.assertEqual(_gradient_diagnostic_summary(None), {
+            'state': 'none',
+            'maximum_absolute_value': None,
+            'norm': None,
+            'finite': None,
+        })
+        self.assertEqual(_gradient_diagnostic_summary(torch.zeros(3)), {
+            'state': 'zero',
+            'maximum_absolute_value': 0.0,
+            'norm': 0.0,
+            'finite': True,
+        })
+        nonzero = _gradient_diagnostic_summary(torch.tensor([3.0, 4.0]))
+        self.assertEqual(nonzero['state'], 'nonzero')
+        self.assertEqual(nonzero['maximum_absolute_value'], 4.0)
+        self.assertEqual(nonzero['norm'], 5.0)
+        self.assertTrue(nonzero['finite'])
+
+    def test_optional_gradient_and_adam_tensor_differences_fail_with_field_name(self) -> None:
+        with self.assertRaisesRegex(AssertionError, 'empty_scene_token.gradient'):
+            _compare_optional_numeric_tensor(
+                torch.zeros(2),
+                None,
+                name='critic1.empty_scene_token.gradient',
+                rtol=1e-4,
+                atol=1e-5,
+            )
+
+    def test_empty_token_adam_difference_is_reported_before_failure(self) -> None:
+        fixture = v2_td3_tests.TestV2TD3()
+        fixture.setUp()
+        observation = v2_td3_tests.collate_v2_observations([
+            v2_td3_tests._observation(0, scales=fixture.scales),
+            v2_td3_tests._observation(3, scales=fixture.scales),
+        ])
+        batch = _fixed_numeric_replay_batch(
+            observation,
+            action_dim=2,
+            device=torch.device('cpu'),
+        )
+
+        def state():
+            return {
+                'parameter': torch.zeros(2),
+                'gradient': torch.ones(2),
+                'adam_exists': True,
+                'adam_step': torch.tensor(1.0),
+                'exp_avg': torch.ones(2),
+                'exp_avg_sq': torch.ones(2),
+            }
+
+        eager_before = {name: state() for name in ('critic1', 'critic2')}
+        eager_after = {name: state() for name in ('critic1', 'critic2')}
+        compiled_before = {name: state() for name in ('critic1', 'critic2')}
+        compiled_after = {name: state() for name in ('critic1', 'critic2')}
+        compiled_after['critic1']['exp_avg'] = torch.tensor([1.0, 1.1])
+        output = StringIO()
+
+        with redirect_stdout(output), self.assertRaisesRegex(
+            AssertionError,
+            'critic1.empty_scene_token.exp_avg',
+        ):
+            _report_and_validate_empty_token_update(
+                update_index=2,
+                update='injected_optimizer_difference',
+                batch_construction='injected_test_batch',
+                batch=batch,
+                eager_before=eager_before,
+                eager_after=eager_after,
+                compiled_before=compiled_before,
+                compiled_after=compiled_after,
+                require_historical_momentum=False,
+                rtol=1e-4,
+                atol=1e-5,
+            )
+
+        record = json.loads(output.getvalue())['compiled_numeric_empty_token']
+        self.assertAlmostEqual(
+            record['critics']['critic1']['after_differences'][
+                'exp_avg_maximum_absolute_difference'
+            ],
+            0.1,
+            places=6,
+        )
+        with self.assertRaisesRegex(AssertionError, 'exp_avg'):
+            _compare_optional_numeric_tensor(
+                torch.zeros(2),
+                torch.ones(2),
+                name='critic1.empty_scene_token.adam.exp_avg',
+                rtol=1e-4,
+                atol=1e-5,
+            )
+
     def test_compiled_numeric_check_runs_isolated_fixed_updates(self) -> None:
         fixture = v2_td3_tests.TestV2TD3()
         fixture.setUp()
@@ -517,6 +627,7 @@ class TestProfileV2TD3(unittest.TestCase):
         torch_rng_before = torch.random.get_rng_state().clone()
         numpy_rng_before = np.random.get_state()
 
+        output = StringIO()
         with mock.patch(
             'brain_uav.scripts.profile_v2_td3.build_v2_stage_engine',
             side_effect=(
@@ -529,7 +640,7 @@ class TestProfileV2TD3(unittest.TestCase):
         ), mock.patch(
             'brain_uav.models.zone_set_encoder.torch.compile',
             side_effect=lambda function, **kwargs: function,
-        ):
+        ), redirect_stdout(output):
             result = _run_compiled_numerics_check(
                 pool=SimpleNamespace(),
                 prepared=SimpleNamespace(),
@@ -554,6 +665,67 @@ class TestProfileV2TD3(unittest.TestCase):
         )
         self.assertEqual(reference.update_count, 2)
         self.assertEqual(compiled.update_count, 2)
+        records = [
+            json.loads(line)['compiled_numeric_empty_token']
+            for line in output.getvalue().splitlines()
+        ]
+        self.assertEqual(
+            [record['update'] for record in records],
+            ['critic_only_with_empty_scene', 'actor_and_target_updated_nonempty'],
+        )
+        self.assertEqual([record['update_index'] for record in records], [1, 2])
+        self.assertEqual(records[0]['batch_construction'], (
+            'synthetic_from_fixed_pool_with_one_zero_zone_sample'
+        ))
+        self.assertEqual(
+            [record['zero_zone_sample_count'] for record in records],
+            [1, 0],
+        )
+        self.assertTrue(records[0]['historical_momentum_prerequisite_met'])
+        for critic_name in ('critic1', 'critic2'):
+            for execution in ('eager', 'compiled'):
+                self.assertEqual(
+                    records[0]['critics'][critic_name][execution]['before'][
+                        'gradient'
+                    ]['state'],
+                    'none',
+                )
+                self.assertEqual(
+                    records[0]['critics'][critic_name][execution]['after'][
+                        'gradient'
+                    ]['state'],
+                    'nonzero',
+                )
+                self.assertEqual(
+                    records[0]['critics'][critic_name][execution]['after'][
+                        'adam'
+                    ]['exp_avg']['state'],
+                    'nonzero',
+                )
+                self.assertEqual(
+                    records[1]['critics'][critic_name][execution]['before'][
+                        'gradient'
+                    ]['state'],
+                    'nonzero',
+                )
+                self.assertEqual(
+                    records[1]['critics'][critic_name][execution]['after'][
+                        'gradient'
+                    ]['state'],
+                    'zero',
+                )
+                self.assertEqual(
+                    records[0]['critics'][critic_name][execution]['after'][
+                        'adam'
+                    ]['step'],
+                    1.0,
+                )
+                self.assertEqual(
+                    records[1]['critics'][critic_name][execution]['after'][
+                        'adam'
+                    ]['step'],
+                    2.0,
+                )
         torch.testing.assert_close(torch.random.get_rng_state(), torch_rng_before)
         numpy_rng_after = np.random.get_state()
         self.assertEqual(numpy_rng_after[0], numpy_rng_before[0])

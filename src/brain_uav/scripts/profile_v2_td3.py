@@ -17,7 +17,7 @@ import torch
 
 from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
 from brain_uav.models import V2SNNPolicyActor
-from brain_uav.observations import collate_v2_observations
+from brain_uav.observations import V2ObservationBatch, collate_v2_observations
 from brain_uav.scripts.common import DEVICE_CHOICES, resolve_training_device
 from brain_uav.trainers.v2_formal_training import (
     V2FormalTrainingConfig,
@@ -427,16 +427,104 @@ def _compare_compiled_numeric_tensors(
     }
 
 
+def _zero_zone_sample_count(observation: V2ObservationBatch) -> int:
+    return int((~observation.presence_mask.any(dim=1)).sum().item())
+
+
+def _gradient_diagnostic_summary(
+    gradient: torch.Tensor | None,
+) -> dict[str, Any]:
+    if gradient is None:
+        return {
+            'state': 'none',
+            'maximum_absolute_value': None,
+            'norm': None,
+            'finite': None,
+        }
+    detached = gradient.detach()
+    finite = bool(torch.isfinite(detached).all().item())
+    maximum_absolute_value = (
+        float(detached.abs().max().item()) if finite and detached.numel() else None
+    )
+    norm = float(torch.linalg.vector_norm(detached).item()) if finite else None
+    state = (
+        'zero'
+        if maximum_absolute_value == 0.0
+        else 'nonzero'
+    )
+    return {
+        'state': state,
+        'maximum_absolute_value': maximum_absolute_value,
+        'norm': norm,
+        'finite': finite,
+    }
+
+
+def _compare_optional_numeric_tensor(
+    reference: torch.Tensor | None,
+    compiled: torch.Tensor | None,
+    *,
+    name: str,
+    rtol: float,
+    atol: float,
+) -> float | None:
+    if (reference is None) != (compiled is None):
+        raise AssertionError(
+            f'Compiled numeric mismatch for {name}: one value is None.'
+        )
+    if reference is None:
+        return None
+    try:
+        torch.testing.assert_close(compiled, reference, rtol=rtol, atol=atol)
+    except AssertionError as exc:
+        raise AssertionError(
+            f'Compiled numeric mismatch for {name}: {exc}'
+        ) from exc
+    difference = (compiled - reference).abs()
+    return float(difference.max().item()) if difference.numel() else 0.0
+
+
+def _numeric_diagnostic_observation_batches(
+    batches: Sequence[V2ObservationBatch],
+    *,
+    device: torch.device,
+) -> tuple[V2ObservationBatch, V2ObservationBatch]:
+    if not batches:
+        raise ValueError('Numeric checking requires compile warmup batches.')
+    candidates = tuple(batch.to(device) for batch in batches)
+    source = max(candidates, key=lambda batch: batch.max_zone_count)
+    if source.batch_size < 2:
+        raise ValueError('Numeric checking requires a batch size of at least two.')
+    nonempty_rows = source.presence_mask.any(dim=1).nonzero(as_tuple=False)
+    if nonempty_rows.numel() == 0:
+        raise AssertionError(
+            'Numeric diagnostic prerequisite not met: no nonempty scene is available.'
+        )
+    row = int(nonempty_rows[0, 0].item())
+    repeats = (source.batch_size,) + (1,) * (source.ego_features.ndim - 1)
+    ego = source.ego_features[row:row + 1].repeat(repeats)
+    repeats = (source.batch_size,) + (1,) * (source.goal_features.ndim - 1)
+    goal = source.goal_features[row:row + 1].repeat(repeats)
+    repeats = (source.batch_size,) + (1,) * (source.zone_features.ndim - 1)
+    zones = source.zone_features[row:row + 1].repeat(repeats)
+    repeats = (source.batch_size,) + (1,) * (source.presence_mask.ndim - 1)
+    mask = source.presence_mask[row:row + 1].repeat(repeats)
+    nonempty = V2ObservationBatch(ego, goal, zones, mask)
+    mixed_zones = zones.clone()
+    mixed_mask = mask.clone()
+    mixed_zones[0].zero_()
+    mixed_mask[0].zero_()
+    mixed = V2ObservationBatch(ego.clone(), goal.clone(), mixed_zones, mixed_mask)
+    return mixed, nonempty
+
+
 def _fixed_numeric_replay_batch(
-    batches: Sequence[Any],
+    observation: V2ObservationBatch,
     *,
     action_dim: int,
     device: torch.device,
 ) -> V2ReplayBatch:
-    if not batches:
-        raise ValueError('Numeric checking requires compile warmup batches.')
-    observation = batches[-1].to(device)
-    next_observation = batches[0].to(device)
+    observation = observation.to(device)
     batch_size = observation.batch_size
     zeros = torch.zeros((batch_size, 1), dtype=torch.float32, device=device)
     return V2ReplayBatch(
@@ -447,12 +535,263 @@ def _fixed_numeric_replay_batch(
         reward=torch.linspace(
             0.25, 0.75, batch_size, dtype=torch.float32, device=device
         ).unsqueeze(-1),
-        next_obs=next_observation,
+        next_obs=observation,
         done=zeros.clone(),
         success=zeros.clone(),
         near_goal=torch.ones_like(zeros),
         line_to_goal_safe=torch.ones_like(zeros),
     )
+
+
+def _empty_token_state(engine, critic_name: str) -> dict[str, Any]:
+    critic = getattr(engine, critic_name)
+    parameter = critic.zone_set_encoder.empty_scene_token
+    optimizer_state = engine.critic_optimizer.state.get(parameter)
+    return {
+        'parameter': parameter.detach().cpu().clone(),
+        'gradient': (
+            None if parameter.grad is None else parameter.grad.detach().cpu().clone()
+        ),
+        'adam_exists': optimizer_state is not None,
+        'adam_step': (
+            None
+            if optimizer_state is None or 'step' not in optimizer_state
+            else torch.as_tensor(optimizer_state['step']).detach().cpu().clone()
+        ),
+        'exp_avg': (
+            None
+            if optimizer_state is None or 'exp_avg' not in optimizer_state
+            else optimizer_state['exp_avg'].detach().cpu().clone()
+        ),
+        'exp_avg_sq': (
+            None
+            if optimizer_state is None or 'exp_avg_sq' not in optimizer_state
+            else optimizer_state['exp_avg_sq'].detach().cpu().clone()
+        ),
+    }
+
+
+def _empty_token_states(engine) -> dict[str, dict[str, Any]]:
+    return {
+        critic_name: _empty_token_state(engine, critic_name)
+        for critic_name in ('critic1', 'critic2')
+    }
+
+
+def _optional_maximum_absolute_difference(
+    left: torch.Tensor | None,
+    right: torch.Tensor | None,
+) -> float | None:
+    if left is None or right is None or left.shape != right.shape:
+        return None
+    difference = (left - right).abs()
+    return float(difference.max().item()) if difference.numel() else 0.0
+
+
+def _adam_diagnostic_summary(state: Mapping[str, Any]) -> dict[str, Any]:
+    step = state['adam_step']
+    return {
+        'exists': bool(state['adam_exists']),
+        'step': None if step is None else float(step.item()),
+        'exp_avg': _gradient_diagnostic_summary(state['exp_avg']),
+        'exp_avg_sq': _gradient_diagnostic_summary(state['exp_avg_sq']),
+    }
+
+
+def _empty_token_execution_record(
+    before: Mapping[str, Any],
+    after: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        'before': {
+            'gradient': _gradient_diagnostic_summary(before['gradient']),
+            'adam': _adam_diagnostic_summary(before),
+        },
+        'after': {
+            'gradient': _gradient_diagnostic_summary(after['gradient']),
+            'adam': _adam_diagnostic_summary(after),
+        },
+        'parameter_delta': _gradient_diagnostic_summary(
+            after['parameter'] - before['parameter']
+        ),
+    }
+
+
+def _empty_token_pair_differences(
+    eager: Mapping[str, Any],
+    compiled: Mapping[str, Any],
+) -> dict[str, float | None]:
+    return {
+        'parameter_maximum_absolute_difference': (
+            _optional_maximum_absolute_difference(
+                eager['parameter'], compiled['parameter']
+            )
+        ),
+        'gradient_maximum_absolute_difference': (
+            _optional_maximum_absolute_difference(
+                eager['gradient'], compiled['gradient']
+            )
+        ),
+        'adam_step_maximum_absolute_difference': (
+            _optional_maximum_absolute_difference(
+                eager['adam_step'], compiled['adam_step']
+            )
+        ),
+        'exp_avg_maximum_absolute_difference': (
+            _optional_maximum_absolute_difference(
+                eager['exp_avg'], compiled['exp_avg']
+            )
+        ),
+        'exp_avg_sq_maximum_absolute_difference': (
+            _optional_maximum_absolute_difference(
+                eager['exp_avg_sq'], compiled['exp_avg_sq']
+            )
+        ),
+    }
+
+
+def _historical_momentum_prerequisite_met(
+    eager_after: Mapping[str, Mapping[str, Any]],
+    compiled_after: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    for states in (eager_after, compiled_after):
+        for critic_name in ('critic1', 'critic2'):
+            gradient = _gradient_diagnostic_summary(
+                states[critic_name]['gradient']
+            )
+            momentum = _gradient_diagnostic_summary(
+                states[critic_name]['exp_avg']
+            )
+            if not (
+                gradient['state'] == 'nonzero'
+                and gradient['finite'] is True
+                and momentum['state'] == 'nonzero'
+                and momentum['finite'] is True
+            ):
+                return False
+    return True
+
+
+def _empty_token_update_record(
+    *,
+    update_index: int,
+    update: str,
+    batch_construction: str,
+    batch: V2ReplayBatch,
+    eager_before: Mapping[str, Mapping[str, Any]],
+    eager_after: Mapping[str, Mapping[str, Any]],
+    compiled_before: Mapping[str, Mapping[str, Any]],
+    compiled_after: Mapping[str, Mapping[str, Any]],
+    require_historical_momentum: bool,
+) -> dict[str, Any]:
+    prerequisite_met = (
+        _historical_momentum_prerequisite_met(eager_after, compiled_after)
+        if require_historical_momentum
+        else None
+    )
+    critics: dict[str, Any] = {}
+    for critic_name in ('critic1', 'critic2'):
+        eager_before_state = eager_before[critic_name]
+        eager_after_state = eager_after[critic_name]
+        compiled_before_state = compiled_before[critic_name]
+        compiled_after_state = compiled_after[critic_name]
+        critics[critic_name] = {
+            'eager': _empty_token_execution_record(
+                eager_before_state, eager_after_state
+            ),
+            'compiled': _empty_token_execution_record(
+                compiled_before_state, compiled_after_state
+            ),
+            'before_differences': _empty_token_pair_differences(
+                eager_before_state, compiled_before_state
+            ),
+            'after_differences': _empty_token_pair_differences(
+                eager_after_state, compiled_after_state
+            ),
+        }
+    return {
+        'update_index': update_index,
+        'update': update,
+        'batch_construction': batch_construction,
+        'batch_size': batch.batch_size,
+        'zero_zone_sample_count': _zero_zone_sample_count(batch.obs),
+        'historical_momentum_prerequisite_met': prerequisite_met,
+        'critics': critics,
+    }
+
+
+def _compare_empty_token_states(
+    eager: Mapping[str, Mapping[str, Any]],
+    compiled: Mapping[str, Mapping[str, Any]],
+    *,
+    rtol: float,
+    atol: float,
+) -> None:
+    for critic_name in ('critic1', 'critic2'):
+        eager_state = eager[critic_name]
+        compiled_state = compiled[critic_name]
+        if eager_state['adam_exists'] != compiled_state['adam_exists']:
+            raise AssertionError(
+                f'Compiled numeric mismatch for {critic_name}.empty_scene_token.'
+                'adam.exists.'
+            )
+        for field in (
+            'parameter', 'gradient', 'adam_step', 'exp_avg', 'exp_avg_sq',
+        ):
+            _compare_optional_numeric_tensor(
+                eager_state[field],
+                compiled_state[field],
+                name=f'{critic_name}.empty_scene_token.{field}',
+                rtol=rtol,
+                atol=atol,
+            )
+
+
+def _report_and_validate_empty_token_update(
+    *,
+    update_index: int,
+    update: str,
+    batch_construction: str,
+    batch: V2ReplayBatch,
+    eager_before: Mapping[str, Mapping[str, Any]],
+    eager_after: Mapping[str, Mapping[str, Any]],
+    compiled_before: Mapping[str, Mapping[str, Any]],
+    compiled_after: Mapping[str, Mapping[str, Any]],
+    require_historical_momentum: bool,
+    rtol: float,
+    atol: float,
+) -> dict[str, Any]:
+    diagnostic_record = _empty_token_update_record(
+        update_index=update_index,
+        update=update,
+        batch_construction=batch_construction,
+        batch=batch,
+        eager_before=eager_before,
+        eager_after=eager_after,
+        compiled_before=compiled_before,
+        compiled_after=compiled_after,
+        require_historical_momentum=require_historical_momentum,
+    )
+    print(json.dumps(
+        {'compiled_numeric_empty_token': diagnostic_record},
+        allow_nan=False,
+        ensure_ascii=False,
+    ), flush=True)
+    if require_historical_momentum and not diagnostic_record[
+        'historical_momentum_prerequisite_met'
+    ]:
+        raise AssertionError(
+            'Numeric diagnostic prerequisite not met: the first update did not '
+            'produce nonzero empty_scene_token gradients and Adam momentum for '
+            'both critics and execution paths.'
+        )
+    _compare_empty_token_states(
+        eager_after,
+        compiled_after,
+        rtol=rtol,
+        atol=atol,
+    )
+    return diagnostic_record
 
 
 def _numeric_update_snapshot(engine, batch: V2ReplayBatch, metrics) -> dict[str, torch.Tensor]:
@@ -520,6 +859,7 @@ def _run_compiled_numerics_check(
     reference = None
     compiled = None
     fixed_batch = None
+    diagnostic_batches = None
     try:
         reference_components = build_v2_stage_engine(
             None,
@@ -560,20 +900,59 @@ def _run_compiled_numerics_check(
         )
         compiled.warmup_online_critic_encoder_compile(warmup_batches)
         compiled.warmup_target_encoder_compile(warmup_batches)
-        fixed_batch = _fixed_numeric_replay_batch(
-            warmup_batches,
-            action_dim=reference.action_dim,
-            device=device,
+        mixed_observation, nonempty_observation = (
+            _numeric_diagnostic_observation_batches(
+                warmup_batches,
+                device=device,
+            )
         )
-        reference.replay.sample = lambda batch_size: fixed_batch
-        compiled.replay.sample = lambda batch_size: fixed_batch
+        diagnostic_batches = (
+            _fixed_numeric_replay_batch(
+                mixed_observation,
+                action_dim=reference.action_dim,
+                device=device,
+            ),
+            _fixed_numeric_replay_batch(
+                nonempty_observation,
+                action_dim=reference.action_dim,
+                device=device,
+            ),
+        )
         update_results: dict[str, Any] = {}
         maximum_absolute_error = 0.0
         maximum_relative_error = 0.0
-        for label, total_steps in (
-            ('critic_only', 1),
-            ('actor_and_target_updated', formal_config.policy_delay),
+        for (
+            update_index,
+            label,
+            diagnostic_label,
+            batch_construction,
+            total_steps,
+            fixed_batch,
+            require_momentum,
+        ) in (
+            (
+                1,
+                'critic_only',
+                'critic_only_with_empty_scene',
+                'synthetic_from_fixed_pool_with_one_zero_zone_sample',
+                1,
+                diagnostic_batches[0],
+                True,
+            ),
+            (
+                2,
+                'actor_and_target_updated',
+                'actor_and_target_updated_nonempty',
+                'fixed_pool_nonempty_sample_repeated',
+                formal_config.policy_delay,
+                diagnostic_batches[1],
+                False,
+            ),
         ):
+            reference.replay.sample = lambda batch_size, batch=fixed_batch: batch
+            compiled.replay.sample = lambda batch_size, batch=fixed_batch: batch
+            eager_before = _empty_token_states(reference)
+            compiled_before = _empty_token_states(compiled)
             update_rng_state = torch.random.get_rng_state()
             update_cuda_rng_state = torch.cuda.get_rng_state_all()
             reference_metrics = reference.update_once(
@@ -586,6 +965,8 @@ def _run_compiled_numerics_check(
                 total_steps=total_steps,
                 bc_lambda=v2_bc_lambda(total_steps - 1),
             )
+            eager_after = _empty_token_states(reference)
+            compiled_after = _empty_token_states(compiled)
             if label == 'critic_only' and (
                 reference_metrics.actor_updated or compiled_metrics.actor_updated
             ):
@@ -596,6 +977,19 @@ def _run_compiled_numerics_check(
                 and compiled_metrics.critic_targets_updated
             ):
                 raise AssertionError('Numeric actor/target update did not execute fully.')
+            diagnostic_record = _report_and_validate_empty_token_update(
+                update_index=update_index,
+                update=diagnostic_label,
+                batch_construction=batch_construction,
+                batch=fixed_batch,
+                eager_before=eager_before,
+                eager_after=eager_after,
+                compiled_before=compiled_before,
+                compiled_after=compiled_after,
+                require_historical_momentum=require_momentum,
+                rtol=COMPILED_NUMERIC_RTOL,
+                atol=COMPILED_NUMERIC_ATOL,
+            )
             comparison = _compare_compiled_numeric_tensors(
                 _numeric_update_snapshot(reference, fixed_batch, reference_metrics),
                 _numeric_update_snapshot(compiled, fixed_batch, compiled_metrics),
@@ -626,6 +1020,7 @@ def _run_compiled_numerics_check(
         }
     finally:
         fixed_batch = None
+        diagnostic_batches = None
         reference = None
         compiled = None
         reference_components = None
