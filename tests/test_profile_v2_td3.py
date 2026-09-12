@@ -30,12 +30,15 @@ from brain_uav.scripts.profile_v2_td3 import (
     _terminal_numeric_observation_batch,
     _gradient_diagnostic_summary,
     _prepare_diagnostic_pools,
+    _report_and_validate_actor_rl_gradients,
+    _report_and_validate_numeric_engine_modes,
     _run_compiled_numerics_check,
     _run_actor_update_with_rl_gradient_capture,
     _report_and_validate_actor_regularizers,
     _report_and_validate_empty_token_update,
     _report_group_localization,
     _run_grouped_compiled_numerics_diagnostic,
+    _set_numeric_engine_modes,
     _zero_zone_sample_count,
     _run_diagnostic_level,
     build_parser,
@@ -1411,6 +1414,22 @@ class TestProfileV2TD3(unittest.TestCase):
         for engine in (reference, compiled):
             engine.policy_delay = 2
             engine.terminal_geo_regularization_enabled = True
+            engine.actor.eval()
+            engine.critic1.eval()
+            engine.critic2.eval()
+            engine.actor_target.train()
+            engine.critic1_target.train()
+            engine.critic2_target.train()
+            for target in (
+                engine.actor_target,
+                engine.critic1_target,
+                engine.critic2_target,
+            ):
+                for parameter in target.parameters():
+                    parameter.requires_grad_(True)
+            engine.bc_reference_actor.train()
+            for parameter in engine.bc_reference_actor.parameters():
+                parameter.requires_grad_(True)
         batch = v2_snn_td3_tests.collate_v2_observations([
             v2_snn_td3_tests._observation(0, fixture.scales),
             v2_snn_td3_tests._observation(10, fixture.scales),
@@ -1461,8 +1480,116 @@ class TestProfileV2TD3(unittest.TestCase):
             'actor_target.eager_snn',
             result['compilation']['enabled_objects'],
         )
+        self.assertEqual(
+            tuple(result['module_modes']),
+            ('before_compile_warmup', 'before_consecutive_updates'),
+        )
+        for phase in result['module_modes'].values():
+            for execution in ('eager', 'compiled'):
+                modes = phase['engines'][execution]
+                self.assertTrue(modes['online_actor_training'])
+                self.assertTrue(modes['online_critics_training']['critic1'])
+                self.assertTrue(modes['online_critics_training']['critic2'])
+                self.assertTrue(all(modes['snn_lif_training'].values()))
+                for target in modes['target_networks'].values():
+                    self.assertFalse(target['training'])
+                    self.assertTrue(target['all_parameters_frozen'])
+                self.assertFalse(modes['bc_reference_actor']['training'])
+                self.assertTrue(
+                    modes['bc_reference_actor']['all_parameters_frozen']
+                )
+        for execution in ('eager', 'compiled'):
+            coverage = result['actor_rl_gradient'][execution][
+                'snn_module_gradient_coverage'
+            ]
+            for module_name in ('zone_set_encoder', 'snn_head.fc1'):
+                self.assertGreater(
+                    coverage[module_name]['finite_nonzero_gradient_count'],
+                    0,
+                )
+                self.assertTrue(
+                    coverage[module_name]['all_present_gradients_finite']
+                )
         self.assertEqual(reference.actor.snn_head.lif1.v, 0.0)
         self.assertEqual(compiled.actor_target.snn_head.lif2.v, 0.0)
+
+    def test_snn_numeric_mode_check_rejects_eval_lif_and_preserves_frozen_models(self):
+        fixture = v2_snn_td3_tests.TestV2SNNTD3()
+        fixture.setUp()
+        eager = fixture.make_engine(bc=fixture.make_actor())
+        compiled = fixture.make_engine(bc=fixture.make_actor())
+        for engine in (eager, compiled):
+            engine.actor.eval()
+            _set_numeric_engine_modes(engine)
+
+        eager.actor.snn_head.lif1.eval()
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaisesRegex(
+            AssertionError,
+            'module modes',
+        ):
+            _report_and_validate_numeric_engine_modes(
+                eager,
+                compiled,
+                model='snn',
+                phase='injected_invalid_mode',
+            )
+        payload = json.loads(output.getvalue().strip())[
+            'compiled_numeric_module_modes'
+        ]
+        self.assertFalse(
+            payload['engines']['eager']['snn_lif_training']['snn_head.lif1']
+        )
+        for engine in (eager, compiled):
+            for target in (
+                engine.actor_target,
+                engine.critic1_target,
+                engine.critic2_target,
+            ):
+                self.assertFalse(target.training)
+                self.assertTrue(all(
+                    not parameter.requires_grad
+                    for parameter in target.parameters()
+                ))
+            self.assertFalse(engine.bc_reference_actor.training)
+            self.assertTrue(all(
+                not parameter.requires_grad
+                for parameter in engine.bc_reference_actor.parameters()
+            ))
+
+    def test_snn_actor_rl_gradient_check_rejects_missing_required_module(self):
+        valid_capture = {
+            'q_output_gradient': torch.ones(2, 1),
+            'actor_gradients': {
+                'zone_set_encoder.empty_scene_token': torch.ones(1, 4),
+                'snn_head.fc1.weight': torch.ones(4, 4),
+            },
+        }
+        missing_fc1 = {
+            'q_output_gradient': torch.ones(2, 1),
+            'actor_gradients': {
+                'zone_set_encoder.empty_scene_token': torch.ones(1, 4),
+            },
+        }
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaisesRegex(
+            AssertionError,
+            'snn_head.fc1',
+        ):
+            _report_and_validate_actor_rl_gradients(
+                valid_capture,
+                missing_fc1,
+                require_snn_module_coverage=True,
+            )
+        payload = json.loads(output.getvalue().strip())[
+            'compiled_numeric_actor_rl_gradient'
+        ]
+        self.assertEqual(
+            payload['compiled']['snn_module_gradient_coverage'][
+                'snn_head.fc1'
+            ]['gradient_count'],
+            0,
+        )
 
     def test_compile_extension_rejects_unsupported_flag_combinations(self) -> None:
         common = {

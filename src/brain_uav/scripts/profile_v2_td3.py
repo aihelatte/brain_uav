@@ -1484,14 +1484,41 @@ def _report_and_validate_actor_regularizers(
 def _report_and_validate_actor_rl_gradients(
     eager: Mapping[str, Any],
     compiled: Mapping[str, Any],
+    *,
+    require_snn_module_coverage: bool = False,
 ) -> dict[str, Any]:
+    required_snn_modules = ('zone_set_encoder', 'snn_head.fc1')
+
+    def module_coverage(
+        gradients: Mapping[str, torch.Tensor],
+        module_name: str,
+    ) -> dict[str, Any]:
+        selected = tuple(
+            gradient
+            for name, gradient in gradients.items()
+            if name == module_name or name.startswith(f'{module_name}.')
+        )
+        finite = tuple(
+            bool(torch.isfinite(gradient).all()) for gradient in selected
+        )
+        return {
+            'gradient_count': len(selected),
+            'finite_nonzero_gradient_count': sum(
+                int(is_finite and bool(torch.count_nonzero(gradient)))
+                for gradient, is_finite in zip(selected, finite)
+            ),
+            'all_present_gradients_finite': bool(
+                selected and all(finite)
+            ),
+        }
+
     def summarize(capture: Mapping[str, Any]) -> dict[str, Any]:
         gradients = capture['actor_gradients']
         nonzero = sum(
             int(bool(torch.count_nonzero(gradient)))
             for gradient in gradients.values()
         )
-        return {
+        summary = {
             'q_output_gradient': _gradient_diagnostic_summary(
                 capture['q_output_gradient']
             ),
@@ -1505,6 +1532,12 @@ def _report_and_validate_actor_rl_gradients(
                 )
             ),
         }
+        if require_snn_module_coverage:
+            summary['snn_module_gradient_coverage'] = {
+                module_name: module_coverage(gradients, module_name)
+                for module_name in required_snn_modules
+            }
+        return summary
 
     record = {'eager': summarize(eager), 'compiled': summarize(compiled)}
     print(json.dumps(
@@ -1523,6 +1556,19 @@ def _report_and_validate_actor_rl_gradients(
                 f'Numeric actor update did not preserve a finite RL gradient '
                 f'path for {execution}.'
             )
+        if require_snn_module_coverage:
+            for module_name, coverage in summary[
+                'snn_module_gradient_coverage'
+            ].items():
+                if not (
+                    coverage['gradient_count'] > 0
+                    and coverage['finite_nonzero_gradient_count'] > 0
+                    and coverage['all_present_gradients_finite']
+                ):
+                    raise AssertionError(
+                        'Numeric diagnostic prerequisite not met: SNN pure RL '
+                        f'gradient did not reach {module_name} for {execution}.'
+                    )
     _compare_optional_numeric_tensor(
         eager['q_output_gradient'],
         compiled['q_output_gradient'],
@@ -1536,6 +1582,124 @@ def _report_and_validate_actor_rl_gradients(
         rtol=COMPILED_NUMERIC_RTOL,
         atol=COMPILED_NUMERIC_ATOL,
     )
+    return record
+
+
+def _set_numeric_engine_modes(engine) -> None:
+    """Establish the modes used by a real TD3 learning update."""
+
+    engine.actor.train()
+    engine.critic1.train()
+    engine.critic2.train()
+    for target in (
+        engine.actor_target,
+        engine.critic1_target,
+        engine.critic2_target,
+    ):
+        target.eval()
+        for parameter in target.parameters():
+            parameter.requires_grad_(False)
+    if engine.bc_reference_actor is not None:
+        engine.bc_reference_actor.eval()
+        for parameter in engine.bc_reference_actor.parameters():
+            parameter.requires_grad_(False)
+
+
+def _numeric_engine_mode_summary(engine, *, model: str) -> dict[str, Any]:
+    def frozen_module_summary(module) -> dict[str, Any]:
+        return {
+            'training': bool(module.training),
+            'all_parameters_frozen': all(
+                not parameter.requires_grad for parameter in module.parameters()
+            ),
+        }
+
+    summary: dict[str, Any] = {
+        'online_actor_training': bool(engine.actor.training),
+        'online_critics_training': {
+            'critic1': bool(engine.critic1.training),
+            'critic2': bool(engine.critic2.training),
+        },
+        'target_networks': {
+            name: frozen_module_summary(module)
+            for name, module in (
+                ('actor_target', engine.actor_target),
+                ('critic1_target', engine.critic1_target),
+                ('critic2_target', engine.critic2_target),
+            )
+        },
+        'bc_reference_actor': (
+            None
+            if engine.bc_reference_actor is None
+            else frozen_module_summary(engine.bc_reference_actor)
+        ),
+    }
+    if model == 'snn':
+        if not isinstance(engine.actor, V2SNNPolicyActor):
+            summary['snn_lif_training'] = {}
+        else:
+            summary['snn_lif_training'] = {
+                f'snn_head.{name}': bool(module.training)
+                for name, module in engine.actor.snn_head.named_modules()
+                if name and 'lif' in name.lower()
+            }
+    return summary
+
+
+def _report_and_validate_numeric_engine_modes(
+    eager,
+    compiled,
+    *,
+    model: str,
+    phase: str,
+) -> dict[str, Any]:
+    record = {
+        'phase': phase,
+        'model': model,
+        'engines': {
+            'eager': _numeric_engine_mode_summary(eager, model=model),
+            'compiled': _numeric_engine_mode_summary(compiled, model=model),
+        },
+    }
+    print(json.dumps(
+        {'compiled_numeric_module_modes': record},
+        allow_nan=False,
+        ensure_ascii=False,
+    ), flush=True)
+
+    problems: list[str] = []
+    for execution, summary in record['engines'].items():
+        if not summary['online_actor_training']:
+            problems.append(f'{execution}.online_actor')
+        for critic_name, training in summary['online_critics_training'].items():
+            if not training:
+                problems.append(f'{execution}.{critic_name}')
+        for target_name, target in summary['target_networks'].items():
+            if target['training'] or not target['all_parameters_frozen']:
+                problems.append(f'{execution}.{target_name}')
+        bc_reference = summary['bc_reference_actor']
+        if bc_reference is None:
+            problems.append(f'{execution}.bc_reference_actor_missing')
+        elif (
+            bc_reference['training']
+            or not bc_reference['all_parameters_frozen']
+        ):
+            problems.append(f'{execution}.bc_reference_actor')
+        if model == 'snn':
+            lif_modes = summary.get('snn_lif_training', {})
+            if not lif_modes:
+                problems.append(f'{execution}.snn_lif_modules_missing')
+            problems.extend(
+                f'{execution}.{name}'
+                for name, training in lif_modes.items()
+                if not training
+            )
+    if problems:
+        raise AssertionError(
+            'Numeric diagnostic module modes are invalid: '
+            + ', '.join(problems)
+            + '.'
+        )
     return record
 
 
@@ -1591,6 +1755,23 @@ def _run_compiled_numerics_check(
         reference = reference_components.engine
         compiled = compiled_components.engine
         compiled.load_checkpoint_state_dict(reference.checkpoint_state_dict())
+        if reference.bc_reference_actor is None or compiled.bc_reference_actor is None:
+            raise AssertionError(
+                'Numeric diagnostic prerequisite not met: a frozen BC reference '
+                'actor is required.'
+            )
+        _set_numeric_engine_modes(reference)
+        _set_numeric_engine_modes(compiled)
+        module_modes = {
+            'before_compile_warmup': (
+                _report_and_validate_numeric_engine_modes(
+                    reference,
+                    compiled,
+                    model=model,
+                    phase='before_compile_warmup',
+                )
+            ),
+        }
         configured = compiled.configure_compilation(
             compile_critic_encoder=compile_critic_encoder,
             compile_target_encoders=compile_target_encoders,
@@ -1614,6 +1795,14 @@ def _run_compiled_numerics_check(
             compiled.warmup_online_critic_encoder_compile(warmup_batches)
             if compile_target_encoders:
                 compiled.warmup_target_encoder_compile(warmup_batches)
+        module_modes['before_consecutive_updates'] = (
+            _report_and_validate_numeric_engine_modes(
+                reference,
+                compiled,
+                model=model,
+                phase='before_consecutive_updates',
+            )
+        )
         mixed_observation, nonempty_observation = (
             _numeric_diagnostic_observation_batches(
                 warmup_batches,
@@ -1642,11 +1831,6 @@ def _run_compiled_numerics_check(
             device=device,
             line_to_goal_safe=False,
         )
-        if reference.bc_reference_actor is None or compiled.bc_reference_actor is None:
-            raise AssertionError(
-                'Numeric diagnostic prerequisite not met: a frozen BC reference '
-                'actor is required.'
-            )
         diagnostic_batches = (
             fixed_batch,
             fixed_batch,
@@ -1814,6 +1998,7 @@ def _run_compiled_numerics_check(
                 actor_rl_gradient = _report_and_validate_actor_rl_gradients(
                     reference_actor_capture,
                     compiled_actor_capture,
+                    require_snn_module_coverage=(model == 'snn'),
                 )
             if capture_regularizers:
                 regularizer_gradient_check = (
@@ -1884,6 +2069,7 @@ def _run_compiled_numerics_check(
             'updates': update_results,
             'actor_rl_gradient': actor_rl_gradient,
             'regularizer_gradient_check': regularizer_gradient_check,
+            'module_modes': module_modes,
             'frozen_critic_actor_encoder_execution': (
                 frozen_critic_strategy
             ),
