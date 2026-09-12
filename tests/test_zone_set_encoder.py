@@ -309,6 +309,38 @@ class TestZoneSetEncoder(unittest.TestCase):
                 )
                 self.assertEqual(tuple(model.state_dict()), state_keys)
 
+    def test_eager_tensor_forward_context_bypasses_compile_and_restores(self):
+        ego, goal, zones, mask = self.inputs([0, 3])
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            self.model.enable_compiled_tensor_forward(backend='eager')
+        compiled = mock.Mock(wraps=self.model._compiled_tensor_forward)
+        self.model._compiled_tensor_forward = compiled
+        with mock.patch.object(
+            self.model,
+            '_compute_policy_context_tensors',
+            wraps=self.model._compute_policy_context_tensors,
+        ) as eager:
+            self.model(ego, goal, zones, mask)
+            self.assertEqual(compiled.call_count, 1)
+            self.assertEqual(eager.call_count, 0)
+
+            with self.model.eager_tensor_forward():
+                output = self.model(ego, goal, zones, mask)
+                output.sum().backward()
+            self.assertEqual(compiled.call_count, 1)
+            self.assertEqual(eager.call_count, 1)
+            self.assertIsNotNone(self.model.empty_scene_token.grad)
+
+            with self.assertRaisesRegex(RuntimeError, 'controlled eager failure'):
+                with self.model.eager_tensor_forward():
+                    raise RuntimeError('controlled eager failure')
+            self.model(ego, goal, zones, mask)
+            self.assertEqual(compiled.call_count, 2)
+            self.assertEqual(eager.call_count, 1)
+
     def test_profiled_forward_marks_only_major_encoder_sections(self):
         inputs = self.inputs([0, 3, 7])
         expected = self.model(*inputs)

@@ -644,12 +644,13 @@ class V2TD3UpdateEngine:
                     parameter.requires_grad_(False)
                 frozen_action = action.detach().clone().requires_grad_(True)
                 try:
-                    frozen_q = self.critic1(
-                        device_batch,
-                        frozen_action,
-                        shared_relations=shared_relations,
-                    )
-                    frozen_q.sum().backward()
+                    with self.critic1.zone_set_encoder.eager_tensor_forward():
+                        frozen_q = self.critic1(
+                            device_batch,
+                            frozen_action,
+                            shared_relations=shared_relations,
+                        )
+                        frozen_q.sum().backward()
                     if frozen_action.grad is None:
                         raise RuntimeError(
                             'Compiled frozen critic warmup did not preserve action gradients.'
@@ -996,13 +997,14 @@ class V2TD3UpdateEngine:
                 with update_timing.section('actor_update'):
                     for parameter in critic1_parameters:
                         parameter.requires_grad_(False)
-                    actor_terms = self._compute_actor_loss_terms(
-                        batch.obs,
-                        batch.line_to_goal_safe,
-                        bc_lambda=bc_lambda_value,
-                        shared_relations=current_shared_relations,
-                        profile_sections=profile_sections,
-                    )
+                    with self.critic1.zone_set_encoder.eager_tensor_forward():
+                        actor_terms = self._compute_actor_loss_terms(
+                            batch.obs,
+                            batch.line_to_goal_safe,
+                            bc_lambda=bc_lambda_value,
+                            shared_relations=current_shared_relations,
+                            profile_sections=profile_sections,
+                        )
                     self._require_finite_loss(
                         actor_terms.actor_loss,
                         component='actor',

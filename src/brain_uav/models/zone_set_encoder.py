@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from math import isfinite, sqrt
-from typing import Callable
+from typing import Callable, Iterator
 
 import torch
 from torch import nn
@@ -395,6 +396,7 @@ class ZoneSetEncoder(nn.Module):
         nn.init.normal_(self.empty_scene_token, mean=0.0, std=0.02)
         self._compiled_tensor_forward: Callable[..., torch.Tensor] | None = None
         self._compiled_tensor_forward_config: dict[str, object] | None = None
+        self._force_eager_tensor_forward = False
 
     @property
     def output_dim(self) -> int:
@@ -434,6 +436,17 @@ class ZoneSetEncoder(nn.Module):
             'fullgraph': bool(fullgraph),
             'dynamic': bool(dynamic),
         }
+
+    @contextmanager
+    def eager_tensor_forward(self) -> Iterator[None]:
+        """Temporarily select the original tensor path without disabling compile."""
+
+        previous = self._force_eager_tensor_forward
+        self._force_eager_tensor_forward = True
+        try:
+            yield
+        finally:
+            self._force_eager_tensor_forward = previous
 
     def _validate_inputs(
         self,
@@ -825,7 +838,10 @@ class ZoneSetEncoder(nn.Module):
         if not diagnostics and not profile_sections:
             tensor_forward = (
                 self._compiled_tensor_forward
-                if self._compiled_tensor_forward is not None
+                if (
+                    self._compiled_tensor_forward is not None
+                    and not self._force_eager_tensor_forward
+                )
                 else self._compute_policy_context_tensors
             )
             return tensor_forward(*tensor_arguments)

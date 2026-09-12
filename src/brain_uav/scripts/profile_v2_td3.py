@@ -38,11 +38,12 @@ from brain_uav.trainers.v2_validation import (
 
 
 DIAGNOSTIC_FORMAT = 'v2_td3_timing_diagnostic'
-DIAGNOSTIC_VERSION = 5
+DIAGNOSTIC_VERSION = 6
 DIAGNOSTIC_LEVELS = ('easy', 'medium', 'hard')
 UPDATE_TIMING_SECTION_NAMES = V2_TD3_UPDATE_TIMING_SECTIONS
 COMPILED_NUMERIC_RTOL = 1e-4
 COMPILED_NUMERIC_ATOL = 1e-5
+FROZEN_CRITIC_ACTOR_ENCODER_EXECUTION = 'eager'
 
 
 def _positive_int(value: Any, *, name: str) -> int:
@@ -890,6 +891,9 @@ def _report_group_localization(
         atol=COMPILED_NUMERIC_ATOL,
     )
     comparison['group'] = str(group).upper()
+    comparison['frozen_critic_actor_encoder_execution'] = (
+        FROZEN_CRITIC_ACTOR_ENCODER_EXECUTION
+    )
     comparison['update_index'] = 1
     comparison['update'] = 'critic_only_with_one_zero_zone_sample'
     comparison['batch'] = eager.get('batch', {})
@@ -1211,6 +1215,39 @@ def _numeric_update_snapshot(engine, batch: V2ReplayBatch, metrics) -> dict[str,
             snapshot[f'gradients.{critic_name}.{parameter_name}'] = (
                 parameter.grad.detach().cpu().clone()
             )
+            optimizer_state = engine.critic_optimizer.state.get(parameter)
+            if optimizer_state is None:
+                raise AssertionError(
+                    f'Numeric check expected Adam state for '
+                    f'{critic_name}.{parameter_name}.'
+                )
+            for field in ('step', 'exp_avg', 'exp_avg_sq'):
+                if field not in optimizer_state:
+                    raise AssertionError(
+                        f'Numeric check expected Adam {field} for '
+                        f'{critic_name}.{parameter_name}.'
+                    )
+                snapshot[
+                    f'optimizer.critic.{critic_name}.{parameter_name}.{field}'
+                ] = torch.as_tensor(optimizer_state[field]).detach().cpu().clone()
+    if metrics.actor_updated:
+        for parameter_name, parameter in engine.actor.named_parameters():
+            if parameter.grad is None:
+                raise AssertionError(
+                    f'Numeric check expected actor gradient for {parameter_name}.'
+                )
+            snapshot[f'gradients.actor.{parameter_name}'] = (
+                parameter.grad.detach().cpu().clone()
+            )
+            optimizer_state = engine.actor_optimizer.state.get(parameter)
+            if optimizer_state is None:
+                raise AssertionError(
+                    f'Numeric check expected actor Adam state for {parameter_name}.'
+                )
+            for field in ('step', 'exp_avg', 'exp_avg_sq'):
+                snapshot[
+                    f'optimizer.actor.{parameter_name}.{field}'
+                ] = torch.as_tensor(optimizer_state[field]).detach().cpu().clone()
     with torch.no_grad():
         next_observation = batch.next_obs.to(engine.device)
         shared_relations = engine._build_shared_relations(next_observation)
@@ -1232,6 +1269,95 @@ def _numeric_update_snapshot(engine, batch: V2ReplayBatch, metrics) -> dict[str,
     snapshot['forward.critic1_target'] = target_q1.detach().cpu().clone()
     snapshot['forward.critic2_target'] = target_q2.detach().cpu().clone()
     return snapshot
+
+
+def _run_actor_update_with_rl_gradient_capture(
+    engine,
+    *,
+    total_steps: int,
+) -> tuple[Any, dict[str, Any]]:
+    q_output_gradient: torch.Tensor | None = None
+
+    def capture_frozen_q_gradient(_module, _inputs, output):
+        if not any(parameter.requires_grad for parameter in engine.critic1.parameters()):
+            def save_gradient(gradient):
+                nonlocal q_output_gradient
+                q_output_gradient = gradient.detach().cpu().clone()
+                return gradient
+            output.register_hook(save_gradient)
+
+    handle = engine.critic1.register_forward_hook(capture_frozen_q_gradient)
+    try:
+        metrics = engine.update_once(total_steps=total_steps, bc_lambda=0.0)
+    finally:
+        handle.remove()
+    actor_gradients = {
+        name: parameter.grad.detach().cpu().clone()
+        for name, parameter in engine.actor.named_parameters()
+        if parameter.grad is not None
+    }
+    return metrics, {
+        'q_output_gradient': q_output_gradient,
+        'actor_gradients': actor_gradients,
+    }
+
+
+def _report_and_validate_actor_rl_gradients(
+    eager: Mapping[str, Any],
+    compiled: Mapping[str, Any],
+) -> dict[str, Any]:
+    def summarize(capture: Mapping[str, Any]) -> dict[str, Any]:
+        gradients = capture['actor_gradients']
+        nonzero = sum(
+            int(bool(torch.count_nonzero(gradient)))
+            for gradient in gradients.values()
+        )
+        return {
+            'q_output_gradient': _gradient_diagnostic_summary(
+                capture['q_output_gradient']
+            ),
+            'actor_parameter_gradient_count': len(gradients),
+            'nonzero_actor_parameter_gradients': nonzero,
+            'all_actor_parameter_gradients_finite': bool(
+                gradients
+                and all(
+                    bool(torch.isfinite(gradient).all())
+                    for gradient in gradients.values()
+                )
+            ),
+        }
+
+    record = {'eager': summarize(eager), 'compiled': summarize(compiled)}
+    print(json.dumps(
+        {'compiled_numeric_actor_rl_gradient': record},
+        allow_nan=False,
+        ensure_ascii=False,
+    ), flush=True)
+    for execution, summary in record.items():
+        if not (
+            summary['q_output_gradient']['state'] == 'nonzero'
+            and summary['q_output_gradient']['finite'] is True
+            and summary['nonzero_actor_parameter_gradients'] > 0
+            and summary['all_actor_parameter_gradients_finite']
+        ):
+            raise AssertionError(
+                f'Numeric actor update did not preserve a finite RL gradient '
+                f'path for {execution}.'
+            )
+    _compare_optional_numeric_tensor(
+        eager['q_output_gradient'],
+        compiled['q_output_gradient'],
+        name='actor_rl.q_output_gradient',
+        rtol=COMPILED_NUMERIC_RTOL,
+        atol=COMPILED_NUMERIC_ATOL,
+    )
+    _compare_compiled_numeric_tensors(
+        eager['actor_gradients'],
+        compiled['actor_gradients'],
+        rtol=COMPILED_NUMERIC_RTOL,
+        atol=COMPILED_NUMERIC_ATOL,
+    )
+    return record
 
 
 def _run_compiled_numerics_check(
@@ -1293,25 +1419,24 @@ def _run_compiled_numerics_check(
         )
         compiled.warmup_online_critic_encoder_compile(warmup_batches)
         compiled.warmup_target_encoder_compile(warmup_batches)
-        mixed_observation, nonempty_observation = (
+        mixed_observation, _ = (
             _numeric_diagnostic_observation_batches(
                 warmup_batches,
                 device=device,
             )
         )
-        diagnostic_batches = (
-            _fixed_numeric_replay_batch(
-                mixed_observation,
-                action_dim=reference.action_dim,
-                device=device,
-            ),
-            _fixed_numeric_replay_batch(
-                nonempty_observation,
-                action_dim=reference.action_dim,
-                device=device,
-            ),
+        fixed_batch = _fixed_numeric_replay_batch(
+            mixed_observation,
+            action_dim=reference.action_dim,
+            device=device,
         )
+        diagnostic_batches = (fixed_batch, fixed_batch, fixed_batch)
+        if formal_config.policy_delay <= 1:
+            raise ValueError(
+                'Compiled numeric three-update checking requires policy_delay > 1.'
+            )
         update_results: dict[str, Any] = {}
+        actor_rl_gradient: dict[str, Any] | None = None
         maximum_absolute_error = 0.0
         maximum_relative_error = 0.0
         for (
@@ -1322,6 +1447,7 @@ def _run_compiled_numerics_check(
             total_steps,
             fixed_batch,
             require_momentum,
+            capture_actor_rl,
         ) in (
             (
                 1,
@@ -1331,14 +1457,26 @@ def _run_compiled_numerics_check(
                 1,
                 diagnostic_batches[0],
                 True,
+                False,
             ),
             (
                 2,
                 'actor_and_target_updated',
-                'actor_and_target_updated_nonempty',
-                'fixed_pool_nonempty_sample_repeated',
+                'actor_and_target_updated_with_empty_scene',
+                'synthetic_from_fixed_pool_with_one_zero_zone_sample',
                 formal_config.policy_delay,
                 diagnostic_batches[1],
+                False,
+                True,
+            ),
+            (
+                3,
+                'critic_only_after_actor',
+                'critic_only_after_actor_with_empty_scene',
+                'synthetic_from_fixed_pool_with_one_zero_zone_sample',
+                formal_config.policy_delay + 1,
+                diagnostic_batches[2],
+                False,
                 False,
             ),
         ):
@@ -1348,19 +1486,39 @@ def _run_compiled_numerics_check(
             compiled_before = _empty_token_states(compiled)
             update_rng_state = torch.random.get_rng_state()
             update_cuda_rng_state = torch.cuda.get_rng_state_all()
-            reference_metrics = reference.update_once(
-                total_steps=total_steps,
-                bc_lambda=v2_bc_lambda(total_steps - 1),
-            )
+            if capture_actor_rl:
+                reference_metrics, reference_actor_rl = (
+                    _run_actor_update_with_rl_gradient_capture(
+                        reference,
+                        total_steps=total_steps,
+                    )
+                )
+            else:
+                reference_metrics = reference.update_once(
+                    total_steps=total_steps,
+                    bc_lambda=0.0,
+                )
             torch.random.set_rng_state(update_rng_state)
             torch.cuda.set_rng_state_all(update_cuda_rng_state)
-            compiled_metrics = compiled.update_once(
-                total_steps=total_steps,
-                bc_lambda=v2_bc_lambda(total_steps - 1),
-            )
+            if capture_actor_rl:
+                compiled_metrics, compiled_actor_rl = (
+                    _run_actor_update_with_rl_gradient_capture(
+                        compiled,
+                        total_steps=total_steps,
+                    )
+                )
+                actor_rl_gradient = _report_and_validate_actor_rl_gradients(
+                    reference_actor_rl,
+                    compiled_actor_rl,
+                )
+            else:
+                compiled_metrics = compiled.update_once(
+                    total_steps=total_steps,
+                    bc_lambda=0.0,
+                )
             eager_after = _empty_token_states(reference)
             compiled_after = _empty_token_states(compiled)
-            if label == 'critic_only' and (
+            if label in ('critic_only', 'critic_only_after_actor') and (
                 reference_metrics.actor_updated or compiled_metrics.actor_updated
             ):
                 raise AssertionError('Numeric critic-only update unexpectedly updated actor.')
@@ -1405,6 +1563,10 @@ def _run_compiled_numerics_check(
             'maximum_absolute_error': maximum_absolute_error,
             'maximum_relative_error': maximum_relative_error,
             'updates': update_results,
+            'actor_rl_gradient': actor_rl_gradient,
+            'frozen_critic_actor_encoder_execution': (
+                FROZEN_CRITIC_ACTOR_ENCODER_EXECUTION
+            ),
             'wall_seconds': perf_counter() - started,
             'measurement_note': (
                 'Uses independent eager and compiled engines before timed diagnosis; '
@@ -1523,6 +1685,9 @@ def _run_grouped_compiled_numerics_diagnostic(
             'passed': comparison['passed'],
             'device': str(device),
             'compiled_objects': enabled_objects,
+            'frozen_critic_actor_encoder_execution': (
+                FROZEN_CRITIC_ACTOR_ENCODER_EXECUTION
+            ),
             'batch_size': fixed_batch.batch_size,
             'zero_zone_sample_count': _zero_zone_sample_count(fixed_batch.obs),
             'earliest_difference_stage': comparison[
@@ -1606,6 +1771,10 @@ def _run_diagnostic_level(
         'mode': 'default',
         'fullgraph': True,
         'dynamic': True,
+        'frozen_critic_actor_encoder_execution': (
+            FROZEN_CRITIC_ACTOR_ENCODER_EXECUTION
+            if compile_critic_encoder else None
+        ),
         'registration_wall_seconds': 0.0,
         'warmup_wall_seconds': 0.0,
         'online_registration_wall_seconds': 0.0,
@@ -2001,6 +2170,7 @@ def run_v2_td3_timing_diagnostic(
     compile_critic_encoder: bool = False,
     compile_target_encoders: bool = False,
     check_compiled_numerics: bool = False,
+    compiled_numerics_only: bool = False,
     compiled_numerics_group: str | None = None,
 ) -> dict[str, Any]:
     if model not in ('ann', 'snn'):
@@ -2022,6 +2192,12 @@ def run_v2_td3_timing_diagnostic(
         raise TypeError('compile_target_encoders must be a bool.')
     if type(check_compiled_numerics) is not bool:
         raise TypeError('check_compiled_numerics must be a bool.')
+    if type(compiled_numerics_only) is not bool:
+        raise TypeError('compiled_numerics_only must be a bool.')
+    if compiled_numerics_only and not check_compiled_numerics:
+        raise ValueError(
+            'compiled_numerics_only requires check_compiled_numerics.'
+        )
     if compiled_numerics_group is not None:
         if type(compiled_numerics_group) is not str:
             raise TypeError('compiled_numerics_group must be a string or None.')
@@ -2032,6 +2208,7 @@ def run_v2_td3_timing_diagnostic(
             compile_critic_encoder
             or compile_target_encoders
             or check_compiled_numerics
+            or compiled_numerics_only
             or profiler_updates
         ):
             raise ValueError(
@@ -2164,6 +2341,32 @@ def run_v2_td3_timing_diagnostic(
             device=target_device,
             snn_time_window=snn_time_window,
         )
+    if compiled_numerics_only:
+        output.mkdir(parents=True, exist_ok=False)
+        summary = {
+            'format': DIAGNOSTIC_FORMAT,
+            'format_version': DIAGNOSTIC_VERSION,
+            'formal_stage_passed': False,
+            'purpose': 'compiled_numeric_correctness_check_only',
+            'model': model,
+            'requested_device': requested_device,
+            'resolved_device': resolved_device,
+            'seed': run_seed,
+            'validation_seed': pool_seed,
+            'bc_checkpoint': str(checkpoint.resolve()),
+            'scenario_pool_directory': str(Path(scenario_pool_dir).resolve()),
+            'scenario_pool_prepare_wall_seconds': pool_prepare_seconds,
+            'compiled_numerics': compiled_numerics,
+            'timing_levels_executed': 0,
+        }
+        summary = json.loads(json.dumps(
+            summary,
+            allow_nan=False,
+            ensure_ascii=False,
+        ))
+        _strict_json_write(output / 'diagnostic_summary.json', summary)
+        print(json.dumps(summary, allow_nan=False, ensure_ascii=False), flush=True)
+        return summary
     output.mkdir(parents=True, exist_ok=False)
     level_results: dict[str, Any] = {}
     for level in DIAGNOSTIC_LEVELS:
@@ -2333,6 +2536,11 @@ def build_parser() -> argparse.ArgumentParser:
         help='Run an isolated CUDA eager-versus-compiled TD3 numeric check.',
     )
     parser.add_argument(
+        '--compiled-numerics-only',
+        action='store_true',
+        help='Exit after the isolated compiled numeric correctness check.',
+    )
+    parser.add_argument(
         '--compiled-numerics-group',
         choices=('A', 'B', 'C'),
         default=None,
@@ -2364,6 +2572,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         compile_critic_encoder=args.compile_critic_encoder,
         compile_target_encoders=args.compile_target_encoders,
         check_compiled_numerics=args.check_compiled_numerics,
+        compiled_numerics_only=args.compiled_numerics_only,
         compiled_numerics_group=args.compiled_numerics_group,
     )
 

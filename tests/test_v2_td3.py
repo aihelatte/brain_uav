@@ -708,6 +708,68 @@ class TestV2TD3(unittest.TestCase):
         self.assertTrue(all(parameter.requires_grad for parameter in engine.critic1.parameters()))
         engine.update_once(total_steps=2)
 
+    def test_compiled_critic_uses_eager_only_while_frozen_for_actor(self):
+        engine = self.make_engine(policy_delay=1)
+        self.fill_replay(engine)
+        observation = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(3, offset=1.0, scales=self.scales),
+        ])
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            engine.enable_online_critic_encoder_compile(backend='eager')
+        encoder = engine.critic1.zone_set_encoder
+        compiled = mock.Mock(wraps=encoder._compiled_tensor_forward)
+        encoder._compiled_tensor_forward = compiled
+        original_requires_grad = tuple(
+            parameter.requires_grad for parameter in engine.critic1.parameters()
+        )
+
+        with mock.patch.object(
+            encoder,
+            '_compute_policy_context_tensors',
+            wraps=encoder._compute_policy_context_tensors,
+        ) as eager:
+            engine.warmup_online_critic_encoder_compile((observation,))
+            self.assertGreater(compiled.call_count, 0)
+            self.assertGreater(eager.call_count, 0)
+            compiled.reset_mock()
+            eager.reset_mock()
+
+            metrics = engine.update_once(total_steps=1, bc_lambda=0.0)
+            self.assertTrue(metrics.actor_updated)
+            self.assertEqual(compiled.call_count, 1)
+            self.assertEqual(eager.call_count, 1)
+            self.assertTrue(any(
+                parameter.grad is not None
+                and bool(torch.count_nonzero(parameter.grad))
+                for parameter in engine.actor.parameters()
+            ))
+            self.assertEqual(
+                tuple(parameter.requires_grad for parameter in engine.critic1.parameters()),
+                original_requires_grad,
+            )
+
+            with mock.patch.object(
+                engine,
+                '_compute_actor_loss_terms',
+                side_effect=RuntimeError('controlled actor failure'),
+            ):
+                with self.assertRaisesRegex(RuntimeError, 'controlled actor failure'):
+                    engine.update_once(total_steps=2, bc_lambda=0.0)
+            self.assertEqual(
+                tuple(parameter.requires_grad for parameter in engine.critic1.parameters()),
+                original_requires_grad,
+            )
+            before = compiled.call_count
+            engine.critic1(
+                observation,
+                torch.zeros((observation.batch_size, engine.action_dim)),
+            )
+            self.assertEqual(compiled.call_count, before + 1)
+
     def test_compile_error_propagates_without_enabling_fallback(self):
         engine = self.make_engine()
         with mock.patch(

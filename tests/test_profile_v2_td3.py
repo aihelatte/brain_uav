@@ -389,6 +389,7 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertFalse(args.compile_critic_encoder)
         self.assertFalse(args.compile_target_encoders)
         self.assertFalse(args.check_compiled_numerics)
+        self.assertFalse(args.compiled_numerics_only)
         self.assertIsNone(args.compiled_numerics_group)
         enabled = build_parser().parse_args([
             '--model', 'ann', '--bc-checkpoint', 'bc.pt',
@@ -406,10 +407,11 @@ class TestProfileV2TD3(unittest.TestCase):
             '--model', 'ann', '--bc-checkpoint', 'bc.pt',
             '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
             '--compile-critic-encoder', '--compile-target-encoders',
-            '--check-compiled-numerics',
+            '--check-compiled-numerics', '--compiled-numerics-only',
         ])
         self.assertTrue(extended.compile_target_encoders)
         self.assertTrue(extended.check_compiled_numerics)
+        self.assertTrue(extended.compiled_numerics_only)
         grouped = build_parser().parse_args([
             '--model', 'ann', '--bc-checkpoint', 'bc.pt',
             '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
@@ -688,6 +690,10 @@ class TestProfileV2TD3(unittest.TestCase):
             record['earliest_difference_stage'],
             'online_forward_and_loss',
         )
+        self.assertEqual(
+            record['frozen_critic_actor_encoder_execution'],
+            'eager',
+        )
 
     def test_capture_hooks_are_removed_after_success_and_exception(self) -> None:
         fixture = v2_td3_tests.TestV2TD3()
@@ -772,6 +778,10 @@ class TestProfileV2TD3(unittest.TestCase):
             )
 
         self.assertTrue(result['passed'])
+        self.assertEqual(
+            result['frozen_critic_actor_encoder_execution'],
+            'eager',
+        )
         self.assertIsNot(eager, compiled)
         self.assertEqual(eager.update_count, 1)
         self.assertEqual(compiled.update_count, 1)
@@ -854,6 +864,64 @@ class TestProfileV2TD3(unittest.TestCase):
                 compile_critic_encoder=True,
             )
 
+    def test_compiled_numerics_only_exits_before_regular_timing(self) -> None:
+        prepared = SimpleNamespace(
+            bc_initialization=SimpleNamespace(actor=torch.nn.Linear(1, 1)),
+            scenario_config=make_scenario_config(),
+            uav_collision_radius=0.0,
+        )
+        numerics = {'requested': True, 'passed': True, 'device': 'cuda'}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / 'numerics-only'
+            with mock.patch(
+                'brain_uav.scripts.profile_v2_td3.resolve_training_device',
+                return_value='cuda',
+            ), mock.patch(
+                'brain_uav.scripts.profile_v2_td3._load_diagnostic_initialization',
+                return_value=prepared,
+            ), mock.patch(
+                'brain_uav.scripts.profile_v2_td3._prepare_diagnostic_pools',
+                return_value={'easy': SimpleNamespace()},
+            ), mock.patch(
+                'brain_uav.scripts.profile_v2_td3._run_compiled_numerics_check',
+                return_value=numerics,
+            ) as numeric_runner, mock.patch(
+                'brain_uav.scripts.profile_v2_td3._run_diagnostic_level',
+                side_effect=AssertionError('regular timing must not run'),
+            ) as level_runner, redirect_stdout(StringIO()):
+                summary = run_v2_td3_timing_diagnostic(
+                    model='ann',
+                    bc_checkpoint=root / 'bc.pt',
+                    output_dir=output,
+                    scenario_pool_dir=root / 'pools',
+                    device='cuda',
+                    steps_per_level=3,
+                    scenario_count=3,
+                    compile_critic_encoder=True,
+                    compile_target_encoders=True,
+                    check_compiled_numerics=True,
+                    compiled_numerics_only=True,
+                )
+
+            persisted = json.loads(
+                (output / 'diagnostic_summary.json').read_text(encoding='utf-8')
+            )
+        self.assertEqual(summary, persisted)
+        self.assertEqual(summary['purpose'], 'compiled_numeric_correctness_check_only')
+        self.assertEqual(summary['timing_levels_executed'], 0)
+        numeric_runner.assert_called_once()
+        level_runner.assert_not_called()
+
+        with self.assertRaisesRegex(ValueError, 'requires check_compiled_numerics'):
+            run_v2_td3_timing_diagnostic(
+                model='ann',
+                bc_checkpoint=Path('unused.pt'),
+                output_dir=Path('unused-output'),
+                scenario_pool_dir=Path('unused-pools'),
+                compiled_numerics_only=True,
+            )
+
     def test_compiled_numeric_check_runs_isolated_fixed_updates(self) -> None:
         fixture = v2_td3_tests.TestV2TD3()
         fixture.setUp()
@@ -904,31 +972,53 @@ class TestProfileV2TD3(unittest.TestCase):
 
         self.assertTrue(result['passed'])
         self.assertEqual(tuple(result['updates']), (
-            'critic_only', 'actor_and_target_updated',
+            'critic_only',
+            'actor_and_target_updated',
+            'critic_only_after_actor',
         ))
         self.assertFalse(compiled.actor.zone_set_encoder.compiled_tensor_forward_enabled)
         self.assertTrue(
             compiled.actor_target.zone_set_encoder.compiled_tensor_forward_enabled
         )
-        self.assertEqual(reference.update_count, 2)
-        self.assertEqual(compiled.update_count, 2)
+        self.assertEqual(reference.update_count, 3)
+        self.assertEqual(compiled.update_count, 3)
+        output_records = [
+            json.loads(line) for line in output.getvalue().splitlines()
+        ]
         records = [
-            json.loads(line)['compiled_numeric_empty_token']
-            for line in output.getvalue().splitlines()
+            payload['compiled_numeric_empty_token']
+            for payload in output_records
+            if 'compiled_numeric_empty_token' in payload
         ]
         self.assertEqual(
-            [record['update'] for record in records],
-            ['critic_only_with_empty_scene', 'actor_and_target_updated_nonempty'],
+            sum('compiled_numeric_actor_rl_gradient' in payload
+                for payload in output_records),
+            1,
         )
-        self.assertEqual([record['update_index'] for record in records], [1, 2])
+        self.assertEqual(
+            [record['update'] for record in records],
+            [
+                'critic_only_with_empty_scene',
+                'actor_and_target_updated_with_empty_scene',
+                'critic_only_after_actor_with_empty_scene',
+            ],
+        )
+        self.assertEqual(
+            [record['update_index'] for record in records],
+            [1, 2, 3],
+        )
         self.assertEqual(records[0]['batch_construction'], (
             'synthetic_from_fixed_pool_with_one_zero_zone_sample'
         ))
         self.assertEqual(
             [record['zero_zone_sample_count'] for record in records],
-            [1, 0],
+            [1, 1, 1],
         )
         self.assertTrue(records[0]['historical_momentum_prerequisite_met'])
+        for execution in ('eager', 'compiled'):
+            rl_gradient = result['actor_rl_gradient'][execution]
+            self.assertEqual(rl_gradient['q_output_gradient']['state'], 'nonzero')
+            self.assertGreater(rl_gradient['nonzero_actor_parameter_gradients'], 0)
         for critic_name in ('critic1', 'critic2'):
             for execution in ('eager', 'compiled'):
                 self.assertEqual(
@@ -959,7 +1049,13 @@ class TestProfileV2TD3(unittest.TestCase):
                     records[1]['critics'][critic_name][execution]['after'][
                         'gradient'
                     ]['state'],
-                    'zero',
+                    'nonzero',
+                )
+                self.assertEqual(
+                    records[2]['critics'][critic_name][execution]['after'][
+                        'gradient'
+                    ]['state'],
+                    'nonzero',
                 )
                 self.assertEqual(
                     records[0]['critics'][critic_name][execution]['after'][
@@ -972,6 +1068,12 @@ class TestProfileV2TD3(unittest.TestCase):
                         'adam'
                     ]['step'],
                     2.0,
+                )
+                self.assertEqual(
+                    records[2]['critics'][critic_name][execution]['after'][
+                        'adam'
+                    ]['step'],
+                    3.0,
                 )
         torch.testing.assert_close(torch.random.get_rng_state(), torch_rng_before)
         numpy_rng_after = np.random.get_state()
