@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator
 
 import torch
 from torch import nn
@@ -85,10 +86,82 @@ class V2ANNPolicyActor(nn.Module):
             nn.Tanh(),
         )
         self.register_buffer('action_limit', limit)
+        self._compiled_full_forward: Callable[..., torch.Tensor] | None = None
+        self._compiled_full_forward_config: dict[str, object] | None = None
+        self._force_eager_full_forward = False
         _reset_linear_layers(self.head)
         final_linear = self.head[4]
         nn.init.uniform_(final_linear.weight, -1e-3, 1e-3)
         nn.init.uniform_(final_linear.bias, -1e-3, 1e-3)
+
+    @property
+    def compiled_full_forward_enabled(self) -> bool:
+        return self._compiled_full_forward is not None
+
+    @property
+    def compiled_full_forward_config(self) -> dict[str, object] | None:
+        if self._compiled_full_forward_config is None:
+            return None
+        return dict(self._compiled_full_forward_config)
+
+    def _compute_full_forward_tensors(
+        self,
+        ego_features: torch.Tensor,
+        goal_features: torch.Tensor,
+        clean_zone_features: torch.Tensor,
+        presence_mask: torch.Tensor,
+        valid_token_mask: torch.Tensor,
+        token_pair_relations: torch.Tensor,
+        relation_pair_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        context = self.zone_set_encoder._compute_policy_context_tensors(
+            ego_features,
+            goal_features,
+            clean_zone_features,
+            presence_mask,
+            valid_token_mask,
+            token_pair_relations,
+            relation_pair_mask,
+        )
+        return self.head(context) * self.action_limit
+
+    def enable_compiled_full_forward(
+        self,
+        *,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> None:
+        if self.compiled_full_forward_enabled:
+            raise RuntimeError('ANN actor full forward is already compiled.')
+        if self.zone_set_encoder.compiled_tensor_forward_enabled:
+            raise RuntimeError(
+                'ANN actor full forward cannot nest a compiled encoder.'
+            )
+        self._compiled_full_forward = torch.compile(
+            self._compute_full_forward_tensors,
+            backend=backend,
+            mode=mode,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+        )
+        self._compiled_full_forward_config = {
+            'backend': backend,
+            'mode': mode,
+            'fullgraph': bool(fullgraph),
+            'dynamic': bool(dynamic),
+        }
+
+    @contextmanager
+    def eager_full_forward(self) -> Iterator[None]:
+        previous = self._force_eager_full_forward
+        self._force_eager_full_forward = True
+        try:
+            with self.zone_set_encoder.eager_tensor_forward():
+                yield
+        finally:
+            self._force_eager_full_forward = previous
 
     def forward(
         self,
@@ -99,6 +172,23 @@ class V2ANNPolicyActor(nn.Module):
     ) -> torch.Tensor:
         if not isinstance(observation, V2ObservationBatch):
             raise TypeError('observation must be a V2ObservationBatch.')
+        if (
+            self._compiled_full_forward is not None
+            and not self._force_eager_full_forward
+            and not profile_sections
+            and (
+                torch.is_grad_enabled()
+                or not any(parameter.requires_grad for parameter in self.parameters())
+            )
+        ):
+            tensor_arguments = self.zone_set_encoder.prepare_tensor_forward_arguments(
+                observation.ego_features,
+                observation.goal_features,
+                observation.zone_features,
+                observation.presence_mask,
+                shared_relations=shared_relations,
+            )
+            return self._compiled_full_forward(*tensor_arguments)
         context = self.zone_set_encoder(
             observation.ego_features,
             observation.goal_features,
@@ -152,6 +242,70 @@ class V2ANNCritic(nn.Module):
         )
         _reset_linear_layers(self.head)
 
+    def encode_context(
+        self,
+        observation: V2ObservationBatch,
+        *,
+        shared_relations: ZoneSetSharedRelations | None = None,
+        profile_sections: bool = False,
+    ) -> torch.Tensor:
+        if not isinstance(observation, V2ObservationBatch):
+            raise TypeError('observation must be a V2ObservationBatch.')
+        return self.zone_set_encoder(
+            observation.ego_features,
+            observation.goal_features,
+            observation.zone_features,
+            observation.presence_mask,
+            shared_relations=shared_relations,
+            profile_sections=profile_sections,
+        )
+
+    def _compute_q_tensors(
+        self,
+        context: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.head(torch.cat((context, action), dim=-1))
+
+    def _compute_full_forward_tensors(
+        self,
+        ego_features: torch.Tensor,
+        goal_features: torch.Tensor,
+        clean_zone_features: torch.Tensor,
+        presence_mask: torch.Tensor,
+        valid_token_mask: torch.Tensor,
+        token_pair_relations: torch.Tensor,
+        relation_pair_mask: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        context = self.zone_set_encoder._compute_policy_context_tensors(
+            ego_features,
+            goal_features,
+            clean_zone_features,
+            presence_mask,
+            valid_token_mask,
+            token_pair_relations,
+            relation_pair_mask,
+        )
+        return self._compute_q_tensors(context, action)
+
+    def forward_from_context(
+        self,
+        context: torch.Tensor,
+        action: torch.Tensor,
+    ) -> torch.Tensor:
+        if not isinstance(context, torch.Tensor):
+            raise TypeError('context must be a torch.Tensor.')
+        if context.dtype != torch.float32:
+            raise TypeError('context must have dtype torch.float32.')
+        expected_context_shape = (action.shape[0], self.zone_set_encoder.output_dim)
+        if context.shape != expected_context_shape:
+            raise ValueError(
+                f'context must have shape {expected_context_shape}; '
+                f'got {tuple(context.shape)}.'
+            )
+        return self._compute_q_tensors(context, action)
+
     def forward(
         self,
         observation: V2ObservationBatch,
@@ -173,12 +327,9 @@ class V2ANNCritic(nn.Module):
             )
         if action.device != observation.ego_features.device:
             raise ValueError('action and observation must be on the same device.')
-        context = self.zone_set_encoder(
-            observation.ego_features,
-            observation.goal_features,
-            observation.zone_features,
-            observation.presence_mask,
+        context = self.encode_context(
+            observation,
             shared_relations=shared_relations,
             profile_sections=profile_sections,
         )
-        return self.head(torch.cat((context, action), dim=-1))
+        return self._compute_q_tensors(context, action)

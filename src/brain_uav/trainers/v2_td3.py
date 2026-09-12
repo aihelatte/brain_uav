@@ -325,6 +325,10 @@ class V2TD3UpdateEngine:
         self.critic_target_update_count = 0
         self.actor_update_count = 0
         self.last_total_steps = 0
+        self.frozen_critic_strategy = 'eager'
+        self._compiled_critic_loss: Callable[..., tuple[torch.Tensor, ...]] | None = None
+        self._compiled_target_block: Callable[..., tuple[torch.Tensor, ...]] | None = None
+        self._compiled_target_critic_td: Callable[..., tuple[torch.Tensor, ...]] | None = None
 
     @staticmethod
     def _optional_positive_float(value: float | None, *, name: str) -> float | None:
@@ -577,6 +581,596 @@ class V2TD3UpdateEngine:
             enabled.append(name)
         return enabled[0], enabled[1]
 
+    def set_frozen_critic_strategy(self, strategy: str) -> None:
+        if strategy not in ('eager', 'compiled_no_grad_context'):
+            raise ValueError(
+                'frozen critic strategy must be eager or '
+                'compiled_no_grad_context.'
+            )
+        if (
+            strategy == 'compiled_no_grad_context'
+            and not self.critic1.zone_set_encoder.compiled_tensor_forward_enabled
+        ):
+            raise RuntimeError(
+                'compiled_no_grad_context requires a compiled critic1 encoder.'
+            )
+        self.frozen_critic_strategy = strategy
+
+    def configure_compilation(
+        self,
+        *,
+        compile_critic_encoder: bool = False,
+        compile_target_encoders: bool = False,
+        compile_actors: bool = False,
+        frozen_critic_strategy: str = 'eager',
+        compile_critic_block: bool = False,
+        compile_target_block: bool = False,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> dict[str, object]:
+        """Register one explicit, non-fallback TD3 compilation configuration."""
+
+        if compile_critic_encoder and compile_critic_block:
+            raise ValueError(
+                'compile_critic_encoder and compile_critic_block are mutually '
+                'exclusive compilation granularities.'
+            )
+        if compile_target_encoders and compile_target_block:
+            raise ValueError(
+                'compile_target_encoders and compile_target_block are mutually '
+                'exclusive compilation granularities.'
+            )
+        if compile_target_encoders and not compile_critic_encoder:
+            raise ValueError(
+                'compile_target_encoders requires compile_critic_encoder.'
+            )
+        if compile_target_block and not compile_critic_block:
+            raise ValueError('compile_target_block requires compile_critic_block.')
+        if frozen_critic_strategy == 'compiled_no_grad_context' and not (
+            compile_critic_encoder or compile_critic_block
+        ):
+            raise ValueError(
+                'compiled_no_grad_context requires a compiled critic path.'
+            )
+
+        options = {
+            'backend': backend,
+            'mode': mode,
+            'fullgraph': fullgraph,
+            'dynamic': dynamic,
+        }
+        enabled: list[str] = []
+        if compile_critic_block:
+            enabled.extend(self.enable_critic_loss_compile(**options))
+        elif compile_critic_encoder:
+            enabled.extend(self.enable_online_critic_encoder_compile(**options))
+        if (
+            frozen_critic_strategy == 'compiled_no_grad_context'
+            and compile_critic_block
+        ):
+            enabled.extend(self.enable_actor_guidance_context_compile(**options))
+        if compile_target_block:
+            enabled.extend(self.enable_target_block_compile(**options))
+        elif compile_target_encoders:
+            enabled.extend(self.enable_target_encoder_compile(**options))
+        if compile_actors:
+            enabled.extend(self.enable_actor_compile(**options))
+        self.set_frozen_critic_strategy(frozen_critic_strategy)
+        return {
+            'enabled_objects': enabled,
+            'critic_granularity': (
+                'full_forward_and_loss' if compile_critic_block
+                else 'encoder' if compile_critic_encoder else 'eager'
+            ),
+            'target_granularity': (
+                'full_tensor_block' if compile_target_block
+                else 'encoder' if compile_target_encoders else 'eager'
+            ),
+            'actor_granularity': (
+                'ann_full_forward_or_snn_encoder' if compile_actors else 'eager'
+            ),
+            'frozen_critic_strategy': frozen_critic_strategy,
+            'select_action_execution': 'eager',
+            'backend': backend,
+            'mode': mode,
+            'fullgraph': fullgraph,
+            'dynamic': dynamic,
+            'cuda_graph': False,
+        }
+
+    def _compute_twin_critic_loss_tensors(
+        self,
+        ego_features: torch.Tensor,
+        goal_features: torch.Tensor,
+        clean_zone_features: torch.Tensor,
+        presence_mask: torch.Tensor,
+        valid_token_mask: torch.Tensor,
+        token_pair_relations: torch.Tensor,
+        relation_pair_mask: torch.Tensor,
+        action: torch.Tensor,
+        target_q: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        encoder_arguments = (
+            ego_features,
+            goal_features,
+            clean_zone_features,
+            presence_mask,
+            valid_token_mask,
+            token_pair_relations,
+            relation_pair_mask,
+        )
+        current_q1 = self.critic1._compute_full_forward_tensors(
+            *encoder_arguments, action
+        )
+        current_q2 = self.critic2._compute_full_forward_tensors(
+            *encoder_arguments, action
+        )
+        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(
+            current_q2, target_q
+        )
+        return current_q1, current_q2, critic_loss
+
+    def enable_critic_loss_compile(
+        self,
+        *,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> tuple[str, str, str]:
+        if self._compiled_critic_loss is not None:
+            raise RuntimeError('Twin critic loss block is already compiled.')
+        if (
+            self.critic1.zone_set_encoder.compiled_tensor_forward_enabled
+            or self.critic2.zone_set_encoder.compiled_tensor_forward_enabled
+        ):
+            raise RuntimeError(
+                'Full critic block forbids nested encoder compilation.'
+            )
+        self._compiled_critic_loss = torch.compile(
+            self._compute_twin_critic_loss_tensors,
+            backend=backend,
+            mode=mode,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+        )
+        return (
+            'critic1.full_forward',
+            'critic2.full_forward',
+            'twin_critic_loss',
+        )
+
+    def enable_actor_guidance_context_compile(
+        self,
+        *,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> tuple[str]:
+        self.critic1.zone_set_encoder.enable_compiled_tensor_forward(
+            backend=backend,
+            mode=mode,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+        )
+        return ('critic1.actor_guidance_context',)
+
+    def _compute_ann_target_block_tensors(
+        self,
+        ego_features: torch.Tensor,
+        goal_features: torch.Tensor,
+        clean_zone_features: torch.Tensor,
+        presence_mask: torch.Tensor,
+        valid_token_mask: torch.Tensor,
+        token_pair_relations: torch.Tensor,
+        relation_pair_mask: torch.Tensor,
+        noise: torch.Tensor,
+        reward: torch.Tensor,
+        done: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        encoder_arguments = (
+            ego_features,
+            goal_features,
+            clean_zone_features,
+            presence_mask,
+            valid_token_mask,
+            token_pair_relations,
+            relation_pair_mask,
+        )
+        next_action = self.actor_target._compute_full_forward_tensors(
+            *encoder_arguments
+        ) + noise
+        next_action = torch.maximum(
+            torch.minimum(next_action, self.action_high),
+            self.action_low,
+        )
+        return self._compute_target_critics_td_tensors(
+            *encoder_arguments,
+            next_action,
+            reward,
+            done,
+        )
+
+    def _compute_target_critics_td_tensors(
+        self,
+        ego_features: torch.Tensor,
+        goal_features: torch.Tensor,
+        clean_zone_features: torch.Tensor,
+        presence_mask: torch.Tensor,
+        valid_token_mask: torch.Tensor,
+        token_pair_relations: torch.Tensor,
+        relation_pair_mask: torch.Tensor,
+        next_action: torch.Tensor,
+        reward: torch.Tensor,
+        done: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        encoder_arguments = (
+            ego_features,
+            goal_features,
+            clean_zone_features,
+            presence_mask,
+            valid_token_mask,
+            token_pair_relations,
+            relation_pair_mask,
+        )
+        target_q1 = self.critic1_target._compute_full_forward_tensors(
+            *encoder_arguments, next_action
+        )
+        target_q2 = self.critic2_target._compute_full_forward_tensors(
+            *encoder_arguments, next_action
+        )
+        target_q = reward + (
+            (1.0 - done) * self.gamma * torch.minimum(target_q1, target_q2)
+        )
+        return next_action, target_q1, target_q2, target_q
+
+    def enable_target_block_compile(
+        self,
+        *,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> tuple[str, str, str, str]:
+        if (
+            self.actor_target.zone_set_encoder.compiled_tensor_forward_enabled
+            or self.critic1_target.zone_set_encoder.compiled_tensor_forward_enabled
+            or self.critic2_target.zone_set_encoder.compiled_tensor_forward_enabled
+        ):
+            raise RuntimeError(
+                'Full target block forbids nested encoder compilation.'
+            )
+        if isinstance(self.actor_target, V2ANNPolicyActor):
+            self._compiled_target_block = torch.compile(
+                self._compute_ann_target_block_tensors,
+                backend=backend,
+                mode=mode,
+                fullgraph=fullgraph,
+                dynamic=dynamic,
+            )
+            return (
+                'actor_target.full_forward',
+                'critic1_target.full_forward',
+                'critic2_target.full_forward',
+                'td_target',
+            )
+        self._compiled_target_critic_td = torch.compile(
+            self._compute_target_critics_td_tensors,
+            backend=backend,
+            mode=mode,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+        )
+        return (
+            'actor_target.eager_snn',
+            'critic1_target.full_forward',
+            'critic2_target.full_forward',
+            'td_target',
+        )
+
+    @contextmanager
+    def _actor_critic_guidance(
+        self,
+        observation: V2ObservationBatch,
+        *,
+        shared_relations: ZoneSetSharedRelations | None,
+        profile_sections: bool,
+    ):
+        if self.frozen_critic_strategy == 'eager':
+            parameters = tuple(self.critic1.parameters())
+            original_requires_grad = tuple(
+                parameter.requires_grad for parameter in parameters
+            )
+            try:
+                for parameter in parameters:
+                    parameter.requires_grad_(False)
+                with self.critic1.zone_set_encoder.eager_tensor_forward():
+                    yield None
+            finally:
+                for parameter, required in zip(parameters, original_requires_grad):
+                    parameter.requires_grad_(required)
+            return
+
+        with torch.no_grad():
+            context = self.critic1.encode_context(
+                observation,
+                shared_relations=shared_relations,
+                profile_sections=profile_sections,
+            )
+        head_parameters = tuple(self.critic1.head.parameters())
+        original_requires_grad = tuple(
+            parameter.requires_grad for parameter in head_parameters
+        )
+        try:
+            for parameter in head_parameters:
+                parameter.requires_grad_(False)
+            yield context
+        finally:
+            for parameter, required in zip(head_parameters, original_requires_grad):
+                parameter.requires_grad_(required)
+
+    def enable_actor_compile(
+        self,
+        *,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> tuple[str, ...]:
+        enabled: list[str] = []
+        for name, actor in (
+            ('actor', self.actor),
+            ('bc_reference_actor', self.bc_reference_actor),
+        ):
+            if actor is None:
+                continue
+            if isinstance(actor, V2ANNPolicyActor):
+                actor.enable_compiled_full_forward(
+                    backend=backend,
+                    mode=mode,
+                    fullgraph=fullgraph,
+                    dynamic=dynamic,
+                )
+                enabled.append(f'{name}.full_forward')
+            else:
+                actor.zone_set_encoder.enable_compiled_tensor_forward(
+                    backend=backend,
+                    mode=mode,
+                    fullgraph=fullgraph,
+                    dynamic=dynamic,
+                )
+                enabled.append(f'{name}.zone_set_encoder')
+        return tuple(enabled)
+
+    def warmup_actor_compile(
+        self,
+        batches: Sequence[V2ObservationBatch],
+    ) -> None:
+        warmup_batches = tuple(batches)
+        if not warmup_batches:
+            raise ValueError('At least one actor compile warmup batch is required.')
+        actors = tuple(
+            actor for actor in (self.actor, self.bc_reference_actor)
+            if actor is not None
+        )
+        actor_parameters = tuple(
+            parameter for actor in actors for parameter in actor.parameters()
+        )
+        requires_grad = tuple(
+            parameter.requires_grad for parameter in actor_parameters
+        )
+        gradient_state = tuple(
+            (
+                parameter.grad,
+                None if parameter.grad is None else parameter.grad.detach().clone(),
+            )
+            for parameter in actor_parameters
+        )
+        training_modes = tuple(actor.training for actor in actors)
+        torch_rng_state = torch.random.get_rng_state()
+        numpy_rng_state = np.random.get_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state_all() if self.device.type == 'cuda' else None
+        )
+        counts_before = (
+            self.update_count,
+            self.critic_update_count,
+            self.critic_target_update_count,
+            self.actor_update_count,
+            self.last_total_steps,
+        )
+        try:
+            self.actor.train()
+            for batch in warmup_batches:
+                device_batch = batch.to(self.device)
+                shared_relations = self._build_shared_relations(device_batch)
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                self.actor(
+                    device_batch,
+                    shared_relations=shared_relations,
+                ).sum().backward()
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                if self.bc_reference_actor is not None:
+                    self.bc_reference_actor.eval()
+                    with torch.no_grad():
+                        self.bc_reference_actor(
+                            device_batch,
+                            shared_relations=shared_relations,
+                        )
+        finally:
+            for actor, training in zip(actors, training_modes):
+                actor.train(training)
+            for parameter, required, (original_grad, saved_grad) in zip(
+                actor_parameters,
+                requires_grad,
+                gradient_state,
+            ):
+                parameter.requires_grad_(required)
+                if original_grad is None:
+                    parameter.grad = None
+                else:
+                    original_grad.copy_(saved_grad)
+                    parameter.grad = original_grad
+            torch.random.set_rng_state(torch_rng_state)
+            np.random.set_state(numpy_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
+        counts_after = (
+            self.update_count,
+            self.critic_update_count,
+            self.critic_target_update_count,
+            self.actor_update_count,
+            self.last_total_steps,
+        )
+        if counts_after != counts_before:
+            raise RuntimeError('Actor compile warmup must not change TD3 counters.')
+
+    def warmup_full_compile(
+        self,
+        batches: Sequence[V2ObservationBatch],
+    ) -> None:
+        warmup_batches = tuple(batches)
+        if not warmup_batches:
+            raise ValueError('At least one full compile warmup batch is required.')
+        if self._compiled_critic_loss is None:
+            raise RuntimeError('The full critic loss block must be compiled first.')
+        target_block_enabled = (
+            self._compiled_target_block is not None
+            or self._compiled_target_critic_td is not None
+        )
+        critic_parameters = tuple(self.critic1.parameters()) + tuple(
+            self.critic2.parameters()
+        )
+        requires_grad = tuple(
+            parameter.requires_grad for parameter in critic_parameters
+        )
+        gradient_state = tuple(
+            (
+                parameter.grad,
+                None if parameter.grad is None else parameter.grad.detach().clone(),
+            )
+            for parameter in critic_parameters
+        )
+        torch_rng_state = torch.random.get_rng_state()
+        numpy_rng_state = np.random.get_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state_all() if self.device.type == 'cuda' else None
+        )
+        counts_before = (
+            self.update_count,
+            self.critic_update_count,
+            self.critic_target_update_count,
+            self.actor_update_count,
+            self.last_total_steps,
+        )
+        try:
+            for batch in warmup_batches:
+                device_batch = batch.to(self.device)
+                shared_relations = self._build_shared_relations(device_batch)
+                encoder_arguments = (
+                    self.critic1.zone_set_encoder.prepare_tensor_forward_arguments(
+                        device_batch.ego_features,
+                        device_batch.goal_features,
+                        device_batch.zone_features,
+                        device_batch.presence_mask,
+                        shared_relations=shared_relations,
+                    )
+                )
+                self.critic2.zone_set_encoder.prepare_tensor_forward_arguments(
+                    device_batch.ego_features,
+                    device_batch.goal_features,
+                    device_batch.zone_features,
+                    device_batch.presence_mask,
+                    shared_relations=shared_relations,
+                )
+                action = torch.zeros(
+                    (device_batch.batch_size, self.action_dim),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                target_q = torch.zeros(
+                    (device_batch.batch_size, 1),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                self.critic_optimizer.zero_grad(set_to_none=True)
+                _, _, critic_loss = self._compiled_critic_loss(
+                    *encoder_arguments,
+                    action,
+                    target_q,
+                )
+                critic_loss.backward()
+                self.critic_optimizer.zero_grad(set_to_none=True)
+
+                if target_block_enabled:
+                    with torch.no_grad():
+                        noise = torch.zeros_like(action)
+                        reward = torch.zeros_like(target_q)
+                        done = torch.zeros_like(target_q)
+                        if self._compiled_target_block is not None:
+                            self._compiled_target_block(
+                                *encoder_arguments,
+                                noise,
+                                reward,
+                                done,
+                            )
+                        else:
+                            next_action = self.actor_target(
+                                device_batch,
+                                shared_relations=shared_relations,
+                            )
+                            self._compiled_target_critic_td(
+                                *encoder_arguments,
+                                next_action,
+                                reward,
+                                done,
+                            )
+
+                if self.frozen_critic_strategy == 'compiled_no_grad_context':
+                    guidance_action = action.detach().clone().requires_grad_(True)
+                    with self._actor_critic_guidance(
+                        device_batch,
+                        shared_relations=shared_relations,
+                        profile_sections=False,
+                    ) as context:
+                        guidance_q = self.critic1.forward_from_context(
+                            context,
+                            guidance_action,
+                        )
+                    guidance_q.sum().backward()
+                    if guidance_action.grad is None:
+                        raise RuntimeError(
+                            'Full compile warmup did not preserve action gradients.'
+                        )
+        finally:
+            for parameter, required, (original_grad, saved_grad) in zip(
+                critic_parameters,
+                requires_grad,
+                gradient_state,
+            ):
+                parameter.requires_grad_(required)
+                if original_grad is None:
+                    parameter.grad = None
+                else:
+                    original_grad.copy_(saved_grad)
+                    parameter.grad = original_grad
+            torch.random.set_rng_state(torch_rng_state)
+            np.random.set_state(numpy_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
+        counts_after = (
+            self.update_count,
+            self.critic_update_count,
+            self.critic_target_update_count,
+            self.actor_update_count,
+            self.last_total_steps,
+        )
+        if counts_after != counts_before:
+            raise RuntimeError('Full compile warmup must not change TD3 counters.')
+
     def warmup_online_critic_encoder_compile(
         self,
         batches: Sequence[V2ObservationBatch],
@@ -639,25 +1233,28 @@ class V2TD3UpdateEngine:
                 critic_sum.backward()
                 self.critic_optimizer.zero_grad(set_to_none=True)
 
-                critic1_parameters = tuple(self.critic1.parameters())
-                for parameter in critic1_parameters:
-                    parameter.requires_grad_(False)
                 frozen_action = action.detach().clone().requires_grad_(True)
-                try:
-                    with self.critic1.zone_set_encoder.eager_tensor_forward():
+                with self._actor_critic_guidance(
+                    device_batch,
+                    shared_relations=shared_relations,
+                    profile_sections=False,
+                ) as context:
+                    if context is None:
                         frozen_q = self.critic1(
                             device_batch,
                             frozen_action,
                             shared_relations=shared_relations,
                         )
-                        frozen_q.sum().backward()
-                    if frozen_action.grad is None:
-                        raise RuntimeError(
-                            'Compiled frozen critic warmup did not preserve action gradients.'
+                    else:
+                        frozen_q = self.critic1.forward_from_context(
+                            context,
+                            frozen_action,
                         )
-                finally:
-                    for parameter in critic1_parameters:
-                        parameter.requires_grad_(True)
+                    frozen_q.sum().backward()
+                if frozen_action.grad is None:
+                    raise RuntimeError(
+                        'Compiled frozen critic warmup did not preserve action gradients.'
+                    )
         finally:
             for parameter, required, (original_grad, saved_grad) in zip(
                 critic_parameters,
@@ -885,32 +1482,85 @@ class V2TD3UpdateEngine:
                     -self.noise_clip,
                     self.noise_clip,
                 )
-                next_action = self.actor_target(
-                    batch.next_obs,
-                    shared_relations=next_shared_relations,
-                    profile_sections=profile_sections,
-                ) + noise
-                next_action = torch.maximum(
-                    torch.minimum(next_action, self.action_high),
-                    self.action_low,
-                )
-                target_q1 = self.critic1_target(
-                    batch.next_obs,
-                    next_action,
-                    shared_relations=next_shared_relations,
-                    profile_sections=profile_sections,
-                )
-                target_q2 = self.critic2_target(
-                    batch.next_obs,
-                    next_action,
-                    shared_relations=next_shared_relations,
-                    profile_sections=profile_sections,
-                )
-                target_q = batch.reward + (
-                    (1.0 - batch.done)
-                    * self.gamma
-                    * torch.minimum(target_q1, target_q2)
-                )
+                if (
+                    self._compiled_target_block is not None
+                    or self._compiled_target_critic_td is not None
+                ):
+                    target_arguments = (
+                        self.actor_target.zone_set_encoder.
+                        prepare_tensor_forward_arguments(
+                            batch.next_obs.ego_features,
+                            batch.next_obs.goal_features,
+                            batch.next_obs.zone_features,
+                            batch.next_obs.presence_mask,
+                            shared_relations=next_shared_relations,
+                        )
+                    )
+                    for target_critic in (
+                        self.critic1_target,
+                        self.critic2_target,
+                    ):
+                        target_critic.zone_set_encoder.prepare_tensor_forward_arguments(
+                            batch.next_obs.ego_features,
+                            batch.next_obs.goal_features,
+                            batch.next_obs.zone_features,
+                            batch.next_obs.presence_mask,
+                            shared_relations=next_shared_relations,
+                        )
+                    if self._compiled_target_block is not None:
+                        next_action, target_q1, target_q2, target_q = (
+                            self._compiled_target_block(
+                                *target_arguments,
+                                noise,
+                                batch.reward,
+                                batch.done,
+                            )
+                        )
+                    else:
+                        next_action = self.actor_target(
+                            batch.next_obs,
+                            shared_relations=next_shared_relations,
+                            profile_sections=profile_sections,
+                        ) + noise
+                        next_action = torch.maximum(
+                            torch.minimum(next_action, self.action_high),
+                            self.action_low,
+                        )
+                        next_action, target_q1, target_q2, target_q = (
+                            self._compiled_target_critic_td(
+                                *target_arguments,
+                                next_action,
+                                batch.reward,
+                                batch.done,
+                            )
+                        )
+                else:
+                    next_action = self.actor_target(
+                        batch.next_obs,
+                        shared_relations=next_shared_relations,
+                        profile_sections=profile_sections,
+                    ) + noise
+                    next_action = torch.maximum(
+                        torch.minimum(next_action, self.action_high),
+                        self.action_low,
+                    )
+                    target_q1 = self.critic1_target(
+                        batch.next_obs,
+                        next_action,
+                        shared_relations=next_shared_relations,
+                        profile_sections=profile_sections,
+                    )
+                    target_q2 = self.critic2_target(
+                        batch.next_obs,
+                        next_action,
+                        shared_relations=next_shared_relations,
+                        profile_sections=profile_sections,
+                    )
+                    target_q = batch.reward + (
+                        (1.0 - batch.done)
+                        * self.gamma
+                        * torch.minimum(target_q1, target_q2)
+                    )
 
         with update_timing.section('online_critic_forward_and_loss'):
             current_shared_relations = (
@@ -921,21 +1571,44 @@ class V2TD3UpdateEngine:
                 if reuse_shared_relations
                 else None
             )
-            current_q1 = self.critic1(
-                batch.obs,
-                batch.action,
-                shared_relations=current_shared_relations,
-                profile_sections=profile_sections,
-            )
-            current_q2 = self.critic2(
-                batch.obs,
-                batch.action,
-                shared_relations=current_shared_relations,
-                profile_sections=profile_sections,
-            )
-            critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(
-                current_q2, target_q
-            )
+            if self._compiled_critic_loss is not None:
+                critic_arguments = (
+                    self.critic1.zone_set_encoder.prepare_tensor_forward_arguments(
+                        batch.obs.ego_features,
+                        batch.obs.goal_features,
+                        batch.obs.zone_features,
+                        batch.obs.presence_mask,
+                        shared_relations=current_shared_relations,
+                    )
+                )
+                self.critic2.zone_set_encoder.prepare_tensor_forward_arguments(
+                    batch.obs.ego_features,
+                    batch.obs.goal_features,
+                    batch.obs.zone_features,
+                    batch.obs.presence_mask,
+                    shared_relations=current_shared_relations,
+                )
+                current_q1, current_q2, critic_loss = self._compiled_critic_loss(
+                    *critic_arguments,
+                    batch.action,
+                    target_q,
+                )
+            else:
+                current_q1 = self.critic1(
+                    batch.obs,
+                    batch.action,
+                    shared_relations=current_shared_relations,
+                    profile_sections=profile_sections,
+                )
+                current_q2 = self.critic2(
+                    batch.obs,
+                    batch.action,
+                    shared_relations=current_shared_relations,
+                    profile_sections=profile_sections,
+                )
+                critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(
+                    current_q2, target_q
+                )
             self._require_finite_loss(
                 critic_loss,
                 component='critic',
@@ -989,47 +1662,37 @@ class V2TD3UpdateEngine:
         actor_terms: _ActorLossTerms | None = None
         if actor_updated:
             with update_timing.section('actor_update'):
-                critic1_parameters = list(self.critic1.parameters())
-                critic1_requires_grad = [
-                    parameter.requires_grad for parameter in critic1_parameters
-                ]
-            try:
-                with update_timing.section('actor_update'):
-                    for parameter in critic1_parameters:
-                        parameter.requires_grad_(False)
-                    with self.critic1.zone_set_encoder.eager_tensor_forward():
-                        actor_terms = self._compute_actor_loss_terms(
-                            batch.obs,
-                            batch.line_to_goal_safe,
-                            bc_lambda=bc_lambda_value,
-                            shared_relations=current_shared_relations,
-                            profile_sections=profile_sections,
-                        )
-                    self._require_finite_loss(
-                        actor_terms.actor_loss,
-                        component='actor',
-                        total_steps=total_steps_value,
+                with self._actor_critic_guidance(
+                    batch.obs,
+                    shared_relations=current_shared_relations,
+                    profile_sections=profile_sections,
+                ) as critic_context:
+                    actor_terms = self._compute_actor_loss_terms(
+                        batch.obs,
+                        batch.line_to_goal_safe,
+                        bc_lambda=bc_lambda_value,
+                        shared_relations=current_shared_relations,
+                        profile_sections=profile_sections,
+                        critic_context=critic_context,
                     )
-                    self.actor_optimizer.zero_grad(set_to_none=True)
-                    actor_terms.actor_loss.backward()
-                    actor_parameters = list(self.actor.parameters())
-                    self._validate_and_clip_gradients(
-                        actor_parameters,
-                        max_norm=self.actor_grad_clip_norm,
-                        component='actor',
-                        total_steps=total_steps_value,
-                    )
-                    self.actor_optimizer.step()
-                with update_timing.section('target_soft_update'):
-                    self._soft_update(self.actor, self.actor_target)
-                    self.actor_update_count += 1
-            finally:
-                with update_timing.section('actor_update'):
-                    for parameter, requires_grad in zip(
-                        critic1_parameters,
-                        critic1_requires_grad,
-                    ):
-                        parameter.requires_grad_(requires_grad)
+                self._require_finite_loss(
+                    actor_terms.actor_loss,
+                    component='actor',
+                    total_steps=total_steps_value,
+                )
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                actor_terms.actor_loss.backward()
+                actor_parameters = list(self.actor.parameters())
+                self._validate_and_clip_gradients(
+                    actor_parameters,
+                    max_norm=self.actor_grad_clip_norm,
+                    component='actor',
+                    total_steps=total_steps_value,
+                )
+                self.actor_optimizer.step()
+            with update_timing.section('target_soft_update'):
+                self._soft_update(self.actor, self.actor_target)
+                self.actor_update_count += 1
 
         self.update_count += 1
         self.critic_update_count += 1
@@ -1077,17 +1740,25 @@ class V2TD3UpdateEngine:
         bc_lambda: float,
         shared_relations: ZoneSetSharedRelations | None = None,
         profile_sections: bool = False,
+        critic_context: torch.Tensor | None = None,
     ) -> _ActorLossTerms:
         actor_actions = self.actor(
             observation,
             shared_relations=shared_relations,
             profile_sections=profile_sections,
         )
-        q_values = self.critic1(
-            observation,
-            actor_actions,
-            shared_relations=shared_relations,
-            profile_sections=profile_sections,
+        q_values = (
+            self.critic1(
+                observation,
+                actor_actions,
+                shared_relations=shared_relations,
+                profile_sections=profile_sections,
+            )
+            if critic_context is None
+            else self.critic1.forward_from_context(
+                critic_context,
+                actor_actions,
+            )
         )
         rl_actor_loss = -q_values.mean()
         q_scale = q_values.detach().abs().mean().clamp(min=1.0)
@@ -1236,8 +1907,14 @@ class V2TD3UpdateEngine:
         ):
             raise TypeError('exploration_rng must be a numpy.random.Generator.')
         batch = collate_v2_observations([observation]).to(self.device)
-        with torch.inference_mode():
-            action = self.actor(batch).detach().cpu().numpy()[0]
+        actor_eager_context = (
+            self.actor.eager_full_forward()
+            if isinstance(self.actor, V2ANNPolicyActor)
+            else self.actor.zone_set_encoder.eager_tensor_forward()
+        )
+        with actor_eager_context:
+            with torch.inference_mode():
+                action = self.actor(batch).detach().cpu().numpy()[0]
         if noise_scale > 0.0:
             noise_source = exploration_rng if exploration_rng is not None else np.random
             action = action + noise_source.normal(

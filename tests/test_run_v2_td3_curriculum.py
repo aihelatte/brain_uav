@@ -107,6 +107,10 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertEqual(args.device, 'auto')
         self.assertEqual(args.model, 'ann')
         self.assertEqual(args.snn_time_window, 4)
+        self.assertFalse(args.compile_actors)
+        self.assertEqual(args.frozen_critic_strategy, 'eager')
+        self.assertFalse(args.compile_critic_block)
+        self.assertFalse(args.compile_target_block)
 
     def test_snn_curriculum_uses_distinct_outputs_and_forwards_model_contract(self):
         calls = []
@@ -161,6 +165,10 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                     model='snn',
                     snn_time_window=3,
                     stage_runner=fake_stage,
+                    compile_actors=True,
+                    frozen_critic_strategy='compiled_no_grad_context',
+                    compile_critic_block=True,
+                    compile_target_block=True,
                 )
         initializer.assert_called_once()
         self.assertEqual(initializer.call_args.kwargs['init_checkpoint'], checkpoint)
@@ -168,6 +176,13 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertEqual(initializer.call_args.kwargs['model_type'], 'snn')
         self.assertEqual(calls[0]['model'], 'snn')
         self.assertEqual(calls[0]['snn_time_window'], 3)
+        self.assertTrue(calls[0]['compile_actors'])
+        self.assertEqual(
+            calls[0]['frozen_critic_strategy'],
+            'compiled_no_grad_context',
+        )
+        self.assertTrue(calls[0]['compile_critic_block'])
+        self.assertTrue(calls[0]['compile_target_block'])
         self.assertIs(calls[0]['prepared_initialization'], prepared)
         self.assertEqual(Path(calls[0]['output']).name, 'v2_snn_td3_easy.pt')
         self.assertEqual(

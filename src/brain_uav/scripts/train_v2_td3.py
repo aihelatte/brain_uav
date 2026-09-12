@@ -6,10 +6,13 @@ import argparse
 from dataclasses import asdict
 import json
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from brain_uav.config import RewardConfig, ScenarioConfig
+from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
 from brain_uav.models import V2SNNPolicyActor, require_v2_spikingjelly
+from brain_uav.observations import collate_v2_observations
 from brain_uav.scripts.common import DEVICE_CHOICES, resolve_training_device
 from brain_uav.trainers.v2_formal_training import (
     V2FormalStageTrainer,
@@ -49,6 +52,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--consecutive-windows', type=int, default=4)
     parser.add_argument('--max-failures-per-window', type=int, default=1)
     parser.add_argument('--validation-max-failures', type=int, default=6)
+    parser.add_argument('--compile-critic-encoder', action='store_true')
+    parser.add_argument('--compile-target-encoders', action='store_true')
+    parser.add_argument('--compile-actors', action='store_true')
+    parser.add_argument(
+        '--frozen-critic-strategy',
+        choices=('eager', 'compiled_no_grad_context'),
+        default='eager',
+    )
+    parser.add_argument('--compile-critic-block', action='store_true')
+    parser.add_argument('--compile-target-block', action='store_true')
     return parser
 
 
@@ -66,6 +79,92 @@ def _write_strict_json(path: Path, payload: Any) -> None:
         json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False),
         encoding='utf-8',
     )
+
+
+def _configure_stage_compilation(
+    engine,
+    pool,
+    prepared: V2PreparedStageInitialization,
+    *,
+    compile_critic_encoder: bool,
+    compile_target_encoders: bool,
+    compile_actors: bool,
+    frozen_critic_strategy: str,
+    compile_critic_block: bool,
+    compile_target_block: bool,
+) -> dict[str, Any]:
+    requested = any((
+        compile_critic_encoder, compile_target_encoders, compile_actors,
+        compile_critic_block, compile_target_block,
+    ))
+    if not requested:
+        if frozen_critic_strategy != 'eager':
+            raise ValueError(
+                'compiled_no_grad_context requires a compiled critic path.'
+            )
+        return {
+            'requested': False,
+            'enabled_objects': [],
+            'frozen_critic_strategy': 'eager',
+            'select_action_execution': 'eager',
+            'cuda_graph': False,
+            'registration_wall_seconds': 0.0,
+            'warmup_wall_seconds': 0.0,
+            'warmup_batch_shapes': [],
+        }
+    registration_started = perf_counter()
+    metadata = engine.configure_compilation(
+        compile_critic_encoder=compile_critic_encoder,
+        compile_target_encoders=compile_target_encoders,
+        compile_actors=compile_actors,
+        frozen_critic_strategy=frozen_critic_strategy,
+        compile_critic_block=compile_critic_block,
+        compile_target_block=compile_target_block,
+        backend='inductor', mode='default', fullgraph=True, dynamic=True,
+    )
+    metadata['requested'] = True
+    metadata['registration_wall_seconds'] = perf_counter() - registration_started
+
+    records_by_zone_count = {}
+    for record in pool.scenarios:
+        records_by_zone_count.setdefault(len(record['payload']['zones']), record)
+    records = tuple(records_by_zone_count.values())
+    warmup_env = V2StaticNoFlyTrajectoryEnv(
+        prepared.scenario_config,
+        prepared.reward_config,
+        seed=pool.stage_seed,
+        fixed_scenarios=[record['payload'] for record in records],
+        uav_collision_radius=prepared.uav_collision_radius,
+    )
+    observations = tuple(
+        warmup_env.reset(options={'scenario': record['payload']})[0]
+        for record in records
+    )
+    batches = [
+        collate_v2_observations([observation] * engine.batch_size).to(engine.device)
+        for observation in observations
+    ]
+    if len(observations) > 1:
+        batches.append(collate_v2_observations([
+            observations[index % len(observations)]
+            for index in range(engine.batch_size)
+        ]).to(engine.device))
+    warmup_batches = tuple(batches)
+    metadata['warmup_batch_shapes'] = [
+        [batch.batch_size, int(batch.zone_features.shape[1])]
+        for batch in warmup_batches
+    ]
+    warmup_started = perf_counter()
+    if compile_actors:
+        engine.warmup_actor_compile(warmup_batches)
+    if compile_critic_block:
+        engine.warmup_full_compile(warmup_batches)
+    elif compile_critic_encoder:
+        engine.warmup_online_critic_encoder_compile(warmup_batches)
+        if compile_target_encoders:
+            engine.warmup_target_encoder_compile(warmup_batches)
+    metadata['warmup_wall_seconds'] = perf_counter() - warmup_started
+    return metadata
 
 
 def run_v2_td3_stage(
@@ -94,6 +193,12 @@ def run_v2_td3_stage(
     snn_time_window: int = 4,
     prepared_initialization: V2PreparedStageInitialization | None = None,
     reporting: bool = True,
+    compile_critic_encoder: bool = False,
+    compile_target_encoders: bool = False,
+    compile_actors: bool = False,
+    frozen_critic_strategy: str = 'eager',
+    compile_critic_block: bool = False,
+    compile_target_block: bool = False,
 ) -> dict[str, Any]:
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
@@ -173,6 +278,17 @@ def run_v2_td3_stage(
         snn_time_window=snn_time_window,
         prepared_initialization=prepared_initialization,
     )
+    compilation_metadata = _configure_stage_compilation(
+        components.engine,
+        pool,
+        prepared_initialization,
+        compile_critic_encoder=compile_critic_encoder,
+        compile_target_encoders=compile_target_encoders,
+        compile_actors=compile_actors,
+        frozen_critic_strategy=frozen_critic_strategy,
+        compile_critic_block=compile_critic_block,
+        compile_target_block=compile_target_block,
+    )
     reporter = (
         V2ExperimentReporter(
             report_path,
@@ -209,6 +325,7 @@ def run_v2_td3_stage(
             'failed_checkpoint_output': str(failed_output_path),
             'metrics_output': str(metrics_path),
             'snn': snn_metadata,
+            'compilation': compilation_metadata,
         })
 
     def validate(actor):
@@ -290,6 +407,7 @@ def run_v2_td3_stage(
             'result': result.to_dict(),
             'checkpoint': str(checkpoint_path),
             'report_directory': str(report_path) if reporter is not None else None,
+            'compilation': compilation_metadata,
         }
         if isinstance(actor, V2SNNPolicyActor):
             metrics_payload['snn'] = {
@@ -318,6 +436,7 @@ def run_v2_td3_stage(
                 components.engine.replay.sampling_implementation
             ),
             'report_directory': str(report_path) if reporter is not None else None,
+            'compilation': compilation_metadata,
         }
         return summary
     finally:
@@ -361,6 +480,12 @@ def main(argv: list[str] | None = None) -> int:
         validation_max_failures=args.validation_max_failures,
         model=args.model,
         snn_time_window=args.snn_time_window,
+        compile_critic_encoder=args.compile_critic_encoder,
+        compile_target_encoders=args.compile_target_encoders,
+        compile_actors=args.compile_actors,
+        frozen_critic_strategy=args.frozen_critic_strategy,
+        compile_critic_block=args.compile_critic_block,
+        compile_target_block=args.compile_target_block,
     )
     print(json.dumps(summary, indent=2, allow_nan=False))
     return 0 if summary['passed'] else 1

@@ -770,6 +770,395 @@ class TestV2TD3(unittest.TestCase):
             )
             self.assertEqual(compiled.call_count, before + 1)
 
+    def test_ann_online_and_bc_actor_compile_while_select_action_stays_eager(self):
+        engine = self.make_engine(
+            policy_delay=1,
+            bc_reference_actor=self.make_bc_reference(0.01),
+        )
+        self.fill_replay(engine, counts=(0, 7))
+        batch = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        with mock.patch(
+            'brain_uav.models.v2_ann.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            enabled = engine.enable_actor_compile()
+        self.assertEqual(enabled, (
+            'actor.full_forward',
+            'bc_reference_actor.full_forward',
+        ))
+        self.assertTrue(engine.actor.compiled_full_forward_enabled)
+        self.assertTrue(engine.bc_reference_actor.compiled_full_forward_enabled)
+        self.assertFalse(engine.actor_target.compiled_full_forward_enabled)
+        engine.warmup_actor_compile((batch,))
+
+        compiled = mock.Mock(wraps=engine.actor._compiled_full_forward)
+        engine.actor._compiled_full_forward = compiled
+        engine.select_action(_observation(7, scales=self.scales))
+        self.assertEqual(compiled.call_count, 0)
+        with torch.no_grad():
+            engine.actor(batch)
+        self.assertEqual(compiled.call_count, 0)
+        metrics = engine.update_once(total_steps=1, bc_lambda=1.5)
+        self.assertTrue(metrics.actor_updated)
+        self.assertEqual(compiled.call_count, 1)
+        self.assertTrue(all(
+            not parameter.requires_grad
+            and parameter.grad is None
+            for parameter in engine.bc_reference_actor.parameters()
+        ))
+
+    def test_compiled_no_grad_context_strategy_preserves_actor_rl_gradient(self):
+        engine = self.make_engine(policy_delay=1)
+        self.fill_replay(engine, counts=(0, 7))
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            engine.enable_online_critic_encoder_compile(backend='eager')
+        engine.set_frozen_critic_strategy('compiled_no_grad_context')
+        encoder_observations = []
+        head_observations = []
+
+        def observe_encoder(_module, _inputs):
+            encoder_observations.append((
+                torch.is_grad_enabled(),
+                tuple(
+                    parameter.requires_grad
+                    for parameter in engine.critic1.zone_set_encoder.parameters()
+                ),
+            ))
+
+        def observe_head(_module, inputs):
+            head_observations.append((
+                bool(inputs[0].requires_grad),
+                tuple(parameter.requires_grad for parameter in engine.critic1.head.parameters()),
+            ))
+
+        encoder_hook = engine.critic1.zone_set_encoder.register_forward_pre_hook(
+            observe_encoder
+        )
+        head_hook = engine.critic1.head.register_forward_pre_hook(observe_head)
+        critic_hook_counts = [0 for _ in engine.critic1.parameters()]
+        gradient_hooks = []
+        for index, parameter in enumerate(engine.critic1.parameters()):
+            def count_gradient(gradient, slot=index):
+                critic_hook_counts[slot] += 1
+                return gradient
+            gradient_hooks.append(parameter.register_hook(count_gradient))
+        try:
+            metrics = engine.update_once(total_steps=1, bc_lambda=0.0)
+        finally:
+            encoder_hook.remove()
+            head_hook.remove()
+            for handle in gradient_hooks:
+                handle.remove()
+
+        self.assertTrue(metrics.actor_updated)
+        self.assertTrue(any(
+            not grad_enabled and all(requires)
+            for grad_enabled, requires in encoder_observations
+        ))
+        self.assertTrue(any(
+            input_requires_grad and not any(head_requires_grad)
+            for input_requires_grad, head_requires_grad in head_observations
+        ))
+        self.assertTrue(all(count <= 1 for count in critic_hook_counts))
+        self.assertTrue(any(
+            parameter.grad is not None
+            and bool(torch.count_nonzero(parameter.grad))
+            for parameter in engine.actor.parameters()
+        ))
+        self.assertTrue(all(
+            parameter.requires_grad for parameter in engine.critic1.parameters()
+        ))
+
+        with mock.patch.object(
+            engine,
+            '_compute_actor_loss_terms',
+            side_effect=RuntimeError('controlled guidance failure'),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'controlled guidance failure'):
+                engine.update_once(total_steps=2, bc_lambda=0.0)
+        self.assertTrue(all(
+            parameter.requires_grad for parameter in engine.critic1.parameters()
+        ))
+
+    def test_compiled_no_grad_context_strategy_requires_compiled_encoder(self):
+        engine = self.make_engine()
+        with self.assertRaisesRegex(RuntimeError, 'compiled critic1 encoder'):
+            engine.set_frozen_critic_strategy('compiled_no_grad_context')
+        with self.assertRaisesRegex(ValueError, 'frozen critic strategy'):
+            engine.set_frozen_critic_strategy('unknown')
+
+    def test_full_compiled_blocks_match_eager_three_update_chain(self):
+        def assert_optimizer_equal(actual, expected):
+            self.assertEqual(actual['param_groups'], expected['param_groups'])
+            self.assertEqual(actual['state'].keys(), expected['state'].keys())
+            for parameter_id, expected_state in expected['state'].items():
+                self.assertEqual(
+                    actual['state'][parameter_id].keys(),
+                    expected_state.keys(),
+                )
+                for name, expected_value in expected_state.items():
+                    torch.testing.assert_close(
+                        actual['state'][parameter_id][name], expected_value
+                    )
+
+        torch.manual_seed(2468)
+        eager = self.make_engine(
+            terminal_enabled=True,
+            bc_reference_actor=self.make_bc_reference(0.02),
+        )
+        torch.manual_seed(9753)
+        compiled = self.make_engine(
+            terminal_enabled=True,
+            bc_reference_actor=self.make_bc_reference(-0.03),
+        )
+        compiled.load_checkpoint_state_dict(eager.checkpoint_state_dict())
+        self.fill_replay(eager, counts=(0, 7), next_counts=(7, 0))
+        batch = eager.replay.sample(2)
+        eager.replay.sample = lambda batch_size: batch
+        compiled.replay.sample = lambda batch_size: batch
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), mock.patch(
+            'brain_uav.models.v2_ann.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            self.assertEqual(compiled.enable_critic_loss_compile(), (
+                'critic1.full_forward',
+                'critic2.full_forward',
+                'twin_critic_loss',
+            ))
+            self.assertEqual(compiled.enable_target_block_compile(), (
+                'actor_target.full_forward',
+                'critic1_target.full_forward',
+                'critic2_target.full_forward',
+                'td_target',
+            ))
+            compiled.enable_actor_compile()
+            compiled.enable_actor_guidance_context_compile()
+        compiled.set_frozen_critic_strategy('compiled_no_grad_context')
+
+        actor_metrics = None
+        for total_steps, bc_lambda in ((1, 0.0), (2, 1.5), (3, 0.0)):
+            update_rng = torch.random.get_rng_state()
+            eager_metrics = eager.update_once(
+                total_steps=total_steps,
+                bc_lambda=bc_lambda,
+            )
+            torch.random.set_rng_state(update_rng)
+            compiled_metrics = compiled.update_once(
+                total_steps=total_steps,
+                bc_lambda=bc_lambda,
+            )
+            self.assertEqual(eager_metrics, compiled_metrics)
+            if eager_metrics.actor_updated:
+                actor_metrics = eager_metrics
+            for model_name in (
+                'actor', 'critic1', 'critic2',
+                'actor_target', 'critic1_target', 'critic2_target',
+            ):
+                self.assert_state_dict_equal(
+                    getattr(compiled, model_name).state_dict(),
+                    getattr(eager, model_name).state_dict(),
+                )
+            assert_optimizer_equal(
+                compiled.actor_optimizer.state_dict(),
+                eager.actor_optimizer.state_dict(),
+            )
+            assert_optimizer_equal(
+                compiled.critic_optimizer.state_dict(),
+                eager.critic_optimizer.state_dict(),
+            )
+        self.assertIsNotNone(actor_metrics)
+        self.assertEqual(actor_metrics.bc_lambda, 1.5)
+        self.assertGreater(actor_metrics.terminal_geo_loss, 0.0)
+
+    def test_full_blocks_reject_nested_encoder_compile(self):
+        engine = self.make_engine()
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            engine.enable_online_critic_encoder_compile(backend='eager')
+        with self.assertRaisesRegex(RuntimeError, 'nested encoder compilation'):
+            engine.enable_critic_loss_compile(backend='eager')
+
+        target_engine = self.make_engine()
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            target_engine.enable_target_encoder_compile(backend='eager')
+        with self.assertRaisesRegex(RuntimeError, 'nested encoder compilation'):
+            target_engine.enable_target_block_compile(backend='eager')
+
+    def test_full_compile_warmup_preserves_parameters_rng_optimizers_and_counts(self):
+        engine = self.make_engine(
+            bc_reference_actor=self.make_bc_reference(0.02),
+        )
+        batch = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), mock.patch(
+            'brain_uav.models.v2_ann.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            engine.enable_critic_loss_compile()
+            engine.enable_target_block_compile()
+            engine.enable_actor_compile()
+            engine.enable_actor_guidance_context_compile()
+        engine.set_frozen_critic_strategy('compiled_no_grad_context')
+        compiled_critic = mock.Mock(wraps=engine._compiled_critic_loss)
+        compiled_target = mock.Mock(wraps=engine._compiled_target_block)
+        engine._compiled_critic_loss = compiled_critic
+        engine._compiled_target_block = compiled_target
+        state_before = {
+            name: deepcopy(getattr(engine, name).state_dict())
+            for name in (
+                'actor', 'critic1', 'critic2',
+                'actor_target', 'critic1_target', 'critic2_target',
+                'bc_reference_actor',
+            )
+        }
+        counts_before = (
+            engine.update_count,
+            engine.critic_update_count,
+            engine.critic_target_update_count,
+            engine.actor_update_count,
+            engine.last_total_steps,
+        )
+        torch.manual_seed(24680)
+        np.random.seed(13579)
+        torch_rng = torch.random.get_rng_state().clone()
+        numpy_rng = np.random.get_state()
+
+        engine.warmup_actor_compile((batch,))
+        engine.warmup_full_compile((batch,))
+
+        self.assertGreater(compiled_critic.call_count, 0)
+        self.assertGreater(compiled_target.call_count, 0)
+
+        for name, expected in state_before.items():
+            self.assert_state_dict_equal(getattr(engine, name).state_dict(), expected)
+        self.assertEqual(counts_before, (
+            engine.update_count,
+            engine.critic_update_count,
+            engine.critic_target_update_count,
+            engine.actor_update_count,
+            engine.last_total_steps,
+        ))
+        self.assertFalse(engine.actor_optimizer.state_dict()['state'])
+        self.assertFalse(engine.critic_optimizer.state_dict()['state'])
+        torch.testing.assert_close(torch.random.get_rng_state(), torch_rng)
+        numpy_after = np.random.get_state()
+        self.assertEqual(numpy_after[0], numpy_rng[0])
+        np.testing.assert_array_equal(numpy_after[1], numpy_rng[1])
+        self.assertEqual(numpy_after[2:], numpy_rng[2:])
+
+    def test_full_critic_only_compile_warmup_does_not_require_target_block(self):
+        engine = self.make_engine()
+        batch = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            metadata = engine.configure_compilation(compile_critic_block=True)
+        state_before = {
+            name: deepcopy(getattr(engine, name).state_dict())
+            for name in (
+                'actor', 'critic1', 'critic2',
+                'actor_target', 'critic1_target', 'critic2_target',
+            )
+        }
+        with mock.patch.object(
+            engine.actor_target,
+            'forward',
+            side_effect=AssertionError('target warmup must not run'),
+        ):
+            engine.warmup_full_compile((batch,))
+        for name, expected in state_before.items():
+            self.assert_state_dict_equal(getattr(engine, name).state_dict(), expected)
+        self.assertIsNone(engine._compiled_target_block)
+        self.assertIsNone(engine._compiled_target_critic_td)
+        self.assertEqual(metadata['target_granularity'], 'eager')
+        self.assertNotIn('td_target', metadata['enabled_objects'])
+
+    def test_compilation_configuration_reports_scope_without_changing_identity(self):
+        engine = self.make_engine(
+            bc_reference_actor=self.make_bc_reference(0.02),
+        )
+        parameter_ids = {
+            name: tuple(id(parameter) for parameter in model.parameters())
+            for name, model in (
+                ('actor', engine.actor), ('critic1', engine.critic1),
+                ('critic2', engine.critic2), ('actor_target', engine.actor_target),
+                ('critic1_target', engine.critic1_target),
+                ('critic2_target', engine.critic2_target),
+                ('bc_reference_actor', engine.bc_reference_actor),
+            )
+        }
+        state_keys = {
+            name: tuple(model.state_dict())
+            for name, model in (
+                ('actor', engine.actor), ('critic1', engine.critic1),
+                ('critic2', engine.critic2), ('actor_target', engine.actor_target),
+                ('critic1_target', engine.critic1_target),
+                ('critic2_target', engine.critic2_target),
+                ('bc_reference_actor', engine.bc_reference_actor),
+            )
+        }
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), mock.patch(
+            'brain_uav.models.v2_ann.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            metadata = engine.configure_compilation(
+                compile_actors=True,
+                frozen_critic_strategy='compiled_no_grad_context',
+                compile_critic_block=True,
+                compile_target_block=True,
+            )
+        self.assertEqual(metadata['critic_granularity'], 'full_forward_and_loss')
+        self.assertEqual(metadata['target_granularity'], 'full_tensor_block')
+        self.assertEqual(metadata['actor_granularity'], 'ann_full_forward_or_snn_encoder')
+        self.assertEqual(metadata['frozen_critic_strategy'], 'compiled_no_grad_context')
+        self.assertEqual(metadata['select_action_execution'], 'eager')
+        self.assertFalse(metadata['cuda_graph'])
+        for name, expected in parameter_ids.items():
+            model = getattr(engine, name)
+            self.assertEqual(tuple(id(parameter) for parameter in model.parameters()), expected)
+            self.assertEqual(tuple(model.state_dict()), state_keys[name])
+
+        with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
+            self.make_engine().configure_compilation(
+                compile_critic_encoder=True,
+                compile_critic_block=True,
+            )
+
     def test_compile_error_propagates_without_enabling_fallback(self):
         engine = self.make_engine()
         with mock.patch(

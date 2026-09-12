@@ -27,9 +27,12 @@ from brain_uav.scripts.profile_v2_td3 import (
     _configure_group_compilation,
     _capture_critic_only_update_stages,
     _fixed_numeric_replay_batch,
+    _terminal_numeric_observation_batch,
     _gradient_diagnostic_summary,
     _prepare_diagnostic_pools,
     _run_compiled_numerics_check,
+    _run_actor_update_with_rl_gradient_capture,
+    _report_and_validate_actor_regularizers,
     _report_and_validate_empty_token_update,
     _report_group_localization,
     _run_grouped_compiled_numerics_diagnostic,
@@ -52,6 +55,7 @@ from brain_uav.trainers.v2_replay_buffer import V2ReplayBuffer
 
 from test_v2_bc import make_scenario_config, make_scenario_payload, write_cluster
 import test_v2_td3 as v2_td3_tests
+import test_v2_snn_td3 as v2_snn_td3_tests
 
 
 class TestProfileV2TD3(unittest.TestCase):
@@ -60,6 +64,10 @@ class TestProfileV2TD3(unittest.TestCase):
                         detailed_profiler_updates=0, profiler_output_dir=None,
                         compile_critic_encoder=False,
                         compile_target_encoders=False,
+                        compile_actors=False,
+                        frozen_critic_strategy='eager',
+                        compile_critic_block=False,
+                        compile_target_block=False,
                         dynamo_graph_counts=(10, 10)):
         # Real environment and replay; only network work and CUDA are test doubles.
         scenario = make_scenario_config()
@@ -137,6 +145,46 @@ class TestProfileV2TD3(unittest.TestCase):
                 for batch in batches
             )
         )
+        def configure_compilation(**kwargs):
+            enabled_objects = []
+            if kwargs['compile_critic_block']:
+                enabled_objects.extend((
+                    'critic1.full_forward', 'critic2.full_forward',
+                    'twin_critic_loss',
+                ))
+            if kwargs['frozen_critic_strategy'] == 'compiled_no_grad_context':
+                enabled_objects.append('critic1.actor_guidance_context')
+            if kwargs['compile_target_block']:
+                enabled_objects.extend((
+                    'actor_target.full_forward', 'critic1_target.full_forward',
+                    'critic2_target.full_forward', 'td_target',
+                ))
+            if kwargs['compile_actors']:
+                enabled_objects.extend((
+                    'actor.full_forward', 'bc_reference_actor.full_forward',
+                ))
+            return {
+                'enabled_objects': enabled_objects,
+                'critic_granularity': (
+                    'full_forward_and_loss'
+                    if kwargs['compile_critic_block'] else 'eager'
+                ),
+                'target_granularity': (
+                    'full_tensor_block'
+                    if kwargs['compile_target_block'] else 'eager'
+                ),
+                'actor_granularity': (
+                    'ann_full_forward_or_snn_encoder'
+                    if kwargs['compile_actors'] else 'eager'
+                ),
+                'frozen_critic_strategy': kwargs['frozen_critic_strategy'],
+                'select_action_execution': 'eager',
+                'cuda_graph': False,
+            }
+
+        engine.configure_compilation = configure_compilation
+        engine.warmup_actor_compile = lambda batches: None
+        engine.warmup_full_compile = lambda batches: None
         synchronization_points = []
         event = mock.Mock()
         event.elapsed_time.return_value = 1.0
@@ -169,6 +217,10 @@ class TestProfileV2TD3(unittest.TestCase):
                 profiler_output_dir=profiler_output_dir,
                 compile_critic_encoder=compile_critic_encoder,
                 compile_target_encoders=compile_target_encoders,
+                compile_actors=compile_actors,
+                frozen_critic_strategy=frozen_critic_strategy,
+                compile_critic_block=compile_critic_block,
+                compile_target_block=compile_target_block,
             )
         return result, replay, synchronization_points
 
@@ -388,6 +440,10 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertEqual(args.detailed_profiler_updates, 0)
         self.assertFalse(args.compile_critic_encoder)
         self.assertFalse(args.compile_target_encoders)
+        self.assertFalse(args.compile_actors)
+        self.assertEqual(args.frozen_critic_strategy, 'eager')
+        self.assertFalse(args.compile_critic_block)
+        self.assertFalse(args.compile_target_block)
         self.assertFalse(args.check_compiled_numerics)
         self.assertFalse(args.compiled_numerics_only)
         self.assertIsNone(args.compiled_numerics_group)
@@ -412,6 +468,20 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertTrue(extended.compile_target_encoders)
         self.assertTrue(extended.check_compiled_numerics)
         self.assertTrue(extended.compiled_numerics_only)
+        full = build_parser().parse_args([
+            '--model', 'ann', '--bc-checkpoint', 'bc.pt',
+            '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
+            '--compile-actors', '--compile-critic-block',
+            '--compile-target-block', '--frozen-critic-strategy',
+            'compiled_no_grad_context',
+        ])
+        self.assertTrue(full.compile_actors)
+        self.assertTrue(full.compile_critic_block)
+        self.assertTrue(full.compile_target_block)
+        self.assertEqual(
+            full.frozen_critic_strategy,
+            'compiled_no_grad_context',
+        )
         grouped = build_parser().parse_args([
             '--model', 'ann', '--bc-checkpoint', 'bc.pt',
             '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
@@ -525,6 +595,39 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertEqual(compile_info['target_warmup_wall_seconds'], 0.0)
         self.assertEqual(len(replay), result['warmup_steps'] + result['measured_steps'])
 
+    def test_full_compile_metadata_declares_granularity_and_no_cuda_graph(self) -> None:
+        result, _, _ = self.run_small_level(
+            compile_actors=True,
+            frozen_critic_strategy='compiled_no_grad_context',
+            compile_critic_block=True,
+            compile_target_block=True,
+        )
+        compile_info = result['critic_encoder_compile']
+        self.assertTrue(compile_info['requested'])
+        self.assertEqual(
+            compile_info['critic_granularity'],
+            'full_forward_and_loss',
+        )
+        self.assertEqual(compile_info['target_granularity'], 'full_tensor_block')
+        self.assertEqual(
+            compile_info['frozen_critic_strategy'],
+            'compiled_no_grad_context',
+        )
+        self.assertEqual(compile_info['select_action_execution'], 'eager')
+        self.assertFalse(compile_info['cuda_graph'])
+        self.assertTrue(compile_info['stable_timing'])
+
+    def test_full_critic_only_diagnostic_does_not_enable_target_block(self) -> None:
+        result, _, _ = self.run_small_level(compile_critic_block=True)
+        compile_info = result['critic_encoder_compile']
+        self.assertEqual(
+            compile_info['critic_granularity'],
+            'full_forward_and_loss',
+        )
+        self.assertEqual(compile_info['target_granularity'], 'eager')
+        self.assertFalse(compile_info['target_block_requested'])
+        self.assertNotIn('td_target', compile_info['enabled_objects'])
+
     def test_compiled_numeric_comparison_accepts_tolerance_and_rejects_mismatch(self) -> None:
         reference = {
             'critic_loss': torch.tensor(1.0),
@@ -554,6 +657,163 @@ class TestProfileV2TD3(unittest.TestCase):
                 rtol=1e-4,
                 atol=1e-5,
             )
+        with self.assertRaisesRegex(
+            AssertionError,
+            'compiled_only=.*gradients.critic1.empty_scene_token',
+        ):
+            _compare_compiled_numeric_tensors(
+                {
+                    'gradients.critic1.empty_scene_token.present': torch.tensor(False),
+                },
+                {
+                    'gradients.critic1.empty_scene_token.present': torch.tensor(True),
+                    'gradients.critic1.empty_scene_token': torch.zeros(1),
+                },
+                rtol=1e-4,
+                atol=1e-5,
+            )
+
+    def test_actor_regularizer_prerequisites_report_before_rejecting_difference(self):
+        metrics = SimpleNamespace(
+            bc_lambda=1.5,
+            bc_loss=0.25,
+            terminal_geo_loss=0.5,
+            terminal_geo_lambda=3000.0,
+        )
+        capture = {
+            'bc_action_gradient': torch.tensor([[0.25, -0.5]]),
+            'terminal_geo_action_gradient': torch.tensor([[0.75, 0.25]]),
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            record = _report_and_validate_actor_regularizers(
+                metrics,
+                metrics,
+                capture,
+                capture,
+                expected_bc_lambda=1.5,
+            )
+        self.assertEqual(record['eager']['bc_action_gradient']['state'], 'nonzero')
+        self.assertEqual(
+            record['compiled']['terminal_geo_action_gradient']['state'],
+            'nonzero',
+        )
+
+        invalid_cases = {
+            'zero_action_gradient': {
+                **capture,
+                'bc_action_gradient': torch.zeros((1, 2)),
+            },
+            'disconnected_action_gradient': {
+                **capture,
+                'bc_action_gradient': None,
+            },
+            'different_action_gradient': {
+                **capture,
+                'bc_action_gradient': torch.tensor([[0.25, -0.75]]),
+            },
+        }
+        for name, invalid in invalid_cases.items():
+            with self.subTest(name=name):
+                output = StringIO()
+                with redirect_stdout(output), self.assertRaises(AssertionError):
+                    _report_and_validate_actor_regularizers(
+                        metrics,
+                        metrics,
+                        capture,
+                        invalid,
+                        expected_bc_lambda=1.5,
+                    )
+                self.assertIn(
+                    'compiled_numeric_actor_regularizers',
+                    output.getvalue(),
+                )
+
+    def test_regularizer_action_gradients_preserve_original_actor_backward(self):
+        fixture = v2_td3_tests.TestV2TD3()
+        fixture.setUp()
+        engine = fixture.make_engine(
+            policy_delay=2,
+            terminal_enabled=True,
+            bc_reference_actor=fixture.make_bc_reference(0.01),
+        )
+        observation = v2_td3_tests.collate_v2_observations([
+            v2_td3_tests._observation(0, scales=fixture.scales),
+            v2_td3_tests._observation(7, scales=fixture.scales),
+        ])
+        terminal_observation = _terminal_numeric_observation_batch(
+            observation,
+            engine,
+        )
+        batch = _fixed_numeric_replay_batch(
+            terminal_observation,
+            action_dim=engine.action_dim,
+            device=torch.device('cpu'),
+            line_to_goal_safe=True,
+        )
+        engine.replay.sample = lambda batch_size: batch
+        engine.update_once(total_steps=2, bc_lambda=0.0)
+        original_actor_terms = engine._compute_actor_loss_terms
+        actor_hooks_before = tuple(engine.actor._forward_hooks)
+        critic_head_hooks_before = tuple(engine.critic1.head._forward_hooks)
+        actor_gradient_calls = [0 for _ in engine.actor.parameters()]
+        gradient_handles = []
+        for index, parameter in enumerate(engine.actor.parameters()):
+            def count_gradient(gradient, slot=index):
+                actor_gradient_calls[slot] += 1
+                return gradient
+            gradient_handles.append(parameter.register_hook(count_gradient))
+        try:
+            metrics, capture = _run_actor_update_with_rl_gradient_capture(
+                engine,
+                total_steps=4,
+                bc_lambda=1.5,
+                capture_regularizers=True,
+            )
+        finally:
+            for handle in gradient_handles:
+                handle.remove()
+
+        self.assertGreater(metrics.bc_loss, 0.0)
+        self.assertGreater(metrics.terminal_geo_loss, 0.0)
+        self.assertTrue(bool(torch.count_nonzero(capture['bc_action_gradient'])))
+        self.assertTrue(bool(torch.count_nonzero(
+            capture['terminal_geo_action_gradient']
+        )))
+        self.assertTrue(any(
+            parameter.grad is not None
+            and bool(torch.count_nonzero(parameter.grad))
+            for parameter in engine.actor.parameters()
+        ))
+        self.assertTrue(any(count == 1 for count in actor_gradient_calls))
+        self.assertTrue(all(count <= 1 for count in actor_gradient_calls))
+        restored_actor_terms = engine._compute_actor_loss_terms
+        self.assertIs(restored_actor_terms.__func__, original_actor_terms.__func__)
+        self.assertIs(restored_actor_terms.__self__, original_actor_terms.__self__)
+        self.assertEqual(tuple(engine.actor._forward_hooks), actor_hooks_before)
+        self.assertEqual(
+            tuple(engine.critic1.head._forward_hooks),
+            critic_head_hooks_before,
+        )
+
+        with mock.patch.object(
+            engine,
+            'update_once',
+            side_effect=RuntimeError('controlled diagnostic failure'),
+        ), self.assertRaisesRegex(RuntimeError, 'controlled diagnostic failure'):
+            _run_actor_update_with_rl_gradient_capture(
+                engine,
+                total_steps=6,
+                bc_lambda=1.5,
+                capture_regularizers=True,
+            )
+        restored_after_error = engine._compute_actor_loss_terms
+        self.assertIs(restored_after_error.__func__, original_actor_terms.__func__)
+        self.assertEqual(tuple(engine.actor._forward_hooks), actor_hooks_before)
+        self.assertEqual(
+            tuple(engine.critic1.head._forward_hooks),
+            critic_head_hooks_before,
+        )
 
     def test_zero_zone_count_and_gradient_diagnostic_states(self) -> None:
         fixture = v2_td3_tests.TestV2TD3()
@@ -898,8 +1158,10 @@ class TestProfileV2TD3(unittest.TestCase):
                     device='cuda',
                     steps_per_level=3,
                     scenario_count=3,
-                    compile_critic_encoder=True,
-                    compile_target_encoders=True,
+                    compile_actors=True,
+                    frozen_critic_strategy='compiled_no_grad_context',
+                    compile_critic_block=True,
+                    compile_target_block=True,
                     check_compiled_numerics=True,
                     compiled_numerics_only=True,
                 )
@@ -911,6 +1173,14 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertEqual(summary['purpose'], 'compiled_numeric_correctness_check_only')
         self.assertEqual(summary['timing_levels_executed'], 0)
         numeric_runner.assert_called_once()
+        numeric_kwargs = numeric_runner.call_args.kwargs
+        self.assertTrue(numeric_kwargs['compile_actors'])
+        self.assertEqual(
+            numeric_kwargs['frozen_critic_strategy'],
+            'compiled_no_grad_context',
+        )
+        self.assertTrue(numeric_kwargs['compile_critic_block'])
+        self.assertTrue(numeric_kwargs['compile_target_block'])
         level_runner.assert_not_called()
 
         with self.assertRaisesRegex(ValueError, 'requires check_compiled_numerics'):
@@ -927,10 +1197,12 @@ class TestProfileV2TD3(unittest.TestCase):
         fixture.setUp()
         reference = fixture.make_engine(
             policy_delay=2,
+            terminal_enabled=True,
             bc_reference_actor=fixture.make_bc_reference(0.01),
         )
         compiled = fixture.make_engine(
             policy_delay=2,
+            terminal_enabled=True,
             bc_reference_actor=fixture.make_bc_reference(0.01),
         )
         batch = v2_td3_tests.collate_v2_observations([
@@ -955,6 +1227,12 @@ class TestProfileV2TD3(unittest.TestCase):
         ), mock.patch(
             'brain_uav.models.zone_set_encoder.torch.compile',
             side_effect=lambda function, **kwargs: function,
+        ), mock.patch(
+            'brain_uav.models.v2_ann.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
         ), redirect_stdout(output):
             result = _run_compiled_numerics_check(
                 pool=SimpleNamespace(),
@@ -968,6 +1246,12 @@ class TestProfileV2TD3(unittest.TestCase):
                 bc_checkpoint=Path('unused.pt'),
                 device=torch.device('cpu'),
                 snn_time_window=4,
+                compile_critic_encoder=False,
+                compile_target_encoders=False,
+                compile_actors=True,
+                frozen_critic_strategy='compiled_no_grad_context',
+                compile_critic_block=True,
+                compile_target_block=True,
             )
 
         self.assertTrue(result['passed'])
@@ -975,13 +1259,18 @@ class TestProfileV2TD3(unittest.TestCase):
             'critic_only',
             'actor_and_target_updated',
             'critic_only_after_actor',
+            'actor_with_bc_and_terminal_geometry',
+            'critic_only_nonempty_after_momentum',
         ))
-        self.assertFalse(compiled.actor.zone_set_encoder.compiled_tensor_forward_enabled)
-        self.assertTrue(
-            compiled.actor_target.zone_set_encoder.compiled_tensor_forward_enabled
+        self.assertTrue(compiled.actor.compiled_full_forward_enabled)
+        self.assertFalse(compiled.actor_target.compiled_full_forward_enabled)
+        self.assertIsNotNone(compiled._compiled_target_block)
+        self.assertEqual(
+            compiled.frozen_critic_strategy,
+            'compiled_no_grad_context',
         )
-        self.assertEqual(reference.update_count, 3)
-        self.assertEqual(compiled.update_count, 3)
+        self.assertEqual(reference.update_count, 5)
+        self.assertEqual(compiled.update_count, 5)
         output_records = [
             json.loads(line) for line in output.getvalue().splitlines()
         ]
@@ -1001,20 +1290,36 @@ class TestProfileV2TD3(unittest.TestCase):
                 'critic_only_with_empty_scene',
                 'actor_and_target_updated_with_empty_scene',
                 'critic_only_after_actor_with_empty_scene',
+                'actor_with_nonzero_bc_and_terminal_geometry',
+                'critic_only_all_nonempty_after_empty_scene_momentum',
             ],
         )
         self.assertEqual(
             [record['update_index'] for record in records],
-            [1, 2, 3],
+            [1, 2, 3, 4, 5],
         )
         self.assertEqual(records[0]['batch_construction'], (
             'synthetic_from_fixed_pool_with_one_zero_zone_sample'
         ))
         self.assertEqual(
             [record['zero_zone_sample_count'] for record in records],
-            [1, 1, 1],
+            [1, 1, 1, 1, 0],
         )
         self.assertTrue(records[0]['historical_momentum_prerequisite_met'])
+        self.assertTrue(records[3]['historical_momentum_prerequisite_met'])
+        self.assertEqual(
+            result['regularizer_gradient_check']['bc_lambda'],
+            1.5,
+        )
+        for execution in ('eager', 'compiled'):
+            regularizers = result['regularizer_gradient_check'][execution]
+            self.assertGreater(regularizers['bc_loss'], 0.0)
+            self.assertEqual(regularizers['bc_action_gradient']['state'], 'nonzero')
+            self.assertGreater(regularizers['terminal_geo_loss'], 0.0)
+            self.assertEqual(
+                regularizers['terminal_geo_action_gradient']['state'],
+                'nonzero',
+            )
         for execution in ('eager', 'compiled'):
             rl_gradient = result['actor_rl_gradient'][execution]
             self.assertEqual(rl_gradient['q_output_gradient']['state'], 'nonzero')
@@ -1057,6 +1362,17 @@ class TestProfileV2TD3(unittest.TestCase):
                     ]['state'],
                     'nonzero',
                 )
+                final_gradient_state = records[4]['critics'][critic_name][
+                    execution
+                ]['after']['gradient']['state']
+                self.assertIn(final_gradient_state, ('none', 'zero'))
+                other_execution = 'compiled' if execution == 'eager' else 'eager'
+                self.assertEqual(
+                    final_gradient_state,
+                    records[4]['critics'][critic_name][other_execution][
+                        'after'
+                    ]['gradient']['state'],
+                )
                 self.assertEqual(
                     records[0]['critics'][critic_name][execution]['after'][
                         'adam'
@@ -1075,11 +1391,78 @@ class TestProfileV2TD3(unittest.TestCase):
                     ]['step'],
                     3.0,
                 )
+                self.assertEqual(
+                    records[4]['critics'][critic_name][execution]['after'][
+                        'adam'
+                    ]['step'],
+                    5.0,
+                )
         torch.testing.assert_close(torch.random.get_rng_state(), torch_rng_before)
         numpy_rng_after = np.random.get_state()
         self.assertEqual(numpy_rng_after[0], numpy_rng_before[0])
         np.testing.assert_array_equal(numpy_rng_after[1], numpy_rng_before[1])
         self.assertEqual(numpy_rng_after[2:], numpy_rng_before[2:])
+
+    def test_snn_compiled_numeric_check_uses_encoder_and_ann_critic_blocks(self):
+        fixture = v2_snn_td3_tests.TestV2SNNTD3()
+        fixture.setUp()
+        reference = fixture.make_engine(bc=fixture.make_actor())
+        compiled = fixture.make_engine(bc=fixture.make_actor())
+        for engine in (reference, compiled):
+            engine.policy_delay = 2
+            engine.terminal_geo_regularization_enabled = True
+        batch = v2_snn_td3_tests.collate_v2_observations([
+            v2_snn_td3_tests._observation(0, fixture.scales),
+            v2_snn_td3_tests._observation(10, fixture.scales),
+        ])
+        with mock.patch(
+            'brain_uav.scripts.profile_v2_td3.build_v2_stage_engine',
+            side_effect=(
+                SimpleNamespace(engine=reference),
+                SimpleNamespace(engine=compiled),
+            ),
+        ), mock.patch(
+            'brain_uav.scripts.profile_v2_td3._compile_warmup_batches',
+            return_value=(batch,),
+        ), mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), redirect_stdout(StringIO()):
+            result = _run_compiled_numerics_check(
+                pool=SimpleNamespace(),
+                prepared=SimpleNamespace(),
+                formal_config=V2FormalTrainingConfig(
+                    stage='easy',
+                    replay_capacity=32,
+                    batch_size=2,
+                    actor_freeze_steps=0,
+                ),
+                bc_checkpoint=Path('unused.pt'),
+                device=torch.device('cpu'),
+                snn_time_window=2,
+                model='snn',
+                compile_critic_encoder=False,
+                compile_target_encoders=False,
+                compile_actors=True,
+                frozen_critic_strategy='compiled_no_grad_context',
+                compile_critic_block=True,
+                compile_target_block=True,
+            )
+        self.assertTrue(result['passed'])
+        self.assertEqual(len(result['updates']), 5)
+        self.assertIn(
+            'actor.zone_set_encoder',
+            result['compilation']['enabled_objects'],
+        )
+        self.assertIn(
+            'actor_target.eager_snn',
+            result['compilation']['enabled_objects'],
+        )
+        self.assertEqual(reference.actor.snn_head.lif1.v, 0.0)
+        self.assertEqual(compiled.actor_target.snn_head.lif2.v, 0.0)
 
     def test_compile_extension_rejects_unsupported_flag_combinations(self) -> None:
         common = {
@@ -1106,6 +1489,22 @@ class TestProfileV2TD3(unittest.TestCase):
                 compile_critic_encoder=True,
                 compile_target_encoders=True,
                 check_compiled_numerics=True,
+            )
+        with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
+            run_v2_td3_timing_diagnostic(
+                **common,
+                compile_critic_encoder=True,
+                compile_critic_block=True,
+            )
+        with self.assertRaisesRegex(ValueError, 'requires compile_critic_block'):
+            run_v2_td3_timing_diagnostic(
+                **common,
+                compile_target_block=True,
+            )
+        with self.assertRaisesRegex(ValueError, 'compiled critic path'):
+            run_v2_td3_timing_diagnostic(
+                **common,
+                frozen_critic_strategy='compiled_no_grad_context',
             )
 
     def test_compile_and_detailed_profiler_combination_is_rejected_before_output(self) -> None:

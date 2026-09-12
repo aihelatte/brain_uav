@@ -179,6 +179,51 @@ class TestV2ANN(unittest.TestCase):
         )
         self.assertTrue(any(parameter.grad is not None for parameter in critic.head.parameters()))
 
+    def test_ann_actor_compiled_full_forward_matches_eager_outputs_and_gradients(self):
+        for counts in ((0, 3, 7), (0, 0), (3, 7)):
+            with self.subTest(counts=counts):
+                torch.manual_seed(1234)
+                actor = V2ANNPolicyActor(
+                    self.scales,
+                    2,
+                    32,
+                    torch.tensor([0.2, 0.3], dtype=torch.float32),
+                )
+                batch = collate_v2_observations([
+                    _observation(count, offset=float(index))
+                    for index, count in enumerate(counts)
+                ])
+                state_keys = tuple(actor.state_dict())
+                parameter_ids = tuple(id(parameter) for parameter in actor.parameters())
+                eager_output = actor(batch)
+                eager_output.square().sum().backward()
+                eager_gradients = {
+                    name: parameter.grad.detach().clone()
+                    for name, parameter in actor.named_parameters()
+                }
+                actor.zero_grad(set_to_none=True)
+
+                with mock.patch(
+                    'brain_uav.models.v2_ann.torch.compile',
+                    side_effect=lambda function, **kwargs: function,
+                ) as compiler:
+                    actor.enable_compiled_full_forward(backend='eager')
+                compiled_output = actor(batch)
+                compiled_output.square().sum().backward()
+
+                torch.testing.assert_close(compiled_output, eager_output)
+                for name, parameter in actor.named_parameters():
+                    torch.testing.assert_close(parameter.grad, eager_gradients[name])
+                self.assertTrue(actor.compiled_full_forward_enabled)
+                self.assertEqual(tuple(actor.state_dict()), state_keys)
+                self.assertEqual(
+                    tuple(id(parameter) for parameter in actor.parameters()),
+                    parameter_ids,
+                )
+                compiler.assert_called_once()
+                self.assertTrue(compiler.call_args.kwargs['fullgraph'])
+                self.assertTrue(compiler.call_args.kwargs['dynamic'])
+
     def test_fast_forwards_do_not_convert_tensor_contents_to_python_scalars(self):
         batch = collate_v2_observations([_observation(0), _observation(6)])
         action = torch.zeros((2, 2), dtype=torch.float32)

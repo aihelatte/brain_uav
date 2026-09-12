@@ -14,7 +14,11 @@ from brain_uav.config import RewardConfig, ScenarioConfig
 from brain_uav.models import V2ANNPolicyActor
 from brain_uav.observations import V2ObservationScales
 from brain_uav.scripts.common import resolve_training_device
-from brain_uav.scripts.train_v2_td3 import build_parser, run_v2_td3_stage
+from brain_uav.scripts.train_v2_td3 import (
+    _configure_stage_compilation,
+    build_parser,
+    run_v2_td3_stage,
+)
 from brain_uav.trainers.v2_formal_training import (
     V2BCFormalInitialization,
     V2PreparedStageInitialization,
@@ -178,6 +182,12 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertEqual(args.consecutive_windows, 4)
         self.assertEqual(args.max_failures_per_window, 1)
         self.assertEqual(args.validation_max_failures, 6)
+        self.assertFalse(args.compile_critic_encoder)
+        self.assertFalse(args.compile_target_encoders)
+        self.assertFalse(args.compile_actors)
+        self.assertEqual(args.frozen_critic_strategy, 'eager')
+        self.assertFalse(args.compile_critic_block)
+        self.assertFalse(args.compile_target_block)
         with self.assertRaises(SystemExit):
             parser.parse_args([
                 '--stage', 'easy_two_zone',
@@ -196,6 +206,93 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             '--snn-time-window', '3',
         ])
         self.assertEqual((snn.model, snn.snn_time_window), ('snn', 3))
+
+    def test_formal_compile_setup_registers_and_warms_requested_full_paths(self):
+        calls = []
+        engine = SimpleNamespace(
+            batch_size=2,
+            device=torch.device('cpu'),
+            configure_compilation=lambda **kwargs: (
+                calls.append(('configure', kwargs))
+                or {
+                    'enabled_objects': ['critic1.full_forward'],
+                    'frozen_critic_strategy': kwargs['frozen_critic_strategy'],
+                    'cuda_graph': False,
+                }
+            ),
+            warmup_actor_compile=lambda batches: calls.append(
+                ('actor_warmup', len(batches))
+            ),
+            warmup_full_compile=lambda batches: calls.append(
+                ('full_warmup', len(batches))
+            ),
+        )
+        fake_batch = SimpleNamespace(
+            batch_size=2,
+            zone_features=torch.zeros((2, 7, 22)),
+            to=lambda device: fake_batch,
+        )
+        prepared = SimpleNamespace(
+            scenario_config=ScenarioConfig(),
+            reward_config=RewardConfig(),
+            uav_collision_radius=0.0,
+        )
+        pool = SimpleNamespace(
+            stage_seed=3,
+            scenarios=({'payload': {'zones': []}}, {'payload': {'zones': [1] * 7}}),
+        )
+        warmup_env = mock.Mock()
+        warmup_env.reset.return_value = ('observation', {})
+        with mock.patch(
+            'brain_uav.scripts.train_v2_td3.V2StaticNoFlyTrajectoryEnv',
+            return_value=warmup_env,
+        ), mock.patch(
+            'brain_uav.scripts.train_v2_td3.collate_v2_observations',
+            return_value=fake_batch,
+        ):
+            metadata = _configure_stage_compilation(
+                engine,
+                pool,
+                prepared,
+                compile_critic_encoder=False,
+                compile_target_encoders=False,
+                compile_actors=True,
+                frozen_critic_strategy='compiled_no_grad_context',
+                compile_critic_block=True,
+                compile_target_block=True,
+            )
+        self.assertEqual(
+            [entry[0] for entry in calls],
+            ['configure', 'actor_warmup', 'full_warmup'],
+        )
+        self.assertTrue(metadata['requested'])
+        self.assertEqual(metadata['warmup_batch_shapes'], [[2, 7]] * 3)
+        self.assertFalse(metadata['cuda_graph'])
+
+        calls.clear()
+        with mock.patch(
+            'brain_uav.scripts.train_v2_td3.V2StaticNoFlyTrajectoryEnv',
+            return_value=warmup_env,
+        ), mock.patch(
+            'brain_uav.scripts.train_v2_td3.collate_v2_observations',
+            return_value=fake_batch,
+        ):
+            _configure_stage_compilation(
+                engine,
+                pool,
+                prepared,
+                compile_critic_encoder=False,
+                compile_target_encoders=False,
+                compile_actors=False,
+                frozen_critic_strategy='eager',
+                compile_critic_block=True,
+                compile_target_block=False,
+            )
+        self.assertEqual(
+            [entry[0] for entry in calls],
+            ['configure', 'full_warmup'],
+        )
+        self.assertFalse(calls[0][1]['compile_target_block'])
 
     def test_shared_device_resolution_is_strict(self):
         with mock.patch(

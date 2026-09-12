@@ -776,6 +776,50 @@ class ZoneSetEncoder(nn.Module):
         )
         return policy_context
 
+    def prepare_tensor_forward_arguments(
+        self,
+        ego_features: torch.Tensor,
+        goal_features: torch.Tensor,
+        zone_features: torch.Tensor,
+        presence_mask: torch.Tensor,
+        *,
+        shared_relations: ZoneSetSharedRelations | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Validate inputs and expose the parameter-free compiled tensor inputs."""
+
+        batch_size, zone_count = self._validate_inputs(
+            ego_features,
+            goal_features,
+            zone_features,
+            presence_mask,
+        )
+        if shared_relations is None:
+            shared_relations = self._build_shared_relations_validated(
+                ego_features,
+                goal_features,
+                zone_features,
+                presence_mask,
+                batch_size=batch_size,
+                zone_count=zone_count,
+            )
+        else:
+            self._validate_shared_relations(
+                shared_relations,
+                ego_features,
+                goal_features,
+                zone_features,
+                presence_mask,
+            )
+        return (
+            ego_features,
+            goal_features,
+            shared_relations.clean_zone_features,
+            presence_mask,
+            shared_relations.valid_token_mask,
+            shared_relations.token_pair_relations,
+            shared_relations.relation_pair_mask,
+        )
+
     def _forward_impl(
         self,
         ego_features: torch.Tensor,

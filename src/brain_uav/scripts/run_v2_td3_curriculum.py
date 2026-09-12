@@ -37,6 +37,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--model', choices=('ann', 'snn'), default='ann')
     parser.add_argument('--snn-time-window', type=int, default=4)
+    parser.add_argument('--compile-critic-encoder', action='store_true')
+    parser.add_argument('--compile-target-encoders', action='store_true')
+    parser.add_argument('--compile-actors', action='store_true')
+    parser.add_argument(
+        '--frozen-critic-strategy',
+        choices=('eager', 'compiled_no_grad_context'),
+        default='eager',
+    )
+    parser.add_argument('--compile-critic-block', action='store_true')
+    parser.add_argument('--compile-target-block', action='store_true')
     return parser
 
 
@@ -102,6 +112,12 @@ def run_v2_curriculum(
     stage_runner: Callable[..., dict[str, Any]] = run_v2_td3_stage,
     model: str = 'ann',
     snn_time_window: int = 4,
+    compile_critic_encoder: bool = False,
+    compile_target_encoders: bool = False,
+    compile_actors: bool = False,
+    frozen_critic_strategy: str = 'eager',
+    compile_critic_block: bool = False,
+    compile_target_block: bool = False,
 ) -> dict[str, Any]:
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
@@ -199,6 +215,12 @@ def run_v2_curriculum(
             prepared_initialization=(
                 prepared_initialization if stage == 'easy' else None
             ),
+            compile_critic_encoder=compile_critic_encoder,
+            compile_target_encoders=compile_target_encoders,
+            compile_actors=compile_actors,
+            frozen_critic_strategy=frozen_critic_strategy,
+            compile_critic_block=compile_critic_block,
+            compile_target_block=compile_target_block,
         )
         summaries.append(summary)
         global_steps = int(summary.get('global_steps_end', global_steps + int(summary['steps'])))
@@ -231,6 +253,15 @@ def run_v2_curriculum(
         'failed_stage': failed_stage,
         'stages': summaries,
         'global_steps': global_steps,
+        'compilation_request': {
+            'compile_critic_encoder': compile_critic_encoder,
+            'compile_target_encoders': compile_target_encoders,
+            'compile_actors': compile_actors,
+            'frozen_critic_strategy': frozen_critic_strategy,
+            'compile_critic_block': compile_critic_block,
+            'compile_target_block': compile_target_block,
+            'cuda_graph': False,
+        },
     }
     _write_json(root / 'summary.json', payload)
     return payload
@@ -255,6 +286,12 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         model=args.model,
         snn_time_window=args.snn_time_window,
+        compile_critic_encoder=args.compile_critic_encoder,
+        compile_target_encoders=args.compile_target_encoders,
+        compile_actors=args.compile_actors,
+        frozen_critic_strategy=args.frozen_critic_strategy,
+        compile_critic_block=args.compile_critic_block,
+        compile_target_block=args.compile_target_block,
     )
     print(json.dumps(summary, indent=2, allow_nan=False))
     return 0 if summary['passed'] else 1

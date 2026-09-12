@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 import math
 import unittest
+from unittest import mock
 
 import numpy as np
 import torch
@@ -16,6 +17,7 @@ from brain_uav.observations import (
     ZONE_FEATURE_DIM,
     V2Observation,
     V2ObservationScales,
+    collate_v2_observations,
 )
 from brain_uav.trainers import V2ReplayBuffer, V2TD3UpdateEngine
 from brain_uav.trainers.v2_td3 import V2_SNN_TD3_CHECKPOINT_FORMAT
@@ -101,6 +103,61 @@ class TestV2SNNTD3(unittest.TestCase):
             for name, value in engine.actor.state_dict().items()
             if value.is_floating_point()
         ))
+        self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+        self.assertEqual(engine.actor_target.snn_head.lif2.v, 0.0)
+
+    def test_snn_actor_compile_scope_is_encoder_only_and_preserves_reset(self) -> None:
+        engine = self.make_engine(bc=self.make_actor())
+        batch = collate_v2_observations([
+            _observation(0, self.scales),
+            _observation(10, self.scales),
+        ])
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            enabled = engine.enable_actor_compile()
+        self.assertEqual(enabled, (
+            'actor.zone_set_encoder',
+            'bc_reference_actor.zone_set_encoder',
+        ))
+        self.assertFalse(hasattr(engine.actor, 'compiled_full_forward_enabled'))
+        engine.warmup_actor_compile((batch,))
+        with mock.patch.object(
+            engine.actor.zone_set_encoder,
+            'forward',
+            wraps=engine.actor.zone_set_encoder.forward,
+        ) as encoder_forward:
+            output = engine.actor(batch)
+        self.assertEqual(output.shape, (2, 2))
+        self.assertEqual(encoder_forward.call_count, 1)
+        self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+        self.assertEqual(engine.actor.snn_head.lif2.v, 0.0)
+
+    def test_snn_full_target_scope_keeps_lif_actor_eager(self) -> None:
+        engine = self.make_engine(bc=self.make_actor())
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            metadata = engine.configure_compilation(
+                compile_actors=True,
+                frozen_critic_strategy='compiled_no_grad_context',
+                compile_critic_block=True,
+                compile_target_block=True,
+            )
+        self.assertIn('actor_target.eager_snn', metadata['enabled_objects'])
+        self.assertIn('critic1_target.full_forward', metadata['enabled_objects'])
+        self.assertFalse(hasattr(engine.actor_target, 'compiled_full_forward_enabled'))
+        self.assertTrue(engine.actor.zone_set_encoder.compiled_tensor_forward_enabled)
+        self.assertTrue(
+            engine.bc_reference_actor.zone_set_encoder.compiled_tensor_forward_enabled
+        )
+        metrics = engine.update_once(total_steps=1, bc_lambda=0.0)
+        self.assertTrue(metrics.actor_updated)
         self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
         self.assertEqual(engine.actor_target.snn_head.lif2.v, 0.0)
 
