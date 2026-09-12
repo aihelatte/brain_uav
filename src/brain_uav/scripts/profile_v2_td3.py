@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping, Sequence
 import numpy as np
 import torch
 
+import brain_uav.trainers.v2_td3 as v2_td3_module
 from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
 from brain_uav.models import V2SNNPolicyActor
 from brain_uav.observations import V2ObservationBatch, collate_v2_observations
@@ -378,6 +379,114 @@ def _compile_warmup_batches(
     return tuple(batches)
 
 
+def _warmup_online_critic_normal_only(
+    engine,
+    batches: Sequence[V2ObservationBatch],
+) -> None:
+    """Compile ordinary critic forwards without exercising the frozen path."""
+
+    warmup_batches = tuple(batches)
+    if not warmup_batches:
+        raise ValueError('At least one compile warmup batch is required.')
+    critic_parameters = tuple(engine.critic1.parameters()) + tuple(
+        engine.critic2.parameters()
+    )
+    requires_grad = tuple(parameter.requires_grad for parameter in critic_parameters)
+    gradient_state = tuple(
+        (
+            parameter.grad,
+            None if parameter.grad is None else parameter.grad.detach().clone(),
+        )
+        for parameter in critic_parameters
+    )
+    torch_rng_state = torch.random.get_rng_state()
+    numpy_rng_state = np.random.get_state()
+    cuda_rng_state = (
+        torch.cuda.get_rng_state_all() if engine.device.type == 'cuda' else None
+    )
+    counts_before = (
+        engine.update_count,
+        engine.critic_update_count,
+        engine.critic_target_update_count,
+        engine.actor_update_count,
+        engine.last_total_steps,
+    )
+    try:
+        for batch in warmup_batches:
+            device_batch = batch.to(engine.device)
+            shared_relations = engine._build_shared_relations(device_batch)
+            action = torch.zeros(
+                (device_batch.batch_size, engine.action_dim),
+                dtype=torch.float32,
+                device=engine.device,
+            )
+            engine.critic_optimizer.zero_grad(set_to_none=True)
+            critic_sum = engine.critic1(
+                device_batch,
+                action,
+                shared_relations=shared_relations,
+            ).sum() + engine.critic2(
+                device_batch,
+                action,
+                shared_relations=shared_relations,
+            ).sum()
+            critic_sum.backward()
+            engine.critic_optimizer.zero_grad(set_to_none=True)
+    finally:
+        for parameter, required, (original_grad, saved_grad) in zip(
+            critic_parameters,
+            requires_grad,
+            gradient_state,
+        ):
+            parameter.requires_grad_(required)
+            if original_grad is None:
+                parameter.grad = None
+            else:
+                original_grad.copy_(saved_grad)
+                parameter.grad = original_grad
+        torch.random.set_rng_state(torch_rng_state)
+        np.random.set_state(numpy_rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_state)
+    counts_after = (
+        engine.update_count,
+        engine.critic_update_count,
+        engine.critic_target_update_count,
+        engine.actor_update_count,
+        engine.last_total_steps,
+    )
+    if counts_after != counts_before:
+        raise RuntimeError('Compile warmup must not change TD3 update counters.')
+
+
+def _configure_group_compilation(
+    engine,
+    group: str,
+    batches: Sequence[V2ObservationBatch],
+) -> list[str]:
+    group_name = str(group).upper()
+    if group_name not in ('A', 'B', 'C'):
+        raise ValueError('compiled numerics group must be A, B, or C.')
+    enabled = list(engine.enable_online_critic_encoder_compile(
+        backend='inductor', mode='default', fullgraph=True, dynamic=True,
+    ) or ('critic1.zone_set_encoder', 'critic2.zone_set_encoder'))
+    if group_name == 'A':
+        _warmup_online_critic_normal_only(engine, batches)
+    else:
+        engine.warmup_online_critic_encoder_compile(batches)
+    if group_name == 'C':
+        targets = engine.enable_target_encoder_compile(
+            backend='inductor', mode='default', fullgraph=True, dynamic=True,
+        ) or (
+            'actor_target.zone_set_encoder',
+            'critic1_target.zone_set_encoder',
+            'critic2_target.zone_set_encoder',
+        )
+        enabled.extend(targets)
+        engine.warmup_target_encoder_compile(batches)
+    return enabled
+
+
 def _compare_compiled_numeric_tensors(
     reference: Mapping[str, torch.Tensor],
     compiled: Mapping[str, torch.Tensor],
@@ -541,6 +650,290 @@ def _fixed_numeric_replay_batch(
         near_goal=torch.ones_like(zeros),
         line_to_goal_safe=torch.ones_like(zeros),
     )
+
+
+_LOCALIZATION_STAGE_ORDER = (
+    'target_forward',
+    'online_forward_and_loss',
+    'backward_pre_clip_gradients',
+    'optimizer_step',
+)
+
+
+def _capture_critic_only_update_stages(
+    engine,
+    batch: V2ReplayBatch,
+    *,
+    total_steps: int,
+    execution: str = 'unspecified',
+) -> dict[str, Any]:
+    """Capture one real critic-only update with temporary, removable hooks."""
+
+    captures: dict[str, Any] = {
+        stage: {} for stage in _LOCALIZATION_STAGE_ORDER
+    }
+    handles: list[Any] = []
+    original_sample = engine.replay.sample
+    original_functional = v2_td3_module.F
+    parameter_before: dict[str, torch.Tensor] = {}
+
+    def save_forward(stage: str, name: str):
+        def hook(_module, _inputs, output):
+            captures[stage][name] = output.detach().cpu().clone()
+        return hook
+
+    for module, stage, name in (
+        (engine.actor_target, 'target_forward', 'actor_target'),
+        (engine.critic1_target, 'target_forward', 'critic1_target'),
+        (engine.critic2_target, 'target_forward', 'critic2_target'),
+        (engine.critic1, 'online_forward_and_loss', 'critic1'),
+        (engine.critic2, 'online_forward_and_loss', 'critic2'),
+    ):
+        handles.append(module.register_forward_hook(save_forward(stage, name)))
+
+    qualified_parameters: list[tuple[str, torch.nn.Parameter]] = []
+    for critic_name in ('critic1', 'critic2'):
+        critic = getattr(engine, critic_name)
+        for parameter_name, parameter in critic.named_parameters():
+            qualified_name = f'{critic_name}.{parameter_name}'
+            qualified_parameters.append((qualified_name, parameter))
+            parameter_before[qualified_name] = parameter.detach().cpu().clone()
+            captures['backward_pre_clip_gradients'][qualified_name] = None
+
+            def gradient_hook(gradient, name=qualified_name):
+                captures['backward_pre_clip_gradients'][name] = (
+                    gradient.detach().cpu().clone()
+                )
+                return gradient
+
+            handles.append(parameter.register_hook(gradient_hook))
+
+    mse_calls = 0
+    original_mse_loss = original_functional.mse_loss
+
+    class _FunctionalProxy:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(original_functional, name)
+
+        def mse_loss(self, input, target, *args, **kwargs):
+            nonlocal mse_calls
+            if mse_calls == 0:
+                captures['target_forward']['td_target'] = (
+                    target.detach().cpu().clone()
+                )
+            mse_calls += 1
+            return original_mse_loss(input, target, *args, **kwargs)
+
+    try:
+        engine.replay.sample = lambda batch_size: batch
+        v2_td3_module.F = _FunctionalProxy()
+        metrics = engine.update_once(total_steps=total_steps, bc_lambda=0.0)
+        if metrics.actor_updated or metrics.critic_targets_updated:
+            raise AssertionError(
+                'Grouped numeric localization requires a critic-only update.'
+            )
+        captures['online_forward_and_loss']['critic_loss'] = torch.as_tensor(
+            metrics.critic_loss,
+            dtype=torch.float32,
+        )
+        for qualified_name, parameter in qualified_parameters:
+            prefix = f'{qualified_name}'
+            optimizer_state = engine.critic_optimizer.state.get(parameter)
+            captures['optimizer_step'][f'parameter_before.{prefix}'] = (
+                parameter_before[qualified_name]
+            )
+            captures['optimizer_step'][f'parameter_after.{prefix}'] = (
+                parameter.detach().cpu().clone()
+            )
+            captures['optimizer_step'][f'adam_exists.{prefix}'] = torch.tensor(
+                optimizer_state is not None
+            )
+            for field in ('step', 'exp_avg', 'exp_avg_sq'):
+                value = None if optimizer_state is None else optimizer_state.get(field)
+                captures['optimizer_step'][f'adam_{field}.{prefix}'] = (
+                    None
+                    if value is None
+                    else torch.as_tensor(value).detach().cpu().clone()
+                )
+        captures['empty_scene_tokens'] = _empty_token_states(engine)
+        captures['batch'] = {
+            'batch_size': batch.batch_size,
+            'zero_zone_sample_count': _zero_zone_sample_count(batch.obs),
+        }
+        return captures
+    except BaseException as exc:
+        print(json.dumps({
+            'compiled_numeric_group_execution_error': {
+                'execution': execution,
+                'exception_type': type(exc).__name__,
+                'message': str(exc),
+                'captured_stages': [
+                    stage for stage in _LOCALIZATION_STAGE_ORDER
+                    if any(value is not None for value in captures[stage].values())
+                ],
+            },
+        }, allow_nan=False, ensure_ascii=False), flush=True)
+        raise
+    finally:
+        engine.replay.sample = original_sample
+        v2_td3_module.F = original_functional
+        for handle in reversed(handles):
+            handle.remove()
+
+
+def _numeric_value_difference(
+    reference: torch.Tensor | None,
+    compiled: torch.Tensor | None,
+    *,
+    rtol: float,
+    atol: float,
+) -> tuple[bool, float | None]:
+    if (reference is None) != (compiled is None):
+        return True, None
+    if reference is None:
+        return False, None
+    if reference.shape != compiled.shape or reference.dtype != compiled.dtype:
+        return True, None
+    if reference.dtype == torch.bool:
+        difference = compiled != reference
+        maximum = float(difference.any().item()) if difference.numel() else 0.0
+    else:
+        difference = (compiled - reference).abs()
+        maximum = float(difference.max().item()) if difference.numel() else 0.0
+    return not torch.allclose(compiled, reference, rtol=rtol, atol=atol), maximum
+
+
+def _compare_localization_stages(
+    eager: Mapping[str, Mapping[str, torch.Tensor | None]],
+    compiled: Mapping[str, Mapping[str, torch.Tensor | None]],
+    *,
+    rtol: float,
+    atol: float,
+) -> dict[str, Any]:
+    stages: dict[str, Any] = {}
+    earliest = None
+    for stage in _LOCALIZATION_STAGE_ORDER:
+        eager_values = eager.get(stage, {})
+        compiled_values = compiled.get(stage, {})
+        names = sorted(set(eager_values) | set(compiled_values))
+        differences: list[tuple[str, float | None]] = []
+        for name in names:
+            if name not in eager_values or name not in compiled_values:
+                differences.append((name, None))
+                continue
+            differs, maximum = _numeric_value_difference(
+                eager_values[name],
+                compiled_values[name],
+                rtol=rtol,
+                atol=atol,
+            )
+            if differs:
+                differences.append((name, maximum))
+        finite_maxima = [value for _, value in differences if value is not None]
+        other = [
+            item for item in differences if '.empty_scene_token' not in item[0]
+        ]
+        other_maxima = [value for _, value in other if value is not None]
+        stages[stage] = {
+            'difference_count': len(differences),
+            'maximum_absolute_difference': (
+                max(finite_maxima) if finite_maxima else None
+            ),
+            'first_difference_name': differences[0][0] if differences else None,
+            'other_parameter_difference_count': len(other),
+            'other_parameter_maximum_absolute_difference': (
+                max(other_maxima) if other_maxima else None
+            ),
+            'other_parameter_first_difference_name': (
+                other[0][0] if other else None
+            ),
+        }
+        if differences and earliest is None:
+            earliest = stage
+    return {
+        'passed': earliest is None,
+        'earliest_difference_stage': earliest,
+        'stages': stages,
+        'rtol': rtol,
+        'atol': atol,
+    }
+
+
+def _empty_token_localization_record(
+    captures: Mapping[str, Any],
+    critic_name: str,
+) -> dict[str, Any]:
+    states = captures.get('empty_scene_tokens', {})
+    state = states.get(critic_name)
+    if state is None:
+        return {}
+    prefix = f'{critic_name}.zone_set_encoder.empty_scene_token'
+    optimizer = captures['optimizer_step']
+    before = optimizer[f'parameter_before.{prefix}']
+    after = optimizer[f'parameter_after.{prefix}']
+    return {
+        'gradient': _gradient_diagnostic_summary(state['gradient']),
+        'parameter_delta': _gradient_diagnostic_summary(after - before),
+        'adam': _adam_diagnostic_summary(state),
+    }
+
+
+def _report_group_localization(
+    group: str,
+    eager: Mapping[str, Any],
+    compiled: Mapping[str, Any],
+) -> dict[str, Any]:
+    comparison = _compare_localization_stages(
+        eager,
+        compiled,
+        rtol=COMPILED_NUMERIC_RTOL,
+        atol=COMPILED_NUMERIC_ATOL,
+    )
+    comparison['group'] = str(group).upper()
+    comparison['update_index'] = 1
+    comparison['update'] = 'critic_only_with_one_zero_zone_sample'
+    comparison['batch'] = eager.get('batch', {})
+    comparison['empty_scene_tokens'] = {}
+    for critic_name in ('critic1', 'critic2'):
+        eager_state = eager.get('empty_scene_tokens', {}).get(critic_name)
+        compiled_state = compiled.get('empty_scene_tokens', {}).get(critic_name)
+        record = {
+            'eager': _empty_token_localization_record(eager, critic_name),
+            'compiled': _empty_token_localization_record(compiled, critic_name),
+            'differences': {},
+        }
+        if eager_state is not None and compiled_state is not None:
+            differences = _empty_token_pair_differences(
+                eager_state,
+                compiled_state,
+            )
+            prefix = f'{critic_name}.zone_set_encoder.empty_scene_token'
+            eager_optimizer = eager['optimizer_step']
+            compiled_optimizer = compiled['optimizer_step']
+            eager_delta = (
+                eager_optimizer[f'parameter_after.{prefix}']
+                - eager_optimizer[f'parameter_before.{prefix}']
+            )
+            compiled_delta = (
+                compiled_optimizer[f'parameter_after.{prefix}']
+                - compiled_optimizer[f'parameter_before.{prefix}']
+            )
+            differences['parameter_delta_maximum_absolute_difference'] = (
+                _optional_maximum_absolute_difference(eager_delta, compiled_delta)
+            )
+            record['differences'] = differences
+        comparison['empty_scene_tokens'][critic_name] = record
+    print(json.dumps(
+        {'compiled_numeric_group_localization': comparison},
+        allow_nan=False,
+        ensure_ascii=False,
+    ), flush=True)
+    if not comparison['passed']:
+        raise AssertionError(
+            'Compiled numeric group localization first differed at '
+            f"{comparison['earliest_difference_stage']}."
+        )
+    return comparison
 
 
 def _empty_token_state(engine, critic_name: str) -> dict[str, Any]:
@@ -1031,6 +1424,129 @@ def _run_compiled_numerics_check(
         torch.cuda.set_rng_state_all(cuda_rng_state)
 
 
+def _run_grouped_compiled_numerics_diagnostic(
+    *,
+    group: str,
+    pool: V2ValidationPool,
+    prepared,
+    formal_config: V2FormalTrainingConfig,
+    bc_checkpoint: Path,
+    device: torch.device,
+    snn_time_window: int,
+) -> dict[str, Any]:
+    """Run one isolated eager/compiled critic-only localization update."""
+
+    group_name = str(group).upper()
+    if group_name not in ('A', 'B', 'C'):
+        raise ValueError('compiled numerics group must be A, B, or C.')
+    torch_rng_state = torch.random.get_rng_state()
+    numpy_rng_state = np.random.get_state()
+    cuda_rng_state = torch.cuda.get_rng_state_all()
+    eager_components = None
+    compiled_components = None
+    eager = None
+    compiled = None
+    fixed_batch = None
+    try:
+        eager_components = build_v2_stage_engine(
+            None,
+            formal_config,
+            init_checkpoint=bc_checkpoint,
+            rewards=None,
+            uav_collision_radius=None,
+            device=device,
+            model_type='ann',
+            snn_time_window=snn_time_window,
+            prepared_initialization=prepared,
+        )
+        compiled_components = build_v2_stage_engine(
+            None,
+            formal_config,
+            init_checkpoint=bc_checkpoint,
+            rewards=None,
+            uav_collision_radius=None,
+            device=device,
+            model_type='ann',
+            snn_time_window=snn_time_window,
+            prepared_initialization=prepared,
+        )
+        eager = eager_components.engine
+        compiled = compiled_components.engine
+        compiled.load_checkpoint_state_dict(eager.checkpoint_state_dict())
+        warmup_batches = _compile_warmup_batches(
+            pool=pool,
+            prepared=prepared,
+            batch_size=eager.batch_size,
+            device=device,
+        )
+        mixed_observation, _ = _numeric_diagnostic_observation_batches(
+            warmup_batches,
+            device=device,
+        )
+        compilation_batches = tuple(warmup_batches) + (mixed_observation,)
+        enabled_objects = _configure_group_compilation(
+            compiled,
+            group_name,
+            compilation_batches,
+        )
+        fixed_batch = _fixed_numeric_replay_batch(
+            mixed_observation,
+            action_dim=eager.action_dim,
+            device=device,
+        )
+        update_torch_rng_state = torch.random.get_rng_state()
+        update_numpy_rng_state = np.random.get_state()
+        update_cuda_rng_state = torch.cuda.get_rng_state_all()
+        eager_capture = _capture_critic_only_update_stages(
+            eager,
+            fixed_batch,
+            total_steps=1,
+            execution='eager',
+        )
+        torch.random.set_rng_state(update_torch_rng_state)
+        np.random.set_state(update_numpy_rng_state)
+        torch.cuda.set_rng_state_all(update_cuda_rng_state)
+        compiled_capture = _capture_critic_only_update_stages(
+            compiled,
+            fixed_batch,
+            total_steps=1,
+            execution='compiled',
+        )
+        comparison = _report_group_localization(
+            group_name,
+            eager_capture,
+            compiled_capture,
+        )
+        return {
+            'requested': True,
+            'group': group_name,
+            'passed': comparison['passed'],
+            'device': str(device),
+            'compiled_objects': enabled_objects,
+            'batch_size': fixed_batch.batch_size,
+            'zero_zone_sample_count': _zero_zone_sample_count(fixed_batch.obs),
+            'earliest_difference_stage': comparison[
+                'earliest_difference_stage'
+            ],
+            'rtol': COMPILED_NUMERIC_RTOL,
+            'atol': COMPILED_NUMERIC_ATOL,
+            'measurement_note': (
+                'Localization-only run in an independent process; compilation, '
+                'warmup, and this update are not stable timing samples.'
+            ),
+        }
+    finally:
+        fixed_batch = None
+        eager = None
+        compiled = None
+        eager_components = None
+        compiled_components = None
+        gc.collect()
+        torch.random.set_rng_state(torch_rng_state)
+        np.random.set_state(numpy_rng_state)
+        torch.cuda.set_rng_state_all(cuda_rng_state)
+
+
 def _run_diagnostic_level(
     *,
     level: str,
@@ -1485,6 +2001,7 @@ def run_v2_td3_timing_diagnostic(
     compile_critic_encoder: bool = False,
     compile_target_encoders: bool = False,
     check_compiled_numerics: bool = False,
+    compiled_numerics_group: str | None = None,
 ) -> dict[str, Any]:
     if model not in ('ann', 'snn'):
         raise ValueError('model must be ann or snn.')
@@ -1505,6 +2022,22 @@ def run_v2_td3_timing_diagnostic(
         raise TypeError('compile_target_encoders must be a bool.')
     if type(check_compiled_numerics) is not bool:
         raise TypeError('check_compiled_numerics must be a bool.')
+    if compiled_numerics_group is not None:
+        if type(compiled_numerics_group) is not str:
+            raise TypeError('compiled_numerics_group must be a string or None.')
+        compiled_numerics_group = compiled_numerics_group.upper()
+        if compiled_numerics_group not in ('A', 'B', 'C'):
+            raise ValueError('compiled_numerics_group must be A, B, or C.')
+        if (
+            compile_critic_encoder
+            or compile_target_encoders
+            or check_compiled_numerics
+            or profiler_updates
+        ):
+            raise ValueError(
+                'compiled_numerics_group is an isolated mode and cannot be '
+                'combined with compile/profiler timing options.'
+            )
     if compile_target_encoders and not compile_critic_encoder:
         raise ValueError(
             'compile_target_encoders requires compile_critic_encoder.'
@@ -1519,6 +2052,8 @@ def run_v2_td3_timing_diagnostic(
         )
     if compile_critic_encoder and model != 'ann':
         raise ValueError('compile_critic_encoder is limited to the ANN diagnostic.')
+    if compiled_numerics_group is not None and model != 'ann':
+        raise ValueError('compiled_numerics_group is limited to the ANN diagnostic.')
     if steps < pool_count:
         raise ValueError('steps_per_level must be at least scenario_count.')
     run_seed = _nonnegative_int(seed, name='seed')
@@ -1530,6 +2065,8 @@ def run_v2_td3_timing_diagnostic(
     target_device = torch.device(resolved_device)
     if check_compiled_numerics and target_device.type != 'cuda':
         raise ValueError('check_compiled_numerics requires a CUDA diagnostic.')
+    if compiled_numerics_group is not None and target_device.type != 'cuda':
+        raise ValueError('compiled_numerics_group requires a CUDA diagnostic.')
     output = Path(output_dir)
     if output.exists():
         raise FileExistsError(f'Use a fresh diagnostic output directory: {output}')
@@ -1571,6 +2108,41 @@ def run_v2_td3_timing_diagnostic(
         uav_collision_radius=prepared.uav_collision_radius,
     )
     pool_prepare_seconds = perf_counter() - pool_started
+    if compiled_numerics_group is not None:
+        localization = _run_grouped_compiled_numerics_diagnostic(
+            group=compiled_numerics_group,
+            pool=pools['easy'],
+            prepared=prepared,
+            formal_config=config,
+            bc_checkpoint=checkpoint,
+            device=target_device,
+            snn_time_window=snn_time_window,
+        )
+        output.mkdir(parents=True, exist_ok=False)
+        summary = {
+            'format': DIAGNOSTIC_FORMAT,
+            'format_version': DIAGNOSTIC_VERSION,
+            'formal_stage_passed': False,
+            'purpose': 'compiled_numeric_group_localization_only',
+            'model': model,
+            'requested_device': requested_device,
+            'resolved_device': resolved_device,
+            'seed': run_seed,
+            'validation_seed': pool_seed,
+            'bc_checkpoint': str(checkpoint.resolve()),
+            'scenario_pool_directory': str(Path(scenario_pool_dir).resolve()),
+            'scenario_pool_prepare_wall_seconds': pool_prepare_seconds,
+            'compiled_numeric_group_localization': localization,
+            'timing_levels_executed': 0,
+        }
+        summary = json.loads(json.dumps(
+            summary,
+            allow_nan=False,
+            ensure_ascii=False,
+        ))
+        _strict_json_write(output / 'diagnostic_summary.json', summary)
+        print(json.dumps(summary, allow_nan=False, ensure_ascii=False), flush=True)
+        return summary
     compiled_numerics = {
         'requested': False,
         'passed': None,
@@ -1760,6 +2332,15 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Run an isolated CUDA eager-versus-compiled TD3 numeric check.',
     )
+    parser.add_argument(
+        '--compiled-numerics-group',
+        choices=('A', 'B', 'C'),
+        default=None,
+        help=(
+            'Run only grouped CUDA localization A, B, or C, then exit without '
+            'the normal timing loop.'
+        ),
+    )
     return parser
 
 
@@ -1783,6 +2364,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         compile_critic_encoder=args.compile_critic_encoder,
         compile_target_encoders=args.compile_target_encoders,
         check_compiled_numerics=args.check_compiled_numerics,
+        compiled_numerics_group=args.compiled_numerics_group,
     )
 
 

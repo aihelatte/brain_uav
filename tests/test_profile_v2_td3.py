@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stdout
+from copy import deepcopy
 from io import StringIO
 import json
 from pathlib import Path
@@ -21,12 +22,17 @@ from brain_uav.scripts.profile_v2_td3 import (
     _UpdateTimingSummary,
     _DetailedUpdateProfiler,
     _compare_compiled_numeric_tensors,
+    _compare_localization_stages,
     _compare_optional_numeric_tensor,
+    _configure_group_compilation,
+    _capture_critic_only_update_stages,
     _fixed_numeric_replay_batch,
     _gradient_diagnostic_summary,
     _prepare_diagnostic_pools,
     _run_compiled_numerics_check,
     _report_and_validate_empty_token_update,
+    _report_group_localization,
+    _run_grouped_compiled_numerics_diagnostic,
     _zero_zone_sample_count,
     _run_diagnostic_level,
     build_parser,
@@ -383,6 +389,7 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertFalse(args.compile_critic_encoder)
         self.assertFalse(args.compile_target_encoders)
         self.assertFalse(args.check_compiled_numerics)
+        self.assertIsNone(args.compiled_numerics_group)
         enabled = build_parser().parse_args([
             '--model', 'ann', '--bc-checkpoint', 'bc.pt',
             '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
@@ -403,6 +410,48 @@ class TestProfileV2TD3(unittest.TestCase):
         ])
         self.assertTrue(extended.compile_target_encoders)
         self.assertTrue(extended.check_compiled_numerics)
+        grouped = build_parser().parse_args([
+            '--model', 'ann', '--bc-checkpoint', 'bc.pt',
+            '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
+            '--compiled-numerics-group', 'B',
+        ])
+        self.assertEqual(grouped.compiled_numerics_group, 'B')
+
+    def test_grouped_compile_modes_have_only_declared_warmup_differences(self) -> None:
+        expected = {
+            'A': ['enable_online', 'warmup_normal'],
+            'B': ['enable_online', 'warmup_full'],
+            'C': [
+                'enable_online', 'warmup_full',
+                'enable_target', 'warmup_target',
+            ],
+        }
+        for group, expected_events in expected.items():
+            with self.subTest(group=group):
+                events = []
+                engine = SimpleNamespace(
+                    enable_online_critic_encoder_compile=(
+                        lambda **kwargs: events.append('enable_online')
+                    ),
+                    warmup_online_critic_encoder_compile=(
+                        lambda batches: events.append('warmup_full')
+                    ),
+                    enable_target_encoder_compile=(
+                        lambda **kwargs: events.append('enable_target')
+                    ),
+                    warmup_target_encoder_compile=(
+                        lambda batches: events.append('warmup_target')
+                    ),
+                )
+                with mock.patch(
+                    'brain_uav.scripts.profile_v2_td3.'
+                    '_warmup_online_critic_normal_only',
+                    side_effect=lambda engine, batches: events.append(
+                        'warmup_normal'
+                    ),
+                ):
+                    _configure_group_compilation(engine, group, ('batch',))
+                self.assertEqual(events, expected_events)
 
     def test_compiled_critic_encoder_reports_separate_warmup_and_stable_timing(self) -> None:
         result, replay, _ = self.run_small_level(
@@ -598,6 +647,142 @@ class TestProfileV2TD3(unittest.TestCase):
             0.1,
             places=6,
         )
+
+    def test_group_localization_reports_earliest_difference_before_failure(self) -> None:
+        eager = {
+            'target_forward': {'actor': torch.zeros(2), 'td_target': torch.ones(1)},
+            'online_forward_and_loss': {
+                'critic1': torch.zeros(1), 'critic_loss': torch.tensor(1.0),
+            },
+            'backward_pre_clip_gradients': {'critic1.weight': torch.ones(2)},
+            'optimizer_step': {'parameters.critic1.weight': torch.ones(2)},
+        }
+        compiled = deepcopy(eager)
+        compiled['online_forward_and_loss']['critic1'] = torch.ones(1)
+        compiled['backward_pre_clip_gradients']['critic1.weight'] = torch.zeros(2)
+        comparison = _compare_localization_stages(
+            eager,
+            compiled,
+            rtol=1e-4,
+            atol=1e-5,
+        )
+        self.assertEqual(
+            comparison['earliest_difference_stage'],
+            'online_forward_and_loss',
+        )
+        self.assertEqual(
+            comparison['stages']['backward_pre_clip_gradients'][
+                'difference_count'
+            ],
+            1,
+        )
+
+        output = StringIO()
+        with redirect_stdout(output), self.assertRaisesRegex(
+            AssertionError,
+            'online_forward_and_loss',
+        ):
+            _report_group_localization('A', eager, compiled)
+        record = json.loads(output.getvalue())['compiled_numeric_group_localization']
+        self.assertEqual(
+            record['earliest_difference_stage'],
+            'online_forward_and_loss',
+        )
+
+    def test_capture_hooks_are_removed_after_success_and_exception(self) -> None:
+        fixture = v2_td3_tests.TestV2TD3()
+        fixture.setUp()
+        engine = fixture.make_engine(policy_delay=2)
+        observation = v2_td3_tests.collate_v2_observations([
+            v2_td3_tests._observation(0, scales=fixture.scales),
+            v2_td3_tests._observation(3, scales=fixture.scales),
+        ])
+        batch = _fixed_numeric_replay_batch(
+            observation,
+            action_dim=2,
+            device=torch.device('cpu'),
+        )
+        hooked_modules = (
+            engine.actor_target,
+            engine.critic1_target,
+            engine.critic2_target,
+            engine.critic1,
+            engine.critic2,
+        )
+        parameters = tuple(engine.critic1.parameters()) + tuple(
+            engine.critic2.parameters()
+        )
+
+        captured = _capture_critic_only_update_stages(
+            engine,
+            batch,
+            total_steps=1,
+        )
+        self.assertIn('td_target', captured['target_forward'])
+        self.assertTrue(all(not module._forward_hooks for module in hooked_modules))
+        self.assertTrue(all(not parameter._backward_hooks for parameter in parameters))
+
+        with mock.patch.object(
+            engine,
+            'update_once',
+            side_effect=RuntimeError('controlled update failure'),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'controlled update failure'):
+                _capture_critic_only_update_stages(
+                    engine,
+                    batch,
+                    total_steps=1,
+                )
+        self.assertTrue(all(not module._forward_hooks for module in hooked_modules))
+        self.assertTrue(all(not parameter._backward_hooks for parameter in parameters))
+
+    def test_grouped_diagnostic_uses_independent_equalized_engines(self) -> None:
+        fixture = v2_td3_tests.TestV2TD3()
+        fixture.setUp()
+        eager = fixture.make_engine(policy_delay=2)
+        compiled = fixture.make_engine(policy_delay=2)
+        observation = v2_td3_tests.collate_v2_observations([
+            v2_td3_tests._observation(0, scales=fixture.scales),
+            v2_td3_tests._observation(3, scales=fixture.scales),
+        ])
+        with mock.patch(
+            'brain_uav.scripts.profile_v2_td3.build_v2_stage_engine',
+            side_effect=(
+                SimpleNamespace(engine=eager),
+                SimpleNamespace(engine=compiled),
+            ),
+        ), mock.patch(
+            'brain_uav.scripts.profile_v2_td3._compile_warmup_batches',
+            return_value=(observation,),
+        ), mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), redirect_stdout(StringIO()):
+            result = _run_grouped_compiled_numerics_diagnostic(
+                group='A',
+                pool=SimpleNamespace(),
+                prepared=SimpleNamespace(),
+                formal_config=V2FormalTrainingConfig(
+                    stage='easy', replay_capacity=32, batch_size=2,
+                    actor_freeze_steps=0,
+                ),
+                bc_checkpoint=Path('unused.pt'),
+                device=torch.device('cpu'),
+                snn_time_window=4,
+            )
+
+        self.assertTrue(result['passed'])
+        self.assertIsNot(eager, compiled)
+        self.assertEqual(eager.update_count, 1)
+        self.assertEqual(compiled.update_count, 1)
+        for eager_model, compiled_model in (
+            (eager.actor, compiled.actor),
+            (eager.critic1, compiled.critic1),
+            (eager.critic2, compiled.critic2),
+        ):
+            fixture.assert_state_dict_equal(
+                eager_model.state_dict(), compiled_model.state_dict()
+            )
         with self.assertRaisesRegex(AssertionError, 'exp_avg'):
             _compare_optional_numeric_tensor(
                 torch.zeros(2),
@@ -605,6 +790,68 @@ class TestProfileV2TD3(unittest.TestCase):
                 name='critic1.empty_scene_token.adam.exp_avg',
                 rtol=1e-4,
                 atol=1e-5,
+            )
+
+    def test_grouped_mode_exits_before_regular_timing(self) -> None:
+        prepared = SimpleNamespace(
+            bc_initialization=SimpleNamespace(actor=torch.nn.Linear(1, 1)),
+            scenario_config=make_scenario_config(),
+            uav_collision_radius=0.0,
+        )
+        localization = {
+            'requested': True,
+            'group': 'B',
+            'passed': True,
+            'device': 'cuda',
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / 'group-b'
+            with mock.patch(
+                'brain_uav.scripts.profile_v2_td3.resolve_training_device',
+                return_value='cuda',
+            ), mock.patch(
+                'brain_uav.scripts.profile_v2_td3._load_diagnostic_initialization',
+                return_value=prepared,
+            ), mock.patch(
+                'brain_uav.scripts.profile_v2_td3._prepare_diagnostic_pools',
+                return_value={'easy': SimpleNamespace()},
+            ), mock.patch(
+                'brain_uav.scripts.profile_v2_td3.'
+                '_run_grouped_compiled_numerics_diagnostic',
+                return_value=localization,
+            ) as group_runner, mock.patch(
+                'brain_uav.scripts.profile_v2_td3._run_diagnostic_level',
+                side_effect=AssertionError('regular timing must not run'),
+            ) as level_runner, redirect_stdout(StringIO()):
+                summary = run_v2_td3_timing_diagnostic(
+                    model='ann',
+                    bc_checkpoint=root / 'bc.pt',
+                    output_dir=output,
+                    scenario_pool_dir=root / 'pools',
+                    device='cuda',
+                    steps_per_level=3,
+                    scenario_count=3,
+                    compiled_numerics_group='B',
+                )
+
+            persisted = json.loads(
+                (output / 'diagnostic_summary.json').read_text(encoding='utf-8')
+            )
+        self.assertEqual(summary, persisted)
+        self.assertEqual(summary['purpose'], 'compiled_numeric_group_localization_only')
+        self.assertEqual(summary['timing_levels_executed'], 0)
+        group_runner.assert_called_once()
+        level_runner.assert_not_called()
+
+        with self.assertRaisesRegex(ValueError, 'isolated mode'):
+            run_v2_td3_timing_diagnostic(
+                model='ann',
+                bc_checkpoint=Path('unused.pt'),
+                output_dir=Path('unused-output'),
+                scenario_pool_dir=Path('unused-pools'),
+                compiled_numerics_group='A',
+                compile_critic_encoder=True,
             )
 
     def test_compiled_numeric_check_runs_isolated_fixed_updates(self) -> None:
