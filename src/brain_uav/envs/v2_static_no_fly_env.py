@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from copy import deepcopy
 from math import isfinite
 from typing import Any
@@ -156,8 +157,48 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         self.observation_space = None
         self.zones: list[NoFlyZone] = []
         self.scenario_metadata: dict[str, Any] = {}
+        self._performance_diagnostic = None
+
+    def set_performance_diagnostic(self, recorder: Any | None) -> None:
+        """Attach a diagnostic-only recorder; normal environments leave it unset."""
+
+        if recorder is not None and not all(
+            callable(getattr(recorder, name, None))
+            for name in (
+                'begin_step', 'end_step', 'begin_reset', 'end_reset',
+                'section', 'source', 'attach_zones',
+            )
+        ):
+            raise TypeError('performance diagnostic recorder is incompatible.')
+        self._performance_diagnostic = recorder
+        if recorder is not None and self.zones:
+            recorder.attach_zones(self.zones)
+
+    def _diagnostic_section(self, name: str):
+        recorder = self._performance_diagnostic
+        return nullcontext() if recorder is None else recorder.section(name)
+
+    def _diagnostic_source(self, name: str):
+        recorder = self._performance_diagnostic
+        return nullcontext() if recorder is None else recorder.source(name)
 
     def reset(
+        self,
+        *,
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[V2Observation, dict[str, Any]]:
+        recorder = self._performance_diagnostic
+        if recorder is None:
+            return self._reset_impl(seed=seed, options=options)
+        recorder.begin_reset()
+        try:
+            with self._diagnostic_source('reset'):
+                return self._reset_impl(seed=seed, options=options)
+        finally:
+            recorder.end_reset()
+
+    def _reset_impl(
         self,
         *,
         seed: int | None = None,
@@ -203,54 +244,71 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         self,
         action: np.ndarray,
     ) -> tuple[V2Observation, float, bool, bool, dict[str, Any]]:
-        action = np.asarray(action, dtype=np.float32).clip(
-            self.action_space.low,
-            self.action_space.high,
-        )
-        prev_state = self.state.copy()
-        prev_action = self.prev_action.copy()
-        prev_distance = self._goal_distance(prev_state[:3])
-        prev_best_goal_distance = self.best_goal_distance_so_far
-        self._apply_action(action)
-        self.last_delta_z = float(self.state[2] - prev_state[2])
-        self.steps += 1
-        self.trajectory.append(self.state[:3].copy())
-        new_distance = self._goal_distance(self.state[:3])
-        self.last_segment_goal_distance = self._segment_goal_distance(
-            prev_state[:3],
-            self.state[:3],
-        )
-        self.last_goal_reached_by_segment = (
-            self.last_segment_goal_distance <= self._active_goal_radius()
-        )
-        step_progress = prev_distance - new_distance
-        self._record_progress(step_progress)
-        terminated, truncated, outcome = self._termination(prev_state[:3])
-        point_clearances = self._point_clearances(self.state[:3])
-        reward = self._compute_reward(
-            prev_state,
-            prev_action,
-            prev_distance,
-            new_distance,
-            action,
-            outcome,
-            prev_best_goal_distance,
-            zone_point_clearances=point_clearances,
-        )
-        if new_distance < self.best_goal_distance_so_far:
-            self.best_goal_distance_so_far = new_distance
-        self.prev_action = action.copy()
-        return (
-            self._get_obs(zone_point_clearances=point_clearances),
-            float(reward),
-            terminated,
-            truncated,
-            self._info(
+        recorder = self._performance_diagnostic
+        if recorder is None:
+            return self._step_impl(action)
+        recorder.begin_step()
+        try:
+            return self._step_impl(action)
+        finally:
+            recorder.end_step()
+
+    def _step_impl(
+        self,
+        action: np.ndarray,
+    ) -> tuple[V2Observation, float, bool, bool, dict[str, Any]]:
+        with self._diagnostic_section('dynamics_position_progress'):
+            action = np.asarray(action, dtype=np.float32).clip(
+                self.action_space.low,
+                self.action_space.high,
+            )
+            prev_state = self.state.copy()
+            prev_action = self.prev_action.copy()
+            prev_distance = self._goal_distance(prev_state[:3])
+            prev_best_goal_distance = self.best_goal_distance_so_far
+            self._apply_action(action)
+            self.last_delta_z = float(self.state[2] - prev_state[2])
+            self.steps += 1
+            self.trajectory.append(self.state[:3].copy())
+            new_distance = self._goal_distance(self.state[:3])
+            self.last_segment_goal_distance = self._segment_goal_distance(
+                prev_state[:3],
+                self.state[:3],
+            )
+            self.last_goal_reached_by_segment = (
+                self.last_segment_goal_distance <= self._active_goal_radius()
+            )
+            step_progress = prev_distance - new_distance
+            self._record_progress(step_progress)
+        with self._diagnostic_section('termination'):
+            terminated, truncated, outcome = self._termination(prev_state[:3])
+        with self._diagnostic_section('current_point_clearance'):
+            point_clearances = self._point_clearances(self.state[:3])
+        with self._diagnostic_section('reward'):
+            reward = self._compute_reward(
+                prev_state,
+                prev_action,
+                prev_distance,
+                new_distance,
+                action,
+                outcome,
+                prev_best_goal_distance,
+                zone_point_clearances=point_clearances,
+            )
+            if new_distance < self.best_goal_distance_so_far:
+                self.best_goal_distance_so_far = new_distance
+            self.prev_action = action.copy()
+        with self._diagnostic_section('observation_construction'):
+            observation = self._get_obs(
+                zone_point_clearances=point_clearances
+            )
+        with self._diagnostic_section('info_construction'):
+            info = self._info(
                 progress=step_progress,
                 outcome=outcome,
                 zone_point_clearances=point_clearances,
-            ),
-        )
+            )
+        return observation, float(reward), terminated, truncated, info
 
     def render(self):
         raise NotImplementedError(
@@ -329,6 +387,8 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         self.state = _finite_vector(payload['state'], shape=(5,), name='scenario state')
         self.goal = _finite_vector(payload['goal'], shape=(3,), name='scenario goal')
         self.zones = zones
+        if self._performance_diagnostic is not None:
+            self._performance_diagnostic.attach_zones(self.zones)
         self.last_curriculum_level = str(payload.get('curriculum_level', 'custom'))
         self.scenario_metadata = _copy_scenario_metadata(payload.get('metadata'))
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from math import isfinite, pi
@@ -47,6 +47,20 @@ V2_TD3_UPDATE_TIMING_SECTIONS = (
     'critic_optimizer_step',
     'actor_update',
     'target_soft_update',
+)
+V2_TD3_UPDATE_DETAIL_SECTIONS = (
+    'critic_zero_grad',
+    'critic_loss_backward',
+    'actor_guidance_context',
+    'actor_forward',
+    'actor_q_rl_loss_and_scale',
+    'actor_bc_reference_forward_and_loss',
+    'actor_terminal_geometry_loss',
+    'actor_loss_composition_and_finite_check',
+    'actor_zero_grad',
+    'actor_backward',
+    'actor_gradient_check_and_clip',
+    'actor_optimizer_step',
 )
 
 V2PolicyActor = V2ANNPolicyActor | V2SNNPolicyActor
@@ -152,6 +166,52 @@ class _OptionalUpdateWallTimer:
     def finish(self) -> None:
         if self.recorder is not None:
             self.recorder(dict(self.values))
+
+
+class _OptionalUpdateDetailTimer:
+    """Optional nested wall/profiler regions that never synchronize CUDA."""
+
+    def __init__(
+        self,
+        recorder: Callable[[dict[str, Any]], None] | None,
+        profile_sections: bool,
+    ) -> None:
+        if recorder is not None and not callable(recorder):
+            raise TypeError(
+                'diagnostic_timing_recorder must be callable when provided.'
+            )
+        if type(profile_sections) is not bool:
+            raise TypeError('diagnostic_profile_sections must be a bool.')
+        self.recorder = recorder
+        self.profile_sections = profile_sections
+        self.wall_seconds = {
+            name: 0.0 for name in V2_TD3_UPDATE_DETAIL_SECTIONS
+        }
+        self.calls = {name: 0 for name in V2_TD3_UPDATE_DETAIL_SECTIONS}
+
+    @contextmanager
+    def section(self, name: str) -> Iterator[None]:
+        if name not in self.wall_seconds:
+            raise KeyError(f'Unknown TD3 detail timing section {name!r}.')
+        started = perf_counter() if self.recorder is not None else None
+        try:
+            if self.profile_sections:
+                with record_function(f'v2_td3.detail.{name}'):
+                    yield
+            else:
+                yield
+        finally:
+            if started is not None:
+                self.wall_seconds[name] += perf_counter() - started
+            if self.recorder is not None or self.profile_sections:
+                self.calls[name] += 1
+
+    def finish(self) -> None:
+        if self.recorder is not None:
+            self.recorder({
+                'wall_seconds': dict(self.wall_seconds),
+                'calls': dict(self.calls),
+            })
 
 
 class V2TD3UpdateEngine:
@@ -1455,8 +1515,26 @@ class V2TD3UpdateEngine:
         timing_recorder: Callable[[dict[str, float]], None] | None = None,
         reuse_shared_relations: bool = True,
         profile_sections: bool = False,
+        diagnostic_timing_recorder: (
+            Callable[[dict[str, Any]], None] | None
+        ) = None,
+        diagnostic_profile_sections: bool = False,
+        compiled_execution_recorder: Callable[[str], None] | None = None,
     ) -> V2TD3UpdateMetrics:
         update_timing = _OptionalUpdateWallTimer(timing_recorder)
+        detail_timing = _OptionalUpdateDetailTimer(
+            diagnostic_timing_recorder,
+            diagnostic_profile_sections,
+        )
+        if (
+            compiled_execution_recorder is not None
+            and not callable(compiled_execution_recorder)
+        ):
+            raise TypeError('compiled_execution_recorder must be callable.')
+
+        def record_compiled_execution(name: str) -> None:
+            if compiled_execution_recorder is not None:
+                compiled_execution_recorder(name)
         total_steps_value = _nonnegative_int(total_steps, name='total_steps')
         bc_lambda_value = _finite_float(bc_lambda, name='bc_lambda')
         if bc_lambda_value < 0.0:
@@ -1508,14 +1586,20 @@ class V2TD3UpdateEngine:
                             shared_relations=next_shared_relations,
                         )
                     if self._compiled_target_block is not None:
-                        next_action, target_q1, target_q2, target_q = (
-                            self._compiled_target_block(
-                                *target_arguments,
-                                noise,
-                                batch.reward,
-                                batch.done,
+                        record_compiled_execution('target_block')
+                        with (
+                            record_function('v2_td3.compiled.target_block')
+                            if diagnostic_profile_sections
+                            else nullcontext()
+                        ):
+                            next_action, target_q1, target_q2, target_q = (
+                                self._compiled_target_block(
+                                    *target_arguments,
+                                    noise,
+                                    batch.reward,
+                                    batch.done,
+                                )
                             )
-                        )
                     else:
                         next_action = self.actor_target(
                             batch.next_obs,
@@ -1526,14 +1610,22 @@ class V2TD3UpdateEngine:
                             torch.minimum(next_action, self.action_high),
                             self.action_low,
                         )
-                        next_action, target_q1, target_q2, target_q = (
-                            self._compiled_target_critic_td(
-                                *target_arguments,
-                                next_action,
-                                batch.reward,
-                                batch.done,
+                        record_compiled_execution('target_critic_td_block')
+                        with (
+                            record_function(
+                                'v2_td3.compiled.target_critic_td_block'
                             )
-                        )
+                            if diagnostic_profile_sections
+                            else nullcontext()
+                        ):
+                            next_action, target_q1, target_q2, target_q = (
+                                self._compiled_target_critic_td(
+                                    *target_arguments,
+                                    next_action,
+                                    batch.reward,
+                                    batch.done,
+                                )
+                            )
                 else:
                     next_action = self.actor_target(
                         batch.next_obs,
@@ -1588,11 +1680,19 @@ class V2TD3UpdateEngine:
                     batch.obs.presence_mask,
                     shared_relations=current_shared_relations,
                 )
-                current_q1, current_q2, critic_loss = self._compiled_critic_loss(
-                    *critic_arguments,
-                    batch.action,
-                    target_q,
-                )
+                record_compiled_execution('critic_block')
+                with (
+                    record_function('v2_td3.compiled.critic_block')
+                    if diagnostic_profile_sections
+                    else nullcontext()
+                ):
+                    current_q1, current_q2, critic_loss = (
+                        self._compiled_critic_loss(
+                            *critic_arguments,
+                            batch.action,
+                            target_q,
+                        )
+                    )
             else:
                 current_q1 = self.critic1(
                     batch.obs,
@@ -1615,18 +1715,28 @@ class V2TD3UpdateEngine:
                 total_steps=total_steps_value,
             )
         with update_timing.section('critic_backward'):
-            if profile_sections:
-                with record_function('v2_td3.critic_backward'):
-                    self.critic_optimizer.zero_grad(set_to_none=True)
-                    critic_loss.backward()
-            else:
-                self.critic_optimizer.zero_grad(set_to_none=True)
-                critic_loss.backward()
+            with (
+                record_function('v2_td3.critic_backward')
+                if profile_sections or diagnostic_profile_sections
+                else nullcontext()
+            ):
+                with detail_timing.section('critic_zero_grad'):
+                    if profile_sections:
+                        with record_function('v2_td3.critic_zero_grad'):
+                            self.critic_optimizer.zero_grad(set_to_none=True)
+                    else:
+                        self.critic_optimizer.zero_grad(set_to_none=True)
+                with detail_timing.section('critic_loss_backward'):
+                    if profile_sections:
+                        with record_function('v2_td3.critic_loss_backward'):
+                            critic_loss.backward()
+                    else:
+                        critic_loss.backward()
         with update_timing.section('critic_gradient_check_and_clip'):
             critic_parameters = list(self.critic1.parameters()) + list(
                 self.critic2.parameters()
             )
-            if profile_sections:
+            if profile_sections or diagnostic_profile_sections:
                 with record_function('v2_td3.critic_gradient_check_and_clip'):
                     self._validate_and_clip_gradients(
                         critic_parameters,
@@ -1642,7 +1752,7 @@ class V2TD3UpdateEngine:
                     total_steps=total_steps_value,
                 )
         with update_timing.section('critic_optimizer_step'):
-            if profile_sections:
+            if profile_sections or diagnostic_profile_sections:
                 with record_function('v2_td3.critic_optimizer_step'):
                     self.critic_optimizer.step()
             else:
@@ -1662,11 +1772,18 @@ class V2TD3UpdateEngine:
         actor_terms: _ActorLossTerms | None = None
         if actor_updated:
             with update_timing.section('actor_update'):
-                with self._actor_critic_guidance(
+                guidance = self._actor_critic_guidance(
                     batch.obs,
                     shared_relations=current_shared_relations,
                     profile_sections=profile_sections,
-                ) as critic_context:
+                )
+                guidance_entered = False
+                try:
+                    with detail_timing.section('actor_guidance_context'):
+                        critic_context = guidance.__enter__()
+                        guidance_entered = True
+                        if self.frozen_critic_strategy == 'compiled_no_grad_context':
+                            record_compiled_execution('frozen_critic_context')
                     actor_terms = self._compute_actor_loss_terms(
                         batch.obs,
                         batch.line_to_goal_safe,
@@ -1674,22 +1791,35 @@ class V2TD3UpdateEngine:
                         shared_relations=current_shared_relations,
                         profile_sections=profile_sections,
                         critic_context=critic_context,
+                        diagnostic_timing=detail_timing,
+                        compiled_execution_recorder=compiled_execution_recorder,
                     )
-                self._require_finite_loss(
-                    actor_terms.actor_loss,
-                    component='actor',
-                    total_steps=total_steps_value,
-                )
-                self.actor_optimizer.zero_grad(set_to_none=True)
-                actor_terms.actor_loss.backward()
-                actor_parameters = list(self.actor.parameters())
-                self._validate_and_clip_gradients(
-                    actor_parameters,
-                    max_norm=self.actor_grad_clip_norm,
-                    component='actor',
-                    total_steps=total_steps_value,
-                )
-                self.actor_optimizer.step()
+                finally:
+                    if guidance_entered:
+                        with detail_timing.section('actor_guidance_context'):
+                            guidance.__exit__(None, None, None)
+                with detail_timing.section(
+                    'actor_loss_composition_and_finite_check'
+                ):
+                    self._require_finite_loss(
+                        actor_terms.actor_loss,
+                        component='actor',
+                        total_steps=total_steps_value,
+                    )
+                with detail_timing.section('actor_zero_grad'):
+                    self.actor_optimizer.zero_grad(set_to_none=True)
+                with detail_timing.section('actor_backward'):
+                    actor_terms.actor_loss.backward()
+                with detail_timing.section('actor_gradient_check_and_clip'):
+                    actor_parameters = list(self.actor.parameters())
+                    self._validate_and_clip_gradients(
+                        actor_parameters,
+                        max_norm=self.actor_grad_clip_norm,
+                        component='actor',
+                        total_steps=total_steps_value,
+                    )
+                with detail_timing.section('actor_optimizer_step'):
+                    self.actor_optimizer.step()
             with update_timing.section('target_soft_update'):
                 self._soft_update(self.actor, self.actor_target)
                 self.actor_update_count += 1
@@ -1729,6 +1859,7 @@ class V2TD3UpdateEngine:
                 critic_targets_updated=critic_targets_updated,
                 actor_updated=True,
             )
+        detail_timing.finish()
         update_timing.finish()
         return metrics
 
@@ -1741,57 +1872,106 @@ class V2TD3UpdateEngine:
         shared_relations: ZoneSetSharedRelations | None = None,
         profile_sections: bool = False,
         critic_context: torch.Tensor | None = None,
+        diagnostic_timing: _OptionalUpdateDetailTimer | None = None,
+        compiled_execution_recorder: Callable[[str], None] | None = None,
     ) -> _ActorLossTerms:
-        actor_actions = self.actor(
-            observation,
-            shared_relations=shared_relations,
-            profile_sections=profile_sections,
-        )
-        q_values = (
-            self.critic1(
+        detail = diagnostic_timing or _OptionalUpdateDetailTimer(None, False)
+        with detail.section('actor_forward'):
+            actor_uses_compiled = (
+                not profile_sections
+                and (
+                    (
+                        isinstance(self.actor, V2ANNPolicyActor)
+                        and self.actor.compiled_full_forward_enabled
+                    )
+                    or (
+                        isinstance(self.actor, V2SNNPolicyActor)
+                        and self.actor.zone_set_encoder.compiled_tensor_forward_enabled
+                    )
+                )
+            )
+            if actor_uses_compiled and compiled_execution_recorder is not None:
+                compiled_execution_recorder('actor')
+            actor_actions = self.actor(
                 observation,
-                actor_actions,
                 shared_relations=shared_relations,
                 profile_sections=profile_sections,
             )
-            if critic_context is None
-            else self.critic1.forward_from_context(
-                critic_context,
-                actor_actions,
-            )
-        )
-        rl_actor_loss = -q_values.mean()
-        q_scale = q_values.detach().abs().mean().clamp(min=1.0)
-        actor_rl_scale = torch.as_tensor(
-            self.actor_rl_scale_alpha,
-            dtype=q_values.dtype,
-            device=q_values.device,
-        ) / q_scale
-        scaled_rl_actor_loss = rl_actor_loss * actor_rl_scale
-        bc_loss = actor_actions.sum() * 0.0
-        if self.bc_reference_actor is not None:
-            with torch.no_grad():
-                reference_actions = self.bc_reference_actor(
+        with detail.section('actor_q_rl_loss_and_scale'):
+            q_values = (
+                self.critic1(
                     observation,
+                    actor_actions,
                     shared_relations=shared_relations,
                     profile_sections=profile_sections,
                 )
-            bc_loss = F.mse_loss(actor_actions, reference_actions)
-        terminal_geo_loss = self._terminal_geo_loss(
-            observation,
-            actor_actions,
-            line_to_goal_safe,
-        )
-        terminal_lambda = (
-            self.terminal_geo_lambda
-            if self.terminal_geo_regularization_enabled
-            else 0.0
-        )
-        actor_loss = (
-            scaled_rl_actor_loss
-            + bc_lambda * bc_loss
-            + terminal_lambda * terminal_geo_loss
-        )
+                if critic_context is None
+                else self.critic1.forward_from_context(
+                    critic_context,
+                    actor_actions,
+                )
+            )
+            rl_actor_loss = -q_values.mean()
+            q_scale = q_values.detach().abs().mean().clamp(min=1.0)
+            actor_rl_scale = torch.as_tensor(
+                self.actor_rl_scale_alpha,
+                dtype=q_values.dtype,
+                device=q_values.device,
+            ) / q_scale
+            scaled_rl_actor_loss = rl_actor_loss * actor_rl_scale
+        with detail.section('actor_bc_reference_forward_and_loss'):
+            bc_loss = actor_actions.sum() * 0.0
+            if self.bc_reference_actor is not None:
+                with torch.no_grad():
+                    reference_uses_compiled = (
+                        not profile_sections
+                        and (
+                            (
+                                isinstance(
+                                    self.bc_reference_actor,
+                                    V2ANNPolicyActor,
+                                )
+                                and self.bc_reference_actor.
+                                compiled_full_forward_enabled
+                            )
+                            or (
+                                isinstance(
+                                    self.bc_reference_actor,
+                                    V2SNNPolicyActor,
+                                )
+                                and self.bc_reference_actor.zone_set_encoder.
+                                compiled_tensor_forward_enabled
+                            )
+                        )
+                    )
+                    if (
+                        reference_uses_compiled
+                        and compiled_execution_recorder is not None
+                    ):
+                        compiled_execution_recorder('bc_reference_actor')
+                    reference_actions = self.bc_reference_actor(
+                        observation,
+                        shared_relations=shared_relations,
+                        profile_sections=profile_sections,
+                    )
+                bc_loss = F.mse_loss(actor_actions, reference_actions)
+        with detail.section('actor_terminal_geometry_loss'):
+            terminal_geo_loss = self._terminal_geo_loss(
+                observation,
+                actor_actions,
+                line_to_goal_safe,
+            )
+        with detail.section('actor_loss_composition_and_finite_check'):
+            terminal_lambda = (
+                self.terminal_geo_lambda
+                if self.terminal_geo_regularization_enabled
+                else 0.0
+            )
+            actor_loss = (
+                scaled_rl_actor_loss
+                + bc_lambda * bc_loss
+                + terminal_lambda * terminal_geo_loss
+            )
         return _ActorLossTerms(
             actor_loss=actor_loss,
             rl_actor_loss=rl_actor_loss,

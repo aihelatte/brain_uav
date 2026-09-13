@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
 import gc
 import json
@@ -31,7 +32,10 @@ from brain_uav.trainers.v2_formal_training import (
     v2_bc_lambda,
 )
 from brain_uav.trainers.v2_replay_buffer import V2ReplayBatch
-from brain_uav.trainers.v2_td3 import V2_TD3_UPDATE_TIMING_SECTIONS
+from brain_uav.trainers.v2_td3 import (
+    V2_TD3_UPDATE_DETAIL_SECTIONS,
+    V2_TD3_UPDATE_TIMING_SECTIONS,
+)
 from brain_uav.trainers.v2_validation import (
     V2ValidationPool,
     derive_validation_stage_seed,
@@ -42,7 +46,7 @@ from brain_uav.trainers.v2_validation import (
 
 
 DIAGNOSTIC_FORMAT = 'v2_td3_timing_diagnostic'
-DIAGNOSTIC_VERSION = 6
+DIAGNOSTIC_VERSION = 7
 DIAGNOSTIC_LEVELS = ('easy', 'medium', 'hard')
 UPDATE_TIMING_SECTION_NAMES = V2_TD3_UPDATE_TIMING_SECTIONS
 COMPILED_NUMERIC_RTOL = 1e-4
@@ -183,6 +187,914 @@ class _UpdateTimingSummary:
             name: self._bucket_payload(bucket)
             for name, bucket in self._buckets.items()
         }
+
+
+class _NestedUpdateTimingSummary:
+    """Aggregate diagnostic child intervals without treating parents as additive."""
+
+    _CRITIC_CHILDREN = ('critic_zero_grad', 'critic_loss_backward')
+    _ACTOR_CHILDREN = tuple(
+        name for name in V2_TD3_UPDATE_DETAIL_SECTIONS
+        if name not in ('critic_zero_grad', 'critic_loss_backward')
+    )
+
+    def __init__(self) -> None:
+        self.update_count = 0
+        self.actor_update_count = 0
+        self.parent_wall_seconds = {
+            'critic_backward': 0.0,
+            'actor_update': 0.0,
+        }
+        self.wall_seconds = {
+            name: 0.0 for name in V2_TD3_UPDATE_DETAIL_SECTIONS
+        }
+        self.calls = {name: 0 for name in V2_TD3_UPDATE_DETAIL_SECTIONS}
+
+    def record(
+        self,
+        *,
+        actor_updated: bool,
+        outer_sections: Mapping[str, float],
+        detail: Mapping[str, Mapping[str, float | int]],
+    ) -> None:
+        for parent in self.parent_wall_seconds:
+            value = float(outer_sections[parent])
+            if not isfinite(value) or value < 0.0:
+                raise RuntimeError('Nested TD3 parent timing must be non-negative.')
+            self.parent_wall_seconds[parent] += value
+        detail_wall = detail['wall_seconds']
+        detail_calls = detail['calls']
+        unknown = (set(detail_wall) | set(detail_calls)) - set(self.wall_seconds)
+        if unknown:
+            raise RuntimeError(f'Unknown nested TD3 timing sections: {sorted(unknown)}.')
+        for name in self.wall_seconds:
+            value = float(detail_wall.get(name, 0.0))
+            calls = int(detail_calls.get(name, 0))
+            if not isfinite(value) or value < 0.0 or calls < 0:
+                raise RuntimeError('Nested TD3 timing values must be non-negative.')
+            self.wall_seconds[name] += value
+            self.calls[name] += calls
+        self.update_count += 1
+        self.actor_update_count += int(actor_updated)
+
+    def _parent_payload(
+        self,
+        parent: str,
+        children: Sequence[str],
+        *,
+        environment_steps: int,
+        actor_parent: bool,
+    ) -> dict[str, Any]:
+        parent_total = self.parent_wall_seconds[parent]
+        event_count = self.actor_update_count if actor_parent else self.update_count
+        child_total = sum(self.wall_seconds[name] for name in children)
+        return {
+            'total_wall_seconds': parent_total,
+            'event_count': event_count,
+            'average_wall_seconds_per_event': (
+                parent_total / event_count if event_count else None
+            ),
+            'average_wall_seconds_per_environment_step': (
+                parent_total / environment_steps if environment_steps else None
+            ),
+            'other_uncovered_wall_seconds': parent_total - child_total,
+            'children_are_mutually_exclusive': True,
+            'children': {
+                name: {
+                    'execution_call_count': self.calls[name],
+                    'total_wall_seconds': self.wall_seconds[name],
+                    'average_wall_seconds_per_update': (
+                        self.wall_seconds[name] / self.update_count
+                        if self.update_count else None
+                    ),
+                    'average_wall_seconds_per_actor_update': (
+                        self.wall_seconds[name] / self.actor_update_count
+                        if self.actor_update_count else None
+                    ),
+                    'average_wall_seconds_per_environment_step': (
+                        self.wall_seconds[name] / environment_steps
+                        if environment_steps else None
+                    ),
+                    'percent_of_parent_wall_seconds': (
+                        100.0 * self.wall_seconds[name] / parent_total
+                        if parent_total > 0.0 else None
+                    ),
+                }
+                for name in children
+            },
+        }
+
+    def to_dict(self, *, environment_steps: int) -> dict[str, Any]:
+        steps = _positive_int(environment_steps, name='environment_steps')
+        return {
+            'update_count': self.update_count,
+            'actor_update_count': self.actor_update_count,
+            'environment_step_count': steps,
+            'critic_backward': self._parent_payload(
+                'critic_backward',
+                self._CRITIC_CHILDREN,
+                environment_steps=steps,
+                actor_parent=False,
+            ),
+            'actor_update': self._parent_payload(
+                'actor_update',
+                self._ACTOR_CHILDREN,
+                environment_steps=steps,
+                actor_parent=True,
+            ),
+            'measurement_note': (
+                'Child intervals are mutually exclusive within each parent. Parent '
+                'and child times must not be added together. Wall intervals use the '
+                'CPU clock without per-section CUDA synchronization, so asynchronous '
+                'CUDA waits may be charged to a later interval.'
+            ),
+        }
+
+
+class _EnvironmentGeometryDiagnostic:
+    """Scoped environment phase and geometry-call recorder for this script."""
+
+    _STEP_SECTIONS = (
+        'dynamics_position_progress',
+        'termination',
+        'current_point_clearance',
+        'reward',
+        'observation_construction',
+        'info_construction',
+    )
+
+    def __init__(
+        self,
+        *,
+        duplicate_audit_steps: int = 8,
+        duplicate_example_limit: int = 5,
+    ) -> None:
+        self.duplicate_audit_steps = _nonnegative_int(
+            duplicate_audit_steps,
+            name='duplicate_audit_steps',
+        )
+        self.duplicate_example_limit = _nonnegative_int(
+            duplicate_example_limit,
+            name='duplicate_example_limit',
+        )
+        self.step_count = 0
+        self.reset_count = 0
+        self._step_started: float | None = None
+        self._reset_started: float | None = None
+        self._step_total = 0.0
+        self._reset_total = 0.0
+        self._section_wall = defaultdict(float)
+        self._section_calls = defaultdict(int)
+        self._source_stack: list[str] = []
+        self._operation_stack: list[str] = []
+        self._geometry: dict[str, dict[str, float | int]] = {}
+        self._restorations: list[tuple[Any, str, bool, Any]] = []
+        self._attached: set[int] = set()
+        self._audit_seen: dict[tuple[Any, ...], dict[str, Any]] = {}
+        self._audit_cycle: str | None = None
+        self._audit_cycle_index: int | None = None
+        self._reset_audit_active = False
+        self._audited_step_count = 0
+        self._audited_reset_count = 0
+        self._duplicate_groups = 0
+        self._duplicate_calls = 0
+        self._duplicate_examples: list[dict[str, Any]] = []
+        self._closed = False
+
+    @contextmanager
+    def source(self, name: str):
+        self._source_stack.append(str(name))
+        try:
+            yield
+        finally:
+            self._source_stack.pop()
+
+    @contextmanager
+    def section(self, name: str):
+        started = perf_counter()
+        try:
+            with self.source(name):
+                yield
+        finally:
+            self._section_wall[name] += perf_counter() - started
+            self._section_calls[name] += 1
+
+    def begin_step(self) -> None:
+        if self._step_started is not None:
+            raise RuntimeError('Environment diagnostic step is already active.')
+        self._step_started = perf_counter()
+
+    def end_step(self) -> None:
+        if self._step_started is None:
+            raise RuntimeError('Environment diagnostic step is not active.')
+        self._step_total += perf_counter() - self._step_started
+        self._step_started = None
+        self.step_count += 1
+
+    def begin_reset(self) -> None:
+        if self._reset_started is not None:
+            raise RuntimeError('Environment diagnostic reset is already active.')
+        self._reset_audit_active = self._begin_audit_cycle('reset')
+        self._reset_started = perf_counter()
+
+    def end_reset(self) -> None:
+        if self._reset_started is None:
+            raise RuntimeError('Environment diagnostic reset is not active.')
+        self._reset_total += perf_counter() - self._reset_started
+        self._reset_started = None
+        self.reset_count += 1
+        if self._reset_audit_active:
+            self._end_audit_cycle('reset')
+            self._reset_audit_active = False
+
+    def _begin_audit_cycle(self, kind: str) -> bool:
+        if self._audit_cycle is not None:
+            raise RuntimeError(
+                f'Geometry audit cycle {self._audit_cycle!r} is already active.'
+            )
+        count = (
+            self._audited_step_count
+            if kind == 'step'
+            else self._audited_reset_count
+        )
+        if count >= self.duplicate_audit_steps:
+            return False
+        self._audit_cycle = kind
+        self._audit_cycle_index = count + 1
+        self._audit_seen.clear()
+        return True
+
+    def _end_audit_cycle(self, kind: str) -> None:
+        if self._audit_cycle != kind:
+            raise RuntimeError(
+                f'Geometry audit cycle {kind!r} is not active.'
+            )
+        if kind == 'step':
+            self._audited_step_count += 1
+        else:
+            self._audited_reset_count += 1
+        self._audit_seen.clear()
+        self._audit_cycle = None
+        self._audit_cycle_index = None
+
+    @contextmanager
+    def audit_step(self):
+        active = self._begin_audit_cycle('step')
+        try:
+            yield
+        finally:
+            if active:
+                self._end_audit_cycle('step')
+
+    @staticmethod
+    def _strict_argument(value: Any) -> tuple[Any, ...]:
+        try:
+            array = np.asarray(value)
+        except (TypeError, ValueError):
+            return ('repr', type(value).__name__, repr(value))
+        if array.ndim == 0:
+            scalar = array.item()
+            if isinstance(scalar, (bool, int, float, str)):
+                return ('scalar', type(scalar).__name__, scalar)
+        contiguous = np.ascontiguousarray(array)
+        return (
+            'array',
+            contiguous.dtype.str,
+            tuple(contiguous.shape),
+            contiguous.tobytes(),
+        )
+
+    def _audit_query(
+        self,
+        owner: Any,
+        operation: str,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ) -> None:
+        if self._audit_cycle is None:
+            return
+        zone = owner if hasattr(owner, 'shape') else None
+        shape = owner.shape if zone is not None else owner
+        key = (
+            id(zone) if zone is not None else None,
+            id(shape),
+            operation,
+            tuple(self._strict_argument(value) for value in args),
+            tuple(
+                (name, self._strict_argument(value))
+                for name, value in sorted(kwargs.items())
+            ),
+        )
+        source = self._source_stack[-1] if self._source_stack else 'unattributed'
+        existing = self._audit_seen.get(key)
+        if existing is None:
+            self._audit_seen[key] = {
+                'count': 1,
+                'sources': [source],
+                'shape_type': type(shape).__name__,
+                'operation': operation,
+            }
+            return
+        existing['count'] += 1
+        if source not in existing['sources']:
+            existing['sources'].append(source)
+        self._duplicate_calls += 1
+        if existing['count'] == 2:
+            self._duplicate_groups += 1
+            if len(self._duplicate_examples) < self.duplicate_example_limit:
+                self._duplicate_examples.append({
+                    '_audit_key': key,
+                    'audit_cycle': self._audit_cycle,
+                    'audit_cycle_index': self._audit_cycle_index,
+                    'shape_type': existing['shape_type'],
+                    'operation': operation,
+                    'sources': list(existing['sources']),
+                    'strictly_identical_call_count': existing['count'],
+                })
+        elif self._duplicate_examples:
+            for example in self._duplicate_examples:
+                if (
+                    example['_audit_key'] == key
+                    and example['audit_cycle'] == self._audit_cycle
+                    and example['audit_cycle_index'] == self._audit_cycle_index
+                ):
+                    example['strictly_identical_call_count'] = existing['count']
+                    example['sources'] = list(existing['sources'])
+                    break
+
+    @contextmanager
+    def _query(
+        self,
+        owner: Any,
+        operation: str,
+        args: tuple[Any, ...],
+        kwargs: Mapping[str, Any],
+    ):
+        source = self._source_stack[-1] if self._source_stack else 'unattributed'
+        shape = owner.shape if hasattr(owner, 'shape') else owner
+        effective_operation = operation
+        if (
+            operation == 'segment_clearance'
+            and self._operation_stack
+            and self._operation_stack[-1] == 'segment_safety'
+        ):
+            effective_operation = 'exact_segment_clearance_within_safety'
+        key = f'{source}|{type(shape).__name__}|{effective_operation}'
+        record = self._geometry.setdefault(key, {'calls': 0, 'wall_seconds': 0.0})
+        self._audit_query(owner, effective_operation, args, kwargs)
+        started = perf_counter()
+        self._operation_stack.append(effective_operation)
+        try:
+            yield
+        finally:
+            self._operation_stack.pop()
+            record['calls'] = int(record['calls']) + 1
+            record['wall_seconds'] = float(record['wall_seconds']) + (
+                perf_counter() - started
+            )
+
+    def _patch_method(self, owner: Any, name: str, operation: str) -> None:
+        if not hasattr(owner, name):
+            return
+        original = getattr(owner, name)
+        had_instance_value = name in getattr(owner, '__dict__', {})
+        instance_value = owner.__dict__.get(name) if had_instance_value else None
+
+        def wrapped(*args, __original=original, __operation=operation, **kwargs):
+            with self._query(owner, __operation, args, kwargs):
+                return __original(*args, **kwargs)
+
+        setattr(owner, name, wrapped)
+        self._restorations.append((owner, name, had_instance_value, instance_value))
+
+    def attach_zones(self, zones: Sequence[Any]) -> None:
+        if self._closed:
+            raise RuntimeError('Environment geometry diagnostic is closed.')
+        for zone in zones:
+            if id(zone) not in self._attached:
+                self._attached.add(id(zone))
+                self._patch_method(zone, 'point_clearance', 'point_clearance')
+                self._patch_method(zone, 'violates_segment', 'segment_safety')
+                self._patch_method(zone, 'segment_clearance', 'segment_clearance')
+            shape = zone.shape
+            if id(shape) not in self._attached:
+                self._attached.add(id(shape))
+                self._patch_method(shape, 'surface_normal', 'surface_normal')
+                self._patch_method(
+                    shape,
+                    'segment_intersection',
+                    'segment_intersection',
+                )
+                self._patch_method(
+                    shape,
+                    'segment_clearance',
+                    'shape_segment_clearance',
+                )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        for owner, name, had_value, value in reversed(self._restorations):
+            if had_value:
+                setattr(owner, name, value)
+            else:
+                delattr(owner, name)
+        self._restorations.clear()
+        self._audit_seen.clear()
+        self._audit_cycle = None
+        self._audit_cycle_index = None
+        self._reset_audit_active = False
+        self._closed = True
+
+    def to_dict(self) -> dict[str, Any]:
+        covered = sum(self._section_wall[name] for name in self._STEP_SECTIONS)
+        return {
+            'enabled': True,
+            'step_count': self.step_count,
+            'reset_count': self.reset_count,
+            'step_total_wall_seconds': self._step_total,
+            'reset_total_wall_seconds': self._reset_total,
+            'step_sections': {
+                name: {
+                    'calls': self._section_calls[name],
+                    'total_wall_seconds': self._section_wall[name],
+                    'average_wall_seconds_per_step': (
+                        self._section_wall[name] / self.step_count
+                        if self.step_count else None
+                    ),
+                }
+                for name in self._STEP_SECTIONS
+            } | {
+                'other_uncovered': {
+                    'calls': self.step_count,
+                    'total_wall_seconds': self._step_total - covered,
+                    'average_wall_seconds_per_step': (
+                        (self._step_total - covered) / self.step_count
+                        if self.step_count else None
+                    ),
+                },
+            },
+            'geometry_queries': {
+                key: dict(value) for key, value in sorted(self._geometry.items())
+            },
+            'duplicate_query_audit': {
+                'sampled_step_limit': self.duplicate_audit_steps,
+                'audited_step_count': self._audited_step_count,
+                'audited_reset_count': self._audited_reset_count,
+                'strict_duplicate_group_count': self._duplicate_groups,
+                'duplicate_call_count_after_first': self._duplicate_calls,
+                'representative_examples': [
+                    {
+                        name: value for name, value in example.items()
+                        if name != '_audit_key'
+                    }
+                    for example in self._duplicate_examples
+                ],
+                'comparison_note': (
+                    'Identity, complete point/segment arrays, and exact keyword '
+                    'arguments are compared without rounding. Calls are reported '
+                    'only; no query cache is used.'
+                ),
+            },
+            'parent_child_note': (
+                'Geometry parent and child calls are not additive. segment_safety '
+                'may return from its AABB test without an '
+                'exact_segment_clearance_within_safety child call.'
+            ),
+        }
+
+
+class _CompiledPathProfiler:
+    """Bounded post-measurement profiler that keeps compiled paths enabled."""
+
+    def __init__(
+        self,
+        device: torch.device,
+        *,
+        requested_updates: int,
+        output_dir: Path,
+        expected_compiled_entries: Sequence[str],
+    ) -> None:
+        self.device = device
+        self.requested_updates = _positive_int(
+            requested_updates,
+            name='compiled_path_profiler_updates',
+        )
+        self.output_dir = Path(output_dir)
+        self.expected_compiled_entries = tuple(expected_compiled_entries)
+        self.captured_updates = 0
+        self.compiled_entry_calls: defaultdict[str, int] = defaultdict(int)
+        self._profiler = None
+        self._closed = False
+        self._activities = [torch.profiler.ProfilerActivity.CPU]
+        if device.type == 'cuda':
+            self._activities.append(torch.profiler.ProfilerActivity.CUDA)
+        self._graph_count_before: int | None = None
+        self._zone_counts: list[int] = []
+        self._bc_effective_updates = 0
+        self._terminal_geometry_effective_updates = 0
+
+    def _ensure_started(self) -> None:
+        if self._profiler is not None:
+            return
+        self.output_dir.mkdir(parents=True, exist_ok=False)
+        self._graph_count_before = _dynamo_unique_graph_count()
+        self._profiler = torch.profiler.profile(
+            activities=self._activities,
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+            acc_events=True,
+        )
+        self._profiler.__enter__()
+        self._profiler.toggle_collection_dynamic(False, self._activities)
+
+    def record_compiled_entry(self, name: str) -> None:
+        self.compiled_entry_calls[str(name)] += 1
+
+    def record_update_inputs(self, batch: V2ReplayBatch, metrics: Any) -> None:
+        counts = batch.obs.presence_mask.sum(dim=1).detach().cpu().tolist()
+        self._zone_counts.extend(int(value) for value in counts)
+        self._bc_effective_updates += int(
+            float(getattr(metrics, 'bc_lambda', 0.0)) > 0.0
+            and float(getattr(metrics, 'bc_loss', 0.0)) != 0.0
+        )
+        self._terminal_geometry_effective_updates += int(
+            float(getattr(metrics, 'terminal_geo_lambda', 0.0)) > 0.0
+            and float(getattr(metrics, 'terminal_geo_loss', 0.0)) != 0.0
+        )
+
+    def run(self, operation: Callable[[], Any]) -> Any:
+        if self.captured_updates >= self.requested_updates:
+            return None
+        self._ensure_started()
+        self._profiler.toggle_collection_dynamic(True, self._activities)
+        try:
+            with torch.profiler.record_function(
+                'v2_td3.compiled_path_profiled_update'
+            ):
+                result = operation()
+        finally:
+            self._profiler.toggle_collection_dynamic(False, self._activities)
+        self.captured_updates += 1
+        self._profiler.step()
+        return result
+
+    @staticmethod
+    def _event_value(event: Any, name: str) -> float | None:
+        value = getattr(event, name, None)
+        return None if value is None else float(value)
+
+    @classmethod
+    def _operation_summary(
+        cls,
+        averages: Sequence[Any],
+        *,
+        self_metric: str,
+        total_metric: str,
+        limit: int = 25,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        available = [
+            event for event in averages
+            if cls._event_value(event, self_metric) is not None
+        ]
+        if not available:
+            return [], {
+                'available': False,
+                'operation_count': None,
+                'calls': None,
+                'self_time_us': None,
+                'total_time_us': None,
+                'total_time_note': (
+                    'Inclusive total is unavailable and is never aggregated '
+                    'across parent/child events.'
+                ),
+            }
+        available.sort(
+            key=lambda event: cls._event_value(event, self_metric) or 0.0,
+            reverse=True,
+        )
+
+        def payload(event: Any) -> dict[str, Any]:
+            return {
+                'name': str(event.key),
+                'calls': int(event.count),
+                'self_time_us': cls._event_value(event, self_metric),
+                'total_time_us': cls._event_value(event, total_metric),
+            }
+
+        top = [payload(event) for event in available[:limit]]
+        other_events = available[limit:]
+        other = {
+            'available': True,
+            'operation_count': len(other_events),
+            'calls': sum(int(event.count) for event in other_events),
+            'self_time_us': sum(
+                cls._event_value(event, self_metric) or 0.0
+                for event in other_events
+            ),
+            'total_time_us': None,
+            'total_time_note': (
+                'Inclusive total is not aggregated for other because parent '
+                'and child event totals overlap.'
+            ),
+        }
+        return top, other
+
+    @staticmethod
+    def _device_type_name(event: Any) -> str | None:
+        device_type = getattr(event, 'device_type', None)
+        if device_type is None:
+            return None
+        name = getattr(device_type, 'name', None)
+        if name is not None:
+            return str(name).upper()
+        text = str(device_type).rsplit('.', 1)[-1]
+        return text.upper() if text else None
+
+    @staticmethod
+    def _cuda_task_kind(name: str) -> str:
+        lowered = name.lower().replace(' ', '')
+        if 'memcpy' in lowered or 'memorycopy' in lowered:
+            return 'memcpy'
+        if 'memset' in lowered or 'memoryset' in lowered:
+            return 'memset'
+        return 'kernel'
+
+    @classmethod
+    def _cuda_device_task_summary(
+        cls,
+        cuda_events: Sequence[Any],
+    ) -> dict[str, Any]:
+        positive_events = [
+            event for event in cuda_events
+            if (cls._event_value(event, 'self_device_time_total') or 0.0) > 0.0
+            or (cls._event_value(event, 'device_time_total') or 0.0) > 0.0
+        ]
+        available = bool(positive_events)
+        result: dict[str, Any] = {
+            'available': available,
+            'data_source': 'CUDA device events',
+            'aggregation_note': (
+                'Counts and self times use CUDA device events only. CPU '
+                'operation-associated device time is a separate attribution '
+                'view and is not added here. Self times are not GPU busy time '
+                'or utilization because streams may overlap.'
+            ),
+        }
+        for kind in ('kernel', 'memcpy', 'memset'):
+            if not available:
+                result[kind] = {
+                    'available': False,
+                    'calls': None,
+                    'self_time_us': None,
+                    'operations': None,
+                }
+                continue
+            events = [
+                event for event in positive_events
+                if cls._cuda_task_kind(str(event.key)) == kind
+            ]
+            rows, _ = cls._operation_summary(
+                events,
+                self_metric='self_device_time_total',
+                total_metric='device_time_total',
+                limit=50,
+            )
+            values = [
+                cls._event_value(event, 'self_device_time_total')
+                for event in events
+            ]
+            result[kind] = {
+                'available': True,
+                'calls': sum(int(event.count) for event in events),
+                'self_time_us': (
+                    sum(float(value) for value in values)
+                    if all(value is not None for value in values)
+                    else None
+                ),
+                'operations': rows,
+            }
+        return result
+
+    def finish(self) -> dict[str, Any]:
+        if self._profiler is None:
+            raise RuntimeError('Compiled path profiler captured no updates.')
+        self._profiler.__exit__(None, None, None)
+        self._closed = True
+        averages = list(self._profiler.key_averages())
+        graph_count_after = _dynamo_unique_graph_count()
+        cpu_events = [
+            event for event in averages
+            if self._device_type_name(event) == 'CPU'
+        ]
+        cuda_events = [
+            event for event in averages
+            if self._device_type_name(event) == 'CUDA'
+        ]
+        cpu_top, cpu_other = self._operation_summary(
+            cpu_events,
+            self_metric='self_cpu_time_total',
+            total_metric='cpu_time_total',
+        )
+        cpu_associated_cuda_events = [
+            event for event in cpu_events
+            if (self._event_value(event, 'self_device_time_total') or 0.0) > 0.0
+            or (self._event_value(event, 'device_time_total') or 0.0) > 0.0
+        ]
+        cpu_associated_cuda_top, cpu_associated_cuda_other = (
+            self._operation_summary(
+                cpu_associated_cuda_events,
+                self_metric='self_device_time_total',
+                total_metric='device_time_total',
+            )
+        )
+        cuda_top, cuda_other = self._operation_summary(
+            cuda_events,
+            self_metric='self_device_time_total',
+            total_metric='device_time_total',
+        )
+        cuda_device_tasks = self._cuda_device_task_summary(cuda_events)
+        cuda_timing_available = bool(
+            self.device.type == 'cuda' and cuda_device_tasks['available']
+        )
+        cpu_path = self.output_dir / 'compiled_operators_cpu.txt'
+        cuda_path = self.output_dir / 'compiled_operators_cuda.txt'
+        trace_path = self.output_dir / 'compiled_medium_trace.json'
+        report_path = self.output_dir / 'compiled_profile_report.txt'
+        device_task_path = self.output_dir / 'compiled_cuda_device_tasks.txt'
+
+        def format_rows(rows: Sequence[Mapping[str, Any]]) -> list[str]:
+            return [
+                f'{row["name"]}\tcalls={row["calls"]}\t'
+                f'self_time_us={row["self_time_us"]}\t'
+                f'inclusive_time_us={row["total_time_us"]}'
+                for row in rows
+            ]
+
+        cpu_path.write_text(
+            '\n'.join((
+                'CPU operations by self CPU time',
+                *format_rows(cpu_top),
+                f'other_self_time_us={cpu_other["self_time_us"]}; '
+                'other_inclusive_time_us=null',
+                '',
+                'CPU operations by associated device time (attribution only)',
+                *format_rows(cpu_associated_cuda_top),
+                f'other_self_time_us='
+                f'{cpu_associated_cuda_other["self_time_us"]}; '
+                'other_inclusive_time_us=null',
+            )) + '\n',
+            encoding='utf-8',
+        )
+        cuda_text = (
+            '\n'.join(
+                f'{kind}: calls={cuda_device_tasks[kind]["calls"]}, '
+                f'self_time_us={cuda_device_tasks[kind]["self_time_us"]}'
+                for kind in ('kernel', 'memcpy', 'memset')
+            ) + '\n'
+            if cuda_timing_available
+            else (
+                'CUDA device events were requested but are unavailable.\n'
+                if self.device.type == 'cuda'
+                else 'CUDA activity was not requested for this CPU diagnostic.\n'
+            )
+        )
+        cuda_path.write_text(cuda_text, encoding='utf-8')
+        device_task_path.write_text(
+            (
+                '\n'.join(
+                    f'{kind}\t{item["name"]}\tcalls={item["calls"]}\t'
+                    f'self_time_us={item["self_time_us"]}\t'
+                    f'inclusive_time_us={item["total_time_us"]}'
+                    for kind in ('kernel', 'memcpy', 'memset')
+                    for item in (cuda_device_tasks[kind]['operations'] or ())
+                ) + '\n'
+                if cuda_timing_available
+                else 'CUDA device-event detail is unavailable from this profiler.\n'
+            ),
+            encoding='utf-8',
+        )
+        self._profiler.export_chrome_trace(str(trace_path))
+        report_path.write_text(
+            '\n'.join((
+                f'captured_updates: {self.captured_updates}',
+                f'device: {self.device}',
+                f'compiled_entry_calls: {dict(self.compiled_entry_calls)}',
+                f'graph_count_before: {self._graph_count_before}',
+                f'graph_count_after: {graph_count_after}',
+                'cuda_capture_status: '
+                + (
+                    'available'
+                    if cuda_timing_available
+                    else (
+                        'unavailable: no positive CUDA timing events were produced'
+                        if self.device.type == 'cuda'
+                        else 'not requested for CPU diagnostic'
+                    )
+                ),
+                'CPU self time and total time are distinct; parent/child rows '
+                'must not be added.',
+                'CUDA event spans are not reported as GPU busy time. Inspect the '
+                'trace for launch gaps and stream idle periods.',
+                'Inductor fused kernel names are retained and are not assigned to '
+                'individual attention or FFN layers.',
+            )) + '\n',
+            encoding='utf-8',
+        )
+        paths = {
+            'cpu_operator_table': str(cpu_path.resolve()),
+            'cuda_operator_table': str(cuda_path.resolve()),
+            'trace': str(trace_path.resolve()),
+            'text_report': str(report_path.resolve()),
+            'cuda_device_task_table': str(device_task_path.resolve()),
+        }
+        missing_entries = [
+            name for name in self.expected_compiled_entries
+            if self.compiled_entry_calls[name] == 0
+        ]
+        if missing_entries:
+            raise RuntimeError(
+                'Requested compiled entries were not executed: '
+                f'{missing_entries}.'
+            )
+        graph_delta = graph_count_after - int(self._graph_count_before)
+        valid_for_stable_analysis = graph_delta == 0 and (
+            self.device.type != 'cuda' or cuda_timing_available
+        )
+        return {
+            'enabled': True,
+            'requested_updates': self.requested_updates,
+            'captured_updates': self.captured_updates,
+            'activities': [activity.name for activity in self._activities],
+            'cuda_activity_requested': self.device.type == 'cuda',
+            'cuda_activity_collected': cuda_timing_available,
+            'cuda_capture_status': (
+                'available'
+                if cuda_timing_available
+                else (
+                    'unavailable: no positive CUDA timing events were produced'
+                    if self.device.type == 'cuda'
+                    else 'not requested for CPU diagnostic'
+                )
+            ),
+            'compiled_entry_calls': dict(self.compiled_entry_calls),
+            'expected_compiled_entries': list(self.expected_compiled_entries),
+            'graph_count_before': self._graph_count_before,
+            'graph_count_after': graph_count_after,
+            'new_graph_count': graph_delta,
+            'valid_for_stable_analysis': valid_for_stable_analysis,
+            'sample_zone_count_min': min(self._zone_counts) if self._zone_counts else None,
+            'sample_zone_count_max': max(self._zone_counts) if self._zone_counts else None,
+            'bc_effective_updates': self._bc_effective_updates,
+            'terminal_geometry_effective_updates': (
+                self._terminal_geometry_effective_updates
+            ),
+            'top_cpu_operations': cpu_top,
+            'other_cpu_operations': cpu_other,
+            'cpu_associated_cuda_operations': (
+                cpu_associated_cuda_top if self.device.type == 'cuda' else None
+            ),
+            'other_cpu_associated_cuda_operations': (
+                cpu_associated_cuda_other if self.device.type == 'cuda' else None
+            ),
+            'top_cuda_operations': cuda_top if cuda_timing_available else None,
+            'other_cuda_operations': cuda_other if cuda_timing_available else None,
+            'cuda_device_tasks': cuda_device_tasks,
+            'top_cuda_kernels': cuda_device_tasks['kernel']['operations'],
+            'cuda_kernel_details_available': bool(
+                cuda_timing_available
+                and cuda_device_tasks['kernel']['operations']
+            ),
+            'cpu_operator_timing_available': cpu_other['available'],
+            'cuda_operator_timing_available': (
+                cuda_timing_available
+            ),
+            'quantitative_cpu_submission_wait_split': None,
+            'quantitative_gpu_idle_time': None,
+            'timeline_interpretation_note': (
+                'PyTorch 2.5.1 does not expose a reliable aggregate split between '
+                'CPU submission work, synchronization waits, and GPU idle time here. '
+                'Use the retained operator names/counts and Chrome trace; unavailable '
+                'aggregates are null rather than measured zero.'
+            ),
+            'output_paths': paths,
+            'output_file_sizes_bytes': {
+                name: Path(path).stat().st_size for name, path in paths.items()
+            },
+            'measurement_note': (
+                'These are profiler-instrumented updates after ordinary measurement '
+                'and are excluded from throughput. CPU self/total and CUDA self/total '
+                'times are reported separately. CPU time is not pure GPU compute; '
+                'timeline gaps require trace inspection. Missing profiler fields are '
+                'reported as null, never as measured zero.'
+            ),
+        }
+
+    def close(self) -> None:
+        if self._profiler is not None and not self._closed:
+            self._profiler.__exit__(None, None, None)
+            self._closed = True
 
 
 class _DetailedUpdateProfiler:
@@ -2239,6 +3151,9 @@ def _run_diagnostic_level(
     frozen_critic_strategy: str = 'eager',
     compile_critic_block: bool = False,
     compile_target_block: bool = False,
+    compiled_path_profiler_updates: int = 0,
+    compiled_profiler_output_dir: Path | None = None,
+    environment_performance_diagnostic: bool = False,
 ) -> dict[str, Any]:
     scenario_count = len(pool.scenarios)
     if scenario_count == 0 or measured_steps < scenario_count:
@@ -2274,6 +3189,15 @@ def _run_diagnostic_level(
         fixed_scenarios=[record['payload'] for record in pool.scenarios],
         uav_collision_radius=prepared.uav_collision_radius,
     )
+    performance_diagnostic_enabled = bool(
+        environment_performance_diagnostic or compiled_path_profiler_updates > 0
+    )
+    environment_diagnostic = (
+        _EnvironmentGeometryDiagnostic(duplicate_audit_steps=8)
+        if performance_diagnostic_enabled
+        else None
+    )
+    nested_update_timing = _NestedUpdateTimingSummary()
     compile_requested = any((
         compile_critic_encoder,
         compile_target_encoders,
@@ -2430,6 +3354,34 @@ def _run_diagnostic_level(
         requested_updates=detailed_profiler_updates,
         output_dir=profiler_output_dir,
     )
+    compiled_path_profiler = None
+    compiled_path_profiler_metadata: dict[str, Any] = {
+        'enabled': False,
+        'requested_updates': 0,
+        'captured_updates': 0,
+        'output_paths': {},
+        'measurement_note': 'Compiled-path performance profiling is disabled.',
+    }
+    if compiled_path_profiler_updates > 0:
+        if compiled_profiler_output_dir is None:
+            raise ValueError(
+                'compiled_profiler_output_dir is required for compiled profiling.'
+            )
+        expected_compiled_entries = ['critic_block', 'target_block']
+        if compile_actors:
+            expected_compiled_entries.extend(('actor', 'bc_reference_actor'))
+        if frozen_critic_strategy == 'compiled_no_grad_context':
+            expected_compiled_entries.append('frozen_critic_context')
+        if model == 'snn':
+            expected_compiled_entries[expected_compiled_entries.index(
+                'target_block'
+            )] = 'target_critic_td_block'
+        compiled_path_profiler = _CompiledPathProfiler(
+            device,
+            requested_updates=compiled_path_profiler_updates,
+            output_dir=compiled_profiler_output_dir,
+            expected_compiled_entries=expected_compiled_entries,
+        )
     observation = None
     episode_transitions: list[tuple[Any, ...]] = []
     slot_refs: list[tuple[int, int]] = []
@@ -2483,6 +3435,8 @@ def _run_diagnostic_level(
                     compile_metadata['measurement_graph_count_before'] = (
                         _dynamo_unique_graph_count()
                     )
+                if environment_diagnostic is not None:
+                    env.set_performance_diagnostic(environment_diagnostic)
                 measured_phase = True
             if not measured_phase and step_number >= warmup_limit:
                 raise RuntimeError('Diagnostic warmup did not reach critic/actor update minima.')
@@ -2496,26 +3450,46 @@ def _run_diagnostic_level(
                 )
                 episode_transitions = []
                 slot_refs = []
-            line_safe = call(
-                'pre_action_geometry_wall_seconds',
-                lambda: env.line_to_goal_is_safe(
-                    env.state[:3],
-                    clearance=formal_config.terminal_geo_safe_clearance,
-                ),
+            audit_step = (
+                environment_diagnostic.audit_step()
+                if environment_diagnostic is not None and measured_phase
+                else nullcontext()
             )
-            action = call(
-                'action_inference_wall_seconds',
-                lambda: engine.select_action(
-                    observation,
-                    exploration_noise=formal_config.noise_schedule.exploration_initial,
-                    exploration_rng=components.exploration_rng,
-                ),
-                cuda_event=True,
-            )
-            next_observation, reward, terminated, truncated, info = call(
-                'environment_step_wall_seconds',
-                lambda: env.step(action),
-            )
+            with audit_step:
+                if environment_diagnostic is None or not measured_phase:
+                    line_safe = call(
+                        'pre_action_geometry_wall_seconds',
+                        lambda: env.line_to_goal_is_safe(
+                            env.state[:3],
+                            clearance=formal_config.terminal_geo_safe_clearance,
+                        ),
+                    )
+                else:
+                    with environment_diagnostic.source('pre_action_geometry'):
+                        line_safe = call(
+                            'pre_action_geometry_wall_seconds',
+                            lambda: env.line_to_goal_is_safe(
+                                env.state[:3],
+                                clearance=(
+                                    formal_config.terminal_geo_safe_clearance
+                                ),
+                            ),
+                        )
+                action = call(
+                    'action_inference_wall_seconds',
+                    lambda: engine.select_action(
+                        observation,
+                        exploration_noise=(
+                            formal_config.noise_schedule.exploration_initial
+                        ),
+                        exploration_rng=components.exploration_rng,
+                    ),
+                    cuda_event=True,
+                )
+                next_observation, reward, terminated, truncated, info = call(
+                    'environment_step_wall_seconds',
+                    lambda: env.step(action),
+                )
             done = bool(terminated or truncated)
             near_goal = _near_goal(info, radius=formal_config.near_goal_radius)
             transition = (
@@ -2549,9 +3523,13 @@ def _run_diagnostic_level(
                     noise_clip=formal_config.noise_schedule.clip_initial,
                 )
                 update_sections: dict[str, float] = {}
+                update_details: dict[str, Any] = {}
 
                 def capture_update_sections(sections: Mapping[str, float]) -> None:
                     update_sections.update(sections)
+
+                def capture_update_details(details: Mapping[str, Any]) -> None:
+                    update_details.update(details)
 
                 def record_update(result: Any, elapsed: float) -> None:
                     update_timing.record(
@@ -2559,6 +3537,12 @@ def _run_diagnostic_level(
                         total_wall_seconds=elapsed,
                         sections=update_sections,
                     )
+                    if performance_diagnostic_enabled:
+                        nested_update_timing.record(
+                            actor_updated=bool(result.actor_updated),
+                            outer_sections=update_sections,
+                            detail=update_details,
+                        )
 
                 def perform_update(profile_sections: bool):
                     nonlocal profiled_update_active
@@ -2579,6 +3563,19 @@ def _run_diagnostic_level(
                                     else None
                                 ),
                                 profile_sections=profile_sections,
+                                **(
+                                    {
+                                        'diagnostic_timing_recorder': (
+                                            capture_update_details
+                                        ),
+                                    }
+                                    if (
+                                        measured_phase
+                                        and performance_diagnostic_enabled
+                                        and not profile_sections
+                                    )
+                                    else {}
+                                ),
                             ),
                             cuda_event=True,
                             on_complete=(None if profile_sections else record_update),
@@ -2618,8 +3615,61 @@ def _run_diagnostic_level(
                     slot_refs = []
         stream_seconds = timing.cuda_stream_interval_seconds()
         measured_total = perf_counter() - measured_started
+        ordinary_actor_updates = engine.actor_update_count - actor_updates_before
+        ordinary_critic_updates = engine.critic_update_count - critic_updates_before
+        ordinary_graph_count_after = (
+            _dynamo_unique_graph_count() if compile_requested else None
+        )
+        if environment_diagnostic is not None:
+            env.set_performance_diagnostic(None)
+            environment_diagnostic.close()
+        if compiled_path_profiler is not None:
+            profiled_actor_results: list[bool] = []
+            for offset in range(compiled_path_profiler.requested_updates):
+                sampled_batch: list[V2ReplayBatch] = []
+
+                def capture_profile_sample(batch_size: int) -> V2ReplayBatch:
+                    batch = original_sample(batch_size)
+                    sampled_batch.append(batch)
+                    return batch
+
+                engine.replay.sample = capture_profile_sample
+                profile_total_steps = step_number + offset + 1
+                engine.set_target_noise(
+                    policy_noise=formal_config.noise_schedule.policy_initial,
+                    noise_clip=formal_config.noise_schedule.clip_initial,
+                )
+                metrics = compiled_path_profiler.run(
+                    lambda total_steps=profile_total_steps: engine.update_once(
+                        total_steps=total_steps,
+                        bc_lambda=v2_bc_lambda(total_steps - 1),
+                        profile_sections=False,
+                        diagnostic_profile_sections=True,
+                        compiled_execution_recorder=(
+                            compiled_path_profiler.record_compiled_entry
+                        ),
+                    )
+                )
+                if len(sampled_batch) != 1:
+                    raise RuntimeError(
+                        'Compiled profiler update must sample Replay exactly once.'
+                    )
+                compiled_path_profiler.record_update_inputs(
+                    sampled_batch[0], metrics
+                )
+                profiled_actor_results.append(bool(metrics.actor_updated))
+            if not (any(profiled_actor_results) and not all(profiled_actor_results)):
+                raise RuntimeError(
+                    'Compiled profiler must capture critic-only and actor updates.'
+                )
+            compiled_path_profiler_metadata = compiled_path_profiler.finish()
     finally:
         engine.replay.sample = original_sample
+        env.set_performance_diagnostic(None)
+        if environment_diagnostic is not None:
+            environment_diagnostic.close()
+        if compiled_path_profiler is not None:
+            compiled_path_profiler.close()
         profiler_metadata = detailed_profiler.finish()
 
     update_seconds = timing.wall_seconds['td3_update_wall_seconds']
@@ -2627,12 +3677,12 @@ def _run_diagnostic_level(
     network_update_seconds = max(0.0, update_seconds - sample_seconds)
     if not all(isfinite(value) and value >= 0.0 for value in timing.wall_seconds.values()):
         raise RuntimeError('Diagnostic produced a non-finite timing value.')
-    actor_updates = engine.actor_update_count - actor_updates_before
-    critic_updates = engine.critic_update_count - critic_updates_before
+    actor_updates = ordinary_actor_updates
+    critic_updates = ordinary_critic_updates
     if critic_updates == 0 or actor_updates == 0:
         raise RuntimeError('Diagnostic measurement must include both critic and actor updates.')
     if compile_requested:
-        graph_count_after = _dynamo_unique_graph_count()
+        graph_count_after = ordinary_graph_count_after
         graph_count_before = compile_metadata['measurement_graph_count_before']
         new_graph_count = graph_count_after - graph_count_before
         stable_timing = new_graph_count == 0
@@ -2652,8 +3702,14 @@ def _run_diagnostic_level(
         'collection, startup, and activity-switching overhead. It must not be used '
         'as normal training throughput or for optimization speedup comparisons.'
         if profiler_overhead_included
-        else 'Detailed profiler is disabled; throughput is calculated from this '
-        'ordinary short-diagnostic wall time.'
+        else (
+            'The optional environment and nested-update diagnostic is enabled. '
+            'This ordinary short-run wall time includes its instrumentation '
+            'overhead; the separate compiled profiler updates are excluded.'
+            if performance_diagnostic_enabled
+            else 'Detailed profiler is disabled; throughput is calculated from this '
+            'ordinary short-diagnostic wall time.'
+        )
     )
     return {
         'curriculum_level': level,
@@ -2668,11 +3724,23 @@ def _run_diagnostic_level(
         'critic_updates': critic_updates,
         'actor_target_updates': actor_updates,
         'detailed_profiler': profiler_metadata,
+        'compiled_path_profiler': compiled_path_profiler_metadata,
+        'environment_geometry_diagnostic': (
+            environment_diagnostic.to_dict()
+            if environment_diagnostic is not None
+            else {
+                'enabled': False,
+                'measurement_note': 'Environment geometry diagnostics are disabled.',
+            }
+        ),
         'critic_encoder_compile': compile_metadata,
         'timing': {
             'total_wall_seconds': measured_total,
             'total_wall_seconds_includes_detailed_profiler_overhead': (
                 profiler_overhead_included
+            ),
+            'total_wall_seconds_includes_performance_diagnostic_overhead': (
+                performance_diagnostic_enabled
             ),
             'total_wall_seconds_note': total_wall_seconds_note,
             'throughput_environment_steps_per_second': (
@@ -2694,6 +3762,11 @@ def _run_diagnostic_level(
                 'td3_profiled_update_wall_seconds'
             ],
             'td3_update_breakdown': update_timing.to_dict(),
+            'td3_nested_update_breakdown': (
+                nested_update_timing.to_dict(environment_steps=measured_steps)
+                if performance_diagnostic_enabled
+                else None
+            ),
             'replay_sample_wall_seconds': sample_seconds,
             'replay_sample_relation': 'within_td3_update',
             'td3_update_excluding_replay_sample_wall_seconds': network_update_seconds,
@@ -2745,6 +3818,7 @@ def run_v2_td3_timing_diagnostic(
     check_compiled_numerics: bool = False,
     compiled_numerics_only: bool = False,
     compiled_numerics_group: str | None = None,
+    compiled_performance_diagnostic_updates: int = 0,
 ) -> dict[str, Any]:
     if model not in ('ann', 'snn'):
         raise ValueError('model must be ann or snn.')
@@ -2759,6 +3833,15 @@ def run_v2_td3_timing_diagnostic(
         detailed_profiler_updates,
         name='detailed_profiler_updates',
     )
+    compiled_profiler_updates = _nonnegative_int(
+        compiled_performance_diagnostic_updates,
+        name='compiled_performance_diagnostic_updates',
+    )
+    if compiled_profiler_updates not in (0, *range(2, 9)):
+        raise ValueError(
+            'compiled_performance_diagnostic_updates must be 0 or between 2 '
+            'and 8 so both critic-only and actor updates can be observed.'
+        )
     if type(compile_critic_encoder) is not bool:
         raise TypeError('compile_critic_encoder must be a bool.')
     if type(compile_target_encoders) is not bool:
@@ -2798,6 +3881,7 @@ def run_v2_td3_timing_diagnostic(
             or check_compiled_numerics
             or compiled_numerics_only
             or profiler_updates
+            or compiled_profiler_updates
         ):
             raise ValueError(
                 'compiled_numerics_group is an isolated mode and cannot be '
@@ -2841,6 +3925,23 @@ def run_v2_td3_timing_diagnostic(
         raise ValueError(
             'compilation cannot be combined with detailed profiler.'
         )
+    if compiled_profiler_updates:
+        if profiler_updates or check_compiled_numerics or compiled_numerics_only:
+            raise ValueError(
+                'compiled performance diagnostic cannot be combined with '
+                'detailed profiler or compiled numerics modes.'
+            )
+        if not (
+            compile_actors
+            and compile_critic_block
+            and compile_target_block
+            and frozen_critic_strategy == 'compiled_no_grad_context'
+        ):
+            raise ValueError(
+                'compiled performance diagnostic requires the full compiled '
+                'actor, critic block, target block, and compiled_no_grad_context '
+                'configuration.'
+            )
     if (compile_critic_encoder or compile_target_encoders) and model != 'ann':
         raise ValueError('compile_critic_encoder is limited to the ANN diagnostic.')
     if compiled_numerics_group is not None and model != 'ann':
@@ -2858,6 +3959,10 @@ def run_v2_td3_timing_diagnostic(
         raise ValueError('check_compiled_numerics requires a CUDA diagnostic.')
     if compiled_numerics_group is not None and target_device.type != 'cuda':
         raise ValueError('compiled_numerics_group requires a CUDA diagnostic.')
+    if compiled_profiler_updates and target_device.type != 'cuda':
+        raise ValueError(
+            'compiled performance diagnostic requires a CUDA diagnostic.'
+        )
     output = Path(output_dir)
     if output.exists():
         raise FileExistsError(f'Use a fresh diagnostic output directory: {output}')
@@ -3014,6 +4119,15 @@ def run_v2_td3_timing_diagnostic(
             frozen_critic_strategy=frozen_critic_strategy,
             compile_critic_block=compile_critic_block,
             compile_target_block=compile_target_block,
+            compiled_path_profiler_updates=(
+                compiled_profiler_updates if level == 'medium' else 0
+            ),
+            compiled_profiler_output_dir=(
+                output / 'compiled_path_profiler' / 'medium'
+                if level == 'medium' and compiled_profiler_updates
+                else None
+            ),
+            environment_performance_diagnostic=bool(compiled_profiler_updates),
         )
         level_results[level] = result
         print(json.dumps({
@@ -3044,6 +4158,57 @@ def run_v2_td3_timing_diagnostic(
                 if name != 'overall_weighted'
             },
         }, allow_nan=False, ensure_ascii=False), flush=True)
+    performance_report: dict[str, Any] = {
+        'enabled': False,
+        'path': None,
+        'size_bytes': None,
+    }
+    if compiled_profiler_updates:
+        report_path = output / 'performance_diagnostic_summary.txt'
+        report_lines = [
+            'UAV V2 TD3 bounded compiled-path performance diagnostic',
+            'Wall subtimings include diagnostic overhead and do not synchronize '
+            'CUDA per child interval.',
+        ]
+        for level in DIAGNOSTIC_LEVELS:
+            environment = level_results[level]['environment_geometry_diagnostic']
+            report_lines.append(
+                f'{level}: environment_steps={environment["step_count"]}, '
+                f'environment_step_wall_seconds='
+                f'{environment["step_total_wall_seconds"]:.9f}'
+            )
+            for name, values in environment['step_sections'].items():
+                report_lines.append(
+                    f'  {name}: calls={values["calls"]}, '
+                    f'average_ms_per_step='
+                    f'{1000.0 * values["average_wall_seconds_per_step"]:.6f}'
+                )
+        medium_profile = level_results['medium']['compiled_path_profiler']
+        report_lines.extend((
+            f'medium_profiled_updates={medium_profile["captured_updates"]}',
+            f'medium_new_graph_count={medium_profile["new_graph_count"]}',
+            f'medium_valid_for_stable_analysis='
+            f'{medium_profile["valid_for_stable_analysis"]}',
+            f'medium_cuda_capture_status='
+            f'{medium_profile["cuda_capture_status"]}',
+            f'medium_sample_zone_count_range='
+            f'{medium_profile["sample_zone_count_min"]}..'
+            f'{medium_profile["sample_zone_count_max"]}',
+            f'medium_bc_effective_updates='
+            f'{medium_profile["bc_effective_updates"]}',
+            f'medium_terminal_geometry_effective_updates='
+            f'{medium_profile["terminal_geometry_effective_updates"]}',
+            f'medium_compiled_entry_calls='
+            f'{medium_profile["compiled_entry_calls"]}',
+            'See compiled operator tables and trace for CPU submission/waits, '
+            'kernel counts, and timeline gaps. Fused kernels retain profiler names.',
+        ))
+        report_path.write_text('\n'.join(report_lines) + '\n', encoding='utf-8')
+        performance_report = {
+            'enabled': True,
+            'path': str(report_path.resolve()),
+            'size_bytes': report_path.stat().st_size,
+        }
     summary = {
         'format': DIAGNOSTIC_FORMAT,
         'format_version': DIAGNOSTIC_VERSION,
@@ -3058,6 +4223,7 @@ def run_v2_td3_timing_diagnostic(
         'bc_checkpoint': str(checkpoint.resolve()),
         'scenario_pool_directory': str(Path(scenario_pool_dir).resolve()),
         'scenario_pool_prepare_wall_seconds': pool_prepare_seconds,
+        'performance_diagnostic_report': performance_report,
         'compiled_numerics': compiled_numerics,
         'scenario_config': asdict(prepared.scenario_config),
         'uav_collision_radius': prepared.uav_collision_radius,
@@ -3071,6 +4237,12 @@ def run_v2_td3_timing_diagnostic(
             'actor_freeze_steps': 0,
             'scenario_count_per_level': pool_count,
             'detailed_profiler_updates_per_level': profiler_updates,
+            'compiled_performance_profiler_updates_medium': (
+                compiled_profiler_updates
+            ),
+            'environment_performance_diagnostic': bool(
+                compiled_profiler_updates
+            ),
             'compile_critic_encoder_requested': compile_critic_encoder,
             'compile_target_encoders_requested': compile_target_encoders,
             'compile_actors_requested': compile_actors,
@@ -3200,6 +4372,19 @@ def build_parser() -> argparse.ArgumentParser:
             'the normal timing loop.'
         ),
     )
+    parser.add_argument(
+        '--compiled-performance-diagnostic-updates',
+        type=int,
+        nargs='?',
+        const=8,
+        default=0,
+        metavar='N',
+        help=(
+            'Enable environment/update detail on all levels and profile at most '
+            'N additional real compiled TD3 updates after medium measurement '
+            '(bare flag: 8).'
+        ),
+    )
     return parser
 
 
@@ -3229,6 +4414,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         check_compiled_numerics=args.check_compiled_numerics,
         compiled_numerics_only=args.compiled_numerics_only,
         compiled_numerics_group=args.compiled_numerics_group,
+        compiled_performance_diagnostic_updates=(
+            args.compiled_performance_diagnostic_updates
+        ),
     )
 
 

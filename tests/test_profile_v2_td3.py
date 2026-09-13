@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from copy import deepcopy
 from io import StringIO
 import json
@@ -21,6 +21,9 @@ from brain_uav.scripts.profile_v2_td3 import (
     UPDATE_TIMING_SECTION_NAMES,
     _UpdateTimingSummary,
     _DetailedUpdateProfiler,
+    _CompiledPathProfiler,
+    _EnvironmentGeometryDiagnostic,
+    _NestedUpdateTimingSummary,
     _compare_compiled_numeric_tensors,
     _compare_localization_stages,
     _compare_optional_numeric_tensor,
@@ -59,9 +62,519 @@ from brain_uav.trainers.v2_replay_buffer import V2ReplayBuffer
 from test_v2_bc import make_scenario_config, make_scenario_payload, write_cluster
 import test_v2_td3 as v2_td3_tests
 import test_v2_snn_td3 as v2_snn_td3_tests
+import test_v2_static_no_fly_env as v2_env_tests
 
 
 class TestProfileV2TD3(unittest.TestCase):
+    def test_nested_update_summary_keeps_actor_parent_and_denominators_distinct(self):
+        summary = _NestedUpdateTimingSummary()
+        summary.record(
+            actor_updated=False,
+            outer_sections={'critic_backward': 0.05, 'actor_update': 0.0},
+            detail={
+                'wall_seconds': {
+                    'critic_zero_grad': 0.01,
+                    'critic_loss_backward': 0.04,
+                },
+                'calls': {'critic_zero_grad': 1, 'critic_loss_backward': 1},
+            },
+        )
+        summary.record(
+            actor_updated=True,
+            outer_sections={'critic_backward': 0.06, 'actor_update': 0.20},
+            detail={
+                'wall_seconds': {
+                    'critic_zero_grad': 0.01,
+                    'critic_loss_backward': 0.05,
+                    'actor_forward': 0.03,
+                    'actor_backward': 0.10,
+                },
+                'calls': {
+                    'critic_zero_grad': 1,
+                    'critic_loss_backward': 1,
+                    'actor_forward': 1,
+                    'actor_backward': 1,
+                },
+            },
+        )
+        payload = summary.to_dict(environment_steps=4)
+        self.assertEqual(payload['update_count'], 2)
+        self.assertEqual(payload['actor_update_count'], 1)
+        self.assertAlmostEqual(
+            payload['critic_backward']['children']['critic_loss_backward'][
+                'average_wall_seconds_per_update'
+            ],
+            0.045,
+        )
+        actor = payload['actor_update']
+        self.assertAlmostEqual(
+            actor['children']['actor_backward'][
+                'average_wall_seconds_per_actor_update'
+            ],
+            0.10,
+        )
+        self.assertAlmostEqual(
+            actor['children']['actor_backward'][
+                'average_wall_seconds_per_environment_step'
+            ],
+            0.025,
+        )
+        self.assertAlmostEqual(actor['other_uncovered_wall_seconds'], 0.07)
+
+    def test_environment_geometry_diagnostic_preserves_results_and_restores_wrappers(self):
+        fixture = v2_env_tests.TestV2StaticNoFlyTrajectoryEnv()
+        zone = v2_env_tests.NoFlyZone(
+            'sphere',
+            v2_env_tests.Sphere([12.0, 2.0, 10.0], 2.0),
+            0.5,
+        )
+        payload = v2_env_tests._scenario(
+            [0.0, 0.0, 10.0, 0.0, 0.0],
+            [30.0, 0.0, 10.0],
+            [zone],
+            metadata={'direct_path_blocker_count': 0},
+        )
+        baseline = fixture.make_env(payload, radius=0.25)
+        measured = fixture.make_env(payload, radius=0.25)
+        action = np.array([0.01, -0.02], dtype=np.float32)
+        diagnostic = _EnvironmentGeometryDiagnostic(
+            duplicate_audit_steps=2,
+            duplicate_example_limit=2,
+        )
+        geometry_calls = {
+            'point_clearance': 0,
+            'violates_segment': 0,
+            'zone_segment_clearance': 0,
+            'surface_normal': 0,
+            'segment_intersection': 0,
+            'shape_segment_clearance': 0,
+        }
+        methods = (
+            (v2_env_tests.NoFlyZone, 'point_clearance', 'point_clearance'),
+            (v2_env_tests.NoFlyZone, 'violates_segment', 'violates_segment'),
+            (
+                v2_env_tests.NoFlyZone,
+                'segment_clearance',
+                'zone_segment_clearance',
+            ),
+            (v2_env_tests.Sphere, 'surface_normal', 'surface_normal'),
+            (
+                v2_env_tests.Sphere,
+                'segment_intersection',
+                'segment_intersection',
+            ),
+            (
+                v2_env_tests.Sphere,
+                'segment_clearance',
+                'shape_segment_clearance',
+            ),
+        )
+
+        def counted(key, original):
+            def wrapper(*args, **kwargs):
+                geometry_calls[key] += 1
+                return original(*args, **kwargs)
+            return wrapper
+
+        with ExitStack() as patches:
+            for owner, name, key in methods:
+                patches.enter_context(mock.patch.object(
+                    owner,
+                    name,
+                    counted(key, getattr(owner, name)),
+                ))
+            baseline_reset = baseline.reset()
+            baseline.line_to_goal_is_safe(baseline.state[:3], clearance=1.0)
+            baseline_step = baseline.step(action)
+            baseline_geometry_calls = dict(geometry_calls)
+            for key in geometry_calls:
+                geometry_calls[key] = 0
+
+            measured.set_performance_diagnostic(diagnostic)
+            measured_reset = measured.reset()
+            with diagnostic.source('pre_action_geometry'):
+                measured.line_to_goal_is_safe(measured.state[:3], clearance=1.0)
+            measured_step = measured.step(action)
+            measured_geometry_calls = dict(geometry_calls)
+        patched_zone = measured.zones[0]
+        patched_shape = patched_zone.shape
+        self.assertIn('point_clearance', patched_zone.__dict__)
+        diagnostic.close()
+        measured.set_performance_diagnostic(None)
+
+        np.testing.assert_array_equal(
+            measured_reset[0].zone_features,
+            baseline_reset[0].zone_features,
+        )
+        self.assertEqual(measured_reset[1], baseline_reset[1])
+        np.testing.assert_array_equal(
+            measured_step[0].zone_features,
+            baseline_step[0].zone_features,
+        )
+        self.assertEqual(measured_step[1:], baseline_step[1:])
+        self.assertEqual(measured_geometry_calls, baseline_geometry_calls)
+        self.assertNotIn('point_clearance', patched_zone.__dict__)
+        self.assertNotIn('surface_normal', patched_shape.__dict__)
+        summary = diagnostic.to_dict()
+        self.assertEqual(summary['step_count'], 1)
+        self.assertEqual(summary['reset_count'], 1)
+        for section in (
+            'dynamics_position_progress',
+            'termination',
+            'current_point_clearance',
+            'reward',
+            'observation_construction',
+            'info_construction',
+        ):
+            self.assertEqual(summary['step_sections'][section]['calls'], 1)
+        geometry = summary['geometry_queries']
+        self.assertTrue(any(
+            key.endswith('|Sphere|point_clearance')
+            for key in geometry
+        ))
+        self.assertTrue(any(
+            key.endswith('|Sphere|surface_normal')
+            for key in geometry
+        ))
+        self.assertTrue(any(
+            key.endswith('|Sphere|segment_safety')
+            for key in geometry
+        ))
+
+    def test_environment_geometry_diagnostic_restores_wrappers_after_exception(self):
+        fixture = v2_env_tests.TestV2StaticNoFlyTrajectoryEnv()
+        payload = v2_env_tests._scenario(
+            [0.0, 0.0, 10.0, 0.0, 0.0],
+            [30.0, 0.0, 10.0],
+            [v2_env_tests.NoFlyZone(
+                'sphere', v2_env_tests.Sphere([12.0, 0.0, 10.0], 2.0)
+            )],
+            metadata={'direct_path_blocker_count': 0},
+        )
+        env = fixture.make_env(payload)
+        diagnostic = _EnvironmentGeometryDiagnostic()
+        env.set_performance_diagnostic(diagnostic)
+        try:
+            env.reset()
+            zone = env.zones[0]
+            shape = zone.shape
+            raise RuntimeError('controlled diagnostic failure')
+        except RuntimeError:
+            pass
+        finally:
+            env.set_performance_diagnostic(None)
+            diagnostic.close()
+        self.assertNotIn('point_clearance', zone.__dict__)
+        self.assertNotIn('surface_normal', shape.__dict__)
+
+    def test_compiled_path_profiler_caps_updates_and_invalidates_new_graphs(self):
+        class FakeEvent:
+            def __init__(
+                self,
+                key,
+                count,
+                self_cpu,
+                cpu_total,
+                self_device,
+                device_total,
+                device_type,
+            ):
+                self.key = key
+                self.count = count
+                self.self_cpu_time_total = self_cpu
+                self.cpu_time_total = cpu_total
+                self.self_device_time_total = self_device
+                self.device_time_total = device_total
+                self.device_type = device_type
+
+        class FakeAverages(list):
+            def table(self, *, sort_by, row_limit):
+                return f'{sort_by}:{row_limit}'
+
+        class FakeProfiler:
+            def __init__(self, events=None):
+                self.toggles = []
+                self._events = events or [
+                    FakeEvent(
+                        'cpu_parent', 1, 30.0, 50.0, 0.0, 90.0,
+                        torch.autograd.DeviceType.CPU,
+                    ),
+                    FakeEvent(
+                        'cpu_child', 2, 10.0, 20.0, 0.0, 8.0,
+                        torch.autograd.DeviceType.CPU,
+                    ),
+                    FakeEvent(
+                        'compiled_kernel', 4, 0.0, 0.0, 80.0, 90.0,
+                        torch.autograd.DeviceType.CUDA,
+                    ),
+                    FakeEvent(
+                        'cudaMemcpyAsync', 2, 0.0, 0.0, 5.0, 5.0,
+                        torch.autograd.DeviceType.CUDA,
+                    ),
+                    FakeEvent(
+                        'cudaMemsetAsync', 1, 0.0, 0.0, 2.0, 2.0,
+                        torch.autograd.DeviceType.CUDA,
+                    ),
+                ]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def toggle_collection_dynamic(self, enabled, activities):
+                self.toggles.append(enabled)
+
+            def step(self):
+                pass
+
+            def key_averages(self):
+                return FakeAverages(self._events)
+
+            def export_chrome_trace(self, path):
+                Path(path).write_text('{}', encoding='utf-8')
+
+        fake = FakeProfiler()
+        calls = []
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            'brain_uav.scripts.profile_v2_td3.torch.profiler.profile',
+            return_value=fake,
+        ), mock.patch(
+            'brain_uav.scripts.profile_v2_td3._dynamo_unique_graph_count',
+            side_effect=(12, 13),
+        ):
+            profiler = _CompiledPathProfiler(
+                torch.device('cuda'),
+                requested_updates=2,
+                output_dir=Path(directory) / 'compiled-profiler',
+                expected_compiled_entries=('critic_block',),
+            )
+
+            def operation():
+                calls.append('update')
+                profiler.record_compiled_entry('critic_block')
+                return len(calls)
+
+            self.assertEqual(profiler.run(operation), 1)
+            self.assertEqual(profiler.run(operation), 2)
+            self.assertIsNone(profiler.run(operation))
+            result = profiler.finish()
+
+        self.assertEqual(calls, ['update', 'update'])
+        self.assertEqual(result['captured_updates'], 2)
+        self.assertEqual(result['compiled_entry_calls']['critic_block'], 2)
+        self.assertEqual(result['graph_count_before'], 12)
+        self.assertEqual(result['graph_count_after'], 13)
+        self.assertFalse(result['valid_for_stable_analysis'])
+        self.assertTrue(result['cuda_activity_requested'])
+        self.assertTrue(result['cuda_activity_collected'])
+        self.assertEqual(result['cuda_capture_status'], 'available')
+        self.assertEqual(result['top_cpu_operations'][0]['name'], 'cpu_parent')
+        self.assertEqual(result['top_cuda_operations'][0]['name'], 'compiled_kernel')
+        self.assertEqual(
+            result['cpu_associated_cuda_operations'][0]['name'],
+            'cpu_parent',
+        )
+        device_tasks = result['cuda_device_tasks']
+        self.assertEqual(device_tasks['data_source'], 'CUDA device events')
+        self.assertEqual(device_tasks['kernel']['calls'], 4)
+        self.assertEqual(device_tasks['memcpy']['calls'], 2)
+        self.assertEqual(device_tasks['memset']['calls'], 1)
+        self.assertEqual(
+            sum(
+                device_tasks[name]['self_time_us']
+                for name in ('kernel', 'memcpy', 'memset')
+            ),
+            87.0,
+        )
+        _, other = _CompiledPathProfiler._operation_summary(
+            fake.key_averages(),
+            self_metric='self_cpu_time_total',
+            total_metric='cpu_time_total',
+            limit=1,
+        )
+        self.assertIsNone(other['total_time_us'])
+        self.assertIn('inclusive', other['total_time_note'].lower())
+        self.assertTrue(all(size > 0 for size in result['output_file_sizes_bytes'].values()))
+
+        missing_cuda = FakeProfiler([
+            FakeEvent(
+                'cpu_only', 1, 4.0, 5.0, 0.0, 0.0,
+                torch.autograd.DeviceType.CPU,
+            ),
+        ])
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
+            'brain_uav.scripts.profile_v2_td3.torch.profiler.profile',
+            return_value=missing_cuda,
+        ), mock.patch(
+            'brain_uav.scripts.profile_v2_td3._dynamo_unique_graph_count',
+            side_effect=(20, 20),
+        ):
+            profiler = _CompiledPathProfiler(
+                torch.device('cuda'),
+                requested_updates=1,
+                output_dir=Path(directory) / 'missing-cuda',
+                expected_compiled_entries=('critic_block',),
+            )
+
+            def cpu_only_operation():
+                profiler.record_compiled_entry('critic_block')
+
+            profiler.run(cpu_only_operation)
+            missing_result = profiler.finish()
+
+        self.assertFalse(missing_result['cuda_activity_collected'])
+        self.assertIsNone(missing_result['top_cuda_operations'])
+        self.assertFalse(missing_result['valid_for_stable_analysis'])
+        self.assertIn('unavailable', missing_result['cuda_capture_status'])
+        self.assertFalse(missing_result['cuda_device_tasks']['available'])
+        self.assertIsNone(missing_result['cuda_device_tasks']['kernel']['calls'])
+
+    def test_geometry_duplicate_audit_is_scoped_to_reset_and_each_step(self):
+        zone = v2_env_tests.NoFlyZone(
+            'sphere',
+            v2_env_tests.Sphere([12.0, 2.0, 10.0], 2.0),
+            0.5,
+        )
+        diagnostic = _EnvironmentGeometryDiagnostic(
+            duplicate_audit_steps=5,
+            duplicate_example_limit=4,
+        )
+        diagnostic.attach_zones([zone])
+        point = np.array([0.0, 0.0, 10.0], dtype=np.float64)
+
+        diagnostic.begin_reset()
+        zone.point_clearance(point, uav_radius=0.25)
+        zone.point_clearance(point, uav_radius=0.25)
+        diagnostic.end_reset()
+
+        with diagnostic.audit_step():
+            with diagnostic.source('pre_action_geometry'):
+                zone.point_clearance(point, uav_radius=0.25)
+            with diagnostic.source('current_point_clearance'):
+                zone.point_clearance(point, uav_radius=0.25)
+
+        with diagnostic.audit_step():
+            zone.point_clearance(point, uav_radius=0.25)
+        with diagnostic.audit_step():
+            zone.point_clearance(point, uav_radius=0.25)
+
+        with self.assertRaisesRegex(RuntimeError, 'controlled'):
+            with diagnostic.audit_step():
+                zone.point_clearance(point, uav_radius=0.25)
+                raise RuntimeError('controlled')
+        with diagnostic.audit_step():
+            zone.point_clearance(point, uav_radius=0.25)
+
+        summary = diagnostic.to_dict()['duplicate_query_audit']
+        self.assertEqual(summary['audited_reset_count'], 1)
+        self.assertEqual(summary['audited_step_count'], 5)
+        self.assertEqual(summary['strict_duplicate_group_count'], 2)
+        self.assertEqual(summary['duplicate_call_count_after_first'], 2)
+        self.assertEqual(len(summary['representative_examples']), 2)
+        reset_example, step_example = summary['representative_examples']
+        self.assertEqual(reset_example['audit_cycle'], 'reset')
+        self.assertEqual(reset_example['audit_cycle_index'], 1)
+        self.assertEqual(step_example['audit_cycle'], 'step')
+        self.assertEqual(step_example['audit_cycle_index'], 1)
+        self.assertEqual(
+            set(step_example['sources']),
+            {'pre_action_geometry', 'current_point_clearance'},
+        )
+        diagnostic.close()
+
+    def test_geometry_duplicate_example_updates_only_its_own_audit_cycle(self):
+        zone = v2_env_tests.NoFlyZone(
+            'sphere',
+            v2_env_tests.Sphere([12.0, 2.0, 10.0], 2.0),
+            0.5,
+        )
+        diagnostic = _EnvironmentGeometryDiagnostic(
+            duplicate_audit_steps=1,
+            duplicate_example_limit=2,
+        )
+        diagnostic.attach_zones([zone])
+        point = np.array([0.0, 0.0, 10.0], dtype=np.float64)
+
+        diagnostic.begin_reset()
+        with diagnostic.source('reset_source'):
+            zone.point_clearance(point, uav_radius=0.25)
+            zone.point_clearance(point, uav_radius=0.25)
+        diagnostic.end_reset()
+
+        with diagnostic.audit_step():
+            with diagnostic.source('step_source'):
+                zone.point_clearance(point, uav_radius=0.25)
+                zone.point_clearance(point, uav_radius=0.25)
+                zone.point_clearance(point, uav_radius=0.25)
+
+        summary = diagnostic.to_dict()['duplicate_query_audit']
+        self.assertEqual(summary['strict_duplicate_group_count'], 2)
+        self.assertEqual(summary['duplicate_call_count_after_first'], 3)
+        self.assertEqual(len(summary['representative_examples']), 2)
+        reset_example, step_example = summary['representative_examples']
+        self.assertEqual(reset_example['audit_cycle'], 'reset')
+        self.assertEqual(reset_example['audit_cycle_index'], 1)
+        self.assertEqual(reset_example['strictly_identical_call_count'], 2)
+        self.assertEqual(reset_example['sources'], ['reset_source'])
+        self.assertEqual(step_example['audit_cycle'], 'step')
+        self.assertEqual(step_example['audit_cycle_index'], 1)
+        self.assertEqual(step_example['strictly_identical_call_count'], 3)
+        self.assertEqual(step_example['sources'], ['step_source'])
+        diagnostic.close()
+
+    def test_compiled_performance_profile_is_post_measurement_and_keeps_compiled_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result, replay, _ = self.run_small_level(
+                warmup=0,
+                steps=5,
+                level='medium',
+                compile_actors=True,
+                frozen_critic_strategy='compiled_no_grad_context',
+                compile_critic_block=True,
+                compile_target_block=True,
+                compiled_path_profiler_updates=2,
+                compiled_profiler_output_dir=Path(directory) / 'profile',
+                dynamo_graph_counts=(10, 10, 10, 10),
+            )
+
+        self.assertEqual(result['critic_updates'], 5)
+        self.assertEqual(result['actor_updates'], 3)
+        self.assertEqual(len(replay), 12)
+        profiler = result['compiled_path_profiler']
+        self.assertEqual(profiler['captured_updates'], 2)
+        self.assertTrue(profiler['valid_for_stable_analysis'])
+        self.assertEqual(profiler['compiled_entry_calls']['critic_block'], 2)
+        self.assertEqual(
+            result['timing']['calls']['td3_update_wall_seconds'],
+            5,
+        )
+        self.assertEqual(
+            result['timing']['td3_nested_update_breakdown']['update_count'],
+            5,
+        )
+        self.assertTrue(result['environment_geometry_diagnostic']['enabled'])
+        self.assertEqual(
+            result['environment_geometry_diagnostic']['step_count'],
+            5,
+        )
+        self.assertEqual(
+            result['environment_geometry_diagnostic'][
+                'duplicate_query_audit'
+            ]['audited_step_count'],
+            5,
+        )
+        profiled_flags = result['_test_diagnostic_profile_flags'][-2:]
+        self.assertEqual(profiled_flags, [(False, True), (False, True)])
+        self.assertIn('critic_block', result['_test_compiled_entry_records'])
+
+    def test_compiled_performance_diagnostic_is_disabled_by_default(self):
+        result, _, _ = self.run_small_level(warmup=0, steps=5)
+        self.assertFalse(result['compiled_path_profiler']['enabled'])
+        self.assertFalse(result['environment_geometry_diagnostic']['enabled'])
+        self.assertIsNone(result['timing']['td3_nested_update_breakdown'])
+
     def run_small_level(self, *, warmup=0, steps=5, early_goal=False,
                         device='cpu', suppress_measured_actor=False,
                         detailed_profiler_updates=0, profiler_output_dir=None,
@@ -71,6 +584,9 @@ class TestProfileV2TD3(unittest.TestCase):
                         frozen_critic_strategy='eager',
                         compile_critic_block=False,
                         compile_target_block=False,
+                        compiled_path_profiler_updates=0,
+                        compiled_profiler_output_dir=None,
+                        level='easy',
                         dynamo_graph_counts=(10, 10)):
         # Real environment and replay; only network work and CUDA are test doubles.
         scenario = make_scenario_config()
@@ -98,10 +614,20 @@ class TestProfileV2TD3(unittest.TestCase):
             submitted.append(observation)
             return np.zeros(2, dtype=np.float32)
 
+        diagnostic_profile_flags = []
+        compiled_entry_records = []
+
         def update_once(*, total_steps, bc_lambda, timing_recorder=None,
-                        profile_sections=False, reuse_shared_relations=True):
+                        profile_sections=False, reuse_shared_relations=True,
+                        diagnostic_timing_recorder=None,
+                        diagnostic_profile_sections=False,
+                        compiled_execution_recorder=None):
             del reuse_shared_relations
             replay.sample(4)
+            diagnostic_profile_flags.append((
+                profile_sections,
+                diagnostic_profile_sections,
+            ))
             engine.critic_update_count += 1
             actor_updated = total_steps % 2 == 0 and not (
                 suppress_measured_actor and total_steps > 7
@@ -120,7 +646,37 @@ class TestProfileV2TD3(unittest.TestCase):
                     'actor_update': 0.06 if actor_updated else 0.0,
                     'target_soft_update': 0.07 if actor_updated else 0.02,
                 })
-            return SimpleNamespace(actor_updated=actor_updated)
+            if diagnostic_timing_recorder is not None:
+                diagnostic_timing_recorder({
+                    'wall_seconds': {
+                        'critic_zero_grad': 0.002,
+                        'critic_loss_backward': 0.018,
+                        'actor_forward': 0.01 if actor_updated else 0.0,
+                        'actor_backward': 0.03 if actor_updated else 0.0,
+                    },
+                    'calls': {
+                        'critic_zero_grad': 1,
+                        'critic_loss_backward': 1,
+                        'actor_forward': int(actor_updated),
+                        'actor_backward': int(actor_updated),
+                    },
+                })
+            if compiled_execution_recorder is not None:
+                for name in (
+                    'critic_block', 'target_block', 'frozen_critic_context',
+                    'actor', 'bc_reference_actor',
+                ):
+                    if name in ('actor', 'bc_reference_actor', 'frozen_critic_context') and not actor_updated:
+                        continue
+                    compiled_execution_recorder(name)
+                    compiled_entry_records.append(name)
+            return SimpleNamespace(
+                actor_updated=actor_updated,
+                bc_lambda=float(bc_lambda),
+                bc_loss=0.5 if bc_lambda else 0.0,
+                terminal_geo_lambda=3000.0,
+                terminal_geo_loss=0.25 if actor_updated else 0.0,
+            )
 
         engine.select_action = select_action
         engine.update_once = update_once
@@ -205,7 +761,7 @@ class TestProfileV2TD3(unittest.TestCase):
             side_effect=dynamo_graph_counts,
         ):
             result = _run_diagnostic_level(
-                level='easy',
+                level=level,
                 pool=SimpleNamespace(stage_seed=101, scenarios=records, scenario_count=3),
                 prepared=SimpleNamespace(
                     scenario_config=scenario, reward_config=RewardConfig(),
@@ -224,7 +780,14 @@ class TestProfileV2TD3(unittest.TestCase):
                 frozen_critic_strategy=frozen_critic_strategy,
                 compile_critic_block=compile_critic_block,
                 compile_target_block=compile_target_block,
+                compiled_path_profiler_updates=compiled_path_profiler_updates,
+                compiled_profiler_output_dir=compiled_profiler_output_dir,
+                environment_performance_diagnostic=(
+                    compiled_path_profiler_updates > 0
+                ),
             )
+        result['_test_diagnostic_profile_flags'] = diagnostic_profile_flags
+        result['_test_compiled_entry_records'] = compiled_entry_records
         return result, replay, synchronization_points
 
     def test_warmup_reaches_update_minima_and_is_excluded_from_measurement(self) -> None:
@@ -354,7 +917,7 @@ class TestProfileV2TD3(unittest.TestCase):
             'critic_backward': 1.0,
             'critic_gradient_check_and_clip': 1.0,
             'critic_optimizer_step': 1.0,
-            'actor_update': 3.0,
+            'actor_update': 1.0,
             'target_soft_update': 2.0,
         })
         for timed_model, untimed_model in (
@@ -1632,6 +2195,44 @@ class TestProfileV2TD3(unittest.TestCase):
             run_v2_td3_timing_diagnostic(
                 **common,
                 frozen_critic_strategy='compiled_no_grad_context',
+            )
+
+    def test_compiled_performance_diagnostic_defaults_and_conflicts(self):
+        required = [
+            '--model', 'ann',
+            '--bc-checkpoint', 'bc.pt',
+            '--output-dir', 'out',
+            '--scenario-pool-dir', 'pools',
+        ]
+        self.assertEqual(
+            build_parser().parse_args(required).
+            compiled_performance_diagnostic_updates,
+            0,
+        )
+        self.assertEqual(
+            build_parser().parse_args(
+                required + ['--compiled-performance-diagnostic-updates']
+            ).compiled_performance_diagnostic_updates,
+            8,
+        )
+        common = {
+            'model': 'ann',
+            'bc_checkpoint': Path('missing.pt'),
+            'output_dir': Path('unused-output'),
+            'scenario_pool_dir': Path('missing-pools'),
+            'device': 'cpu',
+            'compiled_performance_diagnostic_updates': 8,
+        }
+        with self.assertRaisesRegex(ValueError, 'requires the full compiled'):
+            run_v2_td3_timing_diagnostic(**common)
+        with self.assertRaisesRegex(ValueError, 'cannot be combined'):
+            run_v2_td3_timing_diagnostic(
+                **common,
+                compile_actors=True,
+                compile_critic_block=True,
+                compile_target_block=True,
+                frozen_critic_strategy='compiled_no_grad_context',
+                detailed_profiler_updates=1,
             )
 
     def test_compile_and_detailed_profiler_combination_is_rejected_before_output(self) -> None:

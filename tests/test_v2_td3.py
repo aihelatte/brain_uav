@@ -1364,9 +1364,120 @@ class TestV2TD3(unittest.TestCase):
 
         self.assertEqual(labels, [
             'v2_td3.critic_backward',
+            'v2_td3.critic_zero_grad',
+            'v2_td3.critic_loss_backward',
             'v2_td3.critic_gradient_check_and_clip',
             'v2_td3.critic_optimizer_step',
         ])
+
+    def test_compiled_path_diagnostic_marks_nested_update_without_profile_sections(self):
+        engine = self.make_engine(policy_delay=1)
+        self.fill_replay(engine)
+        labels = []
+        detail_records = []
+        actor_profile_flags = []
+        original_actor_forward = engine.actor.forward
+
+        @contextmanager
+        def record(label):
+            labels.append(label)
+            yield
+
+        def actor_forward(*args, **kwargs):
+            actor_profile_flags.append(kwargs.get('profile_sections', False))
+            return original_actor_forward(*args, **kwargs)
+
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.record_function',
+            side_effect=record,
+        ), mock.patch.object(
+            engine.actor,
+            'forward',
+            side_effect=actor_forward,
+        ):
+            metrics = engine.update_once(
+                total_steps=1,
+                diagnostic_profile_sections=True,
+                diagnostic_timing_recorder=detail_records.append,
+            )
+
+        self.assertTrue(metrics.actor_updated)
+        self.assertTrue(actor_profile_flags)
+        self.assertFalse(any(actor_profile_flags))
+        expected = {
+            'critic_zero_grad',
+            'critic_loss_backward',
+            'actor_guidance_context',
+            'actor_forward',
+            'actor_q_rl_loss_and_scale',
+            'actor_bc_reference_forward_and_loss',
+            'actor_terminal_geometry_loss',
+            'actor_loss_composition_and_finite_check',
+            'actor_zero_grad',
+            'actor_backward',
+            'actor_gradient_check_and_clip',
+            'actor_optimizer_step',
+        }
+        self.assertEqual(
+            {
+                label.removeprefix('v2_td3.detail.')
+                for label in labels
+                if label.startswith('v2_td3.detail.')
+            },
+            expected,
+        )
+        self.assertEqual(len(detail_records), 1)
+        self.assertEqual(set(detail_records[0]['wall_seconds']), expected)
+        self.assertEqual(
+            detail_records[0]['calls']['actor_loss_composition_and_finite_check'],
+            2,
+        )
+
+    def test_compiled_execution_recorder_observes_real_full_entries(self):
+        engine = self.make_engine(
+            policy_delay=1,
+            bc_reference_actor=self.make_bc_reference(0.01),
+        )
+        self.fill_replay(engine)
+        observation = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), mock.patch(
+            'brain_uav.models.v2_ann.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            engine.configure_compilation(
+                compile_actors=True,
+                frozen_critic_strategy='compiled_no_grad_context',
+                compile_critic_block=True,
+                compile_target_block=True,
+                backend='eager',
+            )
+            engine.warmup_actor_compile((observation,))
+            engine.warmup_full_compile((observation,))
+            entries = []
+            metrics = engine.update_once(
+                total_steps=1,
+                bc_lambda=1.0,
+                diagnostic_profile_sections=True,
+                compiled_execution_recorder=entries.append,
+            )
+
+        self.assertTrue(metrics.actor_updated)
+        self.assertEqual(set(entries), {
+            'target_block',
+            'critic_block',
+            'frozen_critic_context',
+            'actor',
+            'bc_reference_actor',
+        })
 
     def test_fixed_buffers_are_validated_at_engine_and_checkpoint_boundaries(self):
         action_limit = torch.tensor([0.2, 0.3], dtype=torch.float32)
