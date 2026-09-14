@@ -196,11 +196,30 @@ class RelationAwareSelfAttention(nn.Module):
         queries = self._split_heads(queries)
         keys = self._split_heads(keys)
         values = self._split_heads(values)
-        relation_bias = self.relation_bias(clean_relations).permute(0, 3, 1, 2)
+        relation_weight = torch.cat(
+            (self.relation_bias.weight, self.relation_value.weight),
+            dim=0,
+        )
+        relation_projection_bias = torch.cat(
+            (self.relation_bias.bias, self.relation_value.bias),
+            dim=0,
+        )
+        relation_bias, relation_values = F.linear(
+            clean_relations,
+            relation_weight,
+            relation_projection_bias,
+        ).split(
+            (
+                self.relation_bias.out_features,
+                self.relation_value.out_features,
+            ),
+            dim=-1,
+        )
+        relation_bias = relation_bias.permute(0, 3, 1, 2)
         relation_bias = relation_bias * relation_pair_mask.unsqueeze(1).to(
             relation_bias.dtype
         )
-        relation_values = self.relation_value(clean_relations).reshape(
+        relation_values = relation_values.reshape(
             batch_size,
             token_count,
             token_count,

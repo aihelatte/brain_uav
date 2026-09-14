@@ -40,8 +40,9 @@ def _reference_attention_forward(
     relation_pair_mask,
     *,
     return_attention_weights=False,
+    merge_qkv=False,
 ):
-    """Pre-optimization attention path with three independent Q/K/V linears."""
+    """Independent attention reference with unfused relation projections."""
 
     batch_size, token_count, _ = tokens.shape
     clean_relations = torch.where(
@@ -49,9 +50,27 @@ def _reference_attention_forward(
         pair_relations,
         torch.zeros_like(pair_relations),
     )
-    queries = attention._split_heads(attention.query(tokens))
-    keys = attention._split_heads(attention.key(tokens))
-    values = attention._split_heads(attention.value(tokens))
+    if merge_qkv:
+        qkv_weight = torch.cat(
+            (attention.query.weight, attention.key.weight, attention.value.weight),
+            dim=0,
+        )
+        qkv_bias = torch.cat(
+            (attention.query.bias, attention.key.bias, attention.value.bias),
+            dim=0,
+        )
+        queries, keys, values = torch.nn.functional.linear(
+            tokens,
+            qkv_weight,
+            qkv_bias,
+        ).split(attention.hidden_dim, dim=-1)
+        queries = attention._split_heads(queries)
+        keys = attention._split_heads(keys)
+        values = attention._split_heads(values)
+    else:
+        queries = attention._split_heads(attention.query(tokens))
+        keys = attention._split_heads(attention.key(tokens))
+        values = attention._split_heads(attention.value(tokens))
     relation_bias = attention.relation_bias(clean_relations).permute(0, 3, 1, 2)
     relation_bias = relation_bias * relation_pair_mask.unsqueeze(1).to(
         relation_bias.dtype
@@ -113,6 +132,23 @@ def _use_reference_attention(model):
     for layer in model.layers:
         layer.attention.forward = MethodType(
             _reference_attention_forward,
+            layer.attention,
+        )
+
+
+def _reference_attention_with_independent_relations(attention, *args, **kwargs):
+    return _reference_attention_forward(
+        attention,
+        *args,
+        **kwargs,
+        merge_qkv=True,
+    )
+
+
+def _use_independent_relation_reference(model):
+    for layer in model.layers:
+        layer.attention.forward = MethodType(
+            _reference_attention_with_independent_relations,
             layer.attention,
         )
 
@@ -301,7 +337,7 @@ class TestZoneSetEncoder(unittest.TestCase):
         torch.testing.assert_close(output, torch.zeros_like(output))
         torch.testing.assert_close(weights, torch.zeros_like(weights))
 
-    def test_attention_uses_one_merged_qkv_linear(self):
+    def test_attention_uses_one_merged_linear_per_projection_group(self):
         config = ZoneSetEncoderConfig()
         attention = RelationAwareSelfAttention(config).eval()
         tokens = torch.randn((2, 4, config.hidden_dim), dtype=torch.float32)
@@ -321,7 +357,7 @@ class TestZoneSetEncoder(unittest.TestCase):
         ) as linear:
             attention(tokens, valid_mask, pair_relations, relation_mask)
 
-        self.assertEqual(linear.call_count, 4)
+        self.assertEqual(linear.call_count, 3)
 
     def test_merged_qkv_matches_independent_reference_outputs_and_gradients(self):
         for counts in ([0], [0, 3, 7]):
@@ -382,6 +418,116 @@ class TestZoneSetEncoder(unittest.TestCase):
                                     rtol=2e-6,
                                 )
 
+    def test_merged_relations_match_independent_reference_outputs_and_gradients(self):
+        for counts in ([0], [0, 3, 7]):
+            with self.subTest(counts=counts):
+                torch.manual_seed(733)
+                model = ZoneSetEncoder(self.scales).train()
+                reference = deepcopy(model)
+                _use_independent_relation_reference(reference)
+                actual_inputs = tuple(
+                    value.clone().requires_grad_(value.dtype == torch.float32)
+                    for value in self.inputs(counts)
+                )
+                reference_inputs = tuple(
+                    value.detach().clone().requires_grad_(value.dtype == torch.float32)
+                    for value in actual_inputs
+                )
+
+                actual_output = model(*actual_inputs)
+                reference_output = reference(*reference_inputs)
+                actual_output.square().sum().backward()
+                reference_output.square().sum().backward()
+
+                torch.testing.assert_close(
+                    actual_output,
+                    reference_output,
+                    atol=2e-6,
+                    rtol=2e-6,
+                )
+                for actual, expected in zip(actual_inputs[:3], reference_inputs[:3]):
+                    torch.testing.assert_close(
+                        actual.grad,
+                        expected.grad,
+                        atol=2e-6,
+                        rtol=2e-6,
+                    )
+                for actual_layer, reference_layer in zip(
+                    model.layers,
+                    reference.layers,
+                ):
+                    for projection_name in ('relation_bias', 'relation_value'):
+                        actual_projection = getattr(
+                            actual_layer.attention,
+                            projection_name,
+                        )
+                        reference_projection = getattr(
+                            reference_layer.attention,
+                            projection_name,
+                        )
+                        for parameter_name in ('weight', 'bias'):
+                            torch.testing.assert_close(
+                                getattr(actual_projection, parameter_name).grad,
+                                getattr(reference_projection, parameter_name).grad,
+                                atol=2e-6,
+                                rtol=2e-6,
+                            )
+
+    def test_false_relation_mask_blocks_nonzero_relation_biases(self):
+        torch.manual_seed(739)
+        attention = RelationAwareSelfAttention(ZoneSetEncoderConfig()).train()
+        reference = deepcopy(attention)
+        reference.forward = MethodType(
+            _reference_attention_with_independent_relations,
+            reference,
+        )
+        with torch.no_grad():
+            attention.relation_bias.bias.fill_(3.0)
+            attention.relation_value.bias.fill_(-2.0)
+            reference.load_state_dict(attention.state_dict(), strict=True)
+        tokens = torch.randn((2, 8, attention.hidden_dim), dtype=torch.float32)
+        valid_mask = torch.ones((2, 8), dtype=torch.bool)
+        pair_relations = torch.randn(
+            (2, 8, 8, attention.relation_bias.in_features),
+            dtype=torch.float32,
+        )
+        relation_mask = torch.zeros((2, 8, 8), dtype=torch.bool)
+
+        actual_output = attention(
+            tokens,
+            valid_mask,
+            pair_relations,
+            relation_mask,
+        )
+        reference_output = reference(
+            tokens,
+            valid_mask,
+            pair_relations,
+            relation_mask,
+        )
+        actual_output.square().sum().backward()
+        reference_output.square().sum().backward()
+
+        torch.testing.assert_close(
+            actual_output,
+            reference_output,
+            atol=2e-6,
+            rtol=2e-6,
+        )
+        for projection_name in ('relation_bias', 'relation_value'):
+            actual_projection = getattr(attention, projection_name)
+            reference_projection = getattr(reference, projection_name)
+            for parameter_name in ('weight', 'bias'):
+                actual_gradient = getattr(actual_projection, parameter_name).grad
+                reference_gradient = getattr(reference_projection, parameter_name).grad
+                self.assertIsNotNone(actual_gradient)
+                self.assertIsNotNone(reference_gradient)
+                torch.testing.assert_close(actual_gradient, reference_gradient)
+                torch.testing.assert_close(
+                    actual_gradient,
+                    torch.zeros_like(actual_gradient),
+                )
+
     def test_merged_qkv_preserves_parameters_checkpoint_and_rng_contract(self):
         torch.manual_seed(90210)
         attention = RelationAwareSelfAttention(ZoneSetEncoderConfig())
@@ -419,6 +565,77 @@ class TestZoneSetEncoder(unittest.TestCase):
         attention = RelationAwareSelfAttention(ZoneSetEncoderConfig()).train()
         reference = deepcopy(attention)
         reference.forward = MethodType(_reference_attention_forward, reference)
+        optimizer = torch.optim.Adam(attention.parameters(), lr=1e-2)
+        reference_optimizer = torch.optim.Adam(reference.parameters(), lr=1e-2)
+        tokens = torch.randn((2, 8, attention.hidden_dim), dtype=torch.float32)
+        valid_mask = torch.tensor(
+            [
+                [True, False, False, False, False, False, False, False],
+                [True, True, True, True, True, True, True, True],
+            ]
+        )
+        pair_relations = torch.randn(
+            (2, 8, 8, attention.relation_bias.in_features),
+            dtype=torch.float32,
+        )
+        relation_mask = valid_mask[:, :, None] & valid_mask[:, None, :]
+        previous_output = None
+
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            reference_optimizer.zero_grad(set_to_none=True)
+            actual_output = attention(
+                tokens,
+                valid_mask,
+                pair_relations,
+                relation_mask,
+            )
+            reference_output = reference(
+                tokens,
+                valid_mask,
+                pair_relations,
+                relation_mask,
+            )
+            torch.testing.assert_close(
+                actual_output,
+                reference_output,
+                atol=2e-6,
+                rtol=2e-6,
+            )
+            if previous_output is not None:
+                self.assertFalse(torch.equal(actual_output, previous_output))
+            actual_output.square().mean().backward()
+            reference_output.square().mean().backward()
+            optimizer.step()
+            reference_optimizer.step()
+            previous_output = actual_output.detach().clone()
+
+            for (actual_name, actual_parameter), (
+                reference_name,
+                reference_parameter,
+            ) in zip(attention.named_parameters(), reference.named_parameters()):
+                self.assertEqual(actual_name, reference_name)
+                torch.testing.assert_close(
+                    actual_parameter,
+                    reference_parameter,
+                    atol=2e-6,
+                    rtol=2e-6,
+                )
+            torch.testing.assert_close(
+                optimizer.state_dict(),
+                reference_optimizer.state_dict(),
+                atol=2e-6,
+                rtol=2e-6,
+            )
+
+    def test_merged_relations_two_adam_updates_match_independent_reference(self):
+        torch.manual_seed(487)
+        attention = RelationAwareSelfAttention(ZoneSetEncoderConfig()).train()
+        reference = deepcopy(attention)
+        reference.forward = MethodType(
+            _reference_attention_with_independent_relations,
+            reference,
+        )
         optimizer = torch.optim.Adam(attention.parameters(), lr=1e-2)
         reference_optimizer = torch.optim.Adam(reference.parameters(), lr=1e-2)
         tokens = torch.randn((2, 8, attention.hidden_dim), dtype=torch.float32)
