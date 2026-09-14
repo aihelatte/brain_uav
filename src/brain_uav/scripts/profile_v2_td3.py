@@ -2668,6 +2668,8 @@ def _run_compiled_numerics_check(
     frozen_critic_strategy: str = 'eager',
     compile_critic_block: bool = False,
     compile_target_block: bool = False,
+    compile_shared_relations: bool = False,
+    compile_snn_target_encoder: bool = False,
 ) -> dict[str, Any]:
     torch_rng_state = torch.random.get_rng_state()
     numpy_rng_state = np.random.get_state()
@@ -2729,6 +2731,8 @@ def _run_compiled_numerics_check(
             frozen_critic_strategy=frozen_critic_strategy,
             compile_critic_block=compile_critic_block,
             compile_target_block=compile_target_block,
+            compile_shared_relations=compile_shared_relations,
+            compile_snn_target_encoder=compile_snn_target_encoder,
             backend='inductor', mode='default', fullgraph=True, dynamic=True,
         )
         warmup_batches = _compile_warmup_batches(
@@ -2739,12 +2743,16 @@ def _run_compiled_numerics_check(
         )
         if compile_actors:
             compiled.warmup_actor_compile(warmup_batches)
+        if compile_shared_relations:
+            compiled.warmup_shared_relations_compile(warmup_batches)
         if compile_critic_block:
             compiled.warmup_full_compile(warmup_batches)
-        else:
+        elif compile_critic_encoder:
             compiled.warmup_online_critic_encoder_compile(warmup_batches)
             if compile_target_encoders:
                 compiled.warmup_target_encoder_compile(warmup_batches)
+        if compile_snn_target_encoder and not compile_target_block:
+            compiled.warmup_snn_target_encoder_compile(warmup_batches)
         module_modes['before_consecutive_updates'] = (
             _report_and_validate_numeric_engine_modes(
                 reference,
@@ -3189,6 +3197,8 @@ def _run_diagnostic_level(
     frozen_critic_strategy: str = 'eager',
     compile_critic_block: bool = False,
     compile_target_block: bool = False,
+    compile_shared_relations: bool = False,
+    compile_snn_target_encoder: bool = False,
     compiled_path_profiler_updates: int = 0,
     compiled_profiler_output_dir: Path | None = None,
     environment_performance_diagnostic: bool = False,
@@ -3242,11 +3252,15 @@ def _run_diagnostic_level(
         compile_actors,
         compile_critic_block,
         compile_target_block,
+        compile_shared_relations,
+        compile_snn_target_encoder,
     ))
     extended_compile_requested = any((
         compile_actors,
         compile_critic_block,
         compile_target_block,
+        compile_shared_relations,
+        compile_snn_target_encoder,
         frozen_critic_strategy != 'eager',
     ))
     compile_metadata: dict[str, Any] = {
@@ -3255,6 +3269,8 @@ def _run_diagnostic_level(
         'actors_requested': bool(compile_actors),
         'critic_block_requested': bool(compile_critic_block),
         'target_block_requested': bool(compile_target_block),
+        'shared_relations_requested': bool(compile_shared_relations),
+        'snn_target_encoder_requested': bool(compile_snn_target_encoder),
         'enabled_objects': [],
         'backend': 'inductor',
         'mode': 'default',
@@ -3290,6 +3306,8 @@ def _run_diagnostic_level(
             frozen_critic_strategy=frozen_critic_strategy,
             compile_critic_block=compile_critic_block,
             compile_target_block=compile_target_block,
+            compile_shared_relations=compile_shared_relations,
+            compile_snn_target_encoder=compile_snn_target_encoder,
             backend='inductor', mode='default', fullgraph=True, dynamic=True,
         )
         compile_metadata.update(configured)
@@ -3309,12 +3327,16 @@ def _run_diagnostic_level(
         warmup_started = perf_counter()
         if compile_actors:
             engine.warmup_actor_compile(warmup_batches)
+        if compile_shared_relations:
+            engine.warmup_shared_relations_compile(warmup_batches)
         if compile_critic_block:
             engine.warmup_full_compile(warmup_batches)
         elif compile_critic_encoder:
             engine.warmup_online_critic_encoder_compile(warmup_batches)
             if compile_target_encoders:
                 engine.warmup_target_encoder_compile(warmup_batches)
+        if compile_snn_target_encoder and not compile_target_block:
+            engine.warmup_snn_target_encoder_compile(warmup_batches)
         compile_metadata['warmup_wall_seconds'] = perf_counter() - warmup_started
         compile_metadata['measurement_note'] = (
             'Registration and compile-triggering pure-compute warmup are excluded '
@@ -3410,6 +3432,10 @@ def _run_diagnostic_level(
             expected_compiled_entries.extend(('actor', 'bc_reference_actor'))
         if frozen_critic_strategy == 'compiled_no_grad_context':
             expected_compiled_entries.append('frozen_critic_context')
+        if compile_shared_relations:
+            expected_compiled_entries.append('shared_relations')
+        if compile_snn_target_encoder:
+            expected_compiled_entries.append('snn_target_encoder')
         if model == 'snn':
             expected_compiled_entries[expected_compiled_entries.index(
                 'target_block'
@@ -3853,6 +3879,8 @@ def run_v2_td3_timing_diagnostic(
     frozen_critic_strategy: str = 'eager',
     compile_critic_block: bool = False,
     compile_target_block: bool = False,
+    compile_shared_relations: bool = False,
+    compile_snn_target_encoder: bool = False,
     check_compiled_numerics: bool = False,
     compiled_numerics_only: bool = False,
     compiled_numerics_group: str | None = None,
@@ -3888,6 +3916,8 @@ def run_v2_td3_timing_diagnostic(
         ('compile_actors', compile_actors),
         ('compile_critic_block', compile_critic_block),
         ('compile_target_block', compile_target_block),
+        ('compile_shared_relations', compile_shared_relations),
+        ('compile_snn_target_encoder', compile_snn_target_encoder),
     ):
         if type(value) is not bool:
             raise TypeError(f'{name} must be a bool.')
@@ -3915,6 +3945,8 @@ def run_v2_td3_timing_diagnostic(
             or compile_actors
             or compile_critic_block
             or compile_target_block
+            or compile_shared_relations
+            or compile_snn_target_encoder
             or frozen_critic_strategy != 'eager'
             or check_compiled_numerics
             or compiled_numerics_only
@@ -3925,6 +3957,10 @@ def run_v2_td3_timing_diagnostic(
                 'compiled_numerics_group is an isolated mode and cannot be '
                 'combined with compile/profiler timing options.'
             )
+    if compile_target_encoders and compile_snn_target_encoder:
+        raise ValueError(
+            'compile_target_encoders and compile_snn_target_encoder are mutually exclusive.'
+        )
     if compile_target_encoders and not compile_critic_encoder:
         raise ValueError(
             'compile_target_encoders requires compile_critic_encoder.'
@@ -3937,6 +3973,8 @@ def run_v2_td3_timing_diagnostic(
         raise ValueError(
             'compile_target_encoders and compile_target_block are mutually exclusive.'
         )
+    if compile_snn_target_encoder and model != 'snn':
+        raise ValueError('compile_snn_target_encoder requires the SNN diagnostic.')
     if compile_target_block and not compile_critic_block:
         raise ValueError('compile_target_block requires compile_critic_block.')
     if frozen_critic_strategy == 'compiled_no_grad_context' and not (
@@ -3946,7 +3984,7 @@ def run_v2_td3_timing_diagnostic(
             'compiled_no_grad_context requires a compiled critic path.'
         )
     if check_compiled_numerics and not (
-        compile_target_encoders or compile_target_block
+        compile_target_encoders or compile_target_block or compile_snn_target_encoder
     ):
         raise ValueError(
             'check_compiled_numerics requires compile_target_encoders or '
@@ -3958,6 +3996,8 @@ def run_v2_td3_timing_diagnostic(
         compile_actors,
         compile_critic_block,
         compile_target_block,
+        compile_shared_relations,
+        compile_snn_target_encoder,
     ))
     if compile_requested and profiler_updates:
         raise ValueError(
@@ -4104,6 +4144,8 @@ def run_v2_td3_timing_diagnostic(
             frozen_critic_strategy=frozen_critic_strategy,
             compile_critic_block=compile_critic_block,
             compile_target_block=compile_target_block,
+            compile_shared_relations=compile_shared_relations,
+            compile_snn_target_encoder=compile_snn_target_encoder,
         )
     if compiled_numerics_only:
         output.mkdir(parents=True, exist_ok=False)
@@ -4157,6 +4199,8 @@ def run_v2_td3_timing_diagnostic(
             frozen_critic_strategy=frozen_critic_strategy,
             compile_critic_block=compile_critic_block,
             compile_target_block=compile_target_block,
+            compile_shared_relations=compile_shared_relations,
+            compile_snn_target_encoder=compile_snn_target_encoder,
             compiled_path_profiler_updates=(
                 compiled_profiler_updates if level == 'medium' else 0
             ),
@@ -4287,6 +4331,8 @@ def run_v2_td3_timing_diagnostic(
             'frozen_critic_strategy': frozen_critic_strategy,
             'compile_critic_block_requested': compile_critic_block,
             'compile_target_block_requested': compile_target_block,
+            'compile_shared_relations_requested': compile_shared_relations,
+            'compile_snn_target_encoder_requested': compile_snn_target_encoder,
             'cuda_graph': False,
             'check_compiled_numerics_requested': check_compiled_numerics,
             'compile_critic_encoder_backend': (
@@ -4392,6 +4438,16 @@ def build_parser() -> argparse.ArgumentParser:
         help='Compile the applicable target forward and TD-target tensor block.',
     )
     parser.add_argument(
+        '--compile-shared-relations',
+        action='store_true',
+        help='Compile the canonical shared relation tensor build.',
+    )
+    parser.add_argument(
+        '--compile-snn-target-encoder',
+        action='store_true',
+        help='Compile only the SNN target actor ZoneSetEncoder.',
+    )
+    parser.add_argument(
         '--check-compiled-numerics',
         action='store_true',
         help='Run an isolated CUDA eager-versus-compiled TD3 numeric check.',
@@ -4449,6 +4505,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         frozen_critic_strategy=args.frozen_critic_strategy,
         compile_critic_block=args.compile_critic_block,
         compile_target_block=args.compile_target_block,
+        compile_shared_relations=args.compile_shared_relations,
+        compile_snn_target_encoder=args.compile_snn_target_encoder,
         check_compiled_numerics=args.check_compiled_numerics,
         compiled_numerics_only=args.compiled_numerics_only,
         compiled_numerics_group=args.compiled_numerics_group,

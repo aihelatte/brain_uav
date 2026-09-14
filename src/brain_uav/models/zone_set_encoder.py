@@ -339,8 +339,16 @@ class TaskConditionedPooling(nn.Module):
         return_attention_weights: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         query = self.query(task_embedding).unsqueeze(1)
-        keys = self.key(contextual_tokens)
-        values = self.value(contextual_tokens)
+        key_value_weight = torch.cat((self.key.weight, self.value.weight), dim=0)
+        key_value_bias = torch.cat((self.key.bias, self.value.bias), dim=0)
+        keys, values = F.linear(
+            contextual_tokens,
+            key_value_weight,
+            key_value_bias,
+        ).split(
+            (self.key.out_features, self.value.out_features),
+            dim=-1,
+        )
         scores = torch.sum(query * keys, dim=-1) * self.score_scale
         scores = scores.masked_fill(
             ~valid_token_mask,
@@ -428,6 +436,8 @@ class ZoneSetEncoder(nn.Module):
         self._compiled_tensor_forward: Callable[..., torch.Tensor] | None = None
         self._compiled_tensor_forward_config: dict[str, object] | None = None
         self._force_eager_tensor_forward = False
+        self._compiled_shared_relations: Callable[..., tuple[torch.Tensor, ...]] | None = None
+        self._compiled_shared_relations_config: dict[str, object] | None = None
 
     @property
     def output_dim(self) -> int:
@@ -442,6 +452,40 @@ class ZoneSetEncoder(nn.Module):
         if self._compiled_tensor_forward_config is None:
             return None
         return dict(self._compiled_tensor_forward_config)
+
+    @property
+    def compiled_shared_relations_enabled(self) -> bool:
+        return self._compiled_shared_relations is not None
+
+    @property
+    def compiled_shared_relations_config(self) -> dict[str, object] | None:
+        if self._compiled_shared_relations_config is None:
+            return None
+        return dict(self._compiled_shared_relations_config)
+
+    def enable_compiled_shared_relations(
+        self,
+        *,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> None:
+        if self.compiled_shared_relations_enabled:
+            raise RuntimeError('ZoneSetEncoder shared relations are already compiled.')
+        self._compiled_shared_relations = torch.compile(
+            self._compute_shared_relation_tensors,
+            backend=backend,
+            mode=mode,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+        )
+        self._compiled_shared_relations_config = {
+            'backend': backend,
+            'mode': mode,
+            'fullgraph': bool(fullgraph),
+            'dynamic': bool(dynamic),
+        }
 
     def enable_compiled_tensor_forward(
         self,
@@ -570,12 +614,47 @@ class ZoneSetEncoder(nn.Module):
         batch_size: int,
         zone_count: int,
     ) -> ZoneSetSharedRelations:
+        tensor_build = (
+            self._compiled_shared_relations
+            if (
+                self._compiled_shared_relations is not None
+                and not self._force_eager_tensor_forward
+            )
+            else self._compute_shared_relation_tensors
+        )
+        (
+            clean_zone_features,
+            pair_relations,
+            valid_token_mask,
+            token_pair_relations,
+            relation_pair_mask,
+        ) = tensor_build(ego_features, zone_features, presence_mask)
+        return ZoneSetSharedRelations(
+            scales=self.scales,
+            uav_radius=self.uav_radius,
+            ego_features=ego_features,
+            goal_features=goal_features,
+            zone_features=zone_features,
+            presence_mask=presence_mask,
+            clean_zone_features=clean_zone_features,
+            pair_relations=pair_relations,
+            valid_token_mask=valid_token_mask,
+            token_pair_relations=token_pair_relations,
+            relation_pair_mask=relation_pair_mask,
+        )
+
+    def _compute_shared_relation_tensors(
+        self,
+        ego_features: torch.Tensor,
+        zone_features: torch.Tensor,
+        presence_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         clean_zone_features = torch.where(
             presence_mask.unsqueeze(-1),
             zone_features,
             torch.zeros_like(zone_features),
         )
-        pair_relations = self.pair_relation_builder(
+        pair_relations = self.pair_relation_builder.compute_relations(
             ego_features,
             clean_zone_features,
             presence_mask,
@@ -594,7 +673,7 @@ class ZoneSetEncoder(nn.Module):
             presence_mask.unsqueeze(1)
             & presence_mask.unsqueeze(2)
             & ~torch.eye(
-                zone_count,
+                zone_features.shape[1],
                 dtype=torch.bool,
                 device=presence_mask.device,
             ).unsqueeze(0)
@@ -604,18 +683,12 @@ class ZoneSetEncoder(nn.Module):
             (1, 0, 1, 0),
             value=False,
         )
-        return ZoneSetSharedRelations(
-            scales=self.scales,
-            uav_radius=self.uav_radius,
-            ego_features=ego_features,
-            goal_features=goal_features,
-            zone_features=zone_features,
-            presence_mask=presence_mask,
-            clean_zone_features=clean_zone_features,
-            pair_relations=pair_relations,
-            valid_token_mask=valid_token_mask,
-            token_pair_relations=token_pair_relations,
-            relation_pair_mask=relation_pair_mask,
+        return (
+            clean_zone_features,
+            pair_relations,
+            valid_token_mask,
+            token_pair_relations,
+            relation_pair_mask,
         )
 
     def build_shared_relations(

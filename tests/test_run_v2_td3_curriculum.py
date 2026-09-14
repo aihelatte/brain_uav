@@ -111,6 +111,8 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertEqual(args.frozen_critic_strategy, 'eager')
         self.assertFalse(args.compile_critic_block)
         self.assertFalse(args.compile_target_block)
+        self.assertFalse(args.compile_shared_relations)
+        self.assertFalse(args.compile_snn_target_encoder)
 
     def test_snn_curriculum_uses_distinct_outputs_and_forwards_model_contract(self):
         calls = []
@@ -169,6 +171,8 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                     frozen_critic_strategy='compiled_no_grad_context',
                     compile_critic_block=True,
                     compile_target_block=True,
+                    compile_shared_relations=True,
+                    compile_snn_target_encoder=True,
                 )
         initializer.assert_called_once()
         self.assertEqual(initializer.call_args.kwargs['init_checkpoint'], checkpoint)
@@ -183,6 +187,8 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         )
         self.assertTrue(calls[0]['compile_critic_block'])
         self.assertTrue(calls[0]['compile_target_block'])
+        self.assertTrue(calls[0]['compile_shared_relations'])
+        self.assertTrue(calls[0]['compile_snn_target_encoder'])
         self.assertIs(calls[0]['prepared_initialization'], prepared)
         self.assertEqual(Path(calls[0]['output']).name, 'v2_snn_td3_easy.pt')
         self.assertEqual(
@@ -190,6 +196,8 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         )
         self.assertEqual(result['format'], 'v2_formal_snn_td3_curriculum_summary')
         self.assertEqual(result['model_type'], 'snn')
+        self.assertTrue(result['compilation_request']['compile_shared_relations'])
+        self.assertTrue(result['compilation_request']['compile_snn_target_encoder'])
         self.assertEqual(result['snn'], {
             'time_window': actor.time_window,
             'tau': actor.tau,

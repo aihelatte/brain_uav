@@ -173,6 +173,29 @@ class PairRelationBuilder(nn.Module):
             zone_features,
             torch.zeros_like(zone_features),
         )
+        relations = self.compute_relations(
+            ego_features,
+            clean_zones,
+            presence_mask,
+        )
+        if relations.shape != (
+            batch_size,
+            zone_count,
+            zone_count,
+            PAIR_RELATION_FEATURE_DIM,
+        ):
+            raise RuntimeError('Internal pair-relation shape invariant failed.')
+        return relations
+
+    def compute_relations(
+        self,
+        ego_features: torch.Tensor,
+        clean_zones: torch.Tensor,
+        presence_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute relations from already validated and masked tensors."""
+
+        zone_count = clean_zones.shape[1]
 
         forward = (
             clean_zones[..., ZONE_FEATURE_INDEX['zone_forward_norm']]
@@ -276,13 +299,6 @@ class PairRelationBuilder(nn.Module):
             ).unsqueeze(0)
         )
         relations = relations * pair_mask.unsqueeze(-1).to(relations.dtype)
-        if relations.shape != (
-            batch_size,
-            zone_count,
-            zone_count,
-            PAIR_RELATION_FEATURE_DIM,
-        ):
-            raise RuntimeError('Internal pair-relation shape invariant failed.')
         return relations
 
     def forward_checked(

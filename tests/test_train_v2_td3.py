@@ -188,6 +188,8 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertEqual(args.frozen_critic_strategy, 'eager')
         self.assertFalse(args.compile_critic_block)
         self.assertFalse(args.compile_target_block)
+        self.assertFalse(args.compile_shared_relations)
+        self.assertFalse(args.compile_snn_target_encoder)
         with self.assertRaises(SystemExit):
             parser.parse_args([
                 '--stage', 'easy_two_zone',
@@ -226,6 +228,12 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             warmup_full_compile=lambda batches: calls.append(
                 ('full_warmup', len(batches))
             ),
+            warmup_shared_relations_compile=lambda batches: calls.append(
+                ('shared_warmup', len(batches))
+            ),
+            warmup_snn_target_encoder_compile=lambda batches: calls.append(
+                ('snn_target_warmup', len(batches))
+            ),
         )
         fake_batch = SimpleNamespace(
             batch_size=2,
@@ -260,11 +268,15 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 frozen_critic_strategy='compiled_no_grad_context',
                 compile_critic_block=True,
                 compile_target_block=True,
+                compile_shared_relations=True,
+                compile_snn_target_encoder=True,
             )
         self.assertEqual(
             [entry[0] for entry in calls],
-            ['configure', 'actor_warmup', 'full_warmup'],
+            ['configure', 'actor_warmup', 'shared_warmup', 'full_warmup'],
         )
+        self.assertTrue(calls[0][1]['compile_shared_relations'])
+        self.assertTrue(calls[0][1]['compile_snn_target_encoder'])
         self.assertTrue(metadata['requested'])
         self.assertEqual(metadata['warmup_batch_shapes'], [[2, 7]] * 3)
         self.assertFalse(metadata['cuda_graph'])

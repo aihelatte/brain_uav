@@ -665,6 +665,8 @@ class TestProfileV2TD3(unittest.TestCase):
                         frozen_critic_strategy='eager',
                         compile_critic_block=False,
                         compile_target_block=False,
+                        compile_shared_relations=False,
+                        compile_snn_target_encoder=False,
                         compiled_path_profiler_updates=0,
                         compiled_profiler_output_dir=None,
                         level='easy',
@@ -803,6 +805,10 @@ class TestProfileV2TD3(unittest.TestCase):
                 enabled_objects.extend((
                     'actor.full_forward', 'bc_reference_actor.full_forward',
                 ))
+            if kwargs['compile_shared_relations']:
+                enabled_objects.append('shared_relations.tensor_build')
+            if kwargs['compile_snn_target_encoder']:
+                enabled_objects.append('actor_target.zone_set_encoder')
             return {
                 'enabled_objects': enabled_objects,
                 'critic_granularity': (
@@ -825,6 +831,8 @@ class TestProfileV2TD3(unittest.TestCase):
         engine.configure_compilation = configure_compilation
         engine.warmup_actor_compile = lambda batches: None
         engine.warmup_full_compile = lambda batches: None
+        engine.warmup_shared_relations_compile = lambda batches: None
+        engine.warmup_snn_target_encoder_compile = lambda batches: None
         synchronization_points = []
         event = mock.Mock()
         event.elapsed_time.return_value = 1.0
@@ -861,6 +869,8 @@ class TestProfileV2TD3(unittest.TestCase):
                 frozen_critic_strategy=frozen_critic_strategy,
                 compile_critic_block=compile_critic_block,
                 compile_target_block=compile_target_block,
+                compile_shared_relations=compile_shared_relations,
+                compile_snn_target_encoder=compile_snn_target_encoder,
                 compiled_path_profiler_updates=compiled_path_profiler_updates,
                 compiled_profiler_output_dir=compiled_profiler_output_dir,
                 environment_performance_diagnostic=(
@@ -870,6 +880,17 @@ class TestProfileV2TD3(unittest.TestCase):
         result['_test_diagnostic_profile_flags'] = diagnostic_profile_flags
         result['_test_compiled_entry_records'] = compiled_entry_records
         return result, replay, synchronization_points
+
+    def test_new_compile_scopes_are_forwarded_to_diagnostic_configuration(self) -> None:
+        result, _, _ = self.run_small_level(
+            compile_shared_relations=True,
+            compile_snn_target_encoder=True,
+        )
+        compile_info = result['critic_encoder_compile']
+        self.assertTrue(compile_info['shared_relations_requested'])
+        self.assertTrue(compile_info['snn_target_encoder_requested'])
+        self.assertIn('shared_relations.tensor_build', compile_info['enabled_objects'])
+        self.assertIn('actor_target.zone_set_encoder', compile_info['enabled_objects'])
 
     def test_warmup_reaches_update_minima_and_is_excluded_from_measurement(self) -> None:
         for minimum, actual, critic, actor in ((0, 7, 4, 2), (12, 12, 9, 5)):
@@ -1091,6 +1112,8 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertEqual(args.frozen_critic_strategy, 'eager')
         self.assertFalse(args.compile_critic_block)
         self.assertFalse(args.compile_target_block)
+        self.assertFalse(args.compile_shared_relations)
+        self.assertFalse(args.compile_snn_target_encoder)
         self.assertFalse(args.check_compiled_numerics)
         self.assertFalse(args.compiled_numerics_only)
         self.assertIsNone(args.compiled_numerics_group)
@@ -1135,6 +1158,13 @@ class TestProfileV2TD3(unittest.TestCase):
             '--compiled-numerics-group', 'B',
         ])
         self.assertEqual(grouped.compiled_numerics_group, 'B')
+        new_scopes = build_parser().parse_args([
+            '--model', 'snn', '--bc-checkpoint', 'bc.pt',
+            '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
+            '--compile-shared-relations', '--compile-snn-target-encoder',
+        ])
+        self.assertTrue(new_scopes.compile_shared_relations)
+        self.assertTrue(new_scopes.compile_snn_target_encoder)
 
     def test_grouped_compile_modes_have_only_declared_warmup_differences(self) -> None:
         expected = {
@@ -2276,6 +2306,17 @@ class TestProfileV2TD3(unittest.TestCase):
             run_v2_td3_timing_diagnostic(
                 **common,
                 frozen_critic_strategy='compiled_no_grad_context',
+            )
+        with self.assertRaisesRegex(ValueError, 'requires the SNN diagnostic'):
+            run_v2_td3_timing_diagnostic(
+                **common,
+                compile_snn_target_encoder=True,
+            )
+        with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
+            run_v2_td3_timing_diagnostic(
+                **{**common, 'model': 'snn'},
+                compile_target_encoders=True,
+                compile_snn_target_encoder=True,
             )
 
     def test_compiled_performance_diagnostic_defaults_and_conflicts(self):

@@ -618,14 +618,14 @@ class TestV2TD3(unittest.TestCase):
         with ExitStack() as stack:
             shared_builder = stack.enter_context(mock.patch.object(
                 encoders[0].pair_relation_builder,
-                'forward',
-                wraps=encoders[0].pair_relation_builder.forward,
+                'compute_relations',
+                wraps=encoders[0].pair_relation_builder.compute_relations,
             ))
             other_builders = [
                 stack.enter_context(mock.patch.object(
                     encoder.pair_relation_builder,
-                    'forward',
-                    wraps=encoder.pair_relation_builder.forward,
+                    'compute_relations',
+                    wraps=encoder.pair_relation_builder.compute_relations,
                 ))
                 for encoder in encoders[1:]
             ]
@@ -633,6 +633,26 @@ class TestV2TD3(unittest.TestCase):
 
         self.assertEqual(shared_builder.call_count, 2)
         self.assertEqual(sum(spy.call_count for spy in other_builders), 0)
+
+    def test_ann_select_action_bypasses_compiled_shared_relations(self):
+        engine = self.make_engine()
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            engine.enable_shared_relations_compile()
+        encoder = engine.actor.zone_set_encoder
+        compiled = mock.Mock(wraps=encoder._compiled_shared_relations)
+        encoder._compiled_shared_relations = compiled
+
+        engine.select_action(_observation(7, scales=self.scales))
+        self.assertEqual(compiled.call_count, 0)
+        batch = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        engine._build_shared_relations(batch)
+        self.assertEqual(compiled.call_count, 1)
 
     def test_compile_enables_only_online_critic_encoders_and_preserves_training_bindings(self):
         engine = self.make_engine(policy_delay=1)
@@ -1192,6 +1212,79 @@ class TestV2TD3(unittest.TestCase):
                 compile_critic_encoder=True,
                 compile_critic_block=True,
             )
+
+    def test_shared_relation_compile_warmup_and_update_build_each_observation_once(self):
+        engine = self.make_engine(policy_delay=2)
+        self.fill_replay(engine, counts=(0, 7), next_counts=(7, 0))
+        batch = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        state_before = deepcopy(engine.actor.state_dict())
+        counts_before = (
+            engine.update_count, engine.critic_update_count,
+            engine.critic_target_update_count, engine.actor_update_count,
+            engine.last_total_steps,
+        )
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            metadata = engine.configure_compilation(compile_shared_relations=True)
+        engine.warmup_shared_relations_compile((batch,))
+        self.assertEqual(metadata['shared_relations_granularity'], 'compiled_tensor_build')
+        self.assert_state_dict_equal(engine.actor.state_dict(), state_before)
+        self.assertEqual(counts_before, (
+            engine.update_count, engine.critic_update_count,
+            engine.critic_target_update_count, engine.actor_update_count,
+            engine.last_total_steps,
+        ))
+        with mock.patch.object(
+            engine.actor.zone_set_encoder,
+            'build_shared_relations',
+            wraps=engine.actor.zone_set_encoder.build_shared_relations,
+        ) as build:
+            engine.update_once(total_steps=1)
+        self.assertEqual(build.call_count, 2)
+
+    def test_compiled_shared_relations_match_two_updates_and_adam_state(self):
+        torch.manual_seed(31415)
+        eager = self.make_engine(policy_delay=1)
+        compiled = self.make_engine(policy_delay=1)
+        compiled.load_checkpoint_state_dict(eager.checkpoint_state_dict())
+        self.fill_replay(eager, counts=(0, 7), next_counts=(7, 0))
+        batch = eager.replay.sample(2)
+        eager.replay.sample = lambda batch_size: batch
+        compiled.replay.sample = lambda batch_size: batch
+        compiled.enable_shared_relations_compile(backend='eager')
+        compiled.warmup_shared_relations_compile((batch.obs, batch.next_obs))
+
+        for total_steps in (1, 2):
+            rng_state = torch.random.get_rng_state()
+            expected_metrics = eager.update_once(total_steps=total_steps)
+            torch.random.set_rng_state(rng_state)
+            actual_metrics = compiled.update_once(total_steps=total_steps)
+            self.assertEqual(actual_metrics, expected_metrics)
+        for name in (
+            'actor', 'critic1', 'critic2',
+            'actor_target', 'critic1_target', 'critic2_target',
+        ):
+            self.assert_state_dict_equal(
+                getattr(compiled, name).state_dict(),
+                getattr(eager, name).state_dict(),
+            )
+        for actual, expected in (
+            (compiled.actor_optimizer.state_dict(), eager.actor_optimizer.state_dict()),
+            (compiled.critic_optimizer.state_dict(), eager.critic_optimizer.state_dict()),
+        ):
+            self.assertEqual(actual['param_groups'], expected['param_groups'])
+            self.assertEqual(actual['state'].keys(), expected['state'].keys())
+            for parameter_id, expected_state in expected['state'].items():
+                self.assertEqual(actual['state'][parameter_id].keys(), expected_state.keys())
+                for state_name, expected_value in expected_state.items():
+                    torch.testing.assert_close(
+                        actual['state'][parameter_id][state_name], expected_value
+                    )
 
     def test_compile_error_propagates_without_enabling_fallback(self):
         engine = self.make_engine()

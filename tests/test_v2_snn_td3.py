@@ -134,6 +134,26 @@ class TestV2SNNTD3(unittest.TestCase):
         self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
         self.assertEqual(engine.actor.snn_head.lif2.v, 0.0)
 
+    def test_snn_select_action_bypasses_compiled_shared_relations(self) -> None:
+        engine = self.make_engine()
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            engine.enable_shared_relations_compile()
+        encoder = engine.actor.zone_set_encoder
+        compiled = mock.Mock(wraps=encoder._compiled_shared_relations)
+        encoder._compiled_shared_relations = compiled
+
+        engine.select_action(_observation(10, self.scales))
+        self.assertEqual(compiled.call_count, 0)
+        batch = collate_v2_observations([
+            _observation(0, self.scales),
+            _observation(10, self.scales),
+        ])
+        engine._build_shared_relations(batch)
+        self.assertEqual(compiled.call_count, 1)
+
     def test_snn_full_target_scope_keeps_lif_actor_eager(self) -> None:
         engine = self.make_engine(bc=self.make_actor())
         with mock.patch(
@@ -159,6 +179,106 @@ class TestV2SNNTD3(unittest.TestCase):
         metrics = engine.update_once(total_steps=1, bc_lambda=0.0)
         self.assertTrue(metrics.actor_updated)
         self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+        self.assertEqual(engine.actor_target.snn_head.lif2.v, 0.0)
+
+    def test_snn_target_encoder_compile_is_frozen_encoder_only_and_warmup_is_clean(self) -> None:
+        engine = self.make_engine()
+        batch = collate_v2_observations([
+            _observation(0, self.scales),
+            _observation(10, self.scales),
+        ])
+        state_before = deepcopy(engine.actor_target.state_dict())
+        counts_before = (
+            engine.update_count, engine.critic_update_count,
+            engine.critic_target_update_count, engine.actor_update_count,
+            engine.last_total_steps,
+        )
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            metadata = engine.configure_compilation(
+                compile_snn_target_encoder=True,
+            )
+        self.assertEqual(metadata['snn_target_actor_granularity'], 'encoder')
+        self.assertTrue(engine.actor_target.zone_set_encoder.compiled_tensor_forward_enabled)
+        self.assertFalse(engine.actor.zone_set_encoder.compiled_tensor_forward_enabled)
+        self.assertTrue(all(not parameter.requires_grad for parameter in engine.actor_target.parameters()))
+        engine.warmup_snn_target_encoder_compile((batch,))
+        self.assertEqual(engine.actor_target.snn_head.lif1.v, 0.0)
+        self.assertEqual(engine.actor_target.snn_head.lif2.v, 0.0)
+        self.assertEqual(counts_before, (
+            engine.update_count, engine.critic_update_count,
+            engine.critic_target_update_count, engine.actor_update_count,
+            engine.last_total_steps,
+        ))
+        for name, expected in state_before.items():
+            torch.testing.assert_close(engine.actor_target.state_dict()[name], expected)
+        with torch.no_grad():
+            output = engine.actor_target(batch)
+        self.assertFalse(output.requires_grad)
+
+    def test_snn_target_encoder_compile_reads_soft_updated_weights(self) -> None:
+        torch.manual_seed(777)
+        eager = self.make_engine()
+        compiled = self.make_engine()
+        compiled.load_checkpoint_state_dict(eager.checkpoint_state_dict())
+        batch = collate_v2_observations([
+            _observation(0, self.scales),
+            _observation(10, self.scales),
+        ])
+        compiled.enable_snn_target_encoder_compile(backend='eager')
+        compiled.warmup_snn_target_encoder_compile((batch,))
+        with torch.no_grad():
+            before = compiled.actor_target(batch)
+            eager_parameter = eager.actor.zone_set_encoder.pooling.value.weight
+            compiled_parameter = compiled.actor.zone_set_encoder.pooling.value.weight
+            eager_parameter.add_(0.25)
+            compiled_parameter.add_(0.25)
+            eager._soft_update(eager.actor, eager.actor_target)
+            compiled._soft_update(compiled.actor, compiled.actor_target)
+            expected = eager.actor_target(batch)
+            actual = compiled.actor_target(batch)
+        self.assertFalse(torch.equal(actual, before))
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+
+    def test_snn_target_encoder_compile_combinations_are_precisely_checked(self) -> None:
+        ann_actor = V2ANNPolicyActor(
+            self.scales, 2, 8, torch.tensor([0.2, 0.3], dtype=torch.float32)
+        )
+        ann_engine = V2TD3UpdateEngine(
+            ann_actor, V2ANNCritic(self.scales, 2, 8),
+            V2ANNCritic(self.scales, 2, 8), V2ReplayBuffer(8, 2, 10),
+            actor_lr=1e-3, critic_lr=1e-3, gamma=0.99, tau=0.25,
+            policy_noise=0.01, noise_clip=0.02, policy_delay=1,
+            batch_size=2, action_low=np.array([-0.2, -0.3], dtype=np.float32),
+            action_high=np.array([0.2, 0.3], dtype=np.float32),
+        )
+        with self.assertRaisesRegex(ValueError, 'requires an SNN actor'):
+            ann_engine.configure_compilation(compile_snn_target_encoder=True)
+        with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
+            self.make_engine().configure_compilation(
+                compile_critic_encoder=True,
+                compile_target_encoders=True,
+                compile_snn_target_encoder=True,
+            )
+        engine = self.make_engine()
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ), mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            metadata = engine.configure_compilation(
+                compile_critic_block=True,
+                compile_target_block=True,
+                compile_snn_target_encoder=True,
+            )
+        self.assertIn('actor_target.compiled_snn_encoder', metadata['enabled_objects'])
+        metrics = engine.update_once(total_steps=1)
+        self.assertTrue(metrics.critic_updated)
+        self.assertEqual(engine.actor_target.snn_head.lif1.v, 0.0)
         self.assertEqual(engine.actor_target.snn_head.lif2.v, 0.0)
 
     def test_snn_actor_target_uses_batched_soft_update_reference_formula(self) -> None:

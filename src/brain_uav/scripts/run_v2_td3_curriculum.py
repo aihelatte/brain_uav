@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--snn-time-window', type=int, default=4)
     parser.add_argument('--compile-critic-encoder', action='store_true')
     parser.add_argument('--compile-target-encoders', action='store_true')
+    parser.add_argument('--compile-shared-relations', action='store_true')
+    parser.add_argument('--compile-snn-target-encoder', action='store_true')
     parser.add_argument('--compile-actors', action='store_true')
     parser.add_argument(
         '--frozen-critic-strategy',
@@ -118,6 +120,8 @@ def run_v2_curriculum(
     frozen_critic_strategy: str = 'eager',
     compile_critic_block: bool = False,
     compile_target_block: bool = False,
+    compile_shared_relations: bool = False,
+    compile_snn_target_encoder: bool = False,
 ) -> dict[str, Any]:
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
@@ -221,6 +225,8 @@ def run_v2_curriculum(
             frozen_critic_strategy=frozen_critic_strategy,
             compile_critic_block=compile_critic_block,
             compile_target_block=compile_target_block,
+            compile_shared_relations=compile_shared_relations,
+            compile_snn_target_encoder=compile_snn_target_encoder,
         )
         summaries.append(summary)
         global_steps = int(summary.get('global_steps_end', global_steps + int(summary['steps'])))
@@ -260,6 +266,8 @@ def run_v2_curriculum(
             'frozen_critic_strategy': frozen_critic_strategy,
             'compile_critic_block': compile_critic_block,
             'compile_target_block': compile_target_block,
+            'compile_shared_relations': compile_shared_relations,
+            'compile_snn_target_encoder': compile_snn_target_encoder,
             'cuda_graph': False,
         },
     }
@@ -292,6 +300,8 @@ def main(argv: list[str] | None = None) -> int:
         frozen_critic_strategy=args.frozen_critic_strategy,
         compile_critic_block=args.compile_critic_block,
         compile_target_block=args.compile_target_block,
+        compile_shared_relations=args.compile_shared_relations,
+        compile_snn_target_encoder=args.compile_snn_target_encoder,
     )
     print(json.dumps(summary, indent=2, allow_nan=False))
     return 0 if summary['passed'] else 1

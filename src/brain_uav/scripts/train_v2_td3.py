@@ -54,6 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--validation-max-failures', type=int, default=6)
     parser.add_argument('--compile-critic-encoder', action='store_true')
     parser.add_argument('--compile-target-encoders', action='store_true')
+    parser.add_argument('--compile-shared-relations', action='store_true')
+    parser.add_argument('--compile-snn-target-encoder', action='store_true')
     parser.add_argument('--compile-actors', action='store_true')
     parser.add_argument(
         '--frozen-critic-strategy',
@@ -92,10 +94,13 @@ def _configure_stage_compilation(
     frozen_critic_strategy: str,
     compile_critic_block: bool,
     compile_target_block: bool,
+    compile_shared_relations: bool = False,
+    compile_snn_target_encoder: bool = False,
 ) -> dict[str, Any]:
     requested = any((
         compile_critic_encoder, compile_target_encoders, compile_actors,
         compile_critic_block, compile_target_block,
+        compile_shared_relations, compile_snn_target_encoder,
     ))
     if not requested:
         if frozen_critic_strategy != 'eager':
@@ -120,6 +125,8 @@ def _configure_stage_compilation(
         frozen_critic_strategy=frozen_critic_strategy,
         compile_critic_block=compile_critic_block,
         compile_target_block=compile_target_block,
+        compile_shared_relations=compile_shared_relations,
+        compile_snn_target_encoder=compile_snn_target_encoder,
         backend='inductor', mode='default', fullgraph=True, dynamic=True,
     )
     metadata['requested'] = True
@@ -157,12 +164,16 @@ def _configure_stage_compilation(
     warmup_started = perf_counter()
     if compile_actors:
         engine.warmup_actor_compile(warmup_batches)
+    if compile_shared_relations:
+        engine.warmup_shared_relations_compile(warmup_batches)
     if compile_critic_block:
         engine.warmup_full_compile(warmup_batches)
     elif compile_critic_encoder:
         engine.warmup_online_critic_encoder_compile(warmup_batches)
         if compile_target_encoders:
             engine.warmup_target_encoder_compile(warmup_batches)
+    if compile_snn_target_encoder and not compile_target_block:
+        engine.warmup_snn_target_encoder_compile(warmup_batches)
     metadata['warmup_wall_seconds'] = perf_counter() - warmup_started
     return metadata
 
@@ -199,6 +210,8 @@ def run_v2_td3_stage(
     frozen_critic_strategy: str = 'eager',
     compile_critic_block: bool = False,
     compile_target_block: bool = False,
+    compile_shared_relations: bool = False,
+    compile_snn_target_encoder: bool = False,
 ) -> dict[str, Any]:
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
@@ -288,6 +301,8 @@ def run_v2_td3_stage(
         frozen_critic_strategy=frozen_critic_strategy,
         compile_critic_block=compile_critic_block,
         compile_target_block=compile_target_block,
+        compile_shared_relations=compile_shared_relations,
+        compile_snn_target_encoder=compile_snn_target_encoder,
     )
     reporter = (
         V2ExperimentReporter(
@@ -486,6 +501,8 @@ def main(argv: list[str] | None = None) -> int:
         frozen_critic_strategy=args.frozen_critic_strategy,
         compile_critic_block=args.compile_critic_block,
         compile_target_block=args.compile_target_block,
+        compile_shared_relations=args.compile_shared_relations,
+        compile_snn_target_encoder=args.compile_snn_target_encoder,
     )
     print(json.dumps(summary, indent=2, allow_nan=False))
     return 0 if summary['passed'] else 1

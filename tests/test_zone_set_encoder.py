@@ -153,6 +153,37 @@ def _use_independent_relation_reference(model):
         )
 
 
+def _reference_pooling_forward(
+    pooling,
+    task_embedding,
+    contextual_tokens,
+    valid_token_mask,
+    *,
+    return_attention_weights=False,
+):
+    query = pooling.query(task_embedding).unsqueeze(1)
+    keys = pooling.key(contextual_tokens)
+    values = pooling.value(contextual_tokens)
+    scores = torch.sum(query * keys, dim=-1) * pooling.score_scale
+    scores = scores.masked_fill(
+        ~valid_token_mask,
+        torch.finfo(scores.dtype).min,
+    )
+    weights = torch.softmax(scores, dim=-1)
+    weights = torch.where(
+        valid_token_mask,
+        weights,
+        torch.zeros_like(weights),
+    )
+    weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(
+        torch.finfo(weights.dtype).tiny
+    )
+    summary = torch.sum(weights.unsqueeze(-1) * values, dim=1)
+    if return_attention_weights:
+        return summary, weights
+    return summary
+
+
 class TestZoneSetEncoder(unittest.TestCase):
     def setUp(self):
         self.scales = V2ObservationScales(100.0, 0.0, 50.0, math.pi / 4.0)
@@ -699,6 +730,138 @@ class TestZoneSetEncoder(unittest.TestCase):
                 rtol=2e-6,
             )
 
+    def test_pooling_uses_one_merged_key_value_linear(self):
+        config = ZoneSetEncoderConfig()
+        pooling = TaskConditionedPooling(config).eval()
+        task = torch.randn((2, config.hidden_dim), dtype=torch.float32)
+        tokens = torch.randn((2, 8, config.hidden_dim), dtype=torch.float32)
+        mask = torch.tensor(
+            [
+                [True, False, False, False, False, False, False, False],
+                [True, True, True, True, True, True, True, True],
+            ]
+        )
+
+        original_linear = torch.nn.functional.linear
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.F.linear',
+            wraps=original_linear,
+        ) as linear:
+            pooling(task, tokens, mask)
+
+        self.assertEqual(linear.call_count, 2)
+
+    def test_pooling_merged_key_value_matches_independent_reference(self):
+        config = ZoneSetEncoderConfig()
+        for token_count, mask in (
+            (1, torch.tensor([[True]], dtype=torch.bool)),
+            (
+                8,
+                torch.tensor(
+                    [
+                        [True, False, False, False, False, False, False, False],
+                        [True, True, True, True, True, True, True, True],
+                    ],
+                    dtype=torch.bool,
+                ),
+            ),
+        ):
+            with self.subTest(token_count=token_count):
+                torch.manual_seed(743)
+                pooling = TaskConditionedPooling(config).train()
+                reference = deepcopy(pooling)
+                reference.forward = MethodType(_reference_pooling_forward, reference)
+                batch_size = int(mask.shape[0])
+                task = torch.randn(
+                    (batch_size, config.hidden_dim),
+                    dtype=torch.float32,
+                    requires_grad=True,
+                )
+                tokens = torch.randn(
+                    (batch_size, token_count, config.hidden_dim),
+                    dtype=torch.float32,
+                    requires_grad=True,
+                )
+                reference_task = task.detach().clone().requires_grad_(True)
+                reference_tokens = tokens.detach().clone().requires_grad_(True)
+                state = deepcopy(pooling.state_dict())
+                parameter_ids = tuple(id(value) for value in pooling.parameters())
+
+                actual = pooling(task, tokens, mask)
+                expected = reference(reference_task, reference_tokens, mask)
+                actual.square().sum().backward()
+                expected.square().sum().backward()
+
+                torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+                torch.testing.assert_close(task.grad, reference_task.grad, atol=2e-6, rtol=2e-6)
+                torch.testing.assert_close(tokens.grad, reference_tokens.grad, atol=2e-6, rtol=2e-6)
+                for projection_name in ('key', 'value'):
+                    actual_projection = getattr(pooling, projection_name)
+                    expected_projection = getattr(reference, projection_name)
+                    for parameter_name in ('weight', 'bias'):
+                        torch.testing.assert_close(
+                            getattr(actual_projection, parameter_name).grad,
+                            getattr(expected_projection, parameter_name).grad,
+                            atol=2e-6,
+                            rtol=2e-6,
+                        )
+                self.assertEqual(
+                    tuple(id(value) for value in pooling.parameters()),
+                    parameter_ids,
+                )
+                restored = TaskConditionedPooling(config)
+                restored.load_state_dict(state, strict=True)
+                self.assertEqual(tuple(restored.state_dict()), tuple(state))
+
+    def test_pooling_merged_key_value_tracks_two_adam_updates(self):
+        torch.manual_seed(751)
+        config = ZoneSetEncoderConfig()
+        pooling = TaskConditionedPooling(config).train()
+        reference = deepcopy(pooling)
+        reference.forward = MethodType(_reference_pooling_forward, reference)
+        optimizer = torch.optim.Adam(pooling.parameters(), lr=1e-2)
+        reference_optimizer = torch.optim.Adam(reference.parameters(), lr=1e-2)
+        task = torch.randn((2, config.hidden_dim), dtype=torch.float32)
+        tokens = torch.randn((2, 8, config.hidden_dim), dtype=torch.float32)
+        mask = torch.tensor(
+            [
+                [True, False, False, False, False, False, False, False],
+                [True, True, True, True, True, True, True, True],
+            ]
+        )
+        previous_output = None
+
+        for _ in range(2):
+            optimizer.zero_grad(set_to_none=True)
+            reference_optimizer.zero_grad(set_to_none=True)
+            actual = pooling(task, tokens, mask)
+            expected = reference(task, tokens, mask)
+            torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+            if previous_output is not None:
+                self.assertFalse(torch.equal(actual, previous_output))
+            actual.square().mean().backward()
+            expected.square().mean().backward()
+            optimizer.step()
+            reference_optimizer.step()
+            previous_output = actual.detach().clone()
+            for (actual_name, actual_parameter), (
+                expected_name,
+                expected_parameter,
+            ) in zip(pooling.named_parameters(), reference.named_parameters()):
+                self.assertEqual(actual_name, expected_name)
+                torch.testing.assert_close(
+                    actual_parameter,
+                    expected_parameter,
+                    atol=2e-6,
+                    rtol=2e-6,
+                )
+            torch.testing.assert_close(
+                optimizer.state_dict(),
+                reference_optimizer.state_dict(),
+                atol=2e-6,
+                rtol=2e-6,
+            )
+
     def test_checked_forward_matches_fast_for_all_supported_counts(self):
         for count in (0, 1, 5, 6, 10):
             inputs = self.inputs([count])
@@ -825,6 +988,30 @@ class TestZoneSetEncoder(unittest.TestCase):
             self.model(ego, goal, zones, mask)
             self.assertEqual(compiled.call_count, 2)
             self.assertEqual(eager.call_count, 1)
+
+    def test_eager_context_bypasses_compiled_shared_relations_and_restores_on_error(self):
+        inputs = self.inputs([0, 3])
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            self.model.enable_compiled_shared_relations()
+        compiled = mock.Mock(wraps=self.model._compiled_shared_relations)
+        self.model._compiled_shared_relations = compiled
+
+        self.model.build_shared_relations(*inputs)
+        self.assertEqual(compiled.call_count, 1)
+        with self.model.eager_tensor_forward():
+            self.model.build_shared_relations(*inputs)
+        self.assertEqual(compiled.call_count, 1)
+
+        with self.assertRaisesRegex(RuntimeError, 'controlled eager failure'):
+            with self.model.eager_tensor_forward():
+                self.model.build_shared_relations(*inputs)
+                raise RuntimeError('controlled eager failure')
+        self.assertEqual(compiled.call_count, 1)
+        self.model.build_shared_relations(*inputs)
+        self.assertEqual(compiled.call_count, 2)
 
     def test_profiled_forward_marks_only_major_encoder_sections(self):
         inputs = self.inputs([0, 3, 7])
@@ -1138,6 +1325,66 @@ class TestZoneSetEncoder(unittest.TestCase):
         first.eval()
         first(*self.inputs([5]))
         torch.testing.assert_close(torch.random.get_rng_state(), random_state)
+
+    def test_compiled_shared_relations_match_eager_and_preserve_gradients(self):
+        eager = ZoneSetEncoder(self.scales)
+        compiled = ZoneSetEncoder(self.scales)
+        compiled.load_state_dict(eager.state_dict(), strict=True)
+        parameter_ids = tuple(id(parameter) for parameter in compiled.parameters())
+        state_keys = tuple(compiled.state_dict())
+        compiled.enable_compiled_shared_relations(backend='eager')
+        self.assertTrue(compiled.compiled_shared_relations_enabled)
+        self.assertEqual(compiled.compiled_shared_relations_config['backend'], 'eager')
+        self.assertEqual(tuple(id(parameter) for parameter in compiled.parameters()), parameter_ids)
+        self.assertEqual(tuple(compiled.state_dict()), state_keys)
+
+        for counts in ([0], [0, 3, 7]):
+            with self.subTest(counts=counts):
+                eager_inputs = tuple(value.clone() for value in self.inputs(counts))
+                compiled_inputs = tuple(value.clone() for value in self.inputs(counts))
+                for index in (0, 2):
+                    eager_inputs[index].requires_grad_()
+                    compiled_inputs[index].requires_grad_()
+                expected = eager.build_shared_relations(*eager_inputs)
+                actual = compiled.build_shared_relations(*compiled_inputs)
+                for name in (
+                    'clean_zone_features', 'pair_relations', 'valid_token_mask',
+                    'token_pair_relations', 'relation_pair_mask',
+                ):
+                    torch.testing.assert_close(getattr(actual, name), getattr(expected, name))
+                self.assertIs(actual.ego_features, compiled_inputs[0])
+                self.assertIs(actual.goal_features, compiled_inputs[1])
+                self.assertIs(actual.zone_features, compiled_inputs[2])
+                self.assertIs(actual.presence_mask, compiled_inputs[3])
+                if max(counts) > 0:
+                    expected_loss = expected.clean_zone_features.sum() + expected.pair_relations.sum()
+                    actual_loss = actual.clean_zone_features.sum() + actual.pair_relations.sum()
+                    expected_loss.backward()
+                    actual_loss.backward()
+                    torch.testing.assert_close(compiled_inputs[0].grad, eager_inputs[0].grad)
+                    torch.testing.assert_close(compiled_inputs[2].grad, eager_inputs[2].grad)
+
+    def test_compiled_shared_relations_do_not_reuse_a_previous_batch(self):
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            self.model.enable_compiled_shared_relations()
+        first_inputs = self.inputs([2, 7])
+        second_inputs = self.inputs([0, 3])
+        second_inputs[0][1, EGO_FEATURE_INDEX['sin_psi']] = 0.91
+        first = self.model.build_shared_relations(*first_inputs)
+        second = self.model.build_shared_relations(*second_inputs)
+        eager_second = self.model._compute_shared_relation_tensors(
+            second_inputs[0], second_inputs[2], second_inputs[3]
+        )
+        self.assertIsNot(first.clean_zone_features, second.clean_zone_features)
+        for actual, expected in zip((
+            second.clean_zone_features, second.pair_relations,
+            second.valid_token_mask, second.token_pair_relations,
+            second.relation_pair_mask,
+        ), eager_second):
+            torch.testing.assert_close(actual, expected)
 
     def test_input_validation_rejects_bad_shapes_dtypes_and_devices(self):
         ego, goal, zones, mask = self.inputs([2, 3])

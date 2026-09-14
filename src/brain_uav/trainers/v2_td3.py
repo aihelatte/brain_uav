@@ -641,6 +641,22 @@ class V2TD3UpdateEngine:
             enabled.append(name)
         return enabled[0], enabled[1]
 
+    def enable_shared_relations_compile(
+        self,
+        *,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> tuple[str]:
+        self.actor.zone_set_encoder.enable_compiled_shared_relations(
+            backend=backend,
+            mode=mode,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+        )
+        return ('shared_relations.tensor_build',)
+
     def set_frozen_critic_strategy(self, strategy: str) -> None:
         if strategy not in ('eager', 'compiled_no_grad_context'):
             raise ValueError(
@@ -665,6 +681,8 @@ class V2TD3UpdateEngine:
         frozen_critic_strategy: str = 'eager',
         compile_critic_block: bool = False,
         compile_target_block: bool = False,
+        compile_shared_relations: bool = False,
+        compile_snn_target_encoder: bool = False,
         backend: str = 'inductor',
         mode: str = 'default',
         fullgraph: bool = True,
@@ -681,6 +699,17 @@ class V2TD3UpdateEngine:
             raise ValueError(
                 'compile_target_encoders and compile_target_block are mutually '
                 'exclusive compilation granularities.'
+            )
+        if compile_target_encoders and compile_snn_target_encoder:
+            raise ValueError(
+                'compile_target_encoders and compile_snn_target_encoder are '
+                'mutually exclusive target encoder scopes.'
+            )
+        if compile_snn_target_encoder and not isinstance(
+            self.actor_target, V2SNNPolicyActor
+        ):
+            raise ValueError(
+                'compile_snn_target_encoder requires an SNN actor.'
             )
         if compile_target_encoders and not compile_critic_encoder:
             raise ValueError(
@@ -702,6 +731,8 @@ class V2TD3UpdateEngine:
             'dynamic': dynamic,
         }
         enabled: list[str] = []
+        if compile_shared_relations:
+            enabled.extend(self.enable_shared_relations_compile(**options))
         if compile_critic_block:
             enabled.extend(self.enable_critic_loss_compile(**options))
         elif compile_critic_encoder:
@@ -711,6 +742,8 @@ class V2TD3UpdateEngine:
             and compile_critic_block
         ):
             enabled.extend(self.enable_actor_guidance_context_compile(**options))
+        if compile_snn_target_encoder:
+            enabled.extend(self.enable_snn_target_encoder_compile(**options))
         if compile_target_block:
             enabled.extend(self.enable_target_block_compile(**options))
         elif compile_target_encoders:
@@ -727,6 +760,12 @@ class V2TD3UpdateEngine:
             'target_granularity': (
                 'full_tensor_block' if compile_target_block
                 else 'encoder' if compile_target_encoders else 'eager'
+            ),
+            'shared_relations_granularity': (
+                'compiled_tensor_build' if compile_shared_relations else 'eager'
+            ),
+            'snn_target_actor_granularity': (
+                'encoder' if compile_snn_target_encoder else 'eager'
             ),
             'actor_granularity': (
                 'ann_full_forward_or_snn_encoder' if compile_actors else 'eager'
@@ -896,9 +935,12 @@ class V2TD3UpdateEngine:
         dynamic: bool = True,
     ) -> tuple[str, str, str, str]:
         if (
-            self.actor_target.zone_set_encoder.compiled_tensor_forward_enabled
-            or self.critic1_target.zone_set_encoder.compiled_tensor_forward_enabled
+            self.critic1_target.zone_set_encoder.compiled_tensor_forward_enabled
             or self.critic2_target.zone_set_encoder.compiled_tensor_forward_enabled
+            or (
+                isinstance(self.actor_target, V2ANNPolicyActor)
+                and self.actor_target.zone_set_encoder.compiled_tensor_forward_enabled
+            )
         ):
             raise RuntimeError(
                 'Full target block forbids nested encoder compilation.'
@@ -925,7 +967,11 @@ class V2TD3UpdateEngine:
             dynamic=dynamic,
         )
         return (
-            'actor_target.eager_snn',
+            (
+                'actor_target.compiled_snn_encoder'
+                if self.actor_target.zone_set_encoder.compiled_tensor_forward_enabled
+                else 'actor_target.eager_snn'
+            ),
             'critic1_target.full_forward',
             'critic2_target.full_forward',
             'td_target',
@@ -1357,6 +1403,124 @@ class V2TD3UpdateEngine:
             enabled.append(name)
         return enabled[0], enabled[1], enabled[2]
 
+    def enable_snn_target_encoder_compile(
+        self,
+        *,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> tuple[str]:
+        if not isinstance(self.actor_target, V2SNNPolicyActor):
+            raise ValueError('SNN target encoder compilation requires an SNN actor.')
+        self.actor_target.zone_set_encoder.enable_compiled_tensor_forward(
+            backend=backend,
+            mode=mode,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+        )
+        return ('actor_target.zone_set_encoder',)
+
+    def warmup_shared_relations_compile(
+        self,
+        batches: Sequence[V2ObservationBatch],
+    ) -> None:
+        warmup_batches = tuple(batches)
+        if not warmup_batches:
+            raise ValueError('At least one compile warmup batch is required.')
+        if not self.actor.zone_set_encoder.compiled_shared_relations_enabled:
+            raise RuntimeError('Shared relations must be compiled first.')
+        if any(not isinstance(batch, V2ObservationBatch) for batch in warmup_batches):
+            raise TypeError('Compile warmup batches must be V2ObservationBatch values.')
+        torch_rng_state = torch.random.get_rng_state()
+        numpy_rng_state = np.random.get_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state_all() if self.device.type == 'cuda' else None
+        )
+        counts_before = (
+            self.update_count, self.critic_update_count,
+            self.critic_target_update_count, self.actor_update_count,
+            self.last_total_steps,
+        )
+        try:
+            for batch in warmup_batches:
+                self._build_shared_relations(batch.to(self.device))
+        finally:
+            torch.random.set_rng_state(torch_rng_state)
+            np.random.set_state(numpy_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
+        counts_after = (
+            self.update_count, self.critic_update_count,
+            self.critic_target_update_count, self.actor_update_count,
+            self.last_total_steps,
+        )
+        if counts_after != counts_before:
+            raise RuntimeError('Compile warmup must not change TD3 update counters.')
+
+    def warmup_snn_target_encoder_compile(
+        self,
+        batches: Sequence[V2ObservationBatch],
+    ) -> None:
+        warmup_batches = tuple(batches)
+        if not warmup_batches:
+            raise ValueError('At least one compile warmup batch is required.')
+        target = self.actor_target
+        if not isinstance(target, V2SNNPolicyActor):
+            raise ValueError('SNN target encoder warmup requires an SNN actor.')
+        if not target.zone_set_encoder.compiled_tensor_forward_enabled:
+            raise RuntimeError('SNN target encoder must be compiled first.')
+        if any(not isinstance(batch, V2ObservationBatch) for batch in warmup_batches):
+            raise TypeError('Compile warmup batches must be V2ObservationBatch values.')
+        parameters = tuple(target.parameters())
+        requires_grad = tuple(parameter.requires_grad for parameter in parameters)
+        gradient_state = tuple(
+            (parameter.grad, None if parameter.grad is None else parameter.grad.detach().clone())
+            for parameter in parameters
+        )
+        training = target.training
+        torch_rng_state = torch.random.get_rng_state()
+        numpy_rng_state = np.random.get_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state_all() if self.device.type == 'cuda' else None
+        )
+        counts_before = (
+            self.update_count, self.critic_update_count,
+            self.critic_target_update_count, self.actor_update_count,
+            self.last_total_steps,
+        )
+        try:
+            target.eval()
+            with torch.no_grad():
+                for batch in warmup_batches:
+                    device_batch = batch.to(self.device)
+                    target(
+                        device_batch,
+                        shared_relations=self._build_shared_relations(device_batch),
+                    )
+        finally:
+            target.train(training)
+            for parameter, required, (original_grad, saved_grad) in zip(
+                parameters, requires_grad, gradient_state,
+            ):
+                parameter.requires_grad_(required)
+                if original_grad is None:
+                    parameter.grad = None
+                else:
+                    original_grad.copy_(saved_grad)
+                    parameter.grad = original_grad
+            torch.random.set_rng_state(torch_rng_state)
+            np.random.set_state(numpy_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
+        counts_after = (
+            self.update_count, self.critic_update_count,
+            self.critic_target_update_count, self.actor_update_count,
+            self.last_total_steps,
+        )
+        if counts_after != counts_before:
+            raise RuntimeError('Compile warmup must not change TD3 update counters.')
+
     def warmup_target_encoder_compile(
         self,
         batches: Sequence[V2ObservationBatch],
@@ -1541,6 +1705,11 @@ class V2TD3UpdateEngine:
             batch = batch.to(self.device)
         with update_timing.section('target_forward_and_td_target'):
             with torch.no_grad():
+                if (
+                    reuse_shared_relations
+                    and self.actor.zone_set_encoder.compiled_shared_relations_enabled
+                ):
+                    record_compiled_execution('shared_relations')
                 next_shared_relations = (
                     self._build_shared_relations(
                         batch.next_obs,
@@ -1583,6 +1752,8 @@ class V2TD3UpdateEngine:
                                 )
                             )
                     else:
+                        if self.actor_target.zone_set_encoder.compiled_tensor_forward_enabled:
+                            record_compiled_execution('snn_target_encoder')
                         next_action = self.actor_target(
                             batch.next_obs,
                             shared_relations=next_shared_relations,
@@ -1609,6 +1780,11 @@ class V2TD3UpdateEngine:
                                 )
                             )
                 else:
+                    if (
+                        isinstance(self.actor_target, V2SNNPolicyActor)
+                        and self.actor_target.zone_set_encoder.compiled_tensor_forward_enabled
+                    ):
+                        record_compiled_execution('snn_target_encoder')
                     next_action = self.actor_target(
                         batch.next_obs,
                         shared_relations=next_shared_relations,
@@ -1637,6 +1813,11 @@ class V2TD3UpdateEngine:
                     )
 
         with update_timing.section('online_critic_forward_and_loss'):
+            if (
+                reuse_shared_relations
+                and self.actor.zone_set_encoder.compiled_shared_relations_enabled
+            ):
+                record_compiled_execution('shared_relations')
             current_shared_relations = (
                 self._build_shared_relations(
                     batch.obs,
