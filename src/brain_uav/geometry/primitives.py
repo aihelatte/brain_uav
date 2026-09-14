@@ -277,13 +277,26 @@ class Ellipsoid(GeometryShape):
         distance = float(np.linalg.norm(candidate - closest))
         return -distance if self._level(candidate) < 1.0 else distance
 
-    def surface_normal(self, point: Any) -> np.ndarray:
-        closest = self.closest_point(point)
+    def signed_distance_and_surface_normal(
+        self,
+        point: Any,
+    ) -> tuple[float, np.ndarray]:
+        candidate = as_point3(point)
+        closest = self.closest_point(candidate)
+        distance = float(np.linalg.norm(candidate - closest))
+        signed_distance = -distance if self._level(candidate) < 1.0 else distance
+        return signed_distance, self._surface_normal_from_closest(closest)
+
+    def _surface_normal_from_closest(self, closest: np.ndarray) -> np.ndarray:
         gradient = (closest - self._center) / (self._radii**2)
         norm = float(np.linalg.norm(gradient))
         if norm <= GEOMETRY_TOLERANCE:
             raise GeometryConvergenceError('Ellipsoid surface normal is numerically undefined.')
         return gradient / norm
+
+    def surface_normal(self, point: Any) -> np.ndarray:
+        closest = self.closest_point(point)
+        return self._surface_normal_from_closest(closest)
 
     def segment_intersection(self, start: Any, end: Any) -> SegmentHit | None:
         start_point = as_point3(start, name='start')

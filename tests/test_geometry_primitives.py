@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -205,6 +206,29 @@ class TestEllipsoid(unittest.TestCase):
         normal = self.ellipsoid.surface_normal(point)
         self.assertAlmostEqual(float(np.linalg.norm(normal)), 1.0, places=10)
         self.assertGreater(float(np.dot(closest - point, normal)), 0.0)
+
+    def test_distance_and_normal_share_one_exact_projection(self):
+        original = self.ellipsoid.closest_point
+        cases = (
+            np.array([4.0, 3.0, 5.0]),
+            np.array([0.2, 0.2, 3.2]),
+            np.array([3.0, 0.0, 3.0]),
+        )
+        for point in cases:
+            with self.subTest(point=point.tolist()):
+                expected_distance = self.ellipsoid.signed_distance(point)
+                expected_normal = self.ellipsoid.surface_normal(point)
+                with mock.patch.object(
+                    self.ellipsoid,
+                    'closest_point',
+                    wraps=original,
+                ) as closest_point:
+                    distance, normal = (
+                        self.ellipsoid.signed_distance_and_surface_normal(point)
+                    )
+                self.assertEqual(closest_point.call_count, 1)
+                self.assertEqual(distance, expected_distance)
+                np.testing.assert_array_equal(normal, expected_normal)
 
     def test_internal_projection_remains_finite_at_inactive_axis_pole(self):
         ellipsoid = Ellipsoid(

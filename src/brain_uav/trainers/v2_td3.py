@@ -1139,13 +1139,6 @@ class V2TD3UpdateEngine:
                         shared_relations=shared_relations,
                     )
                 )
-                self.critic2.zone_set_encoder.prepare_tensor_forward_arguments(
-                    device_batch.ego_features,
-                    device_batch.goal_features,
-                    device_batch.zone_features,
-                    device_batch.presence_mask,
-                    shared_relations=shared_relations,
-                )
                 action = torch.zeros(
                     (device_batch.batch_size, self.action_dim),
                     dtype=torch.float32,
@@ -1574,17 +1567,6 @@ class V2TD3UpdateEngine:
                             shared_relations=next_shared_relations,
                         )
                     )
-                    for target_critic in (
-                        self.critic1_target,
-                        self.critic2_target,
-                    ):
-                        target_critic.zone_set_encoder.prepare_tensor_forward_arguments(
-                            batch.next_obs.ego_features,
-                            batch.next_obs.goal_features,
-                            batch.next_obs.zone_features,
-                            batch.next_obs.presence_mask,
-                            shared_relations=next_shared_relations,
-                        )
                     if self._compiled_target_block is not None:
                         record_compiled_execution('target_block')
                         with (
@@ -1672,13 +1654,6 @@ class V2TD3UpdateEngine:
                         batch.obs.presence_mask,
                         shared_relations=current_shared_relations,
                     )
-                )
-                self.critic2.zone_set_encoder.prepare_tensor_forward_arguments(
-                    batch.obs.ego_features,
-                    batch.obs.goal_features,
-                    batch.obs.zone_features,
-                    batch.obs.presence_mask,
-                    shared_relations=current_shared_relations,
                 )
                 record_compiled_execution('critic_block')
                 with (

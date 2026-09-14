@@ -96,6 +96,30 @@ def _validated_zone_point_clearances(
     return clearances.copy()
 
 
+def _validated_zone_surface_normals(
+    values: Any,
+    *,
+    zone_count: int,
+) -> np.ndarray | None:
+    if values is None:
+        return None
+    if isinstance(values, (str, bytes)):
+        raise TypeError('zone_surface_normals must be a finite two-dimensional sequence.')
+    try:
+        normals = np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            'zone_surface_normals must be a finite two-dimensional sequence.'
+        ) from exc
+    if zone_count == 0 and normals.size == 0:
+        normals = np.empty((0, 3), dtype=np.float64)
+    if normals.shape != (zone_count, 3) or not np.all(np.isfinite(normals)):
+        raise ValueError(
+            'zone_surface_normals must contain one finite 3-vector for every zone.'
+        )
+    return normals.copy()
+
+
 def build_v2_observation(
     state: Any,
     goal: Any,
@@ -104,6 +128,7 @@ def build_v2_observation(
     *,
     uav_radius: float = 0.0,
     zone_point_clearances: Sequence[float] | None = None,
+    zone_surface_normals: Sequence[Sequence[float]] | None = None,
 ) -> V2Observation:
     """Build one dynamic-length V2 observation without padding or sorting."""
 
@@ -115,6 +140,10 @@ def build_v2_observation(
     zone_items = _validated_zones(zones)
     point_clearances = _validated_zone_point_clearances(
         zone_point_clearances,
+        zone_count=len(zone_items),
+    )
+    surface_normals = _validated_zone_surface_normals(
+        zone_surface_normals,
         zone_count=len(zone_items),
     )
 
@@ -198,7 +227,11 @@ def build_v2_observation(
         )
 
         outward_normal = _finite_vector(
-            shape.surface_normal(uav_position),
+            (
+                shape.surface_normal(uav_position)
+                if surface_normals is None
+                else surface_normals[row_index]
+            ),
             shape=(3,),
             name=f'zones[{row_index}] surface normal',
         )

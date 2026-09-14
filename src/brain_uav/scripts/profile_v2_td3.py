@@ -574,6 +574,11 @@ class _EnvironmentGeometryDiagnostic:
             if id(zone) not in self._attached:
                 self._attached.add(id(zone))
                 self._patch_method(zone, 'point_clearance', 'point_clearance')
+                self._patch_method(
+                    zone,
+                    'point_clearance_and_surface_normal',
+                    'point_clearance_and_surface_normal',
+                )
                 self._patch_method(zone, 'violates_segment', 'segment_safety')
                 self._patch_method(zone, 'segment_clearance', 'segment_clearance')
             shape = zone.shape
@@ -812,38 +817,53 @@ class _CompiledPathProfiler:
         text = str(device_type).rsplit('.', 1)[-1]
         return text.upper() if text else None
 
-    @staticmethod
-    def _cuda_task_kind(name: str) -> str:
-        lowered = name.lower().replace(' ', '')
-        if 'memcpy' in lowered or 'memorycopy' in lowered:
-            return 'memcpy'
-        if 'memset' in lowered or 'memoryset' in lowered:
-            return 'memset'
-        return 'kernel'
-
     @classmethod
-    def _cuda_device_task_summary(
+    def _trace_cuda_device_task_summary(
         cls,
-        cuda_events: Sequence[Any],
+        trace_events: Sequence[Mapping[str, Any]],
     ) -> dict[str, Any]:
-        positive_events = [
-            event for event in cuda_events
-            if (cls._event_value(event, 'self_device_time_total') or 0.0) > 0.0
-            or (cls._event_value(event, 'device_time_total') or 0.0) > 0.0
-        ]
-        available = bool(positive_events)
+        category_to_kind = {
+            'kernel': 'kernel',
+            'gpu_memcpy': 'memcpy',
+            'gpu_memset': 'memset',
+        }
+        grouped: dict[str, dict[str, list[float | None]]] = {
+            kind: defaultdict(list) for kind in category_to_kind.values()
+        }
+        excluded_interval_markers = 0
+        for event in trace_events:
+            category = event.get('cat')
+            if category == 'gpu_user_annotation':
+                excluded_interval_markers += 1
+                continue
+            kind = category_to_kind.get(category)
+            if kind is None or event.get('ph') != 'X':
+                continue
+            duration = event.get('dur')
+            try:
+                duration_value = float(duration) if duration is not None else None
+            except (TypeError, ValueError, OverflowError):
+                duration_value = None
+            if duration_value is not None and not isfinite(duration_value):
+                duration_value = None
+            grouped[kind][str(event.get('name', '<unnamed>'))].append(
+                duration_value
+            )
+        available = any(grouped[kind] for kind in grouped)
         result: dict[str, Any] = {
             'available': available,
-            'data_source': 'CUDA device events',
+            'data_source': 'Chrome trace event categories',
+            'excluded_interval_markers': excluded_interval_markers,
             'aggregation_note': (
-                'Counts and self times use CUDA device events only. CPU '
-                'operation-associated device time is a separate attribution '
-                'view and is not added here. Self times are not GPU busy time '
-                'or utilization because streams may overlap.'
+                'Counts and durations use only trace categories kernel, '
+                'gpu_memcpy, and gpu_memset. gpu_user_annotation intervals are '
+                'excluded. Durations are not GPU busy time or utilization '
+                'because streams may overlap.'
             ),
         }
         for kind in ('kernel', 'memcpy', 'memset'):
-            if not available:
+            operations = grouped[kind]
+            if not operations:
                 result[kind] = {
                     'available': False,
                     'calls': None,
@@ -851,29 +871,40 @@ class _CompiledPathProfiler:
                     'operations': None,
                 }
                 continue
-            events = [
-                event for event in positive_events
-                if cls._cuda_task_kind(str(event.key)) == kind
-            ]
-            rows, _ = cls._operation_summary(
-                events,
-                self_metric='self_device_time_total',
-                total_metric='device_time_total',
-                limit=50,
+            rows = []
+            for name, durations in operations.items():
+                total = (
+                    sum(float(value) for value in durations)
+                    if all(value is not None for value in durations)
+                    else None
+                )
+                rows.append({
+                    'name': name,
+                    'calls': len(durations),
+                    'self_time_us': total,
+                    'total_time_us': None,
+                })
+            rows.sort(
+                key=lambda row: (
+                    row['self_time_us'] is not None,
+                    row['self_time_us'] or 0.0,
+                ),
+                reverse=True,
             )
-            values = [
-                cls._event_value(event, 'self_device_time_total')
-                for event in events
+            all_durations = [
+                duration
+                for durations in operations.values()
+                for duration in durations
             ]
             result[kind] = {
                 'available': True,
-                'calls': sum(int(event.count) for event in events),
+                'calls': len(all_durations),
                 'self_time_us': (
-                    sum(float(value) for value in values)
-                    if all(value is not None for value in values)
+                    sum(float(value) for value in all_durations)
+                    if all(value is not None for value in all_durations)
                     else None
                 ),
-                'operations': rows,
+                'operations': rows[:50],
             }
         return result
 
@@ -914,15 +945,23 @@ class _CompiledPathProfiler:
             self_metric='self_device_time_total',
             total_metric='device_time_total',
         )
-        cuda_device_tasks = self._cuda_device_task_summary(cuda_events)
-        cuda_timing_available = bool(
-            self.device.type == 'cuda' and cuda_device_tasks['available']
-        )
         cpu_path = self.output_dir / 'compiled_operators_cpu.txt'
         cuda_path = self.output_dir / 'compiled_operators_cuda.txt'
         trace_path = self.output_dir / 'compiled_medium_trace.json'
         report_path = self.output_dir / 'compiled_profile_report.txt'
         device_task_path = self.output_dir / 'compiled_cuda_device_tasks.txt'
+        self._profiler.export_chrome_trace(str(trace_path))
+        try:
+            trace_payload = json.loads(trace_path.read_text(encoding='utf-8'))
+            trace_events = trace_payload.get('traceEvents', ())
+            if not isinstance(trace_events, list):
+                trace_events = ()
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            trace_events = ()
+        cuda_device_tasks = self._trace_cuda_device_task_summary(trace_events)
+        cuda_timing_available = bool(
+            self.device.type == 'cuda' and cuda_device_tasks['available']
+        )
 
         def format_rows(rows: Sequence[Mapping[str, Any]]) -> list[str]:
             return [
@@ -975,7 +1014,6 @@ class _CompiledPathProfiler:
             ),
             encoding='utf-8',
         )
-        self._profiler.export_chrome_trace(str(trace_path))
         report_path.write_text(
             '\n'.join((
                 f'captured_updates: {self.captured_updates}',

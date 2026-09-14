@@ -98,6 +98,20 @@ class NoFlyZone:
         radius = nonnegative_scalar(uav_radius, name='uav_radius')
         return float(self.shape.signed_distance(point) - self.safety_margin - radius)
 
+    def point_clearance_and_surface_normal(
+        self,
+        point: Any,
+        uav_radius: float = 0.0,
+    ) -> tuple[float, np.ndarray]:
+        radius = nonnegative_scalar(uav_radius, name='uav_radius')
+        signed_distance, surface_normal = (
+            self.shape.signed_distance_and_surface_normal(point)
+        )
+        return (
+            float(signed_distance - self.safety_margin - radius),
+            surface_normal,
+        )
+
     def violates_point(self, point: Any, uav_radius: float = 0.0) -> bool:
         return bool(self.point_clearance(point, uav_radius=uav_radius) <= GEOMETRY_TOLERANCE)
 

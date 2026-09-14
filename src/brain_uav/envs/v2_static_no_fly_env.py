@@ -232,9 +232,10 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         self.best_goal_distance_so_far = self._goal_distance(self.state[:3])
         self.last_segment_goal_distance = self.best_goal_distance_so_far
         self.last_goal_reached_by_segment = False
-        point_clearances = self._point_clearances(self.state[:3])
+        point_clearances, surface_normals = self._point_geometry(self.state[:3])
         return self._get_obs(
             zone_point_clearances=point_clearances,
+            zone_surface_normals=surface_normals,
         ), self._info(
             progress=0.0,
             zone_point_clearances=point_clearances,
@@ -283,7 +284,9 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         with self._diagnostic_section('termination'):
             terminated, truncated, outcome = self._termination(prev_state[:3])
         with self._diagnostic_section('current_point_clearance'):
-            point_clearances = self._point_clearances(self.state[:3])
+            point_clearances, surface_normals = self._point_geometry(
+                self.state[:3]
+            )
         with self._diagnostic_section('reward'):
             reward = self._compute_reward(
                 prev_state,
@@ -300,7 +303,8 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
             self.prev_action = action.copy()
         with self._diagnostic_section('observation_construction'):
             observation = self._get_obs(
-                zone_point_clearances=point_clearances
+                zone_point_clearances=point_clearances,
+                zone_surface_normals=surface_normals,
             )
         with self._diagnostic_section('info_construction'):
             info = self._info(
@@ -341,9 +345,10 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         self.best_goal_distance_so_far = self._goal_distance(self.state[:3])
         self.last_segment_goal_distance = self.best_goal_distance_so_far
         self.last_goal_reached_by_segment = False
-        point_clearances = self._point_clearances(self.state[:3])
+        point_clearances, surface_normals = self._point_geometry(self.state[:3])
         return self._get_obs(
             zone_point_clearances=point_clearances,
+            zone_surface_normals=surface_normals,
         ), self._info(
             progress=0.0,
             zone_point_clearances=point_clearances,
@@ -396,6 +401,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         self,
         *,
         zone_point_clearances: Sequence[float] | None = None,
+        zone_surface_normals: Sequence[Sequence[float]] | None = None,
     ) -> V2Observation:
         return build_v2_observation(
             state=self.state,
@@ -404,6 +410,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
             scales=self.observation_scales,
             uav_radius=self.uav_collision_radius,
             zone_point_clearances=zone_point_clearances,
+            zone_surface_normals=zone_surface_normals,
         )
 
     def _validated_zone_point_clearances(
@@ -435,6 +442,33 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
                 for zone in self.zones
             )
         )
+
+    def _point_geometry(
+        self,
+        position: Any,
+    ) -> tuple[tuple[float, ...], tuple[np.ndarray, ...]]:
+        point = _finite_vector(position, shape=(3,), name='position')
+        geometry = tuple(
+            zone.point_clearance_and_surface_normal(
+                point,
+                uav_radius=self.uav_collision_radius,
+            )
+            for zone in self.zones
+        )
+        clearances = self._validated_zone_point_clearances(
+            tuple(clearance for clearance, _ in geometry)
+        )
+        normals = []
+        for _, normal in geometry:
+            # Keep the original geometry precision until observation conversion.
+            try:
+                value = np.asarray(normal, dtype=np.float64)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError('surface_normal must be a finite 3-vector.') from exc
+            if value.shape != (3,) or not np.all(np.isfinite(value)):
+                raise ValueError('surface_normal must be a finite 3-vector.')
+            normals.append(value.copy())
+        return clearances, tuple(normals)
 
     def _zone_query_identity(self) -> tuple[tuple[int, int, float], ...]:
         return tuple(

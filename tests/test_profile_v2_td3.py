@@ -198,7 +198,10 @@ class TestProfileV2TD3(unittest.TestCase):
             measured_geometry_calls = dict(geometry_calls)
         patched_zone = measured.zones[0]
         patched_shape = patched_zone.shape
-        self.assertIn('point_clearance', patched_zone.__dict__)
+        self.assertIn(
+            'point_clearance_and_surface_normal',
+            patched_zone.__dict__,
+        )
         diagnostic.close()
         measured.set_performance_diagnostic(None)
 
@@ -214,6 +217,10 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertEqual(measured_step[1:], baseline_step[1:])
         self.assertEqual(measured_geometry_calls, baseline_geometry_calls)
         self.assertNotIn('point_clearance', patched_zone.__dict__)
+        self.assertNotIn(
+            'point_clearance_and_surface_normal',
+            patched_zone.__dict__,
+        )
         self.assertNotIn('surface_normal', patched_shape.__dict__)
         summary = diagnostic.to_dict()
         self.assertEqual(summary['step_count'], 1)
@@ -229,7 +236,7 @@ class TestProfileV2TD3(unittest.TestCase):
             self.assertEqual(summary['step_sections'][section]['calls'], 1)
         geometry = summary['geometry_queries']
         self.assertTrue(any(
-            key.endswith('|Sphere|point_clearance')
+            key.endswith('|Sphere|point_clearance_and_surface_normal')
             for key in geometry
         ))
         self.assertTrue(any(
@@ -333,7 +340,42 @@ class TestProfileV2TD3(unittest.TestCase):
                 return FakeAverages(self._events)
 
             def export_chrome_trace(self, path):
-                Path(path).write_text('{}', encoding='utf-8')
+                has_cuda = any(
+                    event.device_type == torch.autograd.DeviceType.CUDA
+                    for event in self._events
+                )
+                events = (
+                    [
+                        {
+                            'cat': 'kernel',
+                            'name': 'compiled_kernel',
+                            'ph': 'X',
+                            'dur': 20.0,
+                        }
+                        for _ in range(4)
+                    ]
+                    + [
+                        {
+                            'cat': 'gpu_memcpy',
+                            'name': 'cudaMemcpyAsync',
+                            'ph': 'X',
+                            'dur': 2.5,
+                        }
+                        for _ in range(2)
+                    ]
+                    + [{
+                        'cat': 'gpu_memset',
+                        'name': 'cudaMemsetAsync',
+                        'ph': 'X',
+                        'dur': 2.0,
+                    }]
+                    if has_cuda
+                    else []
+                )
+                Path(path).write_text(
+                    json.dumps({'traceEvents': events}),
+                    encoding='utf-8',
+                )
 
         fake = FakeProfiler()
         calls = []
@@ -377,7 +419,10 @@ class TestProfileV2TD3(unittest.TestCase):
             'cpu_parent',
         )
         device_tasks = result['cuda_device_tasks']
-        self.assertEqual(device_tasks['data_source'], 'CUDA device events')
+        self.assertEqual(
+            device_tasks['data_source'],
+            'Chrome trace event categories',
+        )
         self.assertEqual(device_tasks['kernel']['calls'], 4)
         self.assertEqual(device_tasks['memcpy']['calls'], 2)
         self.assertEqual(device_tasks['memset']['calls'], 1)
@@ -430,6 +475,42 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertIn('unavailable', missing_result['cuda_capture_status'])
         self.assertFalse(missing_result['cuda_device_tasks']['available'])
         self.assertIsNone(missing_result['cuda_device_tasks']['kernel']['calls'])
+
+    def test_trace_cuda_tasks_use_categories_and_exclude_annotations(self):
+        trace_events = [
+            {'cat': 'kernel', 'name': 'kernel_a', 'ph': 'X', 'dur': 4.0},
+            {'cat': 'kernel', 'name': 'kernel_a', 'ph': 'X', 'dur': 6.0},
+            {'cat': 'gpu_memcpy', 'name': 'copy', 'ph': 'X', 'dur': 3.0},
+            {'cat': 'gpu_memset', 'name': 'set', 'ph': 'X', 'dur': 2.0},
+            {
+                'cat': 'gpu_user_annotation',
+                'name': 'v2_td3.critic_backward',
+                'ph': 'X',
+                'dur': 100.0,
+            },
+            {'cat': 'kernel', 'name': 'metadata_only', 'ph': 'M'},
+        ]
+
+        result = _CompiledPathProfiler._trace_cuda_device_task_summary(
+            trace_events
+        )
+
+        self.assertEqual(result['data_source'], 'Chrome trace event categories')
+        self.assertEqual(result['kernel']['calls'], 2)
+        self.assertEqual(result['kernel']['self_time_us'], 10.0)
+        self.assertEqual(result['memcpy']['calls'], 1)
+        self.assertEqual(result['memset']['calls'], 1)
+        self.assertEqual(result['excluded_interval_markers'], 1)
+        self.assertNotIn(
+            'v2_td3.critic_backward',
+            [row['name'] for row in result['kernel']['operations']],
+        )
+
+        unavailable = _CompiledPathProfiler._trace_cuda_device_task_summary([
+            {'name': 'missing_category', 'ph': 'X', 'dur': 5.0},
+        ])
+        self.assertFalse(unavailable['available'])
+        self.assertIsNone(unavailable['kernel']['calls'])
 
     def test_geometry_duplicate_audit_is_scoped_to_reset_and_each_step(self):
         zone = v2_env_tests.NoFlyZone(

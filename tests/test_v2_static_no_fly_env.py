@@ -307,27 +307,40 @@ class TestV2StaticNoFlyTrajectoryEnv(unittest.TestCase):
 
         env = self.make_env(payload, radius=radius)
         original = NoFlyZone.point_clearance
+        combined_original = NoFlyZone.point_clearance_and_surface_normal
         with mock.patch.object(
             NoFlyZone,
             'point_clearance',
             autospec=True,
             side_effect=original,
-        ) as clearance:
+        ) as clearance, mock.patch.object(
+            NoFlyZone,
+            'point_clearance_and_surface_normal',
+            autospec=True,
+            side_effect=combined_original,
+        ) as point_geometry:
             reset_observation, reset_info = env.reset()
-            self.assertEqual(clearance.call_count, len(zones))
+            self.assertEqual(clearance.call_count, 0)
+            self.assertEqual(point_geometry.call_count, len(zones))
             clearance.reset_mock()
+            point_geometry.reset_mock()
 
             step_result = env.step(action)
-            self.assertEqual(clearance.call_count, len(zones))
+            self.assertEqual(clearance.call_count, 0)
+            self.assertEqual(point_geometry.call_count, len(zones))
             clearance.reset_mock()
+            point_geometry.reset_mock()
 
             env.set_goal([75.0, 1.0, 11.0])
-            self.assertEqual(clearance.call_count, len(zones))
+            self.assertEqual(clearance.call_count, 0)
+            self.assertEqual(point_geometry.call_count, len(zones))
             clearance.reset_mock()
+            point_geometry.reset_mock()
 
             other_position = np.array([2.0, 3.0, 12.0], dtype=np.float64)
             env.min_zone_clearance(other_position)
             self.assertEqual(clearance.call_count, len(zones))
+            self.assertEqual(point_geometry.call_count, 0)
             clearance.reset_mock()
             env._zone_warning_penalty(other_position)
             self.assertEqual(clearance.call_count, len(zones))
@@ -370,6 +383,73 @@ class TestV2StaticNoFlyTrajectoryEnv(unittest.TestCase):
             env.rewards.zone_penalty_cap,
         )
         self.assertEqual(step_result[4]['zone_warning_penalty'], expected_penalty)
+
+    def test_lifecycle_reuses_ellipsoid_projection_for_clearance_and_normal(self):
+        zone = NoFlyZone(
+            'ellipsoid',
+            Ellipsoid([20.0, 20.0, 10.0], 2.0, 3.0, 4.0),
+            0.2,
+        )
+        payload = _scenario(
+            [0.0, 0.0, 10.0, 0.0, 0.0],
+            [80.0, 0.0, 10.0],
+            [zone],
+            metadata={'direct_path_blocker_count': 0},
+        )
+        action = np.array([0.01, -0.02], dtype=np.float32)
+        reference = self.make_env(payload, radius=0.75)
+        expected_reset = reference.reset()
+        expected_step = reference.step(action)
+
+        env = self.make_env(payload, radius=0.75)
+        original = Ellipsoid.closest_point
+        with mock.patch.object(
+            Ellipsoid,
+            'closest_point',
+            autospec=True,
+            side_effect=original,
+        ) as closest_point:
+            actual_reset = env.reset()
+            self.assertEqual(closest_point.call_count, 2)
+            closest_point.reset_mock()
+            actual_step = env.step(action)
+            self.assertEqual(closest_point.call_count, 2)
+
+        np.testing.assert_array_equal(
+            actual_reset[0].zone_features,
+            expected_reset[0].zone_features,
+        )
+        self.assertEqual(actual_reset[1], expected_reset[1])
+        np.testing.assert_array_equal(
+            actual_step[0].zone_features,
+            expected_step[0].zone_features,
+        )
+        self.assertEqual(actual_step[1:], expected_step[1:])
+
+    def test_reused_normals_preserve_independent_observation_precision(self):
+        from brain_uav.observations.v2_builder import build_v2_observation
+
+        zone = NoFlyZone(
+            'ellipsoid', Ellipsoid([20.0, 20.0, 15.0], 2.0, 3.0, 4.0), 0.2,
+        )
+        env = self.make_env(_scenario(
+            [1.2, -2.3, 10.4, 0.17, 0.63],
+            [80.0, 3.0, 12.0], [zone],
+        ), radius=0.75)
+        observation, _ = env.reset()
+        reference = build_v2_observation(
+            env.state, env.goal, env.zones, env.observation_scales,
+            uav_radius=env.uav_collision_radius,
+        )
+        for name in ('ego_features', 'goal_features', 'zone_features', 'presence_mask'):
+            np.testing.assert_array_equal(
+                getattr(observation, name), getattr(reference, name),
+            )
+        _, normals = env._point_geometry(env.state[:3])
+        self.assertEqual(normals[0].dtype, np.dtype(np.float64))
+        np.testing.assert_array_equal(
+            normals[0], env.zones[0].shape.surface_normal(env.state[:3]),
+        )
 
     def test_random_generator_is_optional_and_lower_priority_than_explicit_sources(self):
         from brain_uav.envs import V2ScenarioGenerator, V2ScenarioGeneratorConfig

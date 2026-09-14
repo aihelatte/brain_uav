@@ -1001,6 +1001,40 @@ class TestV2TD3(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'nested encoder compilation'):
             target_engine.enable_target_block_compile(backend='eager')
 
+    def test_full_compiled_blocks_prepare_shared_tensor_arguments_once(self):
+        engine = self.make_engine(policy_delay=2)
+        self.fill_replay(engine)
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            engine.enable_critic_loss_compile(backend='eager')
+            engine.enable_target_block_compile(backend='eager')
+
+        encoders = {
+            'critic1': engine.critic1.zone_set_encoder,
+            'critic2': engine.critic2.zone_set_encoder,
+            'actor_target': engine.actor_target.zone_set_encoder,
+            'critic1_target': engine.critic1_target.zone_set_encoder,
+            'critic2_target': engine.critic2_target.zone_set_encoder,
+        }
+        with ExitStack() as stack:
+            prepared = {
+                name: stack.enter_context(mock.patch.object(
+                    encoder,
+                    'prepare_tensor_forward_arguments',
+                    wraps=encoder.prepare_tensor_forward_arguments,
+                ))
+                for name, encoder in encoders.items()
+            }
+            engine.update_once(total_steps=1)
+
+        self.assertEqual(prepared['critic1'].call_count, 1)
+        self.assertEqual(prepared['critic2'].call_count, 0)
+        self.assertEqual(prepared['actor_target'].call_count, 1)
+        self.assertEqual(prepared['critic1_target'].call_count, 0)
+        self.assertEqual(prepared['critic2_target'].call_count, 0)
+
     def test_full_compile_warmup_preserves_parameters_rng_optimizers_and_counts(self):
         engine = self.make_engine(
             bc_reference_actor=self.make_bc_reference(0.02),

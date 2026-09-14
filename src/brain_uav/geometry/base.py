@@ -122,6 +122,14 @@ class GeometryShape(ABC):
     def surface_normal(self, point: Any) -> np.ndarray:
         """Return a deterministic outward unit normal at the closest point."""
 
+    def signed_distance_and_surface_normal(
+        self,
+        point: Any,
+    ) -> tuple[float, np.ndarray]:
+        """Return both point queries; shapes may share their exact solve."""
+
+        return self.signed_distance(point), self.surface_normal(point)
+
     @abstractmethod
     def segment_intersection(self, start: Any, end: Any) -> SegmentHit | None:
         """Return first closed-segment contact, or None when disjoint."""
