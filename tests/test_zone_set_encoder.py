@@ -42,6 +42,7 @@ def _reference_attention_forward(
     *,
     return_attention_weights=False,
     merge_qkv=False,
+    merge_relations=False,
 ):
     """Independent attention reference with unfused relation projections."""
 
@@ -72,11 +73,20 @@ def _reference_attention_forward(
         queries = attention._split_heads(attention.query(tokens))
         keys = attention._split_heads(attention.key(tokens))
         values = attention._split_heads(attention.value(tokens))
-    relation_bias = attention.relation_bias(clean_relations).permute(0, 3, 1, 2)
+    if merge_relations:
+        relation_bias, relation_values = torch.nn.functional.linear(
+            clean_relations,
+            torch.cat((attention.relation_bias.weight, attention.relation_value.weight)),
+            torch.cat((attention.relation_bias.bias, attention.relation_value.bias)),
+        ).split((attention.relation_bias.out_features, attention.relation_value.out_features), dim=-1)
+    else:
+        relation_bias = attention.relation_bias(clean_relations)
+        relation_values = attention.relation_value(clean_relations)
+    relation_bias = relation_bias.permute(0, 3, 1, 2)
     relation_bias = relation_bias * relation_pair_mask.unsqueeze(1).to(
         relation_bias.dtype
     )
-    relation_values = attention.relation_value(clean_relations).reshape(
+    relation_values = relation_values.reshape(
         batch_size,
         token_count,
         token_count,
@@ -143,6 +153,12 @@ def _reference_attention_with_independent_relations(attention, *args, **kwargs):
         *args,
         **kwargs,
         merge_qkv=True,
+    )
+
+
+def _reference_attention_with_merged_relations(attention, *args, **kwargs):
+    return _reference_attention_forward(
+        attention, *args, **kwargs, merge_qkv=True, merge_relations=True,
     )
 
 
@@ -395,6 +411,157 @@ class TestZoneSetEncoder(unittest.TestCase):
             attention(tokens, valid_mask, pair_relations, relation_mask)
 
         self.assertEqual(linear.call_count, 3)
+
+    def test_relation_value_aggregation_matches_old_merged_order_and_gradients(self):
+        for valid_counts in ((0,), (1, 4, 8)):
+            with self.subTest(valid_counts=valid_counts):
+                torch.manual_seed(641)
+                attention = RelationAwareSelfAttention(ZoneSetEncoderConfig()).double().train()
+                reference = deepcopy(attention)
+                reference.forward = MethodType(
+                    _reference_attention_with_merged_relations, reference,
+                )
+                attention.enable_relation_value_aggregation()
+                with torch.no_grad():
+                    attention.relation_value.bias.fill_(1.7)
+                    reference.load_state_dict(attention.state_dict(), strict=True)
+                count = max(max(valid_counts), 1)
+                tokens = torch.randn(
+                    (len(valid_counts), count, attention.hidden_dim),
+                    dtype=torch.float64, requires_grad=True,
+                )
+                relations = torch.randn(
+                    (len(valid_counts), count, count, attention.relation_bias.in_features),
+                    dtype=torch.float64, requires_grad=True,
+                )
+                reference_tokens = tokens.detach().clone().requires_grad_(True)
+                reference_relations = relations.detach().clone().requires_grad_(True)
+                valid = torch.arange(count)[None, :] < torch.tensor(valid_counts)[:, None]
+                relation_mask = valid[:, :, None] & valid[:, None, :]
+                relation_mask = relation_mask & ~torch.eye(count, dtype=torch.bool)[None]
+                actual, actual_weights = attention(
+                    tokens, valid, relations, relation_mask,
+                    return_attention_weights=True,
+                )
+                expected, expected_weights = reference(
+                    reference_tokens, valid, reference_relations, relation_mask,
+                    return_attention_weights=True,
+                )
+                torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+                torch.testing.assert_close(actual_weights, expected_weights, atol=2e-6, rtol=2e-6)
+                if count > 1:
+                    masked_weight_sum = (
+                        actual_weights * relation_mask[:, None]
+                    ).sum(dim=-1)
+                    self.assertTrue(bool((masked_weight_sum[2, :, 0] < 1.0).all()))
+                    self.assertTrue(bool((masked_weight_sum[2, :, 0] > 0.0).all()))
+                actual.square().sum().backward()
+                expected.square().sum().backward()
+                for left, right in ((tokens, reference_tokens), (relations, reference_relations)):
+                    self.assertEqual(left.grad is None, right.grad is None)
+                    if left.grad is not None:
+                        torch.testing.assert_close(left.grad, right.grad, atol=2e-6, rtol=2e-6)
+                for (name, left), (expected_name, right) in zip(
+                    attention.named_parameters(), reference.named_parameters(),
+                ):
+                    self.assertEqual(name, expected_name)
+                    self.assertEqual(left.grad is None, right.grad is None, name)
+                    if left.grad is not None:
+                        torch.testing.assert_close(left.grad, right.grad, atol=2e-6, rtol=2e-6)
+
+    def test_relation_value_aggregation_two_adam_updates_use_new_parameters(self):
+        torch.manual_seed(643)
+        attention = RelationAwareSelfAttention(ZoneSetEncoderConfig()).double().train()
+        reference = deepcopy(attention)
+        reference.forward = MethodType(_reference_attention_with_merged_relations, reference)
+        attention.enable_relation_value_aggregation()
+        with torch.no_grad():
+            attention.relation_value.bias.fill_(1.7)
+            reference.load_state_dict(attention.state_dict(), strict=True)
+        parameter_ids = {name: id(p) for name, p in attention.named_parameters()}
+        original_keys = tuple(attention.state_dict())
+        restored = RelationAwareSelfAttention(ZoneSetEncoderConfig()).double()
+        after_initialization = torch.random.get_rng_state().clone()
+        restored.enable_relation_value_aggregation()
+        torch.testing.assert_close(torch.random.get_rng_state(), after_initialization)
+        restored.load_state_dict(reference.state_dict(), strict=True)
+        self.assertEqual(tuple(restored.state_dict()), original_keys)
+        actual_optimizer = torch.optim.Adam(attention.parameters(), lr=1e-2)
+        reference_optimizer = torch.optim.Adam(reference.parameters(), lr=1e-2)
+        tokens = torch.randn((2, 8, attention.hidden_dim), dtype=torch.float64)
+        relations = torch.randn((2, 8, 8, attention.relation_bias.in_features), dtype=torch.float64)
+        valid = torch.tensor([[True] + [False] * 7, [True] * 8])
+        relation_mask = valid[:, :, None] & valid[:, None, :]
+        relation_mask &= ~torch.eye(8, dtype=torch.bool)[None]
+        previous = None
+        for _ in range(2):
+            actual_optimizer.zero_grad(set_to_none=True)
+            reference_optimizer.zero_grad(set_to_none=True)
+            actual = attention(tokens, valid, relations, relation_mask)
+            expected = reference(tokens, valid, relations, relation_mask)
+            torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+            if previous is not None:
+                self.assertFalse(torch.equal(actual, previous))
+            actual.square().mean().backward()
+            expected.square().mean().backward()
+            actual_optimizer.step()
+            reference_optimizer.step()
+            previous = actual.detach().clone()
+            for (_, left), (_, right) in zip(
+                attention.named_parameters(), reference.named_parameters(),
+            ):
+                torch.testing.assert_close(left, right, atol=2e-6, rtol=2e-6)
+            torch.testing.assert_close(
+                actual_optimizer.state_dict(), reference_optimizer.state_dict(),
+                atol=2e-6, rtol=2e-6,
+            )
+        self.assertEqual(tuple(attention.state_dict()), original_keys)
+        self.assertEqual(
+            {name: id(p) for name, p in attention.named_parameters()}, parameter_ids,
+        )
+
+    def test_relation_value_aggregation_tracks_with_real_fullgraph_dynamo_eager(self):
+        torch._dynamo.reset()
+        torch.manual_seed(647)
+        attention = RelationAwareSelfAttention(ZoneSetEncoderConfig()).double().train()
+        reference = deepcopy(attention)
+        reference.forward = MethodType(_reference_attention_with_merged_relations, reference)
+        attention.enable_relation_value_aggregation()
+        with torch.no_grad():
+            attention.relation_value.bias.fill_(1.7)
+            reference.load_state_dict(attention.state_dict(), strict=True)
+        compiled = torch.compile(attention, backend='eager', fullgraph=True, dynamic=True)
+        tokens = torch.randn((2, 8, attention.hidden_dim), dtype=torch.float64, requires_grad=True)
+        relations = torch.randn(
+            (2, 8, 8, attention.relation_bias.in_features),
+            dtype=torch.float64, requires_grad=True,
+        )
+        expected_tokens = tokens.detach().clone().requires_grad_(True)
+        expected_relations = relations.detach().clone().requires_grad_(True)
+        valid = torch.tensor([[True] + [False] * 7, [True] * 8])
+        relation_mask = valid[:, :, None] & valid[:, None, :]
+        relation_mask &= ~torch.eye(8, dtype=torch.bool)[None]
+        actual, actual_weights = compiled(
+            tokens, valid, relations, relation_mask, return_attention_weights=True,
+        )
+        expected, expected_weights = reference(
+            expected_tokens, valid, expected_relations, relation_mask,
+            return_attention_weights=True,
+        )
+        torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-6)
+        torch.testing.assert_close(actual_weights, expected_weights, atol=2e-6, rtol=2e-6)
+        actual.square().sum().backward()
+        expected.square().sum().backward()
+        for left, right in ((tokens, expected_tokens), (relations, expected_relations)):
+            self.assertEqual(left.grad is None, right.grad is None)
+            if left.grad is not None:
+                torch.testing.assert_close(left.grad, right.grad, atol=2e-6, rtol=2e-6)
+        for (_, left), (_, right) in zip(
+            attention.named_parameters(), reference.named_parameters(),
+        ):
+            self.assertEqual(left.grad is None, right.grad is None)
+            if left.grad is not None:
+                torch.testing.assert_close(left.grad, right.grad, atol=2e-6, rtol=2e-6)
 
     def test_merged_qkv_matches_independent_reference_outputs_and_gradients(self):
         for counts in ([0], [0, 3, 7]):

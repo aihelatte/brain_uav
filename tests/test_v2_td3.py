@@ -7,7 +7,7 @@ from contextlib import contextmanager
 import math
 import unittest
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 from unittest import mock
 
 import numpy as np
@@ -109,6 +109,9 @@ class TestV2TD3(unittest.TestCase):
         action_high=None,
         actor_grad_clip_norm=1.0,
         critic_grad_clip_norm=1.0,
+        fused_adam=False,
+        aggregate_relation_values_first=False,
+        device='cpu',
     ):
         if action_limit is None:
             action_limit = torch.tensor([0.2, 0.3], dtype=torch.float32)
@@ -145,7 +148,9 @@ class TestV2TD3(unittest.TestCase):
             critic_grad_clip_norm=critic_grad_clip_norm,
             terminal_geo_regularization_enabled=terminal_enabled,
             bc_reference_actor=bc_reference_actor,
-            device='cpu',
+            device=device,
+            fused_adam=fused_adam,
+            aggregate_relation_values_first=aggregate_relation_values_first,
         )
 
     def fill_replay(self, engine, counts=(2, 3), next_counts=None):
@@ -179,6 +184,476 @@ class TestV2TD3(unittest.TestCase):
         self.assertEqual(actual.keys(), expected.keys())
         for name in expected:
             torch.testing.assert_close(actual[name], expected[name])
+
+    def test_fused_adam_preserves_zero_none_and_momentum_state_against_adam(self):
+        torch.manual_seed(743)
+        eager = self.make_engine()
+        torch.manual_seed(743)
+        fused = self.make_engine(fused_adam=True)
+        for eager_optimizer, fused_optimizer in (
+            (eager.actor_optimizer, fused.actor_optimizer),
+            (eager.critic_optimizer, fused.critic_optimizer),
+        ):
+            eager_parameters = tuple(eager_optimizer.param_groups[0]['params'])
+            fused_parameters = tuple(fused_optimizer.param_groups[0]['params'])
+            self.assertEqual(len(eager_parameters), len(fused_parameters))
+            self.assertIs(eager_optimizer.param_groups[0].get('fused'), None)
+            self.assertIs(fused_optimizer.param_groups[0]['fused'], True)
+            for step in range(3):
+                for left, right in zip(eager_parameters, fused_parameters):
+                    left.grad = None
+                    right.grad = None
+                for index, gradient in (
+                    (0, 0.2 if step < 2 else None),
+                    (1, 0.0),
+                    (2, None if step < 2 else 0.3),
+                ):
+                    if gradient is not None:
+                        eager_parameters[index].grad = torch.full_like(
+                            eager_parameters[index], gradient,
+                        )
+                        fused_parameters[index].grad = torch.full_like(
+                            fused_parameters[index], gradient,
+                        )
+                eager_optimizer.step()
+                fused_optimizer.step()
+                for left, right in zip(eager_parameters, fused_parameters):
+                    torch.testing.assert_close(left, right, atol=2e-6, rtol=2e-6)
+                    self.assertEqual(left in eager_optimizer.state, right in fused_optimizer.state)
+                    if left in eager_optimizer.state:
+                        for name in ('step', 'exp_avg', 'exp_avg_sq'):
+                            torch.testing.assert_close(
+                                eager_optimizer.state[left][name],
+                                fused_optimizer.state[right][name],
+                                atol=2e-6, rtol=2e-6,
+                            )
+                self.assertEqual(
+                    int(eager_optimizer.state[eager_parameters[0]]['step']),
+                    min(step + 1, 2),
+                )
+                self.assertEqual(
+                    int(eager_optimizer.state[eager_parameters[1]]['step']),
+                    step + 1,
+                )
+
+    def test_checkpoint_restore_keeps_selected_fused_adam_execution(self):
+        eager = self.make_engine(policy_delay=1)
+        self.fill_replay(eager)
+        eager.update_once(total_steps=1)
+        fused = self.make_engine(policy_delay=1, fused_adam=True)
+        fused.load_checkpoint_state_dict(eager.checkpoint_state_dict())
+        self.assertTrue(fused.actor_optimizer.param_groups[0]['fused'])
+        self.assertTrue(fused.critic_optimizer.param_groups[0]['fused'])
+        self.assertTrue(fused.actor_optimizer.state)
+        self.assertTrue(fused.critic_optimizer.state)
+
+    def _assert_checkpoint_adam_execution_switch(self, device):
+        for source_fused, target_fused in ((False, True), (True, False)):
+            with self.subTest(device=device, source_fused=source_fused):
+                torch.manual_seed(751)
+                source = self.make_engine(fused_adam=source_fused, device=device)
+                for optimizer in (source.actor_optimizer, source.critic_optimizer):
+                    parameters = optimizer.param_groups[0]['params']
+                    parameters[0].grad = torch.full_like(parameters[0], 0.2)
+                    parameters[1].grad = torch.zeros_like(parameters[1])
+                    optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+
+                payload = source.checkpoint_state_dict()
+                optimizer_keys = (
+                    'actor_optimizer_state_dict', 'critic_optimizer_state_dict',
+                )
+                if device == 'cpu' and target_fused:
+                    # Also exercise the fused loader's float32 step conversion on CPU.
+                    for key in optimizer_keys:
+                        for state in payload[key]['state'].values():
+                            state['step'] = state['step'].to(dtype=torch.float64)
+                saved_optimizers = {
+                    key: deepcopy(payload[key]) for key in optimizer_keys
+                }
+                reference = self.make_engine(
+                    fused_adam=source_fused, device=device,
+                )
+                reference.load_checkpoint_state_dict(
+                    deepcopy(source.checkpoint_state_dict())
+                )
+                restored = self.make_engine(
+                    fused_adam=target_fused, device=device,
+                )
+                restored.load_checkpoint_state_dict(payload)
+
+                for key, left, right in zip(
+                    optimizer_keys,
+                    (source.actor_optimizer, source.critic_optimizer),
+                    (restored.actor_optimizer, restored.critic_optimizer),
+                ):
+                    group = right.param_groups[0]
+                    self.assertIs(group['fused'], True if target_fused else None)
+                    self.assertIs(group['capturable'], False)
+                    for name in ('lr', 'betas', 'eps', 'weight_decay'):
+                        self.assertEqual(group[name], left.param_groups[0][name])
+                    for source_parameter, restored_parameter in zip(
+                        left.param_groups[0]['params'], group['params'],
+                    ):
+                        torch.testing.assert_close(
+                            restored_parameter, source_parameter,
+                            atol=0, rtol=0,
+                        )
+                        self.assertEqual(
+                            source_parameter in left.state,
+                            restored_parameter in right.state,
+                        )
+                        if source_parameter in left.state:
+                            source_state = left.state[source_parameter]
+                            restored_state = right.state[restored_parameter]
+                            self.assertEqual(
+                                restored_state['step'].device,
+                                restored_parameter.device if target_fused
+                                else torch.device('cpu'),
+                            )
+                            self.assertEqual(
+                                restored_state['step'].dtype, torch.float32,
+                            )
+                            self.assertEqual(
+                                int(restored_state['step']),
+                                int(source_state['step']),
+                            )
+                            for name in ('exp_avg', 'exp_avg_sq'):
+                                torch.testing.assert_close(
+                                    restored_state[name], source_state[name],
+                                    atol=0, rtol=0,
+                                )
+                    self.assertEqual(
+                        payload[key]['param_groups'],
+                        saved_optimizers[key]['param_groups'],
+                    )
+                    for index, state in payload[key]['state'].items():
+                        for name in ('step', 'exp_avg', 'exp_avg_sq'):
+                            torch.testing.assert_close(
+                                state[name], saved_optimizers[key]['state'][index][name],
+                                atol=0, rtol=0,
+                            )
+
+                    reference_optimizer = (
+                        reference.actor_optimizer if key == optimizer_keys[0]
+                        else reference.critic_optimizer
+                    )
+                    left_parameters = reference_optimizer.param_groups[0]['params']
+                    right_parameters = group['params']
+                    left_parameters[0].grad = torch.full_like(left_parameters[0], 0.1)
+                    right_parameters[0].grad = torch.full_like(right_parameters[0], 0.1)
+                    reference_optimizer.step()
+                    right.step()
+                    for source_parameter, restored_parameter in zip(
+                        left_parameters, right_parameters,
+                    ):
+                        torch.testing.assert_close(
+                            restored_parameter, source_parameter,
+                            atol=2e-6, rtol=2e-6,
+                        )
+                        if source_parameter in reference_optimizer.state:
+                            self.assertEqual(
+                                int(right.state[restored_parameter]['step']),
+                                int(reference_optimizer.state[source_parameter]['step']),
+                            )
+                            for name in ('exp_avg', 'exp_avg_sq'):
+                                torch.testing.assert_close(
+                                    right.state[restored_parameter][name],
+                                    reference_optimizer.state[source_parameter][name],
+                                    atol=2e-6, rtol=2e-6,
+                                )
+                    self.assertEqual(int(right.state[right_parameters[0]]['step']), 2)
+                    self.assertEqual(int(right.state[right_parameters[1]]['step']), 1)
+                    self.assertEqual(
+                        payload[key]['param_groups'],
+                        saved_optimizers[key]['param_groups'],
+                    )
+                    for index, state in payload[key]['state'].items():
+                        for name in ('step', 'exp_avg', 'exp_avg_sq'):
+                            torch.testing.assert_close(
+                                state[name], saved_optimizers[key]['state'][index][name],
+                                atol=0, rtol=0,
+                            )
+
+    def test_checkpoint_switches_adam_execution_with_nonempty_cpu_state(self):
+        self._assert_checkpoint_adam_execution_switch('cpu')
+
+    @unittest.skipUnless(torch.cuda.is_available(), 'CUDA unavailable')
+    def test_checkpoint_switches_adam_execution_with_nonempty_cuda_state(self):
+        self._assert_checkpoint_adam_execution_switch('cuda')
+
+    def test_compiled_actor_loss_matches_old_eager_terms_action_q_and_parameter_grads(self):
+        for bc_reference, bc_lambda, terminal, safe_value in (
+            (False, 0.0, False, 0.0),
+            (True, 0.0, False, 0.0),
+            (True, 1.5, True, 0.0),
+            (True, 1.5, True, 1.0),
+        ):
+            with self.subTest(
+                bc_reference=bc_reference, bc_lambda=bc_lambda,
+                terminal=terminal, safe_value=safe_value,
+            ):
+                torch.manual_seed(757)
+                reference_actor = self.make_bc_reference(0.01) if bc_reference else None
+                reference = self.make_engine(
+                    terminal_enabled=terminal, bc_reference_actor=reference_actor,
+                )
+                torch.manual_seed(757)
+                compiled_actor = self.make_bc_reference(0.01) if bc_reference else None
+                compiled = self.make_engine(
+                    terminal_enabled=terminal, bc_reference_actor=compiled_actor,
+                )
+                compiled.load_checkpoint_state_dict(reference.checkpoint_state_dict())
+                compiled.enable_actor_loss_compile(backend='eager', fullgraph=True)
+                observation = collate_v2_observations([
+                    _observation(0, scales=self.scales),
+                    _observation(7, scales=self.scales),
+                ])
+                safe = torch.full((2, 1), safe_value)
+                captures = []
+                for engine in (reference, compiled):
+                    recorded = {}
+                    actor_forward = engine.actor.forward
+                    critic_forward = engine.critic1.forward
+
+                    def capture_actor(*args, _forward=actor_forward, _recorded=recorded, **kwargs):
+                        result = _forward(*args, **kwargs)
+                        result.retain_grad()
+                        _recorded['action'] = result
+                        return result
+
+                    def capture_q(*args, _forward=critic_forward, _recorded=recorded, **kwargs):
+                        result = _forward(*args, **kwargs)
+                        result.retain_grad()
+                        _recorded['q'] = result
+                        return result
+
+                    with mock.patch.object(engine.actor, 'forward', side_effect=capture_actor), mock.patch.object(
+                        engine.critic1, 'forward', side_effect=capture_q,
+                    ):
+                        terms = engine._compute_actor_loss_terms(
+                            observation, safe, bc_lambda=bc_lambda,
+                        )
+                        terms.actor_loss.backward()
+                    recorded['terms'] = terms
+                    recorded['actor_grads'] = {
+                        name: None if p.grad is None else p.grad.detach().clone()
+                        for name, p in engine.actor.named_parameters()
+                    }
+                    recorded['critic_grads'] = {
+                        name: None if p.grad is None else p.grad.detach().clone()
+                        for name, p in engine.critic1.named_parameters()
+                    }
+                    captures.append(recorded)
+                old, new = captures
+                for name in (
+                    'actor_loss', 'rl_actor_loss', 'scaled_rl_actor_loss',
+                    'actor_rl_scale', 'bc_loss', 'terminal_geo_loss',
+                ):
+                    torch.testing.assert_close(
+                        getattr(old['terms'], name), getattr(new['terms'], name),
+                        atol=2e-6, rtol=2e-6,
+                    )
+                for name in ('action', 'q'):
+                    torch.testing.assert_close(old[name], new[name], atol=2e-6, rtol=2e-6)
+                    torch.testing.assert_close(old[name].grad, new[name].grad, atol=2e-6, rtol=2e-6)
+                for key in ('actor_grads', 'critic_grads'):
+                    self.assertEqual(old[key].keys(), new[key].keys())
+                    for name in old[key]:
+                        self.assertEqual(old[key][name] is None, new[key][name] is None, name)
+                        if old[key][name] is not None:
+                            torch.testing.assert_close(
+                                old[key][name], new[key][name], atol=2e-6, rtol=2e-6,
+                            )
+
+    def test_three_optimization_flags_report_actual_scope_and_preserve_bindings(self):
+        engine = self.make_engine(
+            fused_adam=True,
+            aggregate_relation_values_first=True,
+            bc_reference_actor=self.make_bc_reference(0.01),
+        )
+        model_names = (
+            'actor', 'critic1', 'critic2', 'actor_target',
+            'critic1_target', 'critic2_target', 'bc_reference_actor',
+        )
+        ids_before = {
+            name: {key: id(p) for key, p in getattr(engine, name).named_parameters()}
+            for name in model_names
+        }
+        keys_before = {
+            name: tuple(getattr(engine, name).state_dict()) for name in model_names
+        }
+        metadata = engine.configure_compilation(compile_actor_loss=True, backend='eager')
+        self.assertEqual(metadata['actor_loss_granularity'], 'tensor_block')
+        self.assertEqual(metadata['optimizer_execution'], 'fused_adam')
+        self.assertEqual(metadata['relation_value_execution'], 'aggregate_then_project')
+        self.assertIn('actor_loss.tensor_block', metadata['enabled_objects'])
+        for name in model_names:
+            model = getattr(engine, name)
+            self.assertTrue(all(
+                layer.attention.aggregate_relation_values_first
+                for layer in model.zone_set_encoder.layers
+            ))
+            self.assertEqual(
+                {key: id(p) for key, p in model.named_parameters()}, ids_before[name],
+            )
+            self.assertEqual(tuple(model.state_dict()), keys_before[name])
+
+    def test_actor_loss_compile_warmup_preserves_rng_models_optimizers_and_counts(self):
+        engine = self.make_engine(
+            bc_reference_actor=self.make_bc_reference(0.01), terminal_enabled=True,
+        )
+        engine.configure_compilation(compile_actor_loss=True, backend='eager')
+        batches = tuple(collate_v2_observations([
+            _observation(count, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ]) for count in (0, 3, 7))
+        model_names = (
+            'actor', 'critic1', 'critic2', 'actor_target',
+            'critic1_target', 'critic2_target', 'bc_reference_actor',
+        )
+        before = {name: deepcopy(getattr(engine, name).state_dict()) for name in model_names}
+        optimizer_before = (
+            deepcopy(engine.actor_optimizer.state_dict()),
+            deepcopy(engine.critic_optimizer.state_dict()),
+        )
+        counters = (
+            engine.update_count, engine.critic_update_count,
+            engine.critic_target_update_count, engine.actor_update_count,
+            engine.last_total_steps,
+        )
+        torch_rng = torch.random.get_rng_state().clone()
+        numpy_rng = np.random.get_state()
+        engine.warmup_actor_loss_compile(batches)
+        for name in model_names:
+            self.assert_state_dict_equal(getattr(engine, name).state_dict(), before[name])
+        self.assertEqual(engine.actor_optimizer.state_dict(), optimizer_before[0])
+        self.assertEqual(engine.critic_optimizer.state_dict(), optimizer_before[1])
+        self.assertEqual(counters, (
+            engine.update_count, engine.critic_update_count,
+            engine.critic_target_update_count, engine.actor_update_count,
+            engine.last_total_steps,
+        ))
+        torch.testing.assert_close(torch.random.get_rng_state(), torch_rng)
+        numpy_after = np.random.get_state()
+        self.assertEqual(numpy_after[0], numpy_rng[0])
+        np.testing.assert_array_equal(numpy_after[1], numpy_rng[1])
+        self.assertEqual(numpy_after[2:], numpy_rng[2:])
+
+    def test_fused_adam_and_real_dynamo_eager_actor_loss_match_short_td3_updates(self):
+        torch.manual_seed(761)
+        reference = self.make_engine(
+            policy_delay=2, terminal_enabled=True,
+            bc_reference_actor=self.make_bc_reference(0.01),
+        )
+        torch.manual_seed(761)
+        optimized = self.make_engine(
+            policy_delay=2, terminal_enabled=True,
+            bc_reference_actor=self.make_bc_reference(0.01), fused_adam=True,
+        )
+        optimized.load_checkpoint_state_dict(reference.checkpoint_state_dict())
+        self.fill_replay(reference, counts=(0, 7), next_counts=(7, 0))
+        fixed_batch = reference.replay.sample(2)
+        reference.replay.sample = lambda batch_size: fixed_batch
+        optimized.replay.sample = lambda batch_size: fixed_batch
+        optimized.configure_compilation(compile_actor_loss=True, backend='eager')
+        for total_steps, coefficient in ((1, 0.0), (2, 0.0), (3, 0.0), (4, 1.5)):
+            update_rng = torch.random.get_rng_state()
+            expected = reference.update_once(total_steps=total_steps, bc_lambda=coefficient)
+            torch.random.set_rng_state(update_rng)
+            actual = optimized.update_once(total_steps=total_steps, bc_lambda=coefficient)
+            for name, value in asdict(expected).items():
+                observed = getattr(actual, name)
+                if type(value) is bool:
+                    self.assertEqual(value, observed)
+                elif type(value) is float:
+                    torch.testing.assert_close(
+                        torch.tensor(observed), torch.tensor(value),
+                        atol=2e-6, rtol=2e-6,
+                    )
+                else:
+                    self.assertEqual(value, observed)
+            for model_name in (
+                'actor', 'critic1', 'critic2',
+                'actor_target', 'critic1_target', 'critic2_target',
+            ):
+                self.assert_state_dict_equal(
+                    getattr(optimized, model_name).state_dict(),
+                    getattr(reference, model_name).state_dict(),
+                )
+            for expected_optimizer, actual_optimizer in (
+                (reference.actor_optimizer, optimized.actor_optimizer),
+                (reference.critic_optimizer, optimized.critic_optimizer),
+            ):
+                expected_parameters = expected_optimizer.param_groups[0]['params']
+                actual_parameters = actual_optimizer.param_groups[0]['params']
+                for left, right in zip(expected_parameters, actual_parameters):
+                    left_state = expected_optimizer.state.get(left)
+                    right_state = actual_optimizer.state.get(right)
+                    self.assertEqual(left_state is None, right_state is None)
+                    if left_state is not None:
+                        for name in ('step', 'exp_avg', 'exp_avg_sq'):
+                            torch.testing.assert_close(
+                                left_state[name], right_state[name],
+                                atol=2e-6, rtol=2e-6,
+                            )
+
+    def test_actor_loss_stage_bc_coefficient_changes_without_recompilation(self):
+        torch._dynamo.reset()
+        graphs = []
+
+        def counting_backend(graph, inputs):
+            graphs.append(graph)
+            return graph.forward
+
+        engine = self.make_engine(
+            terminal_enabled=True,
+            bc_reference_actor=self.make_bc_reference(0.01),
+        )
+        engine.enable_actor_loss_compile(backend=counting_backend, fullgraph=True)
+        observation = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        safe = torch.ones((2, 1), dtype=torch.float32)
+        zero = engine._compute_actor_loss_terms(observation, safe, bc_lambda=0.0)
+        nonzero = engine._compute_actor_loss_terms(observation, safe, bc_lambda=1.5)
+        self.assertEqual(len(graphs), 1)
+        self.assertGreater(nonzero.actor_loss.item(), zero.actor_loss.item())
+
+    def test_compiled_actor_loss_uses_contract_derived_indices_without_runtime_lookup(self):
+        class ForbiddenLookup:
+            def __getitem__(self, key):
+                raise AssertionError(f'contract lookup during compiled loss: {key}')
+
+        engine = self.make_engine(terminal_enabled=True)
+        engine.enable_actor_loss_compile(backend='eager', fullgraph=True)
+        observation = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        actions = torch.zeros((2, 2), requires_grad=True)
+        q_values = torch.ones((2, 1), requires_grad=True)
+        safe = torch.ones((2, 1))
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.GOAL_FEATURE_INDEX', ForbiddenLookup(),
+        ), mock.patch(
+            'brain_uav.trainers.v2_td3.EGO_FEATURE_INDEX', ForbiddenLookup(),
+        ):
+            total, *_ = engine._compiled_actor_loss(
+                actions, q_values, None,
+                observation.ego_features, observation.goal_features,
+                safe, engine.action_low, engine.action_high,
+                torch.tensor(engine.actor_rl_scale_alpha), torch.tensor(0.0),
+                torch.tensor(engine.terminal_geo_lambda),
+                engine.actor.scales.horizontal_span,
+                engine.actor.scales.vertical_span,
+                engine.actor.scales.gamma_max,
+                engine.terminal_geo_radius, True,
+            )
+            total.backward()
+        self.assertIsNotNone(actions.grad)
+        self.assertIsNotNone(q_values.grad)
 
     def test_targets_are_equal_but_independent_frozen_and_not_optimized(self):
         engine = self.make_engine()

@@ -113,6 +113,9 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertFalse(args.compile_target_block)
         self.assertFalse(args.compile_shared_relations)
         self.assertFalse(args.compile_snn_target_encoder)
+        self.assertFalse(args.fused_adam)
+        self.assertFalse(args.compile_actor_loss)
+        self.assertFalse(args.aggregate_relation_values_first)
 
     def test_snn_curriculum_uses_distinct_outputs_and_forwards_model_contract(self):
         calls = []
@@ -173,6 +176,9 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                     compile_target_block=True,
                     compile_shared_relations=True,
                     compile_snn_target_encoder=True,
+                    fused_adam=True,
+                    compile_actor_loss=True,
+                    aggregate_relation_values_first=True,
                 )
         initializer.assert_called_once()
         self.assertEqual(initializer.call_args.kwargs['init_checkpoint'], checkpoint)
@@ -189,6 +195,9 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertTrue(calls[0]['compile_target_block'])
         self.assertTrue(calls[0]['compile_shared_relations'])
         self.assertTrue(calls[0]['compile_snn_target_encoder'])
+        self.assertTrue(calls[0]['fused_adam'])
+        self.assertTrue(calls[0]['compile_actor_loss'])
+        self.assertTrue(calls[0]['aggregate_relation_values_first'])
         self.assertIs(calls[0]['prepared_initialization'], prepared)
         self.assertEqual(Path(calls[0]['output']).name, 'v2_snn_td3_easy.pt')
         self.assertEqual(
@@ -198,6 +207,9 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertEqual(result['model_type'], 'snn')
         self.assertTrue(result['compilation_request']['compile_shared_relations'])
         self.assertTrue(result['compilation_request']['compile_snn_target_encoder'])
+        self.assertTrue(result['compilation_request']['fused_adam'])
+        self.assertTrue(result['compilation_request']['compile_actor_loss'])
+        self.assertTrue(result['compilation_request']['aggregate_relation_values_first'])
         self.assertEqual(result['snn'], {
             'time_window': actor.time_window,
             'tau': actor.tau,

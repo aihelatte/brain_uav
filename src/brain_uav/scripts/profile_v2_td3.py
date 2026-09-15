@@ -2670,6 +2670,9 @@ def _run_compiled_numerics_check(
     compile_target_block: bool = False,
     compile_shared_relations: bool = False,
     compile_snn_target_encoder: bool = False,
+    fused_adam: bool = False,
+    compile_actor_loss: bool = False,
+    aggregate_relation_values_first: bool = False,
 ) -> dict[str, Any]:
     torch_rng_state = torch.random.get_rng_state()
     numpy_rng_state = np.random.get_state()
@@ -2703,6 +2706,8 @@ def _run_compiled_numerics_check(
             model_type=model,
             snn_time_window=snn_time_window,
             prepared_initialization=prepared,
+            fused_adam=fused_adam,
+            aggregate_relation_values_first=aggregate_relation_values_first,
         )
         reference = reference_components.engine
         compiled = compiled_components.engine
@@ -2733,6 +2738,7 @@ def _run_compiled_numerics_check(
             compile_target_block=compile_target_block,
             compile_shared_relations=compile_shared_relations,
             compile_snn_target_encoder=compile_snn_target_encoder,
+            compile_actor_loss=compile_actor_loss,
             backend='inductor', mode='default', fullgraph=True, dynamic=True,
         )
         warmup_batches = _compile_warmup_batches(
@@ -2753,6 +2759,8 @@ def _run_compiled_numerics_check(
                 compiled.warmup_target_encoder_compile(warmup_batches)
         if compile_snn_target_encoder and not compile_target_block:
             compiled.warmup_snn_target_encoder_compile(warmup_batches)
+        if compile_actor_loss:
+            compiled.warmup_actor_loss_compile(warmup_batches)
         module_modes['before_consecutive_updates'] = (
             _report_and_validate_numeric_engine_modes(
                 reference,
@@ -3034,7 +3042,7 @@ def _run_compiled_numerics_check(
             'compilation': configured,
             'wall_seconds': perf_counter() - started,
             'measurement_note': (
-                'Uses independent eager and compiled engines before timed diagnosis; '
+                'Uses independent original and optimized engines before timed diagnosis; '
                 'this check time is excluded from compile warmup and stable timing.'
             ),
         }
@@ -3199,6 +3207,9 @@ def _run_diagnostic_level(
     compile_target_block: bool = False,
     compile_shared_relations: bool = False,
     compile_snn_target_encoder: bool = False,
+    fused_adam: bool = False,
+    compile_actor_loss: bool = False,
+    aggregate_relation_values_first: bool = False,
     compiled_path_profiler_updates: int = 0,
     compiled_profiler_output_dir: Path | None = None,
     environment_performance_diagnostic: bool = False,
@@ -3227,6 +3238,8 @@ def _run_diagnostic_level(
         model_type=model,
         snn_time_window=snn_time_window,
         prepared_initialization=prepared,
+        fused_adam=fused_adam,
+        aggregate_relation_values_first=aggregate_relation_values_first,
     )
     engine = components.engine
     engine.actor.train()
@@ -3254,6 +3267,7 @@ def _run_diagnostic_level(
         compile_target_block,
         compile_shared_relations,
         compile_snn_target_encoder,
+        compile_actor_loss,
     ))
     extended_compile_requested = any((
         compile_actors,
@@ -3261,6 +3275,7 @@ def _run_diagnostic_level(
         compile_target_block,
         compile_shared_relations,
         compile_snn_target_encoder,
+        compile_actor_loss,
         frozen_critic_strategy != 'eager',
     ))
     compile_metadata: dict[str, Any] = {
@@ -3271,6 +3286,13 @@ def _run_diagnostic_level(
         'target_block_requested': bool(compile_target_block),
         'shared_relations_requested': bool(compile_shared_relations),
         'snn_target_encoder_requested': bool(compile_snn_target_encoder),
+        'actor_loss_requested': bool(compile_actor_loss),
+        'optimizer_execution': 'fused_adam' if fused_adam else 'adam',
+        'relation_value_execution': (
+            'aggregate_then_project' if aggregate_relation_values_first
+            else 'project_then_aggregate'
+        ),
+        'actor_loss_granularity': 'eager',
         'enabled_objects': [],
         'backend': 'inductor',
         'mode': 'default',
@@ -3308,6 +3330,7 @@ def _run_diagnostic_level(
             compile_target_block=compile_target_block,
             compile_shared_relations=compile_shared_relations,
             compile_snn_target_encoder=compile_snn_target_encoder,
+            compile_actor_loss=compile_actor_loss,
             backend='inductor', mode='default', fullgraph=True, dynamic=True,
         )
         compile_metadata.update(configured)
@@ -3337,6 +3360,8 @@ def _run_diagnostic_level(
                 engine.warmup_target_encoder_compile(warmup_batches)
         if compile_snn_target_encoder and not compile_target_block:
             engine.warmup_snn_target_encoder_compile(warmup_batches)
+        if compile_actor_loss:
+            engine.warmup_actor_loss_compile(warmup_batches)
         compile_metadata['warmup_wall_seconds'] = perf_counter() - warmup_started
         compile_metadata['measurement_note'] = (
             'Registration and compile-triggering pure-compute warmup are excluded '
@@ -3436,6 +3461,8 @@ def _run_diagnostic_level(
             expected_compiled_entries.append('shared_relations')
         if compile_snn_target_encoder:
             expected_compiled_entries.append('snn_target_encoder')
+        if compile_actor_loss:
+            expected_compiled_entries.append('actor_loss')
         if model == 'snn':
             expected_compiled_entries[expected_compiled_entries.index(
                 'target_block'
@@ -3881,6 +3908,9 @@ def run_v2_td3_timing_diagnostic(
     compile_target_block: bool = False,
     compile_shared_relations: bool = False,
     compile_snn_target_encoder: bool = False,
+    fused_adam: bool = False,
+    compile_actor_loss: bool = False,
+    aggregate_relation_values_first: bool = False,
     check_compiled_numerics: bool = False,
     compiled_numerics_only: bool = False,
     compiled_numerics_group: str | None = None,
@@ -3918,6 +3948,9 @@ def run_v2_td3_timing_diagnostic(
         ('compile_target_block', compile_target_block),
         ('compile_shared_relations', compile_shared_relations),
         ('compile_snn_target_encoder', compile_snn_target_encoder),
+        ('fused_adam', fused_adam),
+        ('compile_actor_loss', compile_actor_loss),
+        ('aggregate_relation_values_first', aggregate_relation_values_first),
     ):
         if type(value) is not bool:
             raise TypeError(f'{name} must be a bool.')
@@ -3947,6 +3980,9 @@ def run_v2_td3_timing_diagnostic(
             or compile_target_block
             or compile_shared_relations
             or compile_snn_target_encoder
+            or fused_adam
+            or compile_actor_loss
+            or aggregate_relation_values_first
             or frozen_critic_strategy != 'eager'
             or check_compiled_numerics
             or compiled_numerics_only
@@ -3985,10 +4021,11 @@ def run_v2_td3_timing_diagnostic(
         )
     if check_compiled_numerics and not (
         compile_target_encoders or compile_target_block or compile_snn_target_encoder
+        or fused_adam or compile_actor_loss or aggregate_relation_values_first
     ):
         raise ValueError(
-            'check_compiled_numerics requires compile_target_encoders or '
-            'compile_target_block.'
+            'check_compiled_numerics requires a target compile scope or one '
+            'of the new optimization flags.'
         )
     compile_requested = any((
         compile_critic_encoder,
@@ -3998,6 +4035,7 @@ def run_v2_td3_timing_diagnostic(
         compile_target_block,
         compile_shared_relations,
         compile_snn_target_encoder,
+        compile_actor_loss,
     ))
     if compile_requested and profiler_updates:
         raise ValueError(
@@ -4146,6 +4184,9 @@ def run_v2_td3_timing_diagnostic(
             compile_target_block=compile_target_block,
             compile_shared_relations=compile_shared_relations,
             compile_snn_target_encoder=compile_snn_target_encoder,
+            fused_adam=fused_adam,
+            compile_actor_loss=compile_actor_loss,
+            aggregate_relation_values_first=aggregate_relation_values_first,
         )
     if compiled_numerics_only:
         output.mkdir(parents=True, exist_ok=False)
@@ -4201,6 +4242,9 @@ def run_v2_td3_timing_diagnostic(
             compile_target_block=compile_target_block,
             compile_shared_relations=compile_shared_relations,
             compile_snn_target_encoder=compile_snn_target_encoder,
+            fused_adam=fused_adam,
+            compile_actor_loss=compile_actor_loss,
+            aggregate_relation_values_first=aggregate_relation_values_first,
             compiled_path_profiler_updates=(
                 compiled_profiler_updates if level == 'medium' else 0
             ),
@@ -4333,6 +4377,11 @@ def run_v2_td3_timing_diagnostic(
             'compile_target_block_requested': compile_target_block,
             'compile_shared_relations_requested': compile_shared_relations,
             'compile_snn_target_encoder_requested': compile_snn_target_encoder,
+            'fused_adam_requested': fused_adam,
+            'compile_actor_loss_requested': compile_actor_loss,
+            'aggregate_relation_values_first_requested': (
+                aggregate_relation_values_first
+            ),
             'cuda_graph': False,
             'check_compiled_numerics_requested': check_compiled_numerics,
             'compile_critic_encoder_backend': (
@@ -4447,6 +4496,9 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help='Compile only the SNN target actor ZoneSetEncoder.',
     )
+    parser.add_argument('--fused-adam', action='store_true')
+    parser.add_argument('--compile-actor-loss', action='store_true')
+    parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument(
         '--check-compiled-numerics',
         action='store_true',
@@ -4507,6 +4559,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         compile_target_block=args.compile_target_block,
         compile_shared_relations=args.compile_shared_relations,
         compile_snn_target_encoder=args.compile_snn_target_encoder,
+        fused_adam=args.fused_adam,
+        compile_actor_loss=args.compile_actor_loss,
+        aggregate_relation_values_first=args.aggregate_relation_values_first,
         check_compiled_numerics=args.check_compiled_numerics,
         compiled_numerics_only=args.compiled_numerics_only,
         compiled_numerics_group=args.compiled_numerics_group,

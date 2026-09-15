@@ -891,6 +891,8 @@ def build_v2_stage_engine(
     model_type: str = 'ann',
     snn_time_window: int = 4,
     prepared_initialization: V2PreparedStageInitialization | None = None,
+    fused_adam: bool = False,
+    aggregate_relation_values_first: bool = False,
 ) -> V2StageComponents:
     if scenario is not None and not isinstance(scenario, ScenarioConfig):
         raise TypeError('scenario must be a ScenarioConfig when provided.')
@@ -1106,6 +1108,8 @@ def build_v2_stage_engine(
         terminal_geo_lambda=config.terminal_geo_lambda,
         bc_reference_actor=bc_actor,
         device=device,
+        fused_adam=fused_adam,
+        aggregate_relation_values_first=aggregate_relation_values_first,
     )
     if previous_engine_payload is not None:
         engine.load_network_state_dicts(dict(previous_engine_payload))

@@ -41,6 +41,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--compile-target-encoders', action='store_true')
     parser.add_argument('--compile-shared-relations', action='store_true')
     parser.add_argument('--compile-snn-target-encoder', action='store_true')
+    parser.add_argument('--fused-adam', action='store_true')
+    parser.add_argument('--compile-actor-loss', action='store_true')
+    parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument('--compile-actors', action='store_true')
     parser.add_argument(
         '--frozen-critic-strategy',
@@ -122,6 +125,9 @@ def run_v2_curriculum(
     compile_target_block: bool = False,
     compile_shared_relations: bool = False,
     compile_snn_target_encoder: bool = False,
+    fused_adam: bool = False,
+    compile_actor_loss: bool = False,
+    aggregate_relation_values_first: bool = False,
 ) -> dict[str, Any]:
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
@@ -227,6 +233,9 @@ def run_v2_curriculum(
             compile_target_block=compile_target_block,
             compile_shared_relations=compile_shared_relations,
             compile_snn_target_encoder=compile_snn_target_encoder,
+            fused_adam=fused_adam,
+            compile_actor_loss=compile_actor_loss,
+            aggregate_relation_values_first=aggregate_relation_values_first,
         )
         summaries.append(summary)
         global_steps = int(summary.get('global_steps_end', global_steps + int(summary['steps'])))
@@ -268,6 +277,9 @@ def run_v2_curriculum(
             'compile_target_block': compile_target_block,
             'compile_shared_relations': compile_shared_relations,
             'compile_snn_target_encoder': compile_snn_target_encoder,
+            'fused_adam': fused_adam,
+            'compile_actor_loss': compile_actor_loss,
+            'aggregate_relation_values_first': aggregate_relation_values_first,
             'cuda_graph': False,
         },
     }
@@ -302,6 +314,9 @@ def main(argv: list[str] | None = None) -> int:
         compile_target_block=args.compile_target_block,
         compile_shared_relations=args.compile_shared_relations,
         compile_snn_target_encoder=args.compile_snn_target_encoder,
+        fused_adam=args.fused_adam,
+        compile_actor_loss=args.compile_actor_loss,
+        aggregate_relation_values_first=args.aggregate_relation_values_first,
     )
     print(json.dumps(summary, indent=2, allow_nan=False))
     return 0 if summary['passed'] else 1

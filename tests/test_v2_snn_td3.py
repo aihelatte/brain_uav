@@ -56,7 +56,11 @@ class TestV2SNNTD3(unittest.TestCase):
             time_window=time_window,
         )
 
-    def make_engine(self, *, freeze: int = 0, bc=None) -> V2TD3UpdateEngine:
+    def make_engine(
+        self, *, freeze: int = 0, bc=None,
+        fused_adam: bool = False,
+        aggregate_relation_values_first: bool = False,
+    ) -> V2TD3UpdateEngine:
         actor = self.make_actor()
         critic1 = V2ANNCritic(self.scales, 2, 8)
         critic2 = V2ANNCritic(self.scales, 2, 8)
@@ -79,6 +83,8 @@ class TestV2SNNTD3(unittest.TestCase):
             actor_freeze_steps=freeze,
             terminal_geo_regularization_enabled=False,
             bc_reference_actor=bc,
+            fused_adam=fused_adam,
+            aggregate_relation_values_first=aggregate_relation_values_first,
         )
         for index, count in enumerate((0, 6, 10, 2)):
             engine.replay.add(
@@ -105,6 +111,28 @@ class TestV2SNNTD3(unittest.TestCase):
         ))
         self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
         self.assertEqual(engine.actor_target.snn_head.lif2.v, 0.0)
+
+    def test_snn_three_optimizations_keep_lif_reset_and_target_frozen(self) -> None:
+        engine = self.make_engine(
+            bc=self.make_actor(), fused_adam=True,
+            aggregate_relation_values_first=True,
+        )
+        metadata = engine.configure_compilation(
+            compile_actor_loss=True, backend='eager', fullgraph=True,
+        )
+        self.assertEqual(metadata['actor_loss_granularity'], 'tensor_block')
+        self.assertEqual(metadata['optimizer_execution'], 'fused_adam')
+        self.assertTrue(all(
+            layer.attention.aggregate_relation_values_first
+            for layer in engine.actor.zone_set_encoder.layers
+        ))
+        self.assertTrue(all(not p.requires_grad for p in engine.actor_target.parameters()))
+        metrics = engine.update_once(total_steps=1, bc_lambda=1.0)
+        self.assertTrue(metrics.actor_updated)
+        self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+        self.assertEqual(engine.actor_target.snn_head.lif2.v, 0.0)
+        engine.select_action(_observation(10, self.scales))
+        self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
 
     def test_snn_actor_compile_scope_is_encoder_only_and_preserves_reset(self) -> None:
         engine = self.make_engine(bc=self.make_actor())

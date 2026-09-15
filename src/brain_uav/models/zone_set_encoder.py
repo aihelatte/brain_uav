@@ -130,6 +130,10 @@ class RelationAwareSelfAttention(nn.Module):
         self.output = nn.Linear(config.hidden_dim, config.hidden_dim)
         self.relation_bias = nn.Linear(config.relation_dim, config.num_heads)
         self.relation_value = nn.Linear(config.relation_dim, config.hidden_dim)
+        self.aggregate_relation_values_first = False
+
+    def enable_relation_value_aggregation(self) -> None:
+        self.aggregate_relation_values_first = True
 
     def _split_heads(self, value: torch.Tensor) -> torch.Tensor:
         batch_size, token_count, _ = value.shape
@@ -196,39 +200,43 @@ class RelationAwareSelfAttention(nn.Module):
         queries = self._split_heads(queries)
         keys = self._split_heads(keys)
         values = self._split_heads(values)
-        relation_weight = torch.cat(
-            (self.relation_bias.weight, self.relation_value.weight),
-            dim=0,
-        )
-        relation_projection_bias = torch.cat(
-            (self.relation_bias.bias, self.relation_value.bias),
-            dim=0,
-        )
-        relation_bias, relation_values = F.linear(
-            clean_relations,
-            relation_weight,
-            relation_projection_bias,
-        ).split(
-            (
-                self.relation_bias.out_features,
-                self.relation_value.out_features,
-            ),
-            dim=-1,
-        )
+        if self.aggregate_relation_values_first:
+            relation_bias = self.relation_bias(clean_relations)
+        else:
+            relation_weight = torch.cat(
+                (self.relation_bias.weight, self.relation_value.weight),
+                dim=0,
+            )
+            relation_projection_bias = torch.cat(
+                (self.relation_bias.bias, self.relation_value.bias),
+                dim=0,
+            )
+            relation_bias, relation_values = F.linear(
+                clean_relations,
+                relation_weight,
+                relation_projection_bias,
+            ).split(
+                (
+                    self.relation_bias.out_features,
+                    self.relation_value.out_features,
+                ),
+                dim=-1,
+            )
         relation_bias = relation_bias.permute(0, 3, 1, 2)
         relation_bias = relation_bias * relation_pair_mask.unsqueeze(1).to(
             relation_bias.dtype
         )
-        relation_values = relation_values.reshape(
-            batch_size,
-            token_count,
-            token_count,
-            self.num_heads,
-            self.head_dim,
-        ).permute(0, 3, 1, 2, 4)
-        relation_values = relation_values * relation_pair_mask[
-            :, None, :, :, None
-        ].to(relation_values.dtype)
+        if not self.aggregate_relation_values_first:
+            relation_values = relation_values.reshape(
+                batch_size,
+                token_count,
+                token_count,
+                self.num_heads,
+                self.head_dim,
+            ).permute(0, 3, 1, 2, 4)
+            relation_values = relation_values * relation_pair_mask[
+                :, None, :, :, None
+            ].to(relation_values.dtype)
 
         scores = torch.matmul(queries, keys.transpose(-2, -1))
         scores = scores * self.score_scale + relation_bias
@@ -254,11 +262,32 @@ class RelationAwareSelfAttention(nn.Module):
         )
 
         standard_messages = torch.matmul(attention_weights, values)
-        relation_messages = torch.einsum(
-            'bhij,bhijd->bhid',
-            attention_weights,
-            relation_values,
-        )
+        if self.aggregate_relation_values_first:
+            weighted_relations = attention_weights * relation_pair_mask[
+                :, None, :, :
+            ].to(attention_weights.dtype)
+            relation_sum = torch.einsum(
+                'bhij,bijr->bhir', weighted_relations, clean_relations,
+            )
+            relation_messages = torch.einsum(
+                'bhir,hdr->bhid',
+                relation_sum,
+                self.relation_value.weight.reshape(
+                    self.num_heads, self.head_dim, self.relation_value.in_features,
+                ),
+            )
+            relation_messages = relation_messages + (
+                weighted_relations.sum(dim=-1, keepdim=True)
+                * self.relation_value.bias.reshape(self.num_heads, self.head_dim)[
+                    None, :, None, :
+                ]
+            )
+        else:
+            relation_messages = torch.einsum(
+                'bhij,bhijd->bhid',
+                attention_weights,
+                relation_values,
+            )
         contextual = standard_messages + relation_messages
         contextual = contextual.transpose(1, 2).contiguous().reshape(
             batch_size,

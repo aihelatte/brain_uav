@@ -21,6 +21,8 @@ from brain_uav.observations import V2ObservationScales, build_v2_observation
 from brain_uav.scripts.train_v2_bc import train_v2_behavior_cloning
 from brain_uav.trainers import V2ReplayBuffer, V2TD3UpdateEngine
 from brain_uav.trainers.v2_formal_training import (
+    V2BCFormalInitialization,
+    V2PreparedStageInitialization,
     V2_FORMAL_CHECKPOINT_FORMAT,
     V2EarlyStopController,
     V2FormalStageTrainer,
@@ -40,6 +42,7 @@ from brain_uav.trainers.v2_bc import (
     V2_BC_CHECKPOINT_VERSION,
 )
 from test_v2_bc import make_scenario_config, write_cluster
+from brain_uav.v2_curriculum import derive_v2_component_seed
 
 
 def _scenario_payload(zone_count: int, *, goal: bool = False) -> dict:
@@ -131,6 +134,49 @@ def _validation_result(passed: bool) -> V2ValidationResult:
 
 
 class TestV2FormalTraining(unittest.TestCase):
+    def test_builder_forwards_fused_and_relation_flags_with_in_memory_initialization(self):
+        scenario = make_scenario_config()
+        config = V2FormalTrainingConfig(
+            stage='easy', seed=83, max_steps=2, replay_capacity=8, batch_size=2,
+        )
+        source = {}
+        actor = _engine(scenario).actor
+        prepared = V2PreparedStageInitialization(
+            stage='easy',
+            model_seed=derive_v2_component_seed(83, 'easy', 'model'),
+            verified_initialization_source=source,
+            snn_time_window=None,
+            scenario_config=scenario,
+            reward_config=RewardConfig(),
+            uav_collision_radius=0.0,
+            model_type='ann',
+            bc_initialization=V2BCFormalInitialization(
+                actor=actor, scenario_config=scenario,
+                uav_collision_radius=0.0, model_type='ann',
+            ),
+            formal_checkpoint=None,
+            torch_rng_state=torch.get_rng_state().clone(),
+        )
+        eager = build_v2_stage_engine(
+            scenario, config, init_checkpoint=source,
+            prepared_initialization=prepared, device='cpu',
+        ).engine
+        optimized = build_v2_stage_engine(
+            scenario, config, init_checkpoint=source,
+            prepared_initialization=prepared, device='cpu',
+            fused_adam=True, aggregate_relation_values_first=True,
+        ).engine
+        self.assertTrue(optimized.actor_optimizer.param_groups[0]['fused'])
+        self.assertTrue(optimized.critic_optimizer.param_groups[0]['fused'])
+        self.assertTrue(all(
+            layer.attention.aggregate_relation_values_first
+            for layer in optimized.actor.zone_set_encoder.layers
+        ))
+        self.assertEqual(
+            tuple(optimized.checkpoint_state_dict()),
+            tuple(eager.checkpoint_state_dict()),
+        )
+
     @staticmethod
     def _make_v2_bc_checkpoint(
         root: Path,
@@ -975,6 +1021,7 @@ class TestV2FormalTraining(unittest.TestCase):
                 exploration_rng=second.exploration_rng,
             )
             np.testing.assert_array_equal(first_action, second_action)
+
 
     @staticmethod
     def _transition_for_replay(scenario):

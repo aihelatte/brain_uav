@@ -56,6 +56,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--compile-target-encoders', action='store_true')
     parser.add_argument('--compile-shared-relations', action='store_true')
     parser.add_argument('--compile-snn-target-encoder', action='store_true')
+    parser.add_argument('--fused-adam', action='store_true')
+    parser.add_argument('--compile-actor-loss', action='store_true')
+    parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument('--compile-actors', action='store_true')
     parser.add_argument(
         '--frozen-critic-strategy',
@@ -96,11 +99,13 @@ def _configure_stage_compilation(
     compile_target_block: bool,
     compile_shared_relations: bool = False,
     compile_snn_target_encoder: bool = False,
+    compile_actor_loss: bool = False,
 ) -> dict[str, Any]:
     requested = any((
         compile_critic_encoder, compile_target_encoders, compile_actors,
         compile_critic_block, compile_target_block,
         compile_shared_relations, compile_snn_target_encoder,
+        compile_actor_loss,
     ))
     if not requested:
         if frozen_critic_strategy != 'eager':
@@ -113,6 +118,15 @@ def _configure_stage_compilation(
             'frozen_critic_strategy': 'eager',
             'select_action_execution': 'eager',
             'cuda_graph': False,
+            'optimizer_execution': (
+                'fused_adam' if getattr(engine, 'fused_adam', False) else 'adam'
+            ),
+            'relation_value_execution': (
+                'aggregate_then_project'
+                if getattr(engine, 'aggregate_relation_values_first', False)
+                else 'project_then_aggregate'
+            ),
+            'actor_loss_granularity': 'eager',
             'registration_wall_seconds': 0.0,
             'warmup_wall_seconds': 0.0,
             'warmup_batch_shapes': [],
@@ -127,6 +141,7 @@ def _configure_stage_compilation(
         compile_target_block=compile_target_block,
         compile_shared_relations=compile_shared_relations,
         compile_snn_target_encoder=compile_snn_target_encoder,
+        compile_actor_loss=compile_actor_loss,
         backend='inductor', mode='default', fullgraph=True, dynamic=True,
     )
     metadata['requested'] = True
@@ -174,6 +189,8 @@ def _configure_stage_compilation(
             engine.warmup_target_encoder_compile(warmup_batches)
     if compile_snn_target_encoder and not compile_target_block:
         engine.warmup_snn_target_encoder_compile(warmup_batches)
+    if compile_actor_loss:
+        engine.warmup_actor_loss_compile(warmup_batches)
     metadata['warmup_wall_seconds'] = perf_counter() - warmup_started
     return metadata
 
@@ -212,6 +229,9 @@ def run_v2_td3_stage(
     compile_target_block: bool = False,
     compile_shared_relations: bool = False,
     compile_snn_target_encoder: bool = False,
+    fused_adam: bool = False,
+    compile_actor_loss: bool = False,
+    aggregate_relation_values_first: bool = False,
 ) -> dict[str, Any]:
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
@@ -290,6 +310,8 @@ def run_v2_td3_stage(
         model_type=model,
         snn_time_window=snn_time_window,
         prepared_initialization=prepared_initialization,
+        fused_adam=fused_adam,
+        aggregate_relation_values_first=aggregate_relation_values_first,
     )
     compilation_metadata = _configure_stage_compilation(
         components.engine,
@@ -303,6 +325,7 @@ def run_v2_td3_stage(
         compile_target_block=compile_target_block,
         compile_shared_relations=compile_shared_relations,
         compile_snn_target_encoder=compile_snn_target_encoder,
+        compile_actor_loss=compile_actor_loss,
     )
     reporter = (
         V2ExperimentReporter(
@@ -503,6 +526,9 @@ def main(argv: list[str] | None = None) -> int:
         compile_target_block=args.compile_target_block,
         compile_shared_relations=args.compile_shared_relations,
         compile_snn_target_encoder=args.compile_snn_target_encoder,
+        fused_adam=args.fused_adam,
+        compile_actor_loss=args.compile_actor_loss,
+        aggregate_relation_values_first=args.aggregate_relation_values_first,
     )
     print(json.dumps(summary, indent=2, allow_nan=False))
     return 0 if summary['passed'] else 1

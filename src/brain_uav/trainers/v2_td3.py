@@ -31,6 +31,80 @@ from brain_uav.observations import (
 
 from .v2_replay_buffer import V2ReplayBuffer
 
+_GOAL_FORWARD_NORM_INDEX = int(GOAL_FEATURE_INDEX['goal_forward_norm'])
+_GOAL_RIGHT_NORM_INDEX = int(GOAL_FEATURE_INDEX['goal_right_norm'])
+_GOAL_UP_NORM_INDEX = int(GOAL_FEATURE_INDEX['goal_up_norm'])
+_GAMMA_FRACTION_INDEX = int(EGO_FEATURE_INDEX['gamma_fraction'])
+
+
+def _actor_loss_tensor_block(
+    actor_actions: torch.Tensor,
+    q_values: torch.Tensor,
+    reference_actions: torch.Tensor | None,
+    ego_features: torch.Tensor,
+    goal_features: torch.Tensor,
+    line_to_goal_safe: torch.Tensor,
+    action_low: torch.Tensor,
+    action_high: torch.Tensor,
+    alpha: torch.Tensor,
+    bc_lambda: torch.Tensor,
+    terminal_lambda: torch.Tensor,
+    horizontal_span: float,
+    vertical_span: float,
+    gamma_max: float,
+    terminal_radius: float,
+    terminal_enabled: bool,
+) -> tuple[torch.Tensor, ...]:
+    rl_actor_loss = -q_values.mean()
+    q_scale = q_values.detach().abs().mean().clamp(min=1.0)
+    actor_rl_scale = alpha / q_scale
+    scaled_rl_actor_loss = rl_actor_loss * actor_rl_scale
+    bc_loss = (
+        actor_actions.sum() * 0.0 if reference_actions is None
+        else F.mse_loss(actor_actions, reference_actions)
+    )
+    if terminal_enabled:
+        goal_forward = goal_features[:, _GOAL_FORWARD_NORM_INDEX] * horizontal_span
+        goal_right = goal_features[:, _GOAL_RIGHT_NORM_INDEX] * horizontal_span
+        goal_up = goal_features[:, _GOAL_UP_NORM_INDEX] * vertical_span
+        goal_distance = torch.sqrt(
+            goal_forward.square() + goal_right.square() + goal_up.square()
+        )
+        gamma = ego_features[:, _GAMMA_FRACTION_INDEX] * gamma_max
+        target_gamma = torch.atan2(
+            goal_up, torch.sqrt(goal_forward.square() + goal_right.square()),
+        )
+        relative_target_psi = torch.atan2(goal_right, goal_forward)
+        delta_gamma = torch.maximum(
+            torch.minimum(target_gamma - gamma, action_high[0]), action_low[0],
+        )
+        delta_psi = torch.maximum(
+            torch.minimum(
+                torch.remainder(relative_target_psi + pi, 2.0 * pi) - pi,
+                action_high[1],
+            ),
+            action_low[1],
+        )
+        target_action = torch.stack((delta_gamma, delta_psi), dim=-1)
+        squared_error = (actor_actions - target_action).square().mean(dim=-1)
+        eligible = (
+            (line_to_goal_safe.squeeze(-1) > 0.5)
+            & (goal_distance <= terminal_radius)
+        ).to(squared_error.dtype)
+        terminal_geo_loss = (
+            (squared_error * eligible).sum() / eligible.sum().clamp_min(1.0)
+        )
+    else:
+        terminal_geo_loss = actor_actions.sum() * 0.0
+    actor_loss = (
+        scaled_rl_actor_loss + bc_lambda * bc_loss
+        + terminal_lambda * terminal_geo_loss
+    )
+    return (
+        actor_loss, rl_actor_loss, scaled_rl_actor_loss,
+        actor_rl_scale, bc_loss, terminal_geo_loss,
+    )
+
 
 V2_TD3_CHECKPOINT_FORMAT = 'v2_td3_dynamic_set'
 V2_TD3_CHECKPOINT_VERSION = 3
@@ -247,6 +321,8 @@ class V2TD3UpdateEngine:
         terminal_geo_lambda: float = 3000.0,
         bc_reference_actor: V2PolicyActor | None = None,
         device: str | torch.device = 'cpu',
+        fused_adam: bool = False,
+        aggregate_relation_values_first: bool = False,
     ) -> None:
         actor_model_type = _actor_model_type(actor)
         if not isinstance(critic1, V2ANNCritic) or not isinstance(critic2, V2ANNCritic):
@@ -272,6 +348,14 @@ class V2TD3UpdateEngine:
         self._validate_network_architecture(actor, critic2, name='critic2')
 
         self.device = torch.device(device)
+        if type(fused_adam) is not bool:
+            raise TypeError('fused_adam must be a bool.')
+        if type(aggregate_relation_values_first) is not bool:
+            raise TypeError('aggregate_relation_values_first must be a bool.')
+        if fused_adam and self.device.type not in ('cpu', 'cuda'):
+            raise ValueError(f'fused Adam is unsupported on {self.device.type}.')
+        self.fused_adam = fused_adam
+        self.aggregate_relation_values_first = aggregate_relation_values_first
         self.model_type = actor_model_type
         self.actor = actor.to(self.device)
         self.critic1 = critic1.to(self.device)
@@ -353,11 +437,13 @@ class V2TD3UpdateEngine:
         self._validate_all_live_fixed_buffers()
         self._soft_update_parameter_pairs = self._bind_soft_update_parameter_pairs()
         self.actor_optimizer = torch.optim.Adam(
-            self.actor.parameters(), lr=actor_lr_value
+            self.actor.parameters(), lr=actor_lr_value,
+            fused=True if fused_adam else None,
         )
         self.critic_optimizer = torch.optim.Adam(
             list(self.critic1.parameters()) + list(self.critic2.parameters()),
             lr=critic_lr_value,
+            fused=True if fused_adam else None,
         )
         self.bc_reference_actor: V2PolicyActor | None = None
         if bc_reference_actor is not None:
@@ -379,6 +465,15 @@ class V2TD3UpdateEngine:
                 self.bc_reference_actor,
                 name='bc_reference_actor',
             )
+        if aggregate_relation_values_first:
+            for model in (
+                self.actor, self.critic1, self.critic2,
+                self.actor_target, self.critic1_target, self.critic2_target,
+                self.bc_reference_actor,
+            ):
+                if model is not None:
+                    for layer in model.zone_set_encoder.layers:
+                        layer.attention.enable_relation_value_aggregation()
 
         self.update_count = 0
         self.critic_update_count = 0
@@ -389,6 +484,90 @@ class V2TD3UpdateEngine:
         self._compiled_critic_loss: Callable[..., tuple[torch.Tensor, ...]] | None = None
         self._compiled_target_block: Callable[..., tuple[torch.Tensor, ...]] | None = None
         self._compiled_target_critic_td: Callable[..., tuple[torch.Tensor, ...]] | None = None
+        self._compiled_actor_loss: Callable[..., tuple[torch.Tensor, ...]] | None = None
+
+    def enable_actor_loss_compile(
+        self,
+        *,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> tuple[str, ...]:
+        if self._compiled_actor_loss is not None:
+            raise RuntimeError('Actor loss tensor block is already compiled.')
+        self._compiled_actor_loss = torch.compile(
+            _actor_loss_tensor_block,
+            backend=backend, mode=mode, fullgraph=fullgraph, dynamic=dynamic,
+        )
+        return ('actor_loss.tensor_block',)
+
+    def warmup_actor_loss_compile(
+        self, batches: Sequence[V2ObservationBatch],
+    ) -> None:
+        if self._compiled_actor_loss is None:
+            raise RuntimeError('The actor loss tensor block must be compiled first.')
+        warmup_batches = tuple(batches)
+        if not warmup_batches:
+            raise ValueError('At least one actor loss warmup batch is required.')
+        torch_rng = torch.random.get_rng_state()
+        numpy_rng = np.random.get_state()
+        cuda_rng = (
+            torch.cuda.get_rng_state_all() if self.device.type == 'cuda' else None
+        )
+        counts = (
+            self.update_count, self.critic_update_count,
+            self.critic_target_update_count, self.actor_update_count,
+            self.last_total_steps,
+        )
+        try:
+            for batch in warmup_batches:
+                device_batch = batch.to(self.device)
+                for coefficient in (0.0, 1.5):
+                    actions = torch.zeros(
+                        (device_batch.batch_size, self.action_dim),
+                        device=self.device, dtype=torch.float32,
+                        requires_grad=True,
+                    )
+                    q_values = torch.ones(
+                        (device_batch.batch_size, 1), device=self.device,
+                        dtype=torch.float32, requires_grad=True,
+                    )
+                    reference = (
+                        torch.zeros_like(actions)
+                        if self.bc_reference_actor is not None else None
+                    )
+                    total, *_ = self._compiled_actor_loss(
+                        actions, q_values, reference,
+                        device_batch.ego_features, device_batch.goal_features,
+                        torch.ones_like(q_values), self.action_low, self.action_high,
+                        torch.as_tensor(self.actor_rl_scale_alpha, device=self.device),
+                        torch.as_tensor(coefficient, device=self.device),
+                        torch.as_tensor(
+                            self.terminal_geo_lambda
+                            if self.terminal_geo_regularization_enabled else 0.0,
+                            device=self.device,
+                        ),
+                        self.actor.scales.horizontal_span,
+                        self.actor.scales.vertical_span,
+                        self.actor.scales.gamma_max,
+                        self.terminal_geo_radius,
+                        self.terminal_geo_regularization_enabled,
+                    )
+                    total.backward()
+                    if actions.grad is None or q_values.grad is None:
+                        raise RuntimeError('Actor loss warmup lost action or Q gradients.')
+        finally:
+            torch.random.set_rng_state(torch_rng)
+            np.random.set_state(numpy_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+        if counts != (
+            self.update_count, self.critic_update_count,
+            self.critic_target_update_count, self.actor_update_count,
+            self.last_total_steps,
+        ):
+            raise RuntimeError('Actor loss warmup must not change TD3 counters.')
 
     @staticmethod
     def _optional_positive_float(value: float | None, *, name: str) -> float | None:
@@ -683,6 +862,7 @@ class V2TD3UpdateEngine:
         compile_target_block: bool = False,
         compile_shared_relations: bool = False,
         compile_snn_target_encoder: bool = False,
+        compile_actor_loss: bool = False,
         backend: str = 'inductor',
         mode: str = 'default',
         fullgraph: bool = True,
@@ -733,6 +913,8 @@ class V2TD3UpdateEngine:
         enabled: list[str] = []
         if compile_shared_relations:
             enabled.extend(self.enable_shared_relations_compile(**options))
+        if compile_actor_loss:
+            enabled.extend(self.enable_actor_loss_compile(**options))
         if compile_critic_block:
             enabled.extend(self.enable_critic_loss_compile(**options))
         elif compile_critic_encoder:
@@ -769,6 +951,20 @@ class V2TD3UpdateEngine:
             ),
             'actor_granularity': (
                 'ann_full_forward_or_snn_encoder' if compile_actors else 'eager'
+            ),
+            'actor_loss_granularity': (
+                'tensor_block' if compile_actor_loss else 'eager'
+            ),
+            'optimizer_execution': (
+                'fused_adam' if all(
+                    group.get('fused') is True
+                    for optimizer in (self.actor_optimizer, self.critic_optimizer)
+                    for group in optimizer.param_groups
+                ) else 'adam'
+            ),
+            'relation_value_execution': (
+                'aggregate_then_project' if self.aggregate_relation_values_first
+                else 'project_then_aggregate'
             ),
             'frozen_critic_strategy': frozen_critic_strategy,
             'select_action_execution': 'eager',
@@ -2067,16 +2263,19 @@ class V2TD3UpdateEngine:
                     actor_actions,
                 )
             )
-            rl_actor_loss = -q_values.mean()
-            q_scale = q_values.detach().abs().mean().clamp(min=1.0)
-            actor_rl_scale = torch.as_tensor(
-                self.actor_rl_scale_alpha,
-                dtype=q_values.dtype,
-                device=q_values.device,
-            ) / q_scale
-            scaled_rl_actor_loss = rl_actor_loss * actor_rl_scale
+            if self._compiled_actor_loss is None:
+                rl_actor_loss = -q_values.mean()
+                q_scale = q_values.detach().abs().mean().clamp(min=1.0)
+                actor_rl_scale = torch.as_tensor(
+                    self.actor_rl_scale_alpha,
+                    dtype=q_values.dtype,
+                    device=q_values.device,
+                ) / q_scale
+                scaled_rl_actor_loss = rl_actor_loss * actor_rl_scale
         with detail.section('actor_bc_reference_forward_and_loss'):
-            bc_loss = actor_actions.sum() * 0.0
+            reference_actions = None
+            if self._compiled_actor_loss is None:
+                bc_loss = actor_actions.sum() * 0.0
             if self.bc_reference_actor is not None:
                 with torch.no_grad():
                     reference_uses_compiled = (
@@ -2110,24 +2309,49 @@ class V2TD3UpdateEngine:
                         shared_relations=shared_relations,
                         profile_sections=profile_sections,
                     )
-                bc_loss = F.mse_loss(actor_actions, reference_actions)
+                if self._compiled_actor_loss is None:
+                    bc_loss = F.mse_loss(actor_actions, reference_actions)
         with detail.section('actor_terminal_geometry_loss'):
-            terminal_geo_loss = self._terminal_geo_loss(
-                observation,
-                actor_actions,
-                line_to_goal_safe,
-            )
+            if self._compiled_actor_loss is None:
+                terminal_geo_loss = self._terminal_geo_loss(
+                    observation, actor_actions, line_to_goal_safe,
+                )
         with detail.section('actor_loss_composition_and_finite_check'):
             terminal_lambda = (
                 self.terminal_geo_lambda
                 if self.terminal_geo_regularization_enabled
                 else 0.0
             )
-            actor_loss = (
-                scaled_rl_actor_loss
-                + bc_lambda * bc_loss
-                + terminal_lambda * terminal_geo_loss
-            )
+            if self._compiled_actor_loss is None:
+                actor_loss = (
+                    scaled_rl_actor_loss
+                    + bc_lambda * bc_loss
+                    + terminal_lambda * terminal_geo_loss
+                )
+            else:
+                if compiled_execution_recorder is not None:
+                    compiled_execution_recorder('actor_loss')
+                (
+                    actor_loss, rl_actor_loss, scaled_rl_actor_loss,
+                    actor_rl_scale, bc_loss, terminal_geo_loss,
+                ) = self._compiled_actor_loss(
+                    actor_actions, q_values, reference_actions,
+                    observation.ego_features, observation.goal_features,
+                    line_to_goal_safe, self.action_low, self.action_high,
+                    torch.as_tensor(
+                        self.actor_rl_scale_alpha,
+                        dtype=q_values.dtype, device=q_values.device,
+                    ),
+                    torch.as_tensor(bc_lambda, dtype=q_values.dtype, device=q_values.device),
+                    torch.as_tensor(
+                        terminal_lambda, dtype=q_values.dtype, device=q_values.device,
+                    ),
+                    self.actor.scales.horizontal_span,
+                    self.actor.scales.vertical_span,
+                    self.actor.scales.gamma_max,
+                    self.terminal_geo_radius,
+                    self.terminal_geo_regularization_enabled,
+                )
         return _ActorLossTerms(
             actor_loss=actor_loss,
             rl_actor_loss=rl_actor_loss,
@@ -2529,8 +2753,22 @@ class V2TD3UpdateEngine:
 
         for key, model in state_targets:
             model.load_state_dict(payload[key], strict=True)
-        self.actor_optimizer.load_state_dict(payload['actor_optimizer_state_dict'])
-        self.critic_optimizer.load_state_dict(payload['critic_optimizer_state_dict'])
+        for optimizer, key in (
+            (self.actor_optimizer, 'actor_optimizer_state_dict'),
+            (self.critic_optimizer, 'critic_optimizer_state_dict'),
+        ):
+            optimizer_state = deepcopy(payload[key])
+            for saved_group, target_group in zip(
+                optimizer_state['param_groups'], optimizer.param_groups,
+            ):
+                saved_group['fused'] = target_group.get('fused')
+                saved_group['capturable'] = target_group.get('capturable', False)
+            if not self.fused_adam:
+                for state in optimizer_state['state'].values():
+                    step = state.get('step')
+                    if isinstance(step, torch.Tensor):
+                        state['step'] = step.to(device='cpu', dtype=torch.float32)
+            optimizer.load_state_dict(optimizer_state)
         self.update_count = validated_counts['update_count']
         self.critic_update_count = validated_counts['critic_update_count']
         self.critic_target_update_count = validated_counts[

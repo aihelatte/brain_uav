@@ -190,6 +190,18 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertFalse(args.compile_target_block)
         self.assertFalse(args.compile_shared_relations)
         self.assertFalse(args.compile_snn_target_encoder)
+        self.assertFalse(args.fused_adam)
+        self.assertFalse(args.compile_actor_loss)
+        self.assertFalse(args.aggregate_relation_values_first)
+        enabled_optimizations = parser.parse_args([
+            '--stage', 'easy', '--init-checkpoint', 'x',
+            '--output', 'x', '--metrics-out', 'x', '--validation-pool', 'x',
+            '--fused-adam', '--compile-actor-loss',
+            '--aggregate-relation-values-first',
+        ])
+        self.assertTrue(enabled_optimizations.fused_adam)
+        self.assertTrue(enabled_optimizations.compile_actor_loss)
+        self.assertTrue(enabled_optimizations.aggregate_relation_values_first)
         with self.assertRaises(SystemExit):
             parser.parse_args([
                 '--stage', 'easy_two_zone',
@@ -234,6 +246,9 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             warmup_snn_target_encoder_compile=lambda batches: calls.append(
                 ('snn_target_warmup', len(batches))
             ),
+            warmup_actor_loss_compile=lambda batches: calls.append(
+                ('actor_loss_warmup', len(batches))
+            ),
         )
         fake_batch = SimpleNamespace(
             batch_size=2,
@@ -270,13 +285,18 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 compile_target_block=True,
                 compile_shared_relations=True,
                 compile_snn_target_encoder=True,
+                compile_actor_loss=True,
             )
         self.assertEqual(
             [entry[0] for entry in calls],
-            ['configure', 'actor_warmup', 'shared_warmup', 'full_warmup'],
+            [
+                'configure', 'actor_warmup', 'shared_warmup',
+                'full_warmup', 'actor_loss_warmup',
+            ],
         )
         self.assertTrue(calls[0][1]['compile_shared_relations'])
         self.assertTrue(calls[0][1]['compile_snn_target_encoder'])
+        self.assertTrue(calls[0][1]['compile_actor_loss'])
         self.assertTrue(metadata['requested'])
         self.assertEqual(metadata['warmup_batch_shapes'], [[2, 7]] * 3)
         self.assertFalse(metadata['cuda_graph'])

@@ -667,6 +667,9 @@ class TestProfileV2TD3(unittest.TestCase):
                         compile_target_block=False,
                         compile_shared_relations=False,
                         compile_snn_target_encoder=False,
+                        fused_adam=False,
+                        compile_actor_loss=False,
+                        aggregate_relation_values_first=False,
                         compiled_path_profiler_updates=0,
                         compiled_profiler_output_dir=None,
                         level='easy',
@@ -686,6 +689,8 @@ class TestProfileV2TD3(unittest.TestCase):
             actor=torch.nn.Linear(1, 1), replay=replay, batch_size=4,
             critic_update_count=0, actor_update_count=0,
             set_target_noise=lambda **kwargs: None,
+            fused_adam=fused_adam,
+            aggregate_relation_values_first=aggregate_relation_values_first,
         )
         submitted = []
         compile_calls = []
@@ -809,6 +814,8 @@ class TestProfileV2TD3(unittest.TestCase):
                 enabled_objects.append('shared_relations.tensor_build')
             if kwargs['compile_snn_target_encoder']:
                 enabled_objects.append('actor_target.zone_set_encoder')
+            if kwargs['compile_actor_loss']:
+                enabled_objects.append('actor_loss.tensor_block')
             return {
                 'enabled_objects': enabled_objects,
                 'critic_granularity': (
@@ -823,6 +830,16 @@ class TestProfileV2TD3(unittest.TestCase):
                     'ann_full_forward_or_snn_encoder'
                     if kwargs['compile_actors'] else 'eager'
                 ),
+                'actor_loss_granularity': (
+                    'tensor_block' if kwargs['compile_actor_loss'] else 'eager'
+                ),
+                'optimizer_execution': (
+                    'fused_adam' if fused_adam else 'adam'
+                ),
+                'relation_value_execution': (
+                    'aggregate_then_project' if aggregate_relation_values_first
+                    else 'project_then_aggregate'
+                ),
                 'frozen_critic_strategy': kwargs['frozen_critic_strategy'],
                 'select_action_execution': 'eager',
                 'cuda_graph': False,
@@ -833,6 +850,7 @@ class TestProfileV2TD3(unittest.TestCase):
         engine.warmup_full_compile = lambda batches: None
         engine.warmup_shared_relations_compile = lambda batches: None
         engine.warmup_snn_target_encoder_compile = lambda batches: None
+        engine.warmup_actor_loss_compile = lambda batches: None
         synchronization_points = []
         event = mock.Mock()
         event.elapsed_time.return_value = 1.0
@@ -871,6 +889,9 @@ class TestProfileV2TD3(unittest.TestCase):
                 compile_target_block=compile_target_block,
                 compile_shared_relations=compile_shared_relations,
                 compile_snn_target_encoder=compile_snn_target_encoder,
+                fused_adam=fused_adam,
+                compile_actor_loss=compile_actor_loss,
+                aggregate_relation_values_first=aggregate_relation_values_first,
                 compiled_path_profiler_updates=compiled_path_profiler_updates,
                 compiled_profiler_output_dir=compiled_profiler_output_dir,
                 environment_performance_diagnostic=(
@@ -891,6 +912,19 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertTrue(compile_info['snn_target_encoder_requested'])
         self.assertIn('shared_relations.tensor_build', compile_info['enabled_objects'])
         self.assertIn('actor_target.zone_set_encoder', compile_info['enabled_objects'])
+
+    def test_three_optimization_scopes_are_recorded_in_diagnostic(self) -> None:
+        result, _, _ = self.run_small_level(
+            fused_adam=True, compile_actor_loss=True,
+            aggregate_relation_values_first=True,
+        )
+        compile_info = result['critic_encoder_compile']
+        self.assertEqual(compile_info['optimizer_execution'], 'fused_adam')
+        self.assertEqual(compile_info['actor_loss_granularity'], 'tensor_block')
+        self.assertEqual(
+            compile_info['relation_value_execution'], 'aggregate_then_project',
+        )
+        self.assertIn('actor_loss.tensor_block', compile_info['enabled_objects'])
 
     def test_warmup_reaches_update_minima_and_is_excluded_from_measurement(self) -> None:
         for minimum, actual, critic, actor in ((0, 7, 4, 2), (12, 12, 9, 5)):
@@ -1114,6 +1148,9 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertFalse(args.compile_target_block)
         self.assertFalse(args.compile_shared_relations)
         self.assertFalse(args.compile_snn_target_encoder)
+        self.assertFalse(args.fused_adam)
+        self.assertFalse(args.compile_actor_loss)
+        self.assertFalse(args.aggregate_relation_values_first)
         self.assertFalse(args.check_compiled_numerics)
         self.assertFalse(args.compiled_numerics_only)
         self.assertIsNone(args.compiled_numerics_group)
@@ -1165,6 +1202,15 @@ class TestProfileV2TD3(unittest.TestCase):
         ])
         self.assertTrue(new_scopes.compile_shared_relations)
         self.assertTrue(new_scopes.compile_snn_target_encoder)
+        optimization_scopes = build_parser().parse_args([
+            '--model', 'ann', '--bc-checkpoint', 'bc.pt',
+            '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
+            '--fused-adam', '--compile-actor-loss',
+            '--aggregate-relation-values-first',
+        ])
+        self.assertTrue(optimization_scopes.fused_adam)
+        self.assertTrue(optimization_scopes.compile_actor_loss)
+        self.assertTrue(optimization_scopes.aggregate_relation_values_first)
 
     def test_grouped_compile_modes_have_only_declared_warmup_differences(self) -> None:
         expected = {
@@ -1869,6 +1915,65 @@ class TestProfileV2TD3(unittest.TestCase):
                 compiled_numerics_only=True,
             )
 
+    def test_combined_optimizations_use_original_adam_and_relation_order_reference(self) -> None:
+        fixture = v2_td3_tests.TestV2TD3()
+        fixture.setUp()
+        torch.manual_seed(787)
+        reference = fixture.make_engine(
+            policy_delay=2, terminal_enabled=True,
+            bc_reference_actor=fixture.make_bc_reference(0.01),
+        )
+        torch.manual_seed(787)
+        optimized = fixture.make_engine(
+            policy_delay=2, terminal_enabled=True,
+            bc_reference_actor=fixture.make_bc_reference(0.01),
+            fused_adam=True, aggregate_relation_values_first=True,
+        )
+        batch = v2_td3_tests.collate_v2_observations([
+            v2_td3_tests._observation(0, scales=fixture.scales),
+            v2_td3_tests._observation(7, scales=fixture.scales),
+        ])
+        original_compile = torch.compile
+
+        def real_dynamo_eager(function, **kwargs):
+            return original_compile(function, **{**kwargs, 'backend': 'eager'})
+
+        with mock.patch(
+            'brain_uav.scripts.profile_v2_td3.build_v2_stage_engine',
+            side_effect=(
+                SimpleNamespace(engine=reference), SimpleNamespace(engine=optimized),
+            ),
+        ), mock.patch(
+            'brain_uav.scripts.profile_v2_td3._compile_warmup_batches',
+            return_value=(batch,),
+        ), mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=real_dynamo_eager,
+        ), redirect_stdout(StringIO()):
+            result = _run_compiled_numerics_check(
+                pool=SimpleNamespace(), prepared=SimpleNamespace(),
+                formal_config=V2FormalTrainingConfig(
+                    stage='easy', replay_capacity=32, batch_size=2,
+                    actor_freeze_steps=0,
+                ),
+                bc_checkpoint=Path('unused.pt'), device=torch.device('cpu'),
+                snn_time_window=4,
+                compile_critic_encoder=False, compile_target_encoders=False,
+                compile_actors=False, compile_critic_block=False,
+                compile_target_block=False,
+                fused_adam=True, compile_actor_loss=True,
+                aggregate_relation_values_first=True,
+            )
+        self.assertTrue(result['passed'])
+        self.assertEqual(result['compilation']['optimizer_execution'], 'fused_adam')
+        self.assertEqual(
+            result['compilation']['relation_value_execution'],
+            'aggregate_then_project',
+        )
+        self.assertEqual(result['compilation']['actor_loss_granularity'], 'tensor_block')
+        self.assertIs(reference.actor_optimizer.param_groups[0].get('fused'), None)
+        self.assertIs(optimized.actor_optimizer.param_groups[0]['fused'], True)
+
     def test_compiled_numeric_check_runs_isolated_fixed_updates(self) -> None:
         fixture = v2_td3_tests.TestV2TD3()
         fixture.setUp()
@@ -2278,7 +2383,9 @@ class TestProfileV2TD3(unittest.TestCase):
                 **common,
                 compile_target_encoders=True,
             )
-        with self.assertRaisesRegex(ValueError, 'requires compile_target_encoders'):
+        with self.assertRaisesRegex(
+            ValueError, 'requires a target compile scope or one of the new optimization flags'
+        ):
             run_v2_td3_timing_diagnostic(
                 **common,
                 compile_critic_encoder=True,
