@@ -36,11 +36,16 @@ from ..scripts.evaluate import (
 )
 from ..utils.io import ensure_dir, load_checkpoint, now_timestamp, save_json
 from ..utils.seeding import set_global_seed
+from ..utils.v1_spike_aware_thop import (
+    profile_spike_aware_thop,
+    validate_spike_aware_thop_model,
+)
 
 
 ACTOR_EXECUTION_CHOICES = ('eager', 'cuda-graph')
 CUDA_GRAPH_WARMUP_STEPS = 10
 CUDA_GRAPH_SANITY_ATOL = 1e-6
+SPIKE_AWARE_SAMPLE_STRIDE = 100
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,6 +62,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--episode-artifacts', choices=['json', 'none'], default='json')
     parser.add_argument('--reuse-obs-tensor', action='store_true')
     parser.add_argument('--actor-execution', choices=ACTOR_EXECUTION_CHOICES, default='eager')
+    parser.add_argument('--spike-aware-thop', action='store_true',
+                        help='Also estimate V1 synaptic MAC/AC with custom THOP rules, '
+                             'after rollout on sampled observations; does not measure GPU FLOPs.')
     return parser
 
 
@@ -540,6 +548,9 @@ def _build_policy_efficiency_summary(
 
 
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    spike_aware_thop = bool(getattr(args, 'spike_aware_thop', False))
+    if spike_aware_thop and args.method not in {'ann', 'snn'}:
+        raise ValueError('--spike-aware-thop requires an ANN or SNN actor.')
     cfg = ExperimentConfig()
     set_global_seed(args.seed)
     suite_payload = load_benchmark_suite(args.benchmark_suite)
@@ -584,6 +595,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         actor.load_state_dict(checkpoint_payload['state_dict'])
         actor.to(torch_device)
         actor.eval()
+        if spike_aware_thop:
+            validate_spike_aware_thop_model(actor)
     else:
         planner = build_planner(args.method, env)
     reuse_obs_tensor = bool(getattr(args, 'reuse_obs_tensor', False))
@@ -632,6 +645,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     actor_forward_times_ms: list[float] = []
     action_to_cpu_times_ms: list[float] = []
     episode_decision_times_s: list[float] = []
+    spike_aware_observations: list[np.ndarray] = []
 
     for episode_idx in range(episodes):
         scenario_meta = named_scenarios[episode_idx]
@@ -644,6 +658,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         episode_decisions: list[float] = []
 
         while not done:
+            # Copy pre-action observations outside the inference timer. This
+            # deterministic sample includes failed episodes and uses no RNG.
+            if spike_aware_thop and len(episode_decisions) % SPIKE_AWARE_SAMPLE_STRIDE == 0:
+                spike_aware_observations.append(obs.copy())
             if actor is not None:
                 step_start = time.perf_counter()
                 with torch.inference_mode():
@@ -758,6 +776,16 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     ]
 
     if actor is not None:
+        spike_aware_report = None
+        if spike_aware_thop:
+            print(f'[benchmark] Custom THOP profiling: {len(spike_aware_observations)} '
+                  'observations; rollout and inference timing already finished.', flush=True)
+            spike_aware_report = profile_spike_aware_thop(actor, spike_aware_observations)
+            spike_aware_report['sampling'] = {
+                'stride': SPIKE_AWARE_SAMPLE_STRIDE,
+                'rule': 'Pre-action steps 0,100,200,... of every episode; '
+                        'each policy uses its own trajectories; failures included.',
+            }
         efficiency_summary = _build_policy_efficiency_summary(
             method=args.method,
             actor=actor,
@@ -774,6 +802,8 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             cfg=cfg,
             diag_stats=diag_stats,
         )
+        if spike_aware_report is not None:
+            efficiency_summary['spike_aware_thop'] = spike_aware_report
     else:
         efficiency_summary = _build_planner_efficiency_summary(
             method=args.method,

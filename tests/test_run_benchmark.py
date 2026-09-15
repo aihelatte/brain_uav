@@ -7,7 +7,7 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -121,6 +121,69 @@ def _named_scenario(idx: int, category: str = 'single_detour'):
 
 
 class TestRunBenchmark(unittest.TestCase):
+    def test_spike_aware_thop_opt_in_samples_real_steps_after_rollout(self):
+        from brain_uav.models.ann import ANNPolicyActor
+        from brain_uav.utils.v1_spike_aware_thop import profile_spike_aware_thop
+
+        actor = ANNPolicyActor(24, 2, 2, torch.ones(2), ExperimentConfig().scenario)
+        scenarios = [_named_scenario(1), _named_scenario(2)]
+        summaries, actions = [], []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for enabled in (False, True):
+                parser = build_parser()
+                argv = ['--method', 'ann', '--checkpoint', 'model.pt', '--device', 'cpu',
+                        '--output-root', tmpdir, '--run-name', str(enabled)]
+                if enabled:
+                    argv += ['--spike-aware-thop']
+                args = parser.parse_args(argv)
+                env = _DummyEnv(['goal', 'collision'], episode_length=201)
+                step = env.step
+                observed_actions = []
+
+                def observed_step(action):
+                    observed_actions.append(action.copy())
+                    obs, *rest = step(action)
+                    obs.fill(env.step_idx)
+                    return (obs, *rest)
+
+                env.step = observed_step
+
+                def checked_profile(model, samples):
+                    self.assertEqual(env.episode_idx, 1)
+                    self.assertEqual(env.steps, 201)
+                    self.assertEqual([float(x[0]) for x in samples], [0, 100, 200]*2)
+                    return profile_spike_aware_thop(model, samples)
+
+                with ExitStack() as stack:
+                    module = 'brain_uav.scripts.run_benchmark.'
+                    for name, value in {
+                        'load_benchmark_suite': {'suite_name': 'suite', 'seed': 1,
+                            'count_per_category': 2, 'total_scenarios': 2,
+                            'categories': ['single_detour']},
+                        'build_benchmark_scenarios': scenarios, 'make_env': env,
+                        'make_actor': actor, 'load_checkpoint': {'state_dict': actor.state_dict()},
+                        'configure_training_runtime': 'cpu',
+                    }.items():
+                        stack.enter_context(mock.patch(module + name, return_value=value))
+                    profiler = stack.enter_context(mock.patch(module + 'profile_spike_aware_thop',
+                                                               side_effect=checked_profile))
+                    summary = run_benchmark(args)
+                efficiency = json.loads(Path(summary['efficiency_summary_path']).read_text())
+                if enabled:
+                    profiler.assert_called_once()
+                    self.assertEqual(efficiency['spike_aware_thop']['sample_count'], 6)
+                    self.assertEqual(efficiency['spike_aware_thop']['mean_macs'], 56)
+                else:
+                    profiler.assert_not_called()
+                    self.assertNotIn('spike_aware_thop', efficiency)
+                self.assertEqual(efficiency['dense_theoretical_macs'], 56)
+                summaries.append(summary)
+                actions.append(observed_actions)
+        np.testing.assert_array_equal(actions[0], actions[1])
+        for old, new in zip(summaries[0]['records'], summaries[1]['records']):
+            for key in ('outcome', 'steps', 'return', 'goal_distance', 'episode_min_zone_clearance'):
+                self.assertEqual(old[key], new[key])
+
     def test_parser_requires_checkpoint_for_ann(self):
         parser = build_parser()
         args = parser.parse_args(['--method', 'ann'])
