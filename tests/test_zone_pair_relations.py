@@ -7,6 +7,7 @@ import unittest
 from unittest import mock
 
 import torch
+import brain_uav.observations.v2_relations as v2_relations
 
 from brain_uav.observations import (
     EGO_FEATURE_DIM,
@@ -19,6 +20,53 @@ from brain_uav.observations import (
     PairRelationBuilder,
     V2ObservationScales,
 )
+
+
+def _reference_compute_relations(builder, ego_features, clean_zones, presence_mask):
+    forward = clean_zones[..., ZONE_FEATURE_INDEX['zone_forward_norm']] * builder.horizontal_span
+    right = clean_zones[..., ZONE_FEATURE_INDEX['zone_right_norm']] * builder.horizontal_span
+    up = clean_zones[..., ZONE_FEATURE_INDEX['zone_up_norm']] * builder.vertical_span
+    centers = torch.stack((forward, right, up), dim=-1)
+    extent_x = clean_zones[..., ZONE_FEATURE_INDEX['extent_x_norm']] * builder.horizontal_span
+    extent_y = clean_zones[..., ZONE_FEATURE_INDEX['extent_y_norm']] * builder.horizontal_span
+    extent_z = clean_zones[..., ZONE_FEATURE_INDEX['extent_z_norm']] * builder.vertical_span
+    margin = (
+        clean_zones[..., ZONE_FEATURE_INDEX['safety_margin_norm']]
+        * builder.world_diagonal
+        + builder.uav_radius
+    )
+    absolute_sin = torch.abs(ego_features[:, EGO_FEATURE_INDEX['sin_psi']]).unsqueeze(1)
+    absolute_cos = torch.abs(ego_features[:, EGO_FEATURE_INDEX['cos_psi']]).unsqueeze(1)
+    half_extents = torch.stack((
+        0.5 * (absolute_cos * extent_x + absolute_sin * extent_y) + margin,
+        0.5 * (absolute_sin * extent_x + absolute_cos * extent_y) + margin,
+        0.5 * extent_z + margin,
+    ), dim=-1)
+    delta = centers.unsqueeze(1) - centers.unsqueeze(2)
+    gaps = torch.abs(delta) - half_extents.unsqueeze(1) - half_extents.unsqueeze(2)
+    blocks = clean_zones[..., ZONE_FEATURE_INDEX['raw_goal_path_intersects']] > 0.5
+    relations = torch.stack((
+        delta[..., 0] / builder.horizontal_span,
+        delta[..., 1] / builder.horizontal_span,
+        delta[..., 2] / builder.vertical_span,
+        torch.linalg.vector_norm(delta, dim=-1) / builder.world_diagonal,
+        gaps[..., 0] / builder.horizontal_span,
+        gaps[..., 1] / builder.horizontal_span,
+        gaps[..., 2] / builder.vertical_span,
+        torch.linalg.vector_norm(torch.relu(gaps), dim=-1) / builder.world_diagonal,
+        torch.all(gaps <= 0.0, dim=-1).to(torch.float32),
+        (right.unsqueeze(1) * right.unsqueeze(2) < 0.0).to(torch.float32),
+        (up.unsqueeze(1) * up.unsqueeze(2) < 0.0).to(torch.float32),
+        (blocks.unsqueeze(1) & blocks.unsqueeze(2)).to(torch.float32),
+    ), dim=-1)
+    pair_mask = (
+        presence_mask.unsqueeze(1)
+        & presence_mask.unsqueeze(2)
+        & ~torch.eye(
+            clean_zones.shape[1], dtype=torch.bool, device=presence_mask.device
+        ).unsqueeze(0)
+    )
+    return relations * pair_mask.unsqueeze(-1).to(relations.dtype)
 
 
 class TestPairRelationBuilder(unittest.TestCase):
@@ -101,6 +149,73 @@ class TestPairRelationBuilder(unittest.TestCase):
         self.assertIn('vertical_span', buffers)
         self.assertIn('world_diagonal', buffers)
         self.assertIn('uav_radius', buffers)
+
+    def test_compiled_relation_indices_are_derived_from_public_contract(self):
+        expected = {
+            '_ZONE_FORWARD_NORM_INDEX': ZONE_FEATURE_INDEX['zone_forward_norm'],
+            '_ZONE_RIGHT_NORM_INDEX': ZONE_FEATURE_INDEX['zone_right_norm'],
+            '_ZONE_UP_NORM_INDEX': ZONE_FEATURE_INDEX['zone_up_norm'],
+            '_EXTENT_X_NORM_INDEX': ZONE_FEATURE_INDEX['extent_x_norm'],
+            '_EXTENT_Y_NORM_INDEX': ZONE_FEATURE_INDEX['extent_y_norm'],
+            '_EXTENT_Z_NORM_INDEX': ZONE_FEATURE_INDEX['extent_z_norm'],
+            '_SAFETY_MARGIN_NORM_INDEX': ZONE_FEATURE_INDEX['safety_margin_norm'],
+            '_RAW_GOAL_PATH_INTERSECTS_INDEX': ZONE_FEATURE_INDEX['raw_goal_path_intersects'],
+            '_SIN_PSI_INDEX': EGO_FEATURE_INDEX['sin_psi'],
+            '_COS_PSI_INDEX': EGO_FEATURE_INDEX['cos_psi'],
+        }
+        self.assertEqual(
+            {name: getattr(v2_relations, name, None) for name in expected},
+            expected,
+        )
+
+    def test_compute_relations_matches_independent_reference_and_gradients(self):
+        for counts in ([0], [0, 3, 7]):
+            with self.subTest(counts=counts):
+                batch_size = len(counts)
+                zone_count = max(counts)
+                ego = self.ego(
+                    sin_psi=math.sin(0.4),
+                    cos_psi=math.cos(0.4),
+                    batch_size=batch_size,
+                )
+                zones = torch.zeros(
+                    (batch_size, zone_count, ZONE_FEATURE_DIM),
+                    dtype=torch.float32,
+                )
+                mask = torch.zeros((batch_size, zone_count), dtype=torch.bool)
+                for batch_index, count in enumerate(counts):
+                    mask[batch_index, :count] = True
+                    for index in range(count):
+                        zones[batch_index, index] = self.zone(
+                            forward=-15.0 + 6.0 * index,
+                            right=(-1.0) ** index * (2.0 + index),
+                            up=-3.0 + index,
+                            extent_x=4.0 + index,
+                            extent_y=3.0 + 0.5 * index,
+                            extent_z=5.0 + index,
+                            margin=0.5,
+                            blocks=index % 2 == 0,
+                        )
+                expected_ego = ego.clone().requires_grad_()
+                actual_ego = ego.clone().requires_grad_()
+                expected_zones = zones.clone().requires_grad_()
+                actual_zones = zones.clone().requires_grad_()
+                expected_clean = torch.where(
+                    mask.unsqueeze(-1), expected_zones, torch.zeros_like(expected_zones)
+                )
+                actual_clean = torch.where(
+                    mask.unsqueeze(-1), actual_zones, torch.zeros_like(actual_zones)
+                )
+                expected = _reference_compute_relations(
+                    self.builder, expected_ego, expected_clean, mask
+                )
+                actual = self.builder.compute_relations(actual_ego, actual_clean, mask)
+                torch.testing.assert_close(actual, expected)
+                if zone_count:
+                    expected.square().sum().backward()
+                    actual.square().sum().backward()
+                    torch.testing.assert_close(actual_ego.grad, expected_ego.grad)
+                    torch.testing.assert_close(actual_zones.grad, expected_zones.grad)
 
     def test_two_zone_relation_matches_hand_calculation_at_yaw_zero(self):
         zones = torch.stack(

@@ -18,6 +18,20 @@ from .v2_contract import (
 )
 
 
+_ZONE_FORWARD_NORM_INDEX = int(ZONE_FEATURE_INDEX['zone_forward_norm'])
+_ZONE_RIGHT_NORM_INDEX = int(ZONE_FEATURE_INDEX['zone_right_norm'])
+_ZONE_UP_NORM_INDEX = int(ZONE_FEATURE_INDEX['zone_up_norm'])
+_EXTENT_X_NORM_INDEX = int(ZONE_FEATURE_INDEX['extent_x_norm'])
+_EXTENT_Y_NORM_INDEX = int(ZONE_FEATURE_INDEX['extent_y_norm'])
+_EXTENT_Z_NORM_INDEX = int(ZONE_FEATURE_INDEX['extent_z_norm'])
+_SAFETY_MARGIN_NORM_INDEX = int(ZONE_FEATURE_INDEX['safety_margin_norm'])
+_RAW_GOAL_PATH_INTERSECTS_INDEX = int(
+    ZONE_FEATURE_INDEX['raw_goal_path_intersects']
+)
+_SIN_PSI_INDEX = int(EGO_FEATURE_INDEX['sin_psi'])
+_COS_PSI_INDEX = int(EGO_FEATURE_INDEX['cos_psi'])
+
+
 PAIR_RELATION_FEATURE_NAMES = (
     'delta_forward_norm',
     'delta_right_norm',
@@ -198,41 +212,41 @@ class PairRelationBuilder(nn.Module):
         zone_count = clean_zones.shape[1]
 
         forward = (
-            clean_zones[..., ZONE_FEATURE_INDEX['zone_forward_norm']]
+            clean_zones[..., _ZONE_FORWARD_NORM_INDEX]
             * self.horizontal_span
         )
         right = (
-            clean_zones[..., ZONE_FEATURE_INDEX['zone_right_norm']]
+            clean_zones[..., _ZONE_RIGHT_NORM_INDEX]
             * self.horizontal_span
         )
         up = (
-            clean_zones[..., ZONE_FEATURE_INDEX['zone_up_norm']]
+            clean_zones[..., _ZONE_UP_NORM_INDEX]
             * self.vertical_span
         )
         centers = torch.stack((forward, right, up), dim=-1)
 
         extent_x = (
-            clean_zones[..., ZONE_FEATURE_INDEX['extent_x_norm']]
+            clean_zones[..., _EXTENT_X_NORM_INDEX]
             * self.horizontal_span
         )
         extent_y = (
-            clean_zones[..., ZONE_FEATURE_INDEX['extent_y_norm']]
+            clean_zones[..., _EXTENT_Y_NORM_INDEX]
             * self.horizontal_span
         )
         extent_z = (
-            clean_zones[..., ZONE_FEATURE_INDEX['extent_z_norm']]
+            clean_zones[..., _EXTENT_Z_NORM_INDEX]
             * self.vertical_span
         )
         margin = (
-            clean_zones[..., ZONE_FEATURE_INDEX['safety_margin_norm']]
+            clean_zones[..., _SAFETY_MARGIN_NORM_INDEX]
             * self.world_diagonal
             + self.uav_radius
         )
         absolute_sin = torch.abs(
-            ego_features[:, EGO_FEATURE_INDEX['sin_psi']]
+            ego_features[:, _SIN_PSI_INDEX]
         ).unsqueeze(1)
         absolute_cos = torch.abs(
-            ego_features[:, EGO_FEATURE_INDEX['cos_psi']]
+            ego_features[:, _COS_PSI_INDEX]
         ).unsqueeze(1)
         half_forward = (
             0.5 * (absolute_cos * extent_x + absolute_sin * extent_y)
@@ -266,7 +280,7 @@ class PairRelationBuilder(nn.Module):
         straddles_up = up.unsqueeze(1) * up.unsqueeze(2) < 0.0
         blocks = (
             clean_zones[
-                ..., ZONE_FEATURE_INDEX['raw_goal_path_intersects']
+                ..., _RAW_GOAL_PATH_INTERSECTS_INDEX
             ]
             > 0.5
         )

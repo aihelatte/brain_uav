@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import torch
+import brain_uav.observations.v2_relations as v2_relations
 
 from brain_uav.models import (
     RelationAttentionBlock,
@@ -182,6 +183,11 @@ def _reference_pooling_forward(
     if return_attention_weights:
         return summary, weights
     return summary
+
+
+class _ForbiddenIndexLookup:
+    def __getitem__(self, key):
+        raise AssertionError(f'compiled relation path looked up {key!r}')
 
 
 class TestZoneSetEncoder(unittest.TestCase):
@@ -1363,6 +1369,23 @@ class TestZoneSetEncoder(unittest.TestCase):
                     actual_loss.backward()
                     torch.testing.assert_close(compiled_inputs[0].grad, eager_inputs[0].grad)
                     torch.testing.assert_close(compiled_inputs[2].grad, eager_inputs[2].grad)
+
+    def test_compiled_shared_relations_do_not_access_contract_mappings_during_trace(self):
+        inputs = self.inputs([0, 3, 7])
+        torch._dynamo.reset()
+        self.model.enable_compiled_shared_relations(
+            backend='eager', fullgraph=True, dynamic=True
+        )
+        try:
+            with mock.patch.object(
+                v2_relations, 'ZONE_FEATURE_INDEX', _ForbiddenIndexLookup()
+            ), mock.patch.object(
+                v2_relations, 'EGO_FEATURE_INDEX', _ForbiddenIndexLookup()
+            ):
+                shared = self.model.build_shared_relations(*inputs)
+        except Exception as exc:
+            self.fail(f'compiled relation tracing accessed a contract mapping: {exc}')
+        self.assertEqual(shared.pair_relations.shape, (3, 7, 7, 12))
 
     def test_compiled_shared_relations_do_not_reuse_a_previous_batch(self):
         with mock.patch(
