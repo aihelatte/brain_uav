@@ -463,6 +463,7 @@ class V2ExperimentReporter:
         self._window_rows: list[dict[str, Any]] = []
         self._pending_episodes: list[dict[str, Any]] = []
         self._selector = V2TrainingTrajectorySelector(max_steps=max_steps)
+        self._max_steps = max_steps
         self._pending_candidate: int | None = None
         self._pending_validation_global_steps: int | None = None
         self._validation_writer: _JsonlWriter | None = None
@@ -482,10 +483,17 @@ class V2ExperimentReporter:
             'report_directory': str(self.output_dir), **dict(metadata),
         }
         _write_json(self.output_dir / 'stage_start.json', startup)
+        initialization = metadata.get('initialization_source', {})
+        source = (
+            'BC checkpoint' if initialization.get('kind') == 'v2_bc_best'
+            else 'predecessor passed checkpoint'
+        )
         print(f"[V2 {self.model_type.upper()} {self.stage}] start "
               f"requested_device={metadata.get('requested_device')} "
               f"resolved_device={metadata.get('resolved_device')} "
               f"max_steps={metadata.get('max_steps')} "
+              f"loading_existing_model={source} "
+              f"initialization={initialization.get('path')} "
               f"checkpoint={metadata.get('checkpoint_output')} "
               f"episodes={self.output_dir / 'episodes.jsonl'} "
               f"images={self.output_dir / 'trajectories'}")
@@ -495,7 +503,7 @@ class V2ExperimentReporter:
         now = self._clock()
         if now - self._last_console < self._interval:
             return False
-        print(f"[V2 {self.model_type.upper()} {self.stage}] progress "
+        print(f"[V2 {self.model_type.upper()} {self.stage}] progress unfinished_episode "
               f"stage_steps={stage_steps} episodes={completed_episodes} "
               f"current_episode_steps={current_episode_steps} "
               f"elapsed={now - self._stage_started:.1f}s "
@@ -519,6 +527,15 @@ class V2ExperimentReporter:
         persisted['stage_elapsed_seconds'] = now - self._stage_started
         self._episodes.append(persisted)
         self._pending_episodes.append(persisted)
+        print(
+            f"[V2 {self.model_type.upper()} {self.stage}] "
+            f"episode={record['episode']} | step={record['stage_steps']}/{self._max_steps} "
+            f"| length={record['episode_length']} | outcome={record['outcome']} "
+            f"| return={record['episode_return']:.2f} "
+            f"| episode_time={persisted['episode_elapsed_seconds']:.2f}s "
+            f"| actor={record.get('actor_update_status', 'not_updated')}",
+            flush=True,
+        )
         selection = self._selector.select(
             episode=int(record['episode']), stage_steps=int(record['stage_steps']),
             outcome=str(record['outcome']))

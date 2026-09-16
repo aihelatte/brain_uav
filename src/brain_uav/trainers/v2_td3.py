@@ -1106,6 +1106,7 @@ class V2TD3UpdateEngine:
         dynamic: bool = True,
     ) -> tuple[str]:
         self.critic1.zone_set_encoder.enable_compiled_tensor_forward(
+            role='critic_guidance',
             backend=backend,
             mode=mode,
             fullgraph=fullgraph,
@@ -1299,6 +1300,7 @@ class V2TD3UpdateEngine:
                 enabled.append(f'{name}.full_forward')
             else:
                 actor.zone_set_encoder.enable_compiled_tensor_forward(
+                    role='online_actor' if name == 'actor' else 'bc_reference',
                     backend=backend,
                     mode=mode,
                     fullgraph=fullgraph,
@@ -1767,6 +1769,7 @@ class V2TD3UpdateEngine:
             ('critic2_target.zone_set_encoder', self.critic2_target),
         ):
             target.zone_set_encoder.enable_compiled_tensor_forward(
+                role='target_actor' if target is self.actor_target else None,
                 backend=backend,
                 mode=mode,
                 fullgraph=fullgraph,
@@ -1786,6 +1789,7 @@ class V2TD3UpdateEngine:
         if not isinstance(self.actor_target, V2SNNPolicyActor):
             raise ValueError('SNN target encoder compilation requires an SNN actor.')
         self.actor_target.zone_set_encoder.enable_compiled_tensor_forward(
+            role='target_actor',
             backend=backend,
             mode=mode,
             fullgraph=fullgraph,

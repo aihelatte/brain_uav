@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import csv
+from contextlib import redirect_stdout
+from io import StringIO
+from unittest import mock
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -134,6 +137,54 @@ class TestV2TrajectorySelectors(unittest.TestCase):
 
 
 class TestV2ReportingPersistence(unittest.TestCase):
+    def test_episode_console_fields_and_initialization_preserve_jsonl(self) -> None:
+        for model, stage, kind in (
+            ('ann', 'easy', 'v2_bc_best'),
+            ('snn', 'medium', 'validated_v2_td3_stage'),
+        ):
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as directory:
+                clock = _Clock()
+                reporter = V2ExperimentReporter(
+                    Path(directory), stage=stage, model_type=model,
+                    scenario=ScenarioConfig(), rewards=RewardConfig(),
+                    uav_collision_radius=0.0, max_steps=100, clock=clock,
+                )
+                output = StringIO()
+                with redirect_stdout(output), mock.patch(
+                    'brain_uav.trainers.v2_reporting.export_v2_trajectory_views',
+                ):
+                    reporter.start_stage({'initialization_source': {
+                        'kind': kind, 'path': '/existing/model.pt',
+                    }})
+                    reporter.begin_episode()
+                    clock.value = 42.18
+                    record = _episode(12, 'goal', 68)
+                    reporter.record_episode(
+                        record, scenario_payload=_scenario_payload([]),
+                        trajectory=[], actions=[], terminal_state=[],
+                    )
+                    clock.value = 61.0
+                    reporter.maybe_report_progress(
+                        stage_steps=69, completed_episodes=12,
+                        current_episode_steps=1, actor_active=True,
+                    )
+                text = output.getvalue()
+                self.assertIn('initialization=/existing/model.pt', text)
+                self.assertIn('loading_existing_model=' + (
+                    'BC checkpoint' if stage == 'easy' else 'predecessor passed checkpoint'
+                ), text)
+                self.assertIn(
+                    f'[{"V2 " + model.upper()} {stage}] episode=12 | step=68/100 '
+                    '| length=1 | outcome=goal | return=12.00 '
+                    '| episode_time=42.18s | actor=updated', text,
+                )
+                self.assertIn('progress unfinished_episode', text)
+                saved = json.loads((Path(directory) / 'episodes.jsonl').read_text())
+                self.assertEqual(saved['episode_elapsed_seconds'], 42.18)
+                for name, value in record.items():
+                    self.assertEqual(saved[name], value)
+                reporter.close()
+
     def test_episode_window_and_progress_records_flush_without_waiting(self) -> None:
         clock = _Clock()
         with tempfile.TemporaryDirectory() as directory:

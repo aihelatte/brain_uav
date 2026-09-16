@@ -523,11 +523,22 @@ class ZoneSetEncoder(nn.Module):
         mode: str = 'default',
         fullgraph: bool = True,
         dynamic: bool = True,
+        role: str | None = None,
     ) -> None:
         if self.compiled_tensor_forward_enabled:
             raise RuntimeError('ZoneSetEncoder tensor forward is already compiled.')
+        # Separate top-level code objects keep role-specific Dynamo budgets apart.
+        tensor_forward = (
+            self._compute_policy_context_tensors if role is None
+            else {
+                'online_actor': self._online_actor_context_tensors,
+                'bc_reference': self._bc_reference_context_tensors,
+                'target_actor': self._target_actor_context_tensors,
+                'critic_guidance': self._critic_guidance_context_tensors,
+            }[role]
+        )
         compiled = torch.compile(
-            self._compute_policy_context_tensors,
+            tensor_forward,
             backend=backend,
             mode=mode,
             fullgraph=fullgraph,
@@ -540,6 +551,18 @@ class ZoneSetEncoder(nn.Module):
             'fullgraph': bool(fullgraph),
             'dynamic': bool(dynamic),
         }
+
+    def _online_actor_context_tensors(self, *arguments: torch.Tensor) -> torch.Tensor:
+        return self._compute_policy_context_tensors(*arguments)
+
+    def _bc_reference_context_tensors(self, *arguments: torch.Tensor) -> torch.Tensor:
+        return self._compute_policy_context_tensors(*arguments)
+
+    def _target_actor_context_tensors(self, *arguments: torch.Tensor) -> torch.Tensor:
+        return self._compute_policy_context_tensors(*arguments)
+
+    def _critic_guidance_context_tensors(self, *arguments: torch.Tensor) -> torch.Tensor:
+        return self._compute_policy_context_tensors(*arguments)
 
     @contextmanager
     def eager_tensor_forward(self) -> Iterator[None]:

@@ -294,7 +294,7 @@ class TestV2SNNTD3(unittest.TestCase):
         encoder = engine.actor.zone_set_encoder
         training_code = inspect.unwrap(encoder._compiled_tensor_forward).__code__
         inference_code = inspect.unwrap(engine._compiled_action_inference).__code__
-        self.assertIs(training_code, encoder._compute_policy_context_tensors.__code__)
+        self.assertIs(training_code, encoder._online_actor_context_tensors.__code__)
         self.assertIsNot(inference_code, training_code)
 
         for count in (0, 6):
@@ -352,6 +352,48 @@ class TestV2SNNTD3(unittest.TestCase):
             engine.actor.snn_head.lif1.v, torch.tensor([3.0])
         )
         self.assertEqual(engine.actor.snn_head.lif2.v, 4.0)
+
+    def test_snn_formal_compile_roles_have_separate_code_and_warmup(self) -> None:
+        engine = self.make_engine(bc=self.make_actor(time_window=4), time_window=4)
+        engine.configure_compilation(
+            compile_actors=True, compile_critic_block=True,
+            compile_target_block=True, compile_snn_target_encoder=True,
+            frozen_critic_strategy='compiled_no_grad_context', backend='eager',
+        )
+        encoders = (
+            engine.actor.zone_set_encoder, engine.bc_reference_actor.zone_set_encoder,
+            engine.actor_target.zone_set_encoder, engine.critic1.zone_set_encoder,
+        )
+        codes = tuple(inspect.unwrap(e._compiled_tensor_forward).__code__ for e in encoders)
+        self.assertEqual(len(set(codes)), 4)
+        self.assertTrue(all(c is not encoders[0]._compute_policy_context_tensors.__code__ for c in codes))
+        batches = tuple(collate_v2_observations([
+            _observation(count, self.scales), _observation(count, self.scales),
+        ]) for count in (0, 6, 10))
+        before = deepcopy(engine.actor.state_dict())
+        engine.warmup_actor_compile(batches)
+        engine.warmup_full_compile(batches)
+        for name, value in engine.actor.state_dict().items():
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+        self.assertEqual(engine.update_count, 0)
+        self.assertEqual(engine.actor_optimizer.state, {})
+        observation = batches[1]
+        actions = torch.zeros((2, 2), requires_grad=True)
+        with engine._actor_critic_guidance(
+            observation, shared_relations=engine._build_shared_relations(observation),
+            profile_sections=False,
+        ) as context:
+            engine.critic1.forward_from_context(context, actions).sum().backward()
+        self.assertIsNotNone(actions.grad)
+        self.assertTrue(torch.isfinite(actions.grad).all())
+        metrics = engine.update_once(total_steps=1, bc_lambda=1.75)
+        self.assertTrue(metrics.actor_updated)
+        self.assertTrue(any(p.grad is not None for p in engine.actor.parameters()))
+        self.assertTrue(any(p.grad is not None for p in engine.critic1.parameters()))
+        for frozen in (engine.actor_target, engine.bc_reference_actor):
+            self.assertTrue(all(not p.requires_grad and p.grad is None for p in frozen.parameters()))
+        self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+        self.assertEqual(engine.actor_target.snn_head.lif2.v, 0.0)
 
     def test_snn_full_target_scope_keeps_lif_actor_eager(self) -> None:
         engine = self.make_engine(bc=self.make_actor())
