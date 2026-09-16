@@ -192,15 +192,18 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertFalse(args.compile_snn_target_encoder)
         self.assertFalse(args.fused_adam)
         self.assertFalse(args.compile_actor_loss)
+        self.assertFalse(args.compile_action_inference)
         self.assertFalse(args.aggregate_relation_values_first)
         enabled_optimizations = parser.parse_args([
             '--stage', 'easy', '--init-checkpoint', 'x',
             '--output', 'x', '--metrics-out', 'x', '--validation-pool', 'x',
             '--fused-adam', '--compile-actor-loss',
+            '--compile-action-inference',
             '--aggregate-relation-values-first',
         ])
         self.assertTrue(enabled_optimizations.fused_adam)
         self.assertTrue(enabled_optimizations.compile_actor_loss)
+        self.assertTrue(enabled_optimizations.compile_action_inference)
         self.assertTrue(enabled_optimizations.aggregate_relation_values_first)
         with self.assertRaises(SystemExit):
             parser.parse_args([
@@ -249,12 +252,19 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             warmup_actor_loss_compile=lambda batches: calls.append(
                 ('actor_loss_warmup', len(batches))
             ),
+            warmup_action_inference_compile=lambda batches: calls.append(
+                ('action_inference_warmup', len(batches))
+            ),
         )
-        fake_batch = SimpleNamespace(
-            batch_size=2,
-            zone_features=torch.zeros((2, 7, 22)),
-            to=lambda device: fake_batch,
-        )
+        def fake_collate(observations):
+            zone_count = max(0 if value == 'zero' else 7 for value in observations)
+            batch = SimpleNamespace(
+                batch_size=len(observations),
+                zone_features=torch.zeros((len(observations), zone_count, 19)),
+                max_zone_count=zone_count,
+            )
+            batch.to = lambda device: batch
+            return batch
         prepared = SimpleNamespace(
             scenario_config=ScenarioConfig(),
             reward_config=RewardConfig(),
@@ -265,13 +275,13 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             scenarios=({'payload': {'zones': []}}, {'payload': {'zones': [1] * 7}}),
         )
         warmup_env = mock.Mock()
-        warmup_env.reset.return_value = ('observation', {})
+        warmup_env.reset.side_effect = (('zero', {}), ('seven', {}))
         with mock.patch(
             'brain_uav.scripts.train_v2_td3.V2StaticNoFlyTrajectoryEnv',
             return_value=warmup_env,
         ), mock.patch(
             'brain_uav.scripts.train_v2_td3.collate_v2_observations',
-            return_value=fake_batch,
+            side_effect=fake_collate,
         ):
             metadata = _configure_stage_compilation(
                 engine,
@@ -286,28 +296,33 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 compile_shared_relations=True,
                 compile_snn_target_encoder=True,
                 compile_actor_loss=True,
+                compile_action_inference=True,
             )
         self.assertEqual(
             [entry[0] for entry in calls],
             [
                 'configure', 'actor_warmup', 'shared_warmup',
                 'full_warmup', 'actor_loss_warmup',
+                'action_inference_warmup',
             ],
         )
         self.assertTrue(calls[0][1]['compile_shared_relations'])
         self.assertTrue(calls[0][1]['compile_snn_target_encoder'])
         self.assertTrue(calls[0][1]['compile_actor_loss'])
+        self.assertTrue(calls[0][1]['compile_action_inference'])
+        self.assertEqual(metadata['action_inference_warmup_shapes'], [[1, 0], [1, 7]])
         self.assertTrue(metadata['requested'])
-        self.assertEqual(metadata['warmup_batch_shapes'], [[2, 7]] * 3)
+        self.assertEqual(metadata['warmup_batch_shapes'], [[2, 0], [2, 7], [2, 7]])
         self.assertFalse(metadata['cuda_graph'])
 
         calls.clear()
+        warmup_env.reset.side_effect = (('zero', {}), ('seven', {}))
         with mock.patch(
             'brain_uav.scripts.train_v2_td3.V2StaticNoFlyTrajectoryEnv',
             return_value=warmup_env,
         ), mock.patch(
             'brain_uav.scripts.train_v2_td3.collate_v2_observations',
-            return_value=fake_batch,
+            side_effect=fake_collate,
         ):
             _configure_stage_compilation(
                 engine,

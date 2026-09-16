@@ -12,7 +12,7 @@ from typing import Any
 from brain_uav.config import RewardConfig, ScenarioConfig
 from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
 from brain_uav.models import V2SNNPolicyActor, require_v2_spikingjelly
-from brain_uav.observations import collate_v2_observations
+from brain_uav.observations import V2ObservationBatch, collate_v2_observations
 from brain_uav.scripts.common import DEVICE_CHOICES, resolve_training_device
 from brain_uav.trainers.v2_formal_training import (
     V2FormalStageTrainer,
@@ -58,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--compile-snn-target-encoder', action='store_true')
     parser.add_argument('--fused-adam', action='store_true')
     parser.add_argument('--compile-actor-loss', action='store_true')
+    parser.add_argument('--compile-action-inference', action='store_true')
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument('--compile-actors', action='store_true')
     parser.add_argument(
@@ -100,12 +101,14 @@ def _configure_stage_compilation(
     compile_shared_relations: bool = False,
     compile_snn_target_encoder: bool = False,
     compile_actor_loss: bool = False,
+    compile_action_inference: bool = False,
 ) -> dict[str, Any]:
     requested = any((
         compile_critic_encoder, compile_target_encoders, compile_actors,
         compile_critic_block, compile_target_block,
         compile_shared_relations, compile_snn_target_encoder,
         compile_actor_loss,
+        compile_action_inference,
     ))
     if not requested:
         if frozen_critic_strategy != 'eager':
@@ -127,6 +130,8 @@ def _configure_stage_compilation(
                 else 'project_then_aggregate'
             ),
             'actor_loss_granularity': 'eager',
+            'action_inference_granularity': 'eager',
+            'action_inference_warmup_shapes': [],
             'registration_wall_seconds': 0.0,
             'warmup_wall_seconds': 0.0,
             'warmup_batch_shapes': [],
@@ -142,6 +147,7 @@ def _configure_stage_compilation(
         compile_shared_relations=compile_shared_relations,
         compile_snn_target_encoder=compile_snn_target_encoder,
         compile_actor_loss=compile_actor_loss,
+        compile_action_inference=compile_action_inference,
         backend='inductor', mode='default', fullgraph=True, dynamic=True,
     )
     metadata['requested'] = True
@@ -172,6 +178,20 @@ def _configure_stage_compilation(
             for index in range(engine.batch_size)
         ]).to(engine.device))
     warmup_batches = tuple(batches)
+    action_inference_batches = tuple(
+        collate_v2_observations([observation]).to(engine.device)
+        for observation in observations
+    )
+    if action_inference_batches and all(
+        batch.max_zone_count != 0 for batch in action_inference_batches
+    ):
+        first = action_inference_batches[0]
+        action_inference_batches = (V2ObservationBatch(
+            ego_features=first.ego_features,
+            goal_features=first.goal_features,
+            zone_features=first.zone_features[:, :0, :],
+            presence_mask=first.presence_mask[:, :0],
+        ), *action_inference_batches)
     metadata['warmup_batch_shapes'] = [
         [batch.batch_size, int(batch.zone_features.shape[1])]
         for batch in warmup_batches
@@ -191,6 +211,12 @@ def _configure_stage_compilation(
         engine.warmup_snn_target_encoder_compile(warmup_batches)
     if compile_actor_loss:
         engine.warmup_actor_loss_compile(warmup_batches)
+    if compile_action_inference:
+        engine.warmup_action_inference_compile(action_inference_batches)
+        metadata['action_inference_warmup_shapes'] = [
+            [batch.batch_size, int(batch.zone_features.shape[1])]
+            for batch in action_inference_batches
+        ]
     metadata['warmup_wall_seconds'] = perf_counter() - warmup_started
     return metadata
 
@@ -231,6 +257,7 @@ def run_v2_td3_stage(
     compile_snn_target_encoder: bool = False,
     fused_adam: bool = False,
     compile_actor_loss: bool = False,
+    compile_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
 ) -> dict[str, Any]:
     requested_device = device
@@ -326,6 +353,7 @@ def run_v2_td3_stage(
         compile_shared_relations=compile_shared_relations,
         compile_snn_target_encoder=compile_snn_target_encoder,
         compile_actor_loss=compile_actor_loss,
+        compile_action_inference=compile_action_inference,
     )
     reporter = (
         V2ExperimentReporter(
@@ -528,6 +556,7 @@ def main(argv: list[str] | None = None) -> int:
         compile_snn_target_encoder=args.compile_snn_target_encoder,
         fused_adam=args.fused_adam,
         compile_actor_loss=args.compile_actor_loss,
+        compile_action_inference=args.compile_action_inference,
         aggregate_relation_values_first=args.aggregate_relation_values_first,
     )
     print(json.dumps(summary, indent=2, allow_nan=False))

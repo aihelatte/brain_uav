@@ -6,6 +6,7 @@ from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from math import isfinite, pi
+import random
 from time import perf_counter
 from typing import Any, Callable, Iterator, Sequence
 
@@ -485,6 +486,8 @@ class V2TD3UpdateEngine:
         self._compiled_target_block: Callable[..., tuple[torch.Tensor, ...]] | None = None
         self._compiled_target_critic_td: Callable[..., tuple[torch.Tensor, ...]] | None = None
         self._compiled_actor_loss: Callable[..., tuple[torch.Tensor, ...]] | None = None
+        self._compiled_action_inference: Callable[..., torch.Tensor] | None = None
+        self._compiled_action_inference_config: dict[str, object] | None = None
 
     def enable_actor_loss_compile(
         self,
@@ -863,6 +866,7 @@ class V2TD3UpdateEngine:
         compile_shared_relations: bool = False,
         compile_snn_target_encoder: bool = False,
         compile_actor_loss: bool = False,
+        compile_action_inference: bool = False,
         backend: str = 'inductor',
         mode: str = 'default',
         fullgraph: bool = True,
@@ -915,6 +919,8 @@ class V2TD3UpdateEngine:
             enabled.extend(self.enable_shared_relations_compile(**options))
         if compile_actor_loss:
             enabled.extend(self.enable_actor_loss_compile(**options))
+        if compile_action_inference:
+            enabled.extend(self.enable_action_inference_compile(**options))
         if compile_critic_block:
             enabled.extend(self.enable_critic_loss_compile(**options))
         elif compile_critic_encoder:
@@ -955,6 +961,11 @@ class V2TD3UpdateEngine:
             'actor_loss_granularity': (
                 'tensor_block' if compile_actor_loss else 'eager'
             ),
+            'action_inference_granularity': (
+                ('ann_full_forward' if isinstance(self.actor, V2ANNPolicyActor)
+                 else 'snn_encoder')
+                if compile_action_inference else 'eager'
+            ),
             'optimizer_execution': (
                 'fused_adam' if all(
                     group.get('fused') is True
@@ -967,7 +978,9 @@ class V2TD3UpdateEngine:
                 else 'project_then_aggregate'
             ),
             'frozen_critic_strategy': frozen_critic_strategy,
-            'select_action_execution': 'eager',
+            'select_action_execution': (
+                'compiled' if compile_action_inference else 'eager'
+            ),
             'backend': backend,
             'mode': mode,
             'fullgraph': fullgraph,
@@ -1246,6 +1259,120 @@ class V2TD3UpdateEngine:
                 )
                 enabled.append(f'{name}.zone_set_encoder')
         return tuple(enabled)
+
+    def enable_action_inference_compile(
+        self,
+        *,
+        backend: str = 'inductor',
+        mode: str = 'default',
+        fullgraph: bool = True,
+        dynamic: bool = True,
+    ) -> tuple[str, ...]:
+        if self._compiled_action_inference is not None:
+            raise RuntimeError('Action inference is already compiled.')
+        if isinstance(self.actor, V2ANNPolicyActor):
+            tensor_forward = self.actor._compute_full_forward_tensors
+            enabled = 'actor.action_inference_full_forward'
+        else:
+            tensor_forward = self.actor.zone_set_encoder._compute_policy_context_tensors
+            enabled = 'actor.action_inference_encoder'
+        self._compiled_action_inference = torch.compile(
+            tensor_forward,
+            backend=backend,
+            mode=mode,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+        )
+        self._compiled_action_inference_config = {
+            'backend': backend,
+            'mode': mode,
+            'fullgraph': bool(fullgraph),
+            'dynamic': bool(dynamic),
+        }
+        return (enabled,)
+
+    def _action_inference_tensor(self, batch: V2ObservationBatch) -> torch.Tensor:
+        if self._compiled_action_inference is None:
+            actor_eager_context = (
+                self.actor.eager_full_forward()
+                if isinstance(self.actor, V2ANNPolicyActor)
+                else self.actor.zone_set_encoder.eager_tensor_forward()
+            )
+            with actor_eager_context:
+                return self.actor(batch)
+        if isinstance(self.actor, V2ANNPolicyActor):
+            with self.actor.zone_set_encoder.eager_tensor_forward():
+                arguments = self.actor.zone_set_encoder.prepare_tensor_forward_arguments(
+                    batch.ego_features,
+                    batch.goal_features,
+                    batch.zone_features,
+                    batch.presence_mask,
+                )
+            return self._compiled_action_inference(*arguments)
+        with self.actor.reset_state_context():
+            with self.actor.zone_set_encoder.eager_tensor_forward():
+                arguments = self.actor.zone_set_encoder.prepare_tensor_forward_arguments(
+                    batch.ego_features,
+                    batch.goal_features,
+                    batch.zone_features,
+                    batch.presence_mask,
+                )
+            context = self._compiled_action_inference(*arguments)
+            return self.actor.action_from_context(context)
+
+    def warmup_action_inference_compile(
+        self,
+        batches: Sequence[V2ObservationBatch],
+    ) -> None:
+        if self._compiled_action_inference is None:
+            raise RuntimeError('Action inference must be compiled first.')
+        warmup_batches = tuple(batches)
+        if not warmup_batches:
+            raise ValueError('At least one action inference warmup batch is required.')
+        if any(not isinstance(batch, V2ObservationBatch) for batch in warmup_batches):
+            raise TypeError('Action inference warmup batches must be V2ObservationBatch values.')
+        if any(batch.batch_size != 1 for batch in warmup_batches):
+            raise ValueError('Action inference warmup requires batch size 1.')
+        python_rng = random.getstate()
+        torch_rng = torch.random.get_rng_state()
+        numpy_rng = np.random.get_state()
+        cuda_rng = (
+            torch.cuda.get_rng_state_all() if self.device.type == 'cuda' else None
+        )
+        snn_memories = (
+            tuple(
+                (module, name, value.detach().clone() if isinstance(value, torch.Tensor)
+                 else deepcopy(value))
+                for module in self.actor.snn_head.modules()
+                if hasattr(module, 'named_memories')
+                for name, value in module.named_memories()
+            )
+            if isinstance(self.actor, V2SNNPolicyActor) else ()
+        )
+        counts_before = (
+            self.update_count, self.critic_update_count,
+            self.critic_target_update_count, self.actor_update_count,
+            self.last_total_steps,
+        )
+        try:
+            with torch.inference_mode():
+                for batch in warmup_batches:
+                    self._action_inference_tensor(batch.to(self.device))
+        finally:
+            random.setstate(python_rng)
+            torch.random.set_rng_state(torch_rng)
+            np.random.set_state(numpy_rng)
+            if cuda_rng is not None:
+                torch.cuda.set_rng_state_all(cuda_rng)
+            for module, name, value in snn_memories:
+                setattr(module, name, value)
+        counts_after = (
+            self.update_count, self.critic_update_count,
+            self.critic_target_update_count, self.actor_update_count,
+            self.last_total_steps,
+        )
+        if counts_after != counts_before:
+            raise RuntimeError('Action inference warmup must not change TD3 counters.')
 
     def warmup_actor_compile(
         self,
@@ -2467,14 +2594,8 @@ class V2TD3UpdateEngine:
         ):
             raise TypeError('exploration_rng must be a numpy.random.Generator.')
         batch = collate_v2_observations([observation]).to(self.device)
-        actor_eager_context = (
-            self.actor.eager_full_forward()
-            if isinstance(self.actor, V2ANNPolicyActor)
-            else self.actor.zone_set_encoder.eager_tensor_forward()
-        )
-        with actor_eager_context:
-            with torch.inference_mode():
-                action = self.actor(batch).detach().cpu().numpy()[0]
+        with torch.inference_mode():
+            action = self._action_inference_tensor(batch).detach().cpu().numpy()[0]
         if noise_scale > 0.0:
             noise_source = exploration_rng if exploration_rng is not None else np.random
             action = action + noise_source.normal(

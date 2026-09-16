@@ -115,6 +115,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertFalse(args.compile_snn_target_encoder)
         self.assertFalse(args.fused_adam)
         self.assertFalse(args.compile_actor_loss)
+        self.assertFalse(args.compile_action_inference)
         self.assertFalse(args.aggregate_relation_values_first)
 
     def test_snn_curriculum_uses_distinct_outputs_and_forwards_model_contract(self):
@@ -178,6 +179,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                     compile_snn_target_encoder=True,
                     fused_adam=True,
                     compile_actor_loss=True,
+                    compile_action_inference=True,
                     aggregate_relation_values_first=True,
                 )
         initializer.assert_called_once()
@@ -197,6 +199,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertTrue(calls[0]['compile_snn_target_encoder'])
         self.assertTrue(calls[0]['fused_adam'])
         self.assertTrue(calls[0]['compile_actor_loss'])
+        self.assertTrue(calls[0]['compile_action_inference'])
         self.assertTrue(calls[0]['aggregate_relation_values_first'])
         self.assertIs(calls[0]['prepared_initialization'], prepared)
         self.assertEqual(Path(calls[0]['output']).name, 'v2_snn_td3_easy.pt')
@@ -209,6 +212,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertTrue(result['compilation_request']['compile_snn_target_encoder'])
         self.assertTrue(result['compilation_request']['fused_adam'])
         self.assertTrue(result['compilation_request']['compile_actor_loss'])
+        self.assertTrue(result['compilation_request']['compile_action_inference'])
         self.assertTrue(result['compilation_request']['aggregate_relation_values_first'])
         self.assertEqual(result['snn'], {
             'time_window': actor.time_window,

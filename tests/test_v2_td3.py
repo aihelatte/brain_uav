@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import ExitStack
 from contextlib import contextmanager
 import math
+import random
 import unittest
 from copy import deepcopy
 from dataclasses import asdict, replace
@@ -1667,6 +1668,7 @@ class TestV2TD3(unittest.TestCase):
         ):
             metadata = engine.configure_compilation(
                 compile_actors=True,
+                compile_action_inference=True,
                 frozen_critic_strategy='compiled_no_grad_context',
                 compile_critic_block=True,
                 compile_target_block=True,
@@ -1675,7 +1677,10 @@ class TestV2TD3(unittest.TestCase):
         self.assertEqual(metadata['target_granularity'], 'full_tensor_block')
         self.assertEqual(metadata['actor_granularity'], 'ann_full_forward_or_snn_encoder')
         self.assertEqual(metadata['frozen_critic_strategy'], 'compiled_no_grad_context')
-        self.assertEqual(metadata['select_action_execution'], 'eager')
+        self.assertEqual(metadata['select_action_execution'], 'compiled')
+        self.assertIn(
+            'actor.action_inference_full_forward', metadata['enabled_objects']
+        )
         self.assertFalse(metadata['cuda_graph'])
         for name, expected in parameter_ids.items():
             model = getattr(engine, name)
@@ -2486,6 +2491,215 @@ class TestV2TD3(unittest.TestCase):
                 self.assertEqual(action.dtype, np.float32)
                 self.assertTrue(np.all(action >= np.array([-0.2, -0.3], dtype=np.float32)))
                 self.assertTrue(np.all(action <= np.array([0.2, 0.3], dtype=np.float32)))
+
+    def test_ann_action_inference_compile_is_independent_and_uses_current_parameters(self):
+        torch.manual_seed(1201)
+        eager = self.make_engine()
+        compiled = self.make_engine()
+        compiled.load_checkpoint_state_dict(eager.checkpoint_state_dict())
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ) as compile_call:
+            enabled = compiled.enable_action_inference_compile(backend='eager')
+        self.assertEqual(enabled, ('actor.action_inference_full_forward',))
+        self.assertEqual(compile_call.call_count, 1)
+        self.assertIsNot(
+            compiled._compiled_action_inference,
+            compiled.actor._compiled_full_forward,
+        )
+        inference = mock.Mock(wraps=compiled._compiled_action_inference)
+        compiled._compiled_action_inference = inference
+
+        for count in (0, 6, 10):
+            observation = _observation(count, scales=self.scales)
+            np.testing.assert_allclose(
+                compiled.select_action(observation),
+                eager.select_action(observation),
+                rtol=1e-4, atol=1e-5,
+            )
+        self.assertEqual(inference.call_count, 3)
+
+        with torch.no_grad():
+            eager.actor.head[4].bias.add_(0.05)
+            compiled.actor.head[4].bias.add_(0.05)
+        observation = _observation(3, scales=self.scales)
+        np.testing.assert_allclose(
+            compiled.select_action(observation),
+            eager.select_action(observation),
+            rtol=1e-4, atol=1e-5,
+        )
+
+    def test_configure_compilation_reports_independent_action_inference_scope(self):
+        engine = self.make_engine()
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            metadata = engine.configure_compilation(
+                compile_action_inference=True,
+                backend='eager', fullgraph=True, dynamic=True,
+            )
+        self.assertEqual(
+            metadata['enabled_objects'],
+            ['actor.action_inference_full_forward'],
+        )
+        self.assertEqual(metadata['select_action_execution'], 'compiled')
+        self.assertEqual(
+            metadata['action_inference_granularity'],
+            'ann_full_forward',
+        )
+        self.assertEqual(metadata['backend'], 'eager')
+
+    def test_action_inference_compile_preserves_exploration_rng_progression(self):
+        torch.manual_seed(1211)
+        eager = self.make_engine()
+        compiled = self.make_engine()
+        compiled.load_checkpoint_state_dict(eager.checkpoint_state_dict())
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            compiled.enable_action_inference_compile(backend='eager')
+        left_rng = np.random.default_rng(412)
+        right_rng = np.random.default_rng(412)
+        observation = _observation(6, scales=self.scales)
+        for _ in range(2):
+            np.testing.assert_array_equal(
+                compiled.select_action(
+                    observation, exploration_noise=0.02,
+                    exploration_rng=left_rng,
+                ),
+                eager.select_action(
+                    observation, exploration_noise=0.02,
+                    exploration_rng=right_rng,
+                ),
+            )
+        self.assertEqual(left_rng.bit_generator.state, right_rng.bit_generator.state)
+
+    def test_action_inference_compile_coexists_with_critic_only_and_actor_updates(self):
+        engine = self.make_engine(policy_delay=2)
+        self.fill_replay(engine)
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            engine.enable_action_inference_compile(backend='eager')
+        observation = _observation(6, scales=self.scales)
+        engine.select_action(observation)
+        critic_only = engine.update_once(total_steps=1, bc_lambda=0.0)
+        self.assertFalse(critic_only.actor_updated)
+        engine.select_action(observation)
+        actor_update = engine.update_once(total_steps=2, bc_lambda=0.0)
+        self.assertTrue(actor_update.actor_updated)
+        engine.select_action(observation)
+        self.assertTrue(any(
+            parameter.grad is not None for parameter in engine.actor.parameters()
+        ))
+
+    def test_ann_action_inference_real_dynamo_eager_matches_eager(self):
+        engine = self.make_engine()
+        observations = tuple(
+            _observation(count, scales=self.scales) for count in (0, 6, 10)
+        )
+        expected = tuple(engine.select_action(value) for value in observations)
+        engine.enable_action_inference_compile(
+            backend='eager', fullgraph=True, dynamic=True,
+        )
+        batches = tuple(
+            collate_v2_observations([value]) for value in observations
+        )
+        engine.warmup_action_inference_compile(batches)
+        for observation, reference in zip(observations, expected):
+            np.testing.assert_allclose(
+                engine.select_action(observation), reference,
+                rtol=1e-4, atol=1e-5,
+            )
+        with torch.no_grad():
+            engine.actor.head[4].bias.add_(0.04)
+        observation = observations[1]
+        compiled_action = engine.select_action(observation)
+        compiled_forward = engine._compiled_action_inference
+        engine._compiled_action_inference = None
+        try:
+            eager_action = engine.select_action(observation)
+        finally:
+            engine._compiled_action_inference = compiled_forward
+        np.testing.assert_allclose(
+            compiled_action, eager_action, rtol=1e-4, atol=1e-5,
+        )
+
+    def test_action_inference_warmup_is_batch_one_and_has_no_engine_side_effects(self):
+        engine = self.make_engine()
+        batches = tuple(collate_v2_observations([
+            _observation(count, scales=self.scales)
+        ]) for count in (0, 6, 10))
+        state_before = deepcopy(engine.actor.state_dict())
+        other_states_before = {
+            name: deepcopy(getattr(engine, name).state_dict())
+            for name in (
+                'actor_target', 'critic1', 'critic2',
+                'critic1_target', 'critic2_target',
+            )
+        }
+        optimizer_before = deepcopy(engine.actor_optimizer.state_dict())
+        critic_optimizer_before = deepcopy(engine.critic_optimizer.state_dict())
+        replay_before = (
+            engine.replay.size,
+            engine.replay.position,
+            engine.replay.success_size,
+            engine.replay.success_position,
+            deepcopy(engine.replay.rng.bit_generator.state),
+        )
+        counts_before = (
+            engine.update_count, engine.critic_update_count,
+            engine.critic_target_update_count, engine.actor_update_count,
+            engine.last_total_steps,
+        )
+        torch_state = torch.random.get_rng_state().clone()
+        numpy_state = np.random.get_state()
+        python_state = random.getstate()
+        engine.actor.train()
+        engine.actor.head.eval()
+        training_modes = tuple(
+            module.training for module in engine.actor.modules()
+        )
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            engine.enable_action_inference_compile(backend='eager')
+        engine.warmup_action_inference_compile(batches)
+        self.assert_state_dict_equal(engine.actor.state_dict(), state_before)
+        for name, state in other_states_before.items():
+            self.assert_state_dict_equal(getattr(engine, name).state_dict(), state)
+        self.assertEqual(engine.actor_optimizer.state_dict(), optimizer_before)
+        self.assertEqual(engine.critic_optimizer.state_dict(), critic_optimizer_before)
+        self.assertEqual(replay_before, (
+            engine.replay.size,
+            engine.replay.position,
+            engine.replay.success_size,
+            engine.replay.success_position,
+            engine.replay.rng.bit_generator.state,
+        ))
+        self.assertEqual(counts_before, (
+            engine.update_count, engine.critic_update_count,
+            engine.critic_target_update_count, engine.actor_update_count,
+            engine.last_total_steps,
+        ))
+        self.assertTrue(torch.equal(torch.random.get_rng_state(), torch_state))
+        self.assertEqual(random.getstate(), python_state)
+        self.assertEqual(np.random.get_state()[0], numpy_state[0])
+        np.testing.assert_array_equal(np.random.get_state()[1], numpy_state[1])
+        self.assertEqual(
+            tuple(module.training for module in engine.actor.modules()),
+            training_modes,
+        )
+        with self.assertRaisesRegex(ValueError, 'batch size 1'):
+            engine.warmup_action_inference_compile((collate_v2_observations([
+                _observation(0, scales=self.scales),
+                _observation(1, scales=self.scales),
+            ]),))
 
     def test_select_action_uses_independent_precomputed_cpu_action_bounds(self):
         action_low = np.array([-0.2, -0.3], dtype=np.float32)

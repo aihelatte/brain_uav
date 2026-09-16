@@ -60,8 +60,9 @@ class TestV2SNNTD3(unittest.TestCase):
         self, *, freeze: int = 0, bc=None,
         fused_adam: bool = False,
         aggregate_relation_values_first: bool = False,
+        time_window: int = 2,
     ) -> V2TD3UpdateEngine:
-        actor = self.make_actor()
+        actor = self.make_actor(time_window=time_window)
         critic1 = V2ANNCritic(self.scales, 2, 8)
         critic2 = V2ANNCritic(self.scales, 2, 8)
         replay = V2ReplayBuffer(16, 2, 10, seed=31)
@@ -181,6 +182,125 @@ class TestV2SNNTD3(unittest.TestCase):
         ])
         engine._build_shared_relations(batch)
         self.assertEqual(compiled.call_count, 1)
+
+    def test_snn_action_inference_compile_is_encoder_only_and_matches_eager(self) -> None:
+        torch.manual_seed(1301)
+        eager = self.make_engine(time_window=4)
+        compiled = self.make_engine(time_window=4)
+        compiled.load_checkpoint_state_dict(eager.checkpoint_state_dict())
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ) as compile_call:
+            enabled = compiled.enable_action_inference_compile(backend='eager')
+        self.assertEqual(enabled, ('actor.action_inference_encoder',))
+        self.assertEqual(compile_call.call_count, 1)
+        inference = mock.Mock(wraps=compiled._compiled_action_inference)
+        compiled._compiled_action_inference = inference
+        for count in (0, 6, 10):
+            observation = _observation(count, self.scales)
+            np.testing.assert_allclose(
+                compiled.select_action(observation),
+                eager.select_action(observation),
+                rtol=1e-4, atol=1e-5,
+            )
+            self.assertEqual(compiled.actor.snn_head.lif1.v, 0.0)
+            self.assertEqual(compiled.actor.snn_head.lif2.v, 0.0)
+        self.assertEqual(inference.call_count, 3)
+
+        before = compiled.select_action(_observation(2, self.scales))
+        with torch.no_grad():
+            compiled.actor.snn_head.fc2.bias.add_(0.05)
+        after = compiled.select_action(_observation(2, self.scales))
+        self.assertFalse(np.array_equal(before, after))
+
+    def test_snn_action_inference_compile_resets_state_on_failure_and_after_update(self) -> None:
+        engine = self.make_engine(time_window=4)
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            engine.enable_action_inference_compile(backend='eager')
+        original = engine._compiled_action_inference
+        engine._compiled_action_inference = mock.Mock(
+            side_effect=RuntimeError('controlled inference failure')
+        )
+        engine.actor.snn_head.lif1.v = torch.ones(1)
+        with self.assertRaisesRegex(RuntimeError, 'controlled inference failure'):
+            engine.select_action(_observation(6, self.scales))
+        self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+        engine.actor.snn_head.lif1.v = torch.ones(1)
+        with mock.patch.object(
+            engine.actor.zone_set_encoder,
+            'prepare_tensor_forward_arguments',
+            side_effect=RuntimeError('controlled preparation failure'),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'controlled preparation failure'):
+                engine.select_action(_observation(6, self.scales))
+        self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+        engine._compiled_action_inference = original
+
+        engine.select_action(_observation(0, self.scales))
+        metrics = engine.update_once(total_steps=1, bc_lambda=0.0)
+        self.assertTrue(metrics.actor_updated)
+        engine.select_action(_observation(10, self.scales))
+        self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+        self.assertEqual(engine.actor.snn_head.lif2.v, 0.0)
+        self.assertTrue(any(
+            parameter.grad is not None
+            for parameter in engine.actor.parameters()
+        ))
+
+    def test_snn_action_inference_real_dynamo_eager_matches_eager(self) -> None:
+        engine = self.make_engine(time_window=4)
+        observations = tuple(
+            _observation(count, self.scales) for count in (0, 6, 10)
+        )
+        expected = tuple(engine.select_action(value) for value in observations)
+        engine.enable_action_inference_compile(
+            backend='eager', fullgraph=True, dynamic=True,
+        )
+        engine.warmup_action_inference_compile(tuple(
+            collate_v2_observations([value]) for value in observations
+        ))
+        for observation, reference in zip(observations, expected):
+            np.testing.assert_allclose(
+                engine.select_action(observation), reference,
+                rtol=1e-4, atol=1e-5,
+            )
+            self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+            self.assertEqual(engine.actor.snn_head.lif2.v, 0.0)
+        with torch.no_grad():
+            engine.actor.zone_set_encoder.empty_scene_token.add_(0.03)
+        observation = observations[0]
+        compiled_action = engine.select_action(observation)
+        compiled_forward = engine._compiled_action_inference
+        engine._compiled_action_inference = None
+        try:
+            eager_action = engine.select_action(observation)
+        finally:
+            engine._compiled_action_inference = compiled_forward
+        np.testing.assert_allclose(
+            compiled_action, eager_action, rtol=1e-4, atol=1e-5,
+        )
+
+    def test_snn_action_inference_warmup_restores_persistent_state(self) -> None:
+        engine = self.make_engine(time_window=4)
+        batches = tuple(collate_v2_observations([
+            _observation(count, self.scales)
+        ]) for count in (0, 6, 10))
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            engine.enable_action_inference_compile(backend='eager')
+        engine.actor.snn_head.lif1.v = torch.tensor([3.0])
+        engine.actor.snn_head.lif2.v = 4.0
+        engine.warmup_action_inference_compile(batches)
+        torch.testing.assert_close(
+            engine.actor.snn_head.lif1.v, torch.tensor([3.0])
+        )
+        self.assertEqual(engine.actor.snn_head.lif2.v, 4.0)
 
     def test_snn_full_target_scope_keeps_lif_actor_eager(self) -> None:
         engine = self.make_engine(bc=self.make_actor())

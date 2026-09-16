@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from math import isfinite
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 from torch import nn
@@ -199,6 +200,17 @@ class V2SNNPolicyActor(nn.Module):
         )
         self.register_buffer('action_limit', limit)
 
+    @contextmanager
+    def reset_state_context(self) -> Iterator[None]:
+        functional.reset_net(self.snn_head)
+        try:
+            yield
+        finally:
+            functional.reset_net(self.snn_head)
+
+    def action_from_context(self, context: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(self.snn_head(context)) * self.action_limit
+
     def forward(
         self,
         observation: V2ObservationBatch,
@@ -208,8 +220,7 @@ class V2SNNPolicyActor(nn.Module):
     ) -> torch.Tensor:
         if not isinstance(observation, V2ObservationBatch):
             raise TypeError('observation must be a V2ObservationBatch.')
-        functional.reset_net(self.snn_head)
-        try:
+        with self.reset_state_context():
             context = self.zone_set_encoder(
                 observation.ego_features,
                 observation.goal_features,
@@ -218,9 +229,7 @@ class V2SNNPolicyActor(nn.Module):
                 shared_relations=shared_relations,
                 profile_sections=profile_sections,
             )
-            return torch.tanh(self.snn_head(context)) * self.action_limit
-        finally:
-            functional.reset_net(self.snn_head)
+            return self.action_from_context(context)
 
 
 __all__ = [

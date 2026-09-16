@@ -1334,6 +1334,25 @@ def _compile_warmup_batches(
     return tuple(batches)
 
 
+def _action_inference_warmup_batches(
+    *, pool: V2ValidationPool, prepared, device: torch.device,
+) -> tuple[V2ObservationBatch, ...]:
+    batches = list(_compile_warmup_batches(
+        pool=pool, prepared=prepared, batch_size=1, device=device,
+    ))
+    if not batches:
+        raise ValueError('At least one action inference warmup batch is required.')
+    if all(batch.max_zone_count != 0 for batch in batches):
+        first = batches[0]
+        batches.insert(0, V2ObservationBatch(
+            ego_features=first.ego_features,
+            goal_features=first.goal_features,
+            zone_features=first.zone_features[:, :0, :],
+            presence_mask=first.presence_mask[:, :0],
+        ))
+    return tuple(batches)
+
+
 def _warmup_online_critic_normal_only(
     engine,
     batches: Sequence[V2ObservationBatch],
@@ -2672,6 +2691,7 @@ def _run_compiled_numerics_check(
     compile_snn_target_encoder: bool = False,
     fused_adam: bool = False,
     compile_actor_loss: bool = False,
+    compile_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
 ) -> dict[str, Any]:
     torch_rng_state = torch.random.get_rng_state()
@@ -2739,6 +2759,7 @@ def _run_compiled_numerics_check(
             compile_shared_relations=compile_shared_relations,
             compile_snn_target_encoder=compile_snn_target_encoder,
             compile_actor_loss=compile_actor_loss,
+            compile_action_inference=compile_action_inference,
             backend='inductor', mode='default', fullgraph=True, dynamic=True,
         )
         warmup_batches = _compile_warmup_batches(
@@ -2761,6 +2782,25 @@ def _run_compiled_numerics_check(
             compiled.warmup_snn_target_encoder_compile(warmup_batches)
         if compile_actor_loss:
             compiled.warmup_actor_loss_compile(warmup_batches)
+        action_inference_batches = _action_inference_warmup_batches(
+            pool=pool, prepared=prepared, device=device,
+        )
+        if compile_action_inference:
+            compiled.warmup_action_inference_compile(action_inference_batches)
+        action_inference_comparison = []
+        with torch.inference_mode():
+            for batch in action_inference_batches:
+                expected = reference._action_inference_tensor(batch)
+                actual = compiled._action_inference_tensor(batch)
+                torch.testing.assert_close(
+                    actual, expected,
+                    rtol=COMPILED_NUMERIC_RTOL,
+                    atol=COMPILED_NUMERIC_ATOL,
+                )
+                action_inference_comparison.append({
+                    'batch_size': batch.batch_size,
+                    'zone_count': batch.max_zone_count,
+                })
         module_modes['before_consecutive_updates'] = (
             _report_and_validate_numeric_engine_modes(
                 reference,
@@ -3040,6 +3080,7 @@ def _run_compiled_numerics_check(
                 frozen_critic_strategy
             ),
             'compilation': configured,
+            'action_inference_comparison': action_inference_comparison,
             'wall_seconds': perf_counter() - started,
             'measurement_note': (
                 'Uses independent original and optimized engines before timed diagnosis; '
@@ -3209,6 +3250,7 @@ def _run_diagnostic_level(
     compile_snn_target_encoder: bool = False,
     fused_adam: bool = False,
     compile_actor_loss: bool = False,
+    compile_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
     compiled_path_profiler_updates: int = 0,
     compiled_profiler_output_dir: Path | None = None,
@@ -3268,6 +3310,7 @@ def _run_diagnostic_level(
         compile_shared_relations,
         compile_snn_target_encoder,
         compile_actor_loss,
+        compile_action_inference,
     ))
     extended_compile_requested = any((
         compile_actors,
@@ -3276,6 +3319,7 @@ def _run_diagnostic_level(
         compile_shared_relations,
         compile_snn_target_encoder,
         compile_actor_loss,
+        compile_action_inference,
         frozen_critic_strategy != 'eager',
     ))
     compile_metadata: dict[str, Any] = {
@@ -3287,12 +3331,14 @@ def _run_diagnostic_level(
         'shared_relations_requested': bool(compile_shared_relations),
         'snn_target_encoder_requested': bool(compile_snn_target_encoder),
         'actor_loss_requested': bool(compile_actor_loss),
+        'action_inference_requested': bool(compile_action_inference),
         'optimizer_execution': 'fused_adam' if fused_adam else 'adam',
         'relation_value_execution': (
             'aggregate_then_project' if aggregate_relation_values_first
             else 'project_then_aggregate'
         ),
         'actor_loss_granularity': 'eager',
+        'action_inference_granularity': 'eager',
         'enabled_objects': [],
         'backend': 'inductor',
         'mode': 'default',
@@ -3311,6 +3357,7 @@ def _run_diagnostic_level(
         'target_registration_wall_seconds': 0.0,
         'target_warmup_wall_seconds': 0.0,
         'warmup_batch_shapes': [],
+        'action_inference_warmup_shapes': [],
         'target_warmup_batch_shapes': [],
         'measurement_graph_count_before': None,
         'measurement_graph_count_after': None,
@@ -3331,6 +3378,7 @@ def _run_diagnostic_level(
             compile_shared_relations=compile_shared_relations,
             compile_snn_target_encoder=compile_snn_target_encoder,
             compile_actor_loss=compile_actor_loss,
+            compile_action_inference=compile_action_inference,
             backend='inductor', mode='default', fullgraph=True, dynamic=True,
         )
         compile_metadata.update(configured)
@@ -3362,6 +3410,15 @@ def _run_diagnostic_level(
             engine.warmup_snn_target_encoder_compile(warmup_batches)
         if compile_actor_loss:
             engine.warmup_actor_loss_compile(warmup_batches)
+        if compile_action_inference:
+            action_batches = _action_inference_warmup_batches(
+                pool=pool, prepared=prepared, device=device,
+            )
+            engine.warmup_action_inference_compile(action_batches)
+            compile_metadata['action_inference_warmup_shapes'] = [
+                [batch.batch_size, batch.max_zone_count]
+                for batch in action_batches
+            ]
         compile_metadata['warmup_wall_seconds'] = perf_counter() - warmup_started
         compile_metadata['measurement_note'] = (
             'Registration and compile-triggering pure-compute warmup are excluded '
@@ -3910,6 +3967,7 @@ def run_v2_td3_timing_diagnostic(
     compile_snn_target_encoder: bool = False,
     fused_adam: bool = False,
     compile_actor_loss: bool = False,
+    compile_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
     check_compiled_numerics: bool = False,
     compiled_numerics_only: bool = False,
@@ -3950,6 +4008,7 @@ def run_v2_td3_timing_diagnostic(
         ('compile_snn_target_encoder', compile_snn_target_encoder),
         ('fused_adam', fused_adam),
         ('compile_actor_loss', compile_actor_loss),
+        ('compile_action_inference', compile_action_inference),
         ('aggregate_relation_values_first', aggregate_relation_values_first),
     ):
         if type(value) is not bool:
@@ -3982,6 +4041,7 @@ def run_v2_td3_timing_diagnostic(
             or compile_snn_target_encoder
             or fused_adam
             or compile_actor_loss
+            or compile_action_inference
             or aggregate_relation_values_first
             or frozen_critic_strategy != 'eager'
             or check_compiled_numerics
@@ -4021,7 +4081,8 @@ def run_v2_td3_timing_diagnostic(
         )
     if check_compiled_numerics and not (
         compile_target_encoders or compile_target_block or compile_snn_target_encoder
-        or fused_adam or compile_actor_loss or aggregate_relation_values_first
+        or fused_adam or compile_actor_loss or compile_action_inference
+        or aggregate_relation_values_first
     ):
         raise ValueError(
             'check_compiled_numerics requires a target compile scope or one '
@@ -4036,6 +4097,7 @@ def run_v2_td3_timing_diagnostic(
         compile_shared_relations,
         compile_snn_target_encoder,
         compile_actor_loss,
+        compile_action_inference,
     ))
     if compile_requested and profiler_updates:
         raise ValueError(
@@ -4186,6 +4248,7 @@ def run_v2_td3_timing_diagnostic(
             compile_snn_target_encoder=compile_snn_target_encoder,
             fused_adam=fused_adam,
             compile_actor_loss=compile_actor_loss,
+            compile_action_inference=compile_action_inference,
             aggregate_relation_values_first=aggregate_relation_values_first,
         )
     if compiled_numerics_only:
@@ -4244,6 +4307,7 @@ def run_v2_td3_timing_diagnostic(
             compile_snn_target_encoder=compile_snn_target_encoder,
             fused_adam=fused_adam,
             compile_actor_loss=compile_actor_loss,
+            compile_action_inference=compile_action_inference,
             aggregate_relation_values_first=aggregate_relation_values_first,
             compiled_path_profiler_updates=(
                 compiled_profiler_updates if level == 'medium' else 0
@@ -4379,6 +4443,7 @@ def run_v2_td3_timing_diagnostic(
             'compile_snn_target_encoder_requested': compile_snn_target_encoder,
             'fused_adam_requested': fused_adam,
             'compile_actor_loss_requested': compile_actor_loss,
+            'compile_action_inference_requested': compile_action_inference,
             'aggregate_relation_values_first_requested': (
                 aggregate_relation_values_first
             ),
@@ -4498,6 +4563,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('--fused-adam', action='store_true')
     parser.add_argument('--compile-actor-loss', action='store_true')
+    parser.add_argument('--compile-action-inference', action='store_true')
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument(
         '--check-compiled-numerics',
@@ -4561,6 +4627,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         compile_snn_target_encoder=args.compile_snn_target_encoder,
         fused_adam=args.fused_adam,
         compile_actor_loss=args.compile_actor_loss,
+        compile_action_inference=args.compile_action_inference,
         aggregate_relation_values_first=args.aggregate_relation_values_first,
         check_compiled_numerics=args.check_compiled_numerics,
         compiled_numerics_only=args.compiled_numerics_only,
