@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from contextlib import contextmanager
+import inspect
 import math
 import random
 import unittest
@@ -2618,6 +2619,55 @@ class TestV2TD3(unittest.TestCase):
         with torch.no_grad():
             engine.actor.head[4].bias.add_(0.04)
         observation = observations[1]
+        compiled_action = engine.select_action(observation)
+        compiled_forward = engine._compiled_action_inference
+        engine._compiled_action_inference = None
+        try:
+            eager_action = engine.select_action(observation)
+        finally:
+            engine._compiled_action_inference = compiled_forward
+        np.testing.assert_allclose(
+            compiled_action, eager_action, rtol=1e-4, atol=1e-5,
+        )
+
+    def test_ann_training_and_action_inference_have_separate_dynamo_code(self):
+        engine = self.make_engine(policy_delay=2)
+        self.fill_replay(engine, counts=(0, 6))
+        engine.configure_compilation(
+            compile_actors=True, compile_action_inference=True,
+            backend='eager', fullgraph=True, dynamic=True,
+        )
+        training_code = inspect.unwrap(engine.actor._compiled_full_forward).__code__
+        inference_code = inspect.unwrap(engine._compiled_action_inference).__code__
+        self.assertIs(training_code, engine.actor._compute_full_forward_tensors.__code__)
+        self.assertIsNot(inference_code, training_code)
+
+        for count in (0, 6):
+            observation = _observation(count, scales=self.scales)
+            compiled_action = engine.select_action(observation)
+            compiled_forward = engine._compiled_action_inference
+            engine._compiled_action_inference = None
+            try:
+                eager_action = engine.select_action(observation)
+            finally:
+                engine._compiled_action_inference = compiled_forward
+            np.testing.assert_allclose(
+                compiled_action, eager_action, rtol=1e-4, atol=1e-5,
+            )
+
+        critic_only = engine.update_once(total_steps=1, bc_lambda=0.0)
+        self.assertFalse(critic_only.actor_updated)
+        observation = _observation(6, scales=self.scales)
+        engine.select_action(observation)
+        actor_before = deepcopy(engine.actor.state_dict())
+        actor_update = engine.update_once(total_steps=2, bc_lambda=0.0)
+        self.assertTrue(actor_update.actor_updated)
+        self.assertTrue(any(
+            not torch.equal(actor_before[name], value)
+            for name, value in engine.actor.state_dict().items()
+            if value.is_floating_point()
+        ))
+        self.assertTrue(any(parameter.grad is not None for parameter in engine.actor.parameters()))
         compiled_action = engine.select_action(observation)
         compiled_forward = engine._compiled_action_inference
         engine._compiled_action_inference = None

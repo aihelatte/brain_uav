@@ -38,6 +38,38 @@ _GOAL_UP_NORM_INDEX = int(GOAL_FEATURE_INDEX['goal_up_norm'])
 _GAMMA_FRACTION_INDEX = int(EGO_FEATURE_INDEX['gamma_fraction'])
 
 
+def _action_inference_ann_tensors(
+    actor: V2ANNPolicyActor,
+    ego_features: torch.Tensor,
+    goal_features: torch.Tensor,
+    clean_zone_features: torch.Tensor,
+    presence_mask: torch.Tensor,
+    valid_token_mask: torch.Tensor,
+    token_pair_relations: torch.Tensor,
+    relation_pair_mask: torch.Tensor,
+) -> torch.Tensor:
+    return actor._compute_full_forward_tensors(
+        ego_features, goal_features, clean_zone_features, presence_mask,
+        valid_token_mask, token_pair_relations, relation_pair_mask,
+    )
+
+
+def _action_inference_snn_encoder_tensors(
+    encoder: nn.Module,
+    ego_features: torch.Tensor,
+    goal_features: torch.Tensor,
+    clean_zone_features: torch.Tensor,
+    presence_mask: torch.Tensor,
+    valid_token_mask: torch.Tensor,
+    token_pair_relations: torch.Tensor,
+    relation_pair_mask: torch.Tensor,
+) -> torch.Tensor:
+    return encoder._compute_policy_context_tensors(
+        ego_features, goal_features, clean_zone_features, presence_mask,
+        valid_token_mask, token_pair_relations, relation_pair_mask,
+    )
+
+
 def _actor_loss_tensor_block(
     actor_actions: torch.Tensor,
     q_values: torch.Tensor,
@@ -1271,10 +1303,10 @@ class V2TD3UpdateEngine:
         if self._compiled_action_inference is not None:
             raise RuntimeError('Action inference is already compiled.')
         if isinstance(self.actor, V2ANNPolicyActor):
-            tensor_forward = self.actor._compute_full_forward_tensors
+            tensor_forward = _action_inference_ann_tensors
             enabled = 'actor.action_inference_full_forward'
         else:
-            tensor_forward = self.actor.zone_set_encoder._compute_policy_context_tensors
+            tensor_forward = _action_inference_snn_encoder_tensors
             enabled = 'actor.action_inference_encoder'
         self._compiled_action_inference = torch.compile(
             tensor_forward,
@@ -1308,7 +1340,7 @@ class V2TD3UpdateEngine:
                     batch.zone_features,
                     batch.presence_mask,
                 )
-            return self._compiled_action_inference(*arguments)
+            return self._compiled_action_inference(self.actor, *arguments)
         with self.actor.reset_state_context():
             with self.actor.zone_set_encoder.eager_tensor_forward():
                 arguments = self.actor.zone_set_encoder.prepare_tensor_forward_arguments(
@@ -1317,7 +1349,9 @@ class V2TD3UpdateEngine:
                     batch.zone_features,
                     batch.presence_mask,
                 )
-            context = self._compiled_action_inference(*arguments)
+            context = self._compiled_action_inference(
+                self.actor.zone_set_encoder, *arguments,
+            )
             return self.actor.action_from_context(context)
 
     def warmup_action_inference_compile(

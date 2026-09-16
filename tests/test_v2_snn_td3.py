@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import inspect
 import math
 import unittest
 from unittest import mock
@@ -283,6 +284,56 @@ class TestV2SNNTD3(unittest.TestCase):
         np.testing.assert_allclose(
             compiled_action, eager_action, rtol=1e-4, atol=1e-5,
         )
+
+    def test_snn_training_and_action_inference_have_separate_dynamo_code(self) -> None:
+        engine = self.make_engine(time_window=4)
+        engine.configure_compilation(
+            compile_actors=True, compile_action_inference=True,
+            backend='eager', fullgraph=True, dynamic=True,
+        )
+        encoder = engine.actor.zone_set_encoder
+        training_code = inspect.unwrap(encoder._compiled_tensor_forward).__code__
+        inference_code = inspect.unwrap(engine._compiled_action_inference).__code__
+        self.assertIs(training_code, encoder._compute_policy_context_tensors.__code__)
+        self.assertIsNot(inference_code, training_code)
+
+        for count in (0, 6):
+            observation = _observation(count, self.scales)
+            compiled_action = engine.select_action(observation)
+            compiled_forward = engine._compiled_action_inference
+            engine._compiled_action_inference = None
+            try:
+                eager_action = engine.select_action(observation)
+            finally:
+                engine._compiled_action_inference = compiled_forward
+            np.testing.assert_allclose(
+                compiled_action, eager_action, rtol=1e-4, atol=1e-5,
+            )
+            self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+            self.assertEqual(engine.actor.snn_head.lif2.v, 0.0)
+
+        observation = _observation(6, self.scales)
+        actor_before = deepcopy(engine.actor.state_dict())
+        metrics = engine.update_once(total_steps=1, bc_lambda=0.0)
+        self.assertTrue(metrics.actor_updated)
+        self.assertTrue(any(
+            not torch.equal(actor_before[name], value)
+            for name, value in engine.actor.state_dict().items()
+            if value.is_floating_point()
+        ))
+        self.assertTrue(any(parameter.grad is not None for parameter in engine.actor.parameters()))
+        compiled_action = engine.select_action(observation)
+        compiled_forward = engine._compiled_action_inference
+        engine._compiled_action_inference = None
+        try:
+            eager_action = engine.select_action(observation)
+        finally:
+            engine._compiled_action_inference = compiled_forward
+        np.testing.assert_allclose(
+            compiled_action, eager_action, rtol=1e-4, atol=1e-5,
+        )
+        self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+        self.assertEqual(engine.actor.snn_head.lif2.v, 0.0)
 
     def test_snn_action_inference_warmup_restores_persistent_state(self) -> None:
         engine = self.make_engine(time_window=4)
