@@ -58,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--compile-snn-target-encoder', action='store_true')
     parser.add_argument('--fused-adam', action='store_true')
     parser.add_argument('--compile-actor-loss', action='store_true')
+    parser.add_argument('--cache-actor-loss-coefficients', action='store_true')
     parser.add_argument('--compile-action-inference', action='store_true')
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument('--compile-actors', action='store_true')
@@ -101,8 +102,11 @@ def _configure_stage_compilation(
     compile_shared_relations: bool = False,
     compile_snn_target_encoder: bool = False,
     compile_actor_loss: bool = False,
+    cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
 ) -> dict[str, Any]:
+    if cache_actor_loss_coefficients and not compile_actor_loss:
+        raise ValueError('cache_actor_loss_coefficients requires compile_actor_loss.')
     requested = any((
         compile_critic_encoder, compile_target_encoders, compile_actors,
         compile_critic_block, compile_target_block,
@@ -130,6 +134,8 @@ def _configure_stage_compilation(
                 else 'project_then_aggregate'
             ),
             'actor_loss_granularity': 'eager',
+            'actor_loss_coefficients_requested': False,
+            'actor_loss_coefficient_execution': 'per_update',
             'action_inference_granularity': 'eager',
             'action_inference_warmup_shapes': [],
             'registration_wall_seconds': 0.0,
@@ -147,10 +153,12 @@ def _configure_stage_compilation(
         compile_shared_relations=compile_shared_relations,
         compile_snn_target_encoder=compile_snn_target_encoder,
         compile_actor_loss=compile_actor_loss,
+        cache_actor_loss_coefficients=cache_actor_loss_coefficients,
         compile_action_inference=compile_action_inference,
         backend='inductor', mode='default', fullgraph=True, dynamic=True,
     )
     metadata['requested'] = True
+    metadata['actor_loss_coefficients_requested'] = cache_actor_loss_coefficients
     metadata['registration_wall_seconds'] = perf_counter() - registration_started
 
     records_by_zone_count = {}
@@ -257,6 +265,7 @@ def run_v2_td3_stage(
     compile_snn_target_encoder: bool = False,
     fused_adam: bool = False,
     compile_actor_loss: bool = False,
+    cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
 ) -> dict[str, Any]:
@@ -353,6 +362,7 @@ def run_v2_td3_stage(
         compile_shared_relations=compile_shared_relations,
         compile_snn_target_encoder=compile_snn_target_encoder,
         compile_actor_loss=compile_actor_loss,
+        cache_actor_loss_coefficients=cache_actor_loss_coefficients,
         compile_action_inference=compile_action_inference,
     )
     reporter = (
@@ -556,6 +566,7 @@ def main(argv: list[str] | None = None) -> int:
         compile_snn_target_encoder=args.compile_snn_target_encoder,
         fused_adam=args.fused_adam,
         compile_actor_loss=args.compile_actor_loss,
+        cache_actor_loss_coefficients=args.cache_actor_loss_coefficients,
         compile_action_inference=args.compile_action_inference,
         aggregate_relation_values_first=args.aggregate_relation_values_first,
     )

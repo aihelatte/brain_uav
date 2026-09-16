@@ -115,6 +115,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertFalse(args.compile_snn_target_encoder)
         self.assertFalse(args.fused_adam)
         self.assertFalse(args.compile_actor_loss)
+        self.assertFalse(args.cache_actor_loss_coefficients)
         self.assertFalse(args.compile_action_inference)
         self.assertFalse(args.aggregate_relation_values_first)
 
@@ -179,6 +180,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                     compile_snn_target_encoder=True,
                     fused_adam=True,
                     compile_actor_loss=True,
+                    cache_actor_loss_coefficients=True,
                     compile_action_inference=True,
                     aggregate_relation_values_first=True,
                 )
@@ -199,6 +201,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertTrue(calls[0]['compile_snn_target_encoder'])
         self.assertTrue(calls[0]['fused_adam'])
         self.assertTrue(calls[0]['compile_actor_loss'])
+        self.assertTrue(calls[0]['cache_actor_loss_coefficients'])
         self.assertTrue(calls[0]['compile_action_inference'])
         self.assertTrue(calls[0]['aggregate_relation_values_first'])
         self.assertIs(calls[0]['prepared_initialization'], prepared)
@@ -212,6 +215,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertTrue(result['compilation_request']['compile_snn_target_encoder'])
         self.assertTrue(result['compilation_request']['fused_adam'])
         self.assertTrue(result['compilation_request']['compile_actor_loss'])
+        self.assertTrue(result['compilation_request']['cache_actor_loss_coefficients'])
         self.assertTrue(result['compilation_request']['compile_action_inference'])
         self.assertTrue(result['compilation_request']['aggregate_relation_values_first'])
         self.assertEqual(result['snn'], {

@@ -192,17 +192,20 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertFalse(args.compile_snn_target_encoder)
         self.assertFalse(args.fused_adam)
         self.assertFalse(args.compile_actor_loss)
+        self.assertFalse(args.cache_actor_loss_coefficients)
         self.assertFalse(args.compile_action_inference)
         self.assertFalse(args.aggregate_relation_values_first)
         enabled_optimizations = parser.parse_args([
             '--stage', 'easy', '--init-checkpoint', 'x',
             '--output', 'x', '--metrics-out', 'x', '--validation-pool', 'x',
             '--fused-adam', '--compile-actor-loss',
+            '--cache-actor-loss-coefficients',
             '--compile-action-inference',
             '--aggregate-relation-values-first',
         ])
         self.assertTrue(enabled_optimizations.fused_adam)
         self.assertTrue(enabled_optimizations.compile_actor_loss)
+        self.assertTrue(enabled_optimizations.cache_actor_loss_coefficients)
         self.assertTrue(enabled_optimizations.compile_action_inference)
         self.assertTrue(enabled_optimizations.aggregate_relation_values_first)
         with self.assertRaises(SystemExit):
@@ -296,6 +299,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 compile_shared_relations=True,
                 compile_snn_target_encoder=True,
                 compile_actor_loss=True,
+                cache_actor_loss_coefficients=True,
                 compile_action_inference=True,
             )
         self.assertEqual(
@@ -309,6 +313,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertTrue(calls[0][1]['compile_shared_relations'])
         self.assertTrue(calls[0][1]['compile_snn_target_encoder'])
         self.assertTrue(calls[0][1]['compile_actor_loss'])
+        self.assertTrue(calls[0][1]['cache_actor_loss_coefficients'])
         self.assertTrue(calls[0][1]['compile_action_inference'])
         self.assertEqual(metadata['action_inference_warmup_shapes'], [[1, 0], [1, 7]])
         self.assertTrue(metadata['requested'])

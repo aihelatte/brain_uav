@@ -2691,6 +2691,7 @@ def _run_compiled_numerics_check(
     compile_snn_target_encoder: bool = False,
     fused_adam: bool = False,
     compile_actor_loss: bool = False,
+    cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
 ) -> dict[str, Any]:
@@ -2759,6 +2760,7 @@ def _run_compiled_numerics_check(
             compile_shared_relations=compile_shared_relations,
             compile_snn_target_encoder=compile_snn_target_encoder,
             compile_actor_loss=compile_actor_loss,
+            cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
             backend='inductor', mode='default', fullgraph=True, dynamic=True,
         )
@@ -3250,6 +3252,7 @@ def _run_diagnostic_level(
     compile_snn_target_encoder: bool = False,
     fused_adam: bool = False,
     compile_actor_loss: bool = False,
+    cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
     compiled_path_profiler_updates: int = 0,
@@ -3331,6 +3334,7 @@ def _run_diagnostic_level(
         'shared_relations_requested': bool(compile_shared_relations),
         'snn_target_encoder_requested': bool(compile_snn_target_encoder),
         'actor_loss_requested': bool(compile_actor_loss),
+        'actor_loss_coefficients_requested': bool(cache_actor_loss_coefficients),
         'action_inference_requested': bool(compile_action_inference),
         'optimizer_execution': 'fused_adam' if fused_adam else 'adam',
         'relation_value_execution': (
@@ -3338,6 +3342,7 @@ def _run_diagnostic_level(
             else 'project_then_aggregate'
         ),
         'actor_loss_granularity': 'eager',
+        'actor_loss_coefficient_execution': 'per_update',
         'action_inference_granularity': 'eager',
         'enabled_objects': [],
         'backend': 'inductor',
@@ -3378,6 +3383,7 @@ def _run_diagnostic_level(
             compile_shared_relations=compile_shared_relations,
             compile_snn_target_encoder=compile_snn_target_encoder,
             compile_actor_loss=compile_actor_loss,
+            cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
             backend='inductor', mode='default', fullgraph=True, dynamic=True,
         )
@@ -3967,6 +3973,7 @@ def run_v2_td3_timing_diagnostic(
     compile_snn_target_encoder: bool = False,
     fused_adam: bool = False,
     compile_actor_loss: bool = False,
+    cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
     check_compiled_numerics: bool = False,
@@ -4008,6 +4015,7 @@ def run_v2_td3_timing_diagnostic(
         ('compile_snn_target_encoder', compile_snn_target_encoder),
         ('fused_adam', fused_adam),
         ('compile_actor_loss', compile_actor_loss),
+        ('cache_actor_loss_coefficients', cache_actor_loss_coefficients),
         ('compile_action_inference', compile_action_inference),
         ('aggregate_relation_values_first', aggregate_relation_values_first),
     ):
@@ -4017,6 +4025,8 @@ def run_v2_td3_timing_diagnostic(
         raise ValueError(
             'frozen_critic_strategy must be eager or compiled_no_grad_context.'
         )
+    if cache_actor_loss_coefficients and not compile_actor_loss:
+        raise ValueError('cache_actor_loss_coefficients requires compile_actor_loss.')
     if type(check_compiled_numerics) is not bool:
         raise TypeError('check_compiled_numerics must be a bool.')
     if type(compiled_numerics_only) is not bool:
@@ -4248,6 +4258,7 @@ def run_v2_td3_timing_diagnostic(
             compile_snn_target_encoder=compile_snn_target_encoder,
             fused_adam=fused_adam,
             compile_actor_loss=compile_actor_loss,
+            cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
             aggregate_relation_values_first=aggregate_relation_values_first,
         )
@@ -4307,6 +4318,7 @@ def run_v2_td3_timing_diagnostic(
             compile_snn_target_encoder=compile_snn_target_encoder,
             fused_adam=fused_adam,
             compile_actor_loss=compile_actor_loss,
+            cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
             aggregate_relation_values_first=aggregate_relation_values_first,
             compiled_path_profiler_updates=(
@@ -4443,6 +4455,7 @@ def run_v2_td3_timing_diagnostic(
             'compile_snn_target_encoder_requested': compile_snn_target_encoder,
             'fused_adam_requested': fused_adam,
             'compile_actor_loss_requested': compile_actor_loss,
+            'cache_actor_loss_coefficients_requested': cache_actor_loss_coefficients,
             'compile_action_inference_requested': compile_action_inference,
             'aggregate_relation_values_first_requested': (
                 aggregate_relation_values_first
@@ -4563,6 +4576,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('--fused-adam', action='store_true')
     parser.add_argument('--compile-actor-loss', action='store_true')
+    parser.add_argument('--cache-actor-loss-coefficients', action='store_true')
     parser.add_argument('--compile-action-inference', action='store_true')
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument(
@@ -4627,6 +4641,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         compile_snn_target_encoder=args.compile_snn_target_encoder,
         fused_adam=args.fused_adam,
         compile_actor_loss=args.compile_actor_loss,
+        cache_actor_loss_coefficients=args.cache_actor_loss_coefficients,
         compile_action_inference=args.compile_action_inference,
         aggregate_relation_values_first=args.aggregate_relation_values_first,
         check_compiled_numerics=args.check_compiled_numerics,

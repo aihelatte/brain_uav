@@ -518,6 +518,10 @@ class V2TD3UpdateEngine:
         self._compiled_target_block: Callable[..., tuple[torch.Tensor, ...]] | None = None
         self._compiled_target_critic_td: Callable[..., tuple[torch.Tensor, ...]] | None = None
         self._compiled_actor_loss: Callable[..., tuple[torch.Tensor, ...]] | None = None
+        self.cache_actor_loss_coefficients = False
+        self._actor_loss_coefficient_cache: dict[
+            str, tuple[tuple[float, torch.device, torch.dtype], torch.Tensor]
+        ] = {}
         self._compiled_action_inference: Callable[..., torch.Tensor] | None = None
         self._compiled_action_inference_config: dict[str, object] | None = None
 
@@ -898,6 +902,7 @@ class V2TD3UpdateEngine:
         compile_shared_relations: bool = False,
         compile_snn_target_encoder: bool = False,
         compile_actor_loss: bool = False,
+        cache_actor_loss_coefficients: bool = False,
         compile_action_inference: bool = False,
         backend: str = 'inductor',
         mode: str = 'default',
@@ -920,6 +925,12 @@ class V2TD3UpdateEngine:
             raise ValueError(
                 'compile_target_encoders and compile_snn_target_encoder are '
                 'mutually exclusive target encoder scopes.'
+            )
+        if type(cache_actor_loss_coefficients) is not bool:
+            raise TypeError('cache_actor_loss_coefficients must be a bool.')
+        if cache_actor_loss_coefficients and not compile_actor_loss:
+            raise ValueError(
+                'cache_actor_loss_coefficients requires compile_actor_loss.'
             )
         if compile_snn_target_encoder and not isinstance(
             self.actor_target, V2SNNPolicyActor
@@ -971,6 +982,7 @@ class V2TD3UpdateEngine:
         if compile_actors:
             enabled.extend(self.enable_actor_compile(**options))
         self.set_frozen_critic_strategy(frozen_critic_strategy)
+        self.cache_actor_loss_coefficients = cache_actor_loss_coefficients
         return {
             'enabled_objects': enabled,
             'critic_granularity': (
@@ -992,6 +1004,9 @@ class V2TD3UpdateEngine:
             ),
             'actor_loss_granularity': (
                 'tensor_block' if compile_actor_loss else 'eager'
+            ),
+            'actor_loss_coefficient_execution': (
+                'cached' if self.cache_actor_loss_coefficients else 'per_update'
             ),
             'action_inference_granularity': (
                 ('ann_full_forward' if isinstance(self.actor, V2ANNPolicyActor)
@@ -2376,6 +2391,17 @@ class V2TD3UpdateEngine:
         update_timing.finish()
         return metrics
 
+    def _actor_loss_coefficient_tensor(
+        self, name: str, value: float, like: torch.Tensor,
+    ) -> torch.Tensor:
+        key = (value, like.device, like.dtype)
+        cached = self._actor_loss_coefficient_cache.get(name)
+        if cached is None or cached[0] != key:
+            tensor = torch.as_tensor(value, dtype=like.dtype, device=like.device)
+            cached = (key, tensor)
+            self._actor_loss_coefficient_cache[name] = cached
+        return cached[1]
+
     def _compute_actor_loss_terms(
         self,
         observation: V2ObservationBatch,
@@ -2492,6 +2518,30 @@ class V2TD3UpdateEngine:
             else:
                 if compiled_execution_recorder is not None:
                     compiled_execution_recorder('actor_loss')
+                if self.cache_actor_loss_coefficients:
+                    coefficients = (
+                        self._actor_loss_coefficient_tensor(
+                            'alpha', self.actor_rl_scale_alpha, q_values,
+                        ),
+                        self._actor_loss_coefficient_tensor('bc', bc_lambda, q_values),
+                        self._actor_loss_coefficient_tensor(
+                            'terminal', terminal_lambda, q_values,
+                        ),
+                    )
+                else:
+                    coefficients = (
+                        torch.as_tensor(
+                            self.actor_rl_scale_alpha,
+                            dtype=q_values.dtype, device=q_values.device,
+                        ),
+                        torch.as_tensor(
+                            bc_lambda, dtype=q_values.dtype, device=q_values.device,
+                        ),
+                        torch.as_tensor(
+                            terminal_lambda, dtype=q_values.dtype,
+                            device=q_values.device,
+                        ),
+                    )
                 (
                     actor_loss, rl_actor_loss, scaled_rl_actor_loss,
                     actor_rl_scale, bc_loss, terminal_geo_loss,
@@ -2499,14 +2549,7 @@ class V2TD3UpdateEngine:
                     actor_actions, q_values, reference_actions,
                     observation.ego_features, observation.goal_features,
                     line_to_goal_safe, self.action_low, self.action_high,
-                    torch.as_tensor(
-                        self.actor_rl_scale_alpha,
-                        dtype=q_values.dtype, device=q_values.device,
-                    ),
-                    torch.as_tensor(bc_lambda, dtype=q_values.dtype, device=q_values.device),
-                    torch.as_tensor(
-                        terminal_lambda, dtype=q_values.dtype, device=q_values.device,
-                    ),
+                    *coefficients,
                     self.actor.scales.horizontal_span,
                     self.actor.scales.vertical_span,
                     self.actor.scales.gamma_max,
@@ -2831,6 +2874,7 @@ class V2TD3UpdateEngine:
             target.eval()
             for parameter in target.parameters():
                 parameter.requires_grad_(False)
+        self._actor_loss_coefficient_cache.clear()
 
     def load_checkpoint_state_dict(self, payload: dict[str, Any]) -> None:
         """Strictly restore a V2 dynamic-set TD3 checkpoint payload."""
@@ -2946,3 +2990,4 @@ class V2TD3UpdateEngine:
             target.eval()
             for parameter in target.parameters():
                 parameter.requires_grad_(False)
+        self._actor_loss_coefficient_cache.clear()

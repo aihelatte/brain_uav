@@ -406,7 +406,11 @@ class TestV2TD3(unittest.TestCase):
                     terminal_enabled=terminal, bc_reference_actor=compiled_actor,
                 )
                 compiled.load_checkpoint_state_dict(reference.checkpoint_state_dict())
-                compiled.enable_actor_loss_compile(backend='eager', fullgraph=True)
+                compiled.configure_compilation(
+                    compile_actor_loss=True,
+                    cache_actor_loss_coefficients=True,
+                    backend='eager', fullgraph=True,
+                )
                 observation = collate_v2_observations([
                     _observation(0, scales=self.scales),
                     _observation(7, scales=self.scales),
@@ -505,7 +509,10 @@ class TestV2TD3(unittest.TestCase):
         engine = self.make_engine(
             bc_reference_actor=self.make_bc_reference(0.01), terminal_enabled=True,
         )
-        engine.configure_compilation(compile_actor_loss=True, backend='eager')
+        engine.configure_compilation(
+            compile_actor_loss=True, cache_actor_loss_coefficients=True,
+            backend='eager',
+        )
         batches = tuple(collate_v2_observations([
             _observation(count, scales=self.scales),
             _observation(7, scales=self.scales),
@@ -526,7 +533,9 @@ class TestV2TD3(unittest.TestCase):
         )
         torch_rng = torch.random.get_rng_state().clone()
         numpy_rng = np.random.get_state()
+        self.assertEqual(engine._actor_loss_coefficient_cache, {})
         engine.warmup_actor_loss_compile(batches)
+        self.assertEqual(engine._actor_loss_coefficient_cache, {})
         for name in model_names:
             self.assert_state_dict_equal(getattr(engine, name).state_dict(), before[name])
         self.assertEqual(engine.actor_optimizer.state_dict(), optimizer_before[0])
@@ -541,6 +550,114 @@ class TestV2TD3(unittest.TestCase):
         self.assertEqual(numpy_after[0], numpy_rng[0])
         np.testing.assert_array_equal(numpy_after[1], numpy_rng[1])
         self.assertEqual(numpy_after[2:], numpy_rng[2:])
+
+    def test_actor_loss_coefficient_cache_reuses_and_replaces_scalars(self):
+        engine = self.make_engine(
+            terminal_enabled=True,
+            bc_reference_actor=self.make_bc_reference(0.01),
+        )
+        metadata = engine.configure_compilation(
+            compile_actor_loss=True, cache_actor_loss_coefficients=True,
+            backend='eager',
+        )
+        self.assertEqual(metadata['actor_loss_coefficient_execution'], 'cached')
+        observation = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        safe = torch.ones((2, 1), dtype=torch.float32)
+        scalar_calls = []
+        original = engine._compiled_actor_loss
+
+        def capture(*args):
+            scalar_calls.append(args[8:11])
+            return original(*args)
+
+        engine._compiled_actor_loss = capture
+        original_terms = engine._compute_actor_loss_terms(
+            observation, safe, bc_lambda=1.75,
+        )
+        repeated = engine._compute_actor_loss_terms(
+            observation, safe, bc_lambda=1.75,
+        )
+        self.assertTrue(all(a is b for a, b in zip(scalar_calls[0], scalar_calls[1])))
+        self.assertTrue(all(not value.requires_grad for value in scalar_calls[0]))
+        self.assertTrue(all(value.ndim == 0 for value in scalar_calls[0]))
+
+        changed_bc = engine._compute_actor_loss_terms(
+            observation, safe, bc_lambda=2.25,
+        )
+        self.assertIs(scalar_calls[1][0], scalar_calls[2][0])
+        self.assertIsNot(scalar_calls[1][1], scalar_calls[2][1])
+        self.assertIs(scalar_calls[1][2], scalar_calls[2][2])
+        torch.testing.assert_close(
+            changed_bc.actor_loss - repeated.actor_loss,
+            0.5 * changed_bc.bc_loss,
+        )
+
+        engine.actor_rl_scale_alpha = 3.5
+        engine.terminal_geo_regularization_enabled = False
+        engine._compute_actor_loss_terms(observation, safe, bc_lambda=2.25)
+        self.assertIsNot(scalar_calls[2][0], scalar_calls[3][0])
+        self.assertIs(scalar_calls[2][1], scalar_calls[3][1])
+        self.assertIsNot(scalar_calls[2][2], scalar_calls[3][2])
+        self.assertEqual(scalar_calls[3][2].item(), 0.0)
+        engine.terminal_geo_regularization_enabled = True
+        engine.terminal_geo_lambda = 120.0
+        engine._compute_actor_loss_terms(observation, safe, bc_lambda=2.25)
+        self.assertIsNot(scalar_calls[3][2], scalar_calls[4][2])
+        self.assertEqual(scalar_calls[4][2].item(), 120.0)
+        double_bc = engine._actor_loss_coefficient_tensor(
+            'bc', 2.25, torch.ones(1, dtype=torch.float64),
+        )
+        self.assertEqual(double_bc.dtype, torch.float64)
+        self.assertIsNot(double_bc, scalar_calls[4][1])
+        original_terms.actor_loss.backward()
+
+    def test_actor_loss_coefficient_cache_off_and_checkpoint_load_invalidates(self):
+        observation = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        safe = torch.ones((2, 1), dtype=torch.float32)
+        for cached in (False, True):
+            with self.subTest(cached=cached):
+                engine = self.make_engine()
+                payload = engine.checkpoint_state_dict()
+                metadata = engine.configure_compilation(
+                    compile_actor_loss=True,
+                    cache_actor_loss_coefficients=cached,
+                    backend='eager',
+                )
+                self.assertEqual(
+                    metadata['actor_loss_coefficient_execution'],
+                    'cached' if cached else 'per_update',
+                )
+                scalar_calls = []
+                original = engine._compiled_actor_loss
+
+                def capture(*args):
+                    scalar_calls.append(args[8:11])
+                    return original(*args)
+
+                engine._compiled_actor_loss = capture
+                engine._compute_actor_loss_terms(observation, safe, bc_lambda=0.0)
+                engine._compute_actor_loss_terms(observation, safe, bc_lambda=0.0)
+                self.assertEqual(
+                    all(a is b for a, b in zip(scalar_calls[0], scalar_calls[1])),
+                    cached,
+                )
+                engine.load_checkpoint_state_dict(payload)
+                engine._compute_actor_loss_terms(observation, safe, bc_lambda=0.0)
+                self.assertTrue(all(
+                    a is not b for a, b in zip(scalar_calls[1], scalar_calls[2])
+                ))
+
+    def test_actor_loss_coefficient_cache_requires_compiled_loss(self):
+        with self.assertRaisesRegex(ValueError, 'requires compile_actor_loss'):
+            self.make_engine().configure_compilation(
+                cache_actor_loss_coefficients=True, backend='eager',
+            )
 
     def test_fused_adam_and_real_dynamo_eager_actor_loss_match_short_td3_updates(self):
         torch.manual_seed(761)
@@ -558,8 +675,11 @@ class TestV2TD3(unittest.TestCase):
         fixed_batch = reference.replay.sample(2)
         reference.replay.sample = lambda batch_size: fixed_batch
         optimized.replay.sample = lambda batch_size: fixed_batch
-        optimized.configure_compilation(compile_actor_loss=True, backend='eager')
-        for total_steps, coefficient in ((1, 0.0), (2, 0.0), (3, 0.0), (4, 1.5)):
+        optimized.configure_compilation(
+            compile_actor_loss=True, cache_actor_loss_coefficients=True,
+            backend='eager',
+        )
+        for total_steps, coefficient in ((1, 0.0), (2, 0.0), (3, 0.0), (4, 1.75)):
             update_rng = torch.random.get_rng_state()
             expected = reference.update_once(total_steps=total_steps, bc_lambda=coefficient)
             torch.random.set_rng_state(update_rng)
@@ -612,7 +732,10 @@ class TestV2TD3(unittest.TestCase):
             terminal_enabled=True,
             bc_reference_actor=self.make_bc_reference(0.01),
         )
-        engine.enable_actor_loss_compile(backend=counting_backend, fullgraph=True)
+        engine.configure_compilation(
+            compile_actor_loss=True, cache_actor_loss_coefficients=True,
+            backend=counting_backend, fullgraph=True,
+        )
         observation = collate_v2_observations([
             _observation(0, scales=self.scales),
             _observation(7, scales=self.scales),

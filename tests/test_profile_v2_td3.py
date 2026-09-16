@@ -669,6 +669,7 @@ class TestProfileV2TD3(unittest.TestCase):
                         compile_snn_target_encoder=False,
                         fused_adam=False,
                         compile_actor_loss=False,
+                        cache_actor_loss_coefficients=False,
                         compile_action_inference=False,
                         aggregate_relation_values_first=False,
                         compiled_path_profiler_updates=0,
@@ -836,6 +837,9 @@ class TestProfileV2TD3(unittest.TestCase):
                 'actor_loss_granularity': (
                     'tensor_block' if kwargs['compile_actor_loss'] else 'eager'
                 ),
+                'actor_loss_coefficient_execution': (
+                    'cached' if kwargs['cache_actor_loss_coefficients'] else 'per_update'
+                ),
                 'action_inference_granularity': (
                     'ann_full_forward'
                     if kwargs['compile_action_inference'] else 'eager'
@@ -901,6 +905,7 @@ class TestProfileV2TD3(unittest.TestCase):
                 compile_snn_target_encoder=compile_snn_target_encoder,
                 fused_adam=fused_adam,
                 compile_actor_loss=compile_actor_loss,
+                cache_actor_loss_coefficients=cache_actor_loss_coefficients,
                 compile_action_inference=compile_action_inference,
                 aggregate_relation_values_first=aggregate_relation_values_first,
                 compiled_path_profiler_updates=compiled_path_profiler_updates,
@@ -952,11 +957,14 @@ class TestProfileV2TD3(unittest.TestCase):
     def test_three_optimization_scopes_are_recorded_in_diagnostic(self) -> None:
         result, _, _ = self.run_small_level(
             fused_adam=True, compile_actor_loss=True,
+            cache_actor_loss_coefficients=True,
             aggregate_relation_values_first=True,
         )
         compile_info = result['critic_encoder_compile']
         self.assertEqual(compile_info['optimizer_execution'], 'fused_adam')
         self.assertEqual(compile_info['actor_loss_granularity'], 'tensor_block')
+        self.assertTrue(compile_info['actor_loss_coefficients_requested'])
+        self.assertEqual(compile_info['actor_loss_coefficient_execution'], 'cached')
         self.assertEqual(
             compile_info['relation_value_execution'], 'aggregate_then_project',
         )
@@ -1186,6 +1194,7 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertFalse(args.compile_snn_target_encoder)
         self.assertFalse(args.fused_adam)
         self.assertFalse(args.compile_actor_loss)
+        self.assertFalse(args.cache_actor_loss_coefficients)
         self.assertFalse(args.compile_action_inference)
         self.assertFalse(args.aggregate_relation_values_first)
         self.assertFalse(args.check_compiled_numerics)
@@ -1243,11 +1252,13 @@ class TestProfileV2TD3(unittest.TestCase):
             '--model', 'ann', '--bc-checkpoint', 'bc.pt',
             '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
             '--fused-adam', '--compile-actor-loss',
+            '--cache-actor-loss-coefficients',
             '--compile-action-inference',
             '--aggregate-relation-values-first',
         ])
         self.assertTrue(optimization_scopes.fused_adam)
         self.assertTrue(optimization_scopes.compile_actor_loss)
+        self.assertTrue(optimization_scopes.cache_actor_loss_coefficients)
         self.assertTrue(optimization_scopes.compile_action_inference)
         self.assertTrue(optimization_scopes.aggregate_relation_values_first)
 
@@ -2093,10 +2104,14 @@ class TestProfileV2TD3(unittest.TestCase):
                 frozen_critic_strategy='compiled_no_grad_context',
                 compile_critic_block=True,
                 compile_target_block=True,
+                compile_actor_loss=True,
+                cache_actor_loss_coefficients=True,
                 compile_action_inference=True,
             )
 
         self.assertTrue(result['passed'])
+        self.assertFalse(reference.cache_actor_loss_coefficients)
+        self.assertTrue(compiled.cache_actor_loss_coefficients)
         self.assertIsNone(reference._compiled_action_inference)
         self.assertIsNotNone(compiled._compiled_action_inference)
         self.assertEqual(
@@ -2447,6 +2462,11 @@ class TestProfileV2TD3(unittest.TestCase):
             'scenario_pool_dir': Path('missing-pools'),
             'device': 'cpu',
         }
+        with self.assertRaisesRegex(ValueError, 'requires compile_actor_loss'):
+            run_v2_td3_timing_diagnostic(
+                **common,
+                cache_actor_loss_coefficients=True,
+            )
         with self.assertRaisesRegex(ValueError, 'requires compile_critic_encoder'):
             run_v2_td3_timing_diagnostic(
                 **common,

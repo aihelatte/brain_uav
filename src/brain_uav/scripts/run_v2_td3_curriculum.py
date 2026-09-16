@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--compile-snn-target-encoder', action='store_true')
     parser.add_argument('--fused-adam', action='store_true')
     parser.add_argument('--compile-actor-loss', action='store_true')
+    parser.add_argument('--cache-actor-loss-coefficients', action='store_true')
     parser.add_argument('--compile-action-inference', action='store_true')
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument('--compile-actors', action='store_true')
@@ -128,6 +129,7 @@ def run_v2_curriculum(
     compile_snn_target_encoder: bool = False,
     fused_adam: bool = False,
     compile_actor_loss: bool = False,
+    cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
 ) -> dict[str, Any]:
@@ -135,6 +137,8 @@ def run_v2_curriculum(
     resolved_device = resolve_training_device(requested_device)
     if model not in ('ann', 'snn'):
         raise ValueError('model must be "ann" or "snn".')
+    if cache_actor_loss_coefficients and not compile_actor_loss:
+        raise ValueError('cache_actor_loss_coefficients requires compile_actor_loss.')
     if type(snn_time_window) is not int or snn_time_window <= 0:
         raise ValueError('snn_time_window must be a positive integer.')
     if model == 'snn':
@@ -237,6 +241,7 @@ def run_v2_curriculum(
             compile_snn_target_encoder=compile_snn_target_encoder,
             fused_adam=fused_adam,
             compile_actor_loss=compile_actor_loss,
+            cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
             aggregate_relation_values_first=aggregate_relation_values_first,
         )
@@ -282,6 +287,7 @@ def run_v2_curriculum(
             'compile_snn_target_encoder': compile_snn_target_encoder,
             'fused_adam': fused_adam,
             'compile_actor_loss': compile_actor_loss,
+            'cache_actor_loss_coefficients': cache_actor_loss_coefficients,
             'compile_action_inference': compile_action_inference,
             'aggregate_relation_values_first': aggregate_relation_values_first,
             'cuda_graph': False,
@@ -320,6 +326,7 @@ def main(argv: list[str] | None = None) -> int:
         compile_snn_target_encoder=args.compile_snn_target_encoder,
         fused_adam=args.fused_adam,
         compile_actor_loss=args.compile_actor_loss,
+        cache_actor_loss_coefficients=args.cache_actor_loss_coefficients,
         compile_action_inference=args.compile_action_inference,
         aggregate_relation_values_first=args.aggregate_relation_values_first,
     )
