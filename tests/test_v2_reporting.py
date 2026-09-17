@@ -29,6 +29,7 @@ from brain_uav.trainers.v2_reporting import (
     V2TrainingTrajectorySelector,
     V2ValidationTrajectorySelector,
     _format_duration,
+    _format_scientific,
     _plot_training_windows,
     export_v2_trajectory_views,
 )
@@ -581,6 +582,20 @@ class TestV2DurationFormatting(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _format_duration(invalid)
 
+    def test_scientific_notation_drops_exponent_padding(self) -> None:
+        for value, expected in (
+            (282745.415728, '2.83e5'),
+            (0.0, '0.00e0'),
+            (-0.0015, '-1.50e-3'),
+            (1e-12, '1.00e-12'),
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(_format_scientific(value), expected)
+        for invalid in (float('nan'), float('inf')):
+            with self.subTest(invalid=invalid):
+                with self.assertRaises(ValueError):
+                    _format_scientific(invalid)
+
 
 class TestV2EpisodeLineLayout(unittest.TestCase):
     def test_outcome_column_is_aligned_across_outcomes(self) -> None:
@@ -797,17 +812,35 @@ class TestV2TrainingCurvePlot(unittest.TestCase):
             ))
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'training_curves.png'
-            _plot_training_windows(path, rows)
+            _plot_training_windows(path, rows, required_qualified_windows=4)
             self.assertTrue(path.is_file())
             image = mpimg.imread(path)
             self.assertGreater(image.shape[0], image.shape[1])
             self.assertGreater(image.shape[1], 500)
 
+    def test_streak_axis_keeps_streaks_above_the_requirement_visible(self) -> None:
+        # The streak keeps climbing past the requirement until stage_steps
+        # reaches early_stop_min_steps, so the axis must not clip at 4.
+        rows = [
+            _window_row(window_index=index + 1, consecutive_qualified_windows=streak)
+            for index, streak in enumerate((3, 5, 6, 0))
+        ]
+        captured: list[tuple[float, float]] = []
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'training_curves.png'
+            with mock.patch(
+                'matplotlib.axes.Axes.set_ylim', autospec=True,
+                side_effect=lambda axis, *args, **kwargs: captured.append(args),
+            ):
+                _plot_training_windows(path, rows, required_qualified_windows=4)
+        self.assertIn((0, 6), captured)
+
     def test_plot_failure_is_reported_not_swallowed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'missing_dir' / 'curves.png'
             with self.assertRaisesRegex(RuntimeError, 'Failed to render V2 training curves'):
-                _plot_training_windows(path, [_window_row()])
+                _plot_training_windows(path, [_window_row()],
+                                       required_qualified_windows=4)
 
 
 if __name__ == '__main__':

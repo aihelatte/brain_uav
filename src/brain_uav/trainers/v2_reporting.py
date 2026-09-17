@@ -428,7 +428,8 @@ def export_v2_trajectory_views(target_dir: str | Path, stem: str,
     return {'json': str(json_path), 'png': str(png_path)}
 
 
-def _plot_training_windows(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
+def _plot_training_windows(path: Path, rows: Sequence[Mapping[str, Any]], *,
+                           required_qualified_windows: int) -> None:
     try:
         import matplotlib
         matplotlib.use('Agg', force=True)
@@ -467,9 +468,21 @@ def _plot_training_windows(path: Path, rows: Sequence[Mapping[str, Any]]) -> Non
         axes[1].set_title('Failure Count Against Early-Stop Threshold')
         axes[1].set_ylabel('failures')
         streak_axis = axes[1].twinx()
-        streak_axis.plot(x, values('consecutive_qualified_windows'), marker='o',
-                         markersize=4, color='tab:blue', label='qualified streak')
-        streak_axis.set_ylabel('qualified streak')
+        streak_values = values('consecutive_qualified_windows')
+        streak_axis.plot(x, streak_values, marker='o', markersize=4,
+                         color='tab:blue', label='qualified streak')
+        # The streak is an integer count read against the early-stop requirement,
+        # so the axis spans that requirement rather than the observed maximum.
+        # It keeps climbing past the requirement while stage_steps is still below
+        # early_stop_min_steps, so the observed maximum still sets the ceiling.
+        streak_upper = max(
+            required_qualified_windows,
+            int(max(streak_values)) if rows else 0,
+        )
+        streak_axis.set_ylim(0, streak_upper)
+        streak_axis.set_yticks(range(0, streak_upper + 1))
+        streak_axis.set_ylabel(
+            f'qualified streak (need {required_qualified_windows})')
         failure_handles, failure_labels = axes[1].get_legend_handles_labels()
         streak_handles, streak_labels = streak_axis.get_legend_handles_labels()
         axes[1].legend(failure_handles + streak_handles, failure_labels + streak_labels)
@@ -840,7 +853,9 @@ class V2ExperimentReporter:
         stage_end['stage_elapsed_seconds'] = stage_elapsed_seconds
         _write_json(self.output_dir / 'stage_end.json', stage_end)
         _write_csv(self.output_dir / 'windows.csv', self._window_rows)
-        _plot_training_windows(self.output_dir / 'training_curves.png', self._window_rows)
+        _plot_training_windows(
+            self.output_dir / 'training_curves.png', self._window_rows,
+            required_qualified_windows=self._required_qualified_windows)
         print(f"[V2 {self.model_type.upper()} {self.stage}] finish "
               f"status={result['status']} reason={result['stop_reason']} "
               f"steps={result['stage_steps']} elapsed={stage_elapsed_seconds:.1f}s "
