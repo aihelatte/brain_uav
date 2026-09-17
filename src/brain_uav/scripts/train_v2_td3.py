@@ -374,6 +374,7 @@ def run_v2_td3_stage(
             rewards=reward_config,
             uav_collision_radius=effective_uav_collision_radius,
             max_steps=config.max_steps,
+            required_qualified_windows=config.consecutive_qualified_windows,
         )
         if reporting
         else None

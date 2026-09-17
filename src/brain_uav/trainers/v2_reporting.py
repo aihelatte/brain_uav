@@ -23,6 +23,42 @@ V2_REPORT_OUTCOMES = ('goal', 'ground', 'boundary', 'collision', 'timeout')
 V2_SAFETY_VISUALIZATION_NOTE = (
     'Conservative visual approximation; not used for collision checking.'
 )
+# Console/plot display order and colors. The colors mirror the V1 palette in
+# scripts/train_td3.py (OUTCOME_KEYS/OUTCOME_COLORS) so V1 and V2 figures read
+# the same; V2 has no 'other' outcome, so that entry is absent here.
+V2_CONSOLE_OUTCOME_ORDER = ('goal', 'collision', 'ground', 'boundary', 'timeout')
+V2_PLOT_OUTCOME_ORDER = ('goal', 'timeout', 'boundary', 'ground', 'collision')
+V2_OUTCOME_COLORS = {
+    'goal': 'tab:green',
+    'timeout': 'tab:orange',
+    'boundary': 'tab:red',
+    'ground': 'tab:brown',
+    'collision': 'tab:purple',
+}
+
+
+def _format_duration(seconds: float) -> str:
+    """Render an elapsed/remaining duration with a self-selected unit."""
+
+    value = float(seconds)
+    if not isfinite(value) or value < 0.0:
+        raise ValueError('duration seconds must be finite and non-negative.')
+    if value >= 3600.0:
+        return f'{value / 3600.0:.1f}h'
+    if value >= 60.0:
+        return f'{int(value // 60.0)}m'
+    return f'{int(value)}s'
+
+
+def _format_scientific(value: float) -> str:
+    """Two-digit mantissa scientific notation without exponent padding."""
+
+    number = float(value)
+    if not isfinite(number):
+        raise ValueError('scientific notation requires a finite number.')
+    mantissa, _, exponent = f'{number:.2e}'.partition('e')
+    sign = '-' if exponent.startswith('-') else ''
+    return f'{mantissa}e{sign}{int(exponent.lstrip("+-"))}'
 
 
 def _json_ready(value: Any, *, path: str = 'value') -> Any:
@@ -397,26 +433,80 @@ def _plot_training_windows(path: Path, rows: Sequence[Mapping[str, Any]]) -> Non
         import matplotlib
         matplotlib.use('Agg', force=True)
         import matplotlib.pyplot as plt
-        fig, axes = plt.subplots(4, 1, figsize=(12, 16), sharex=True)
-        x = np.arange(1, len(rows) + 1)
+        fig, axes = plt.subplots(4, 1, figsize=(16, 18))
+        x = np.arange(len(rows))
+        labels = [
+            f"{row.get('episode_start', 0)}-{row.get('episode_end', 0)}" for row in rows
+        ]
+        tick_step = max(1, len(labels) // 18)
+        tick_positions = list(x[::tick_step])
+        tick_labels = labels[::tick_step]
 
         def values(name: str) -> list[float]:
             return [float(row.get(name, 0.0)) for row in rows]
 
-        axes[0].plot(x, values('goal_ratio'), marker='o')
-        axes[0].set_ylabel('goal ratio')
-        axes[1].plot(x, values('average_return'), marker='o')
-        axes[1].set_ylabel('average return')
-        axes[2].plot(x, values('average_length'), marker='o')
-        axes[2].set_ylabel('average length')
-        axes[3].plot(x, values('average_actor_loss'), label='actor')
-        axes[3].plot(x, values('average_critic_loss'), label='critic')
-        axes[3].set_ylabel('loss')
-        axes[3].set_xlabel('complete/partial window')
-        axes[3].legend()
+        bottoms = np.zeros(len(rows), dtype=np.float64)
+        for outcome in V2_PLOT_OUTCOME_ORDER:
+            counts = np.asarray(values(f'{outcome}_count'), dtype=np.float64)
+            axes[0].bar(x, counts, bottom=bottoms, label=outcome,
+                        color=V2_OUTCOME_COLORS[outcome], width=0.85)
+            bottoms = bottoms + counts
+        axes[0].set_title('Outcome Counts Per Episode Window')
+        axes[0].set_ylabel('episodes')
+        # Windows are full by construction, so the stack reaches the top; add
+        # headroom to keep the legend off the bars.
+        if bottoms.size:
+            axes[0].set_ylim(0.0, float(bottoms.max()) * 1.25 or 1.0)
+        axes[0].legend(ncol=5, loc='upper left', framealpha=0.9)
+        axes[0].grid(axis='y', alpha=0.25)
+
+        axes[1].bar(x, values('failure_count'), color='tab:red', width=0.85,
+                    label='failure count')
+        axes[1].axhline(1.0, color='red', linestyle='--', linewidth=1.2,
+                        label='early-stop threshold (1)')
+        axes[1].set_title('Failure Count Against Early-Stop Threshold')
+        axes[1].set_ylabel('failures')
+        streak_axis = axes[1].twinx()
+        streak_axis.plot(x, values('consecutive_qualified_windows'), marker='o',
+                         markersize=4, color='tab:blue', label='qualified streak')
+        streak_axis.set_ylabel('qualified streak')
+        failure_handles, failure_labels = axes[1].get_legend_handles_labels()
+        streak_handles, streak_labels = streak_axis.get_legend_handles_labels()
+        axes[1].legend(failure_handles + streak_handles, failure_labels + streak_labels)
+        axes[1].grid(axis='y', alpha=0.25)
+
+        axes[2].plot(x, values('average_return'), marker='o', markersize=4,
+                     color='tab:blue', label='average return')
+        axes[2].set_title('Average Return And Episode Length')
+        axes[2].set_ylabel('average return')
+        length_axis = axes[2].twinx()
+        length_axis.plot(x, values('average_length'), marker='s', markersize=4,
+                         color='tab:cyan', label='average length')
+        length_axis.set_ylabel('average length')
+        return_handles, return_labels = axes[2].get_legend_handles_labels()
+        length_handles, length_labels = length_axis.get_legend_handles_labels()
+        axes[2].legend(return_handles + length_handles, return_labels + length_labels)
+        axes[2].grid(alpha=0.25)
+
+        axes[3].plot(x, values('average_actor_loss'), marker='o', markersize=4,
+                     color='tab:olive', label='actor loss')
+        axes[3].set_title('Average Actor And Critic Loss')
+        axes[3].set_ylabel('actor loss')
+        axes[3].set_xlabel('episode window')
+        critic_axis = axes[3].twinx()
+        critic_axis.plot(x, values('average_critic_loss'), marker='s', markersize=4,
+                         color='tab:pink', label='critic loss')
+        critic_axis.set_yscale('log')
+        critic_axis.set_ylabel('critic loss (log)')
+        actor_handles, actor_labels = axes[3].get_legend_handles_labels()
+        critic_handles, critic_labels = critic_axis.get_legend_handles_labels()
+        axes[3].legend(actor_handles + critic_handles, actor_labels + critic_labels)
+        axes[3].grid(alpha=0.25)
+
         for axis in axes:
-            axis.grid(alpha=0.25)
-        fig.tight_layout()
+            axis.set_xticks(tick_positions)
+            axis.set_xticklabels(tick_labels, rotation=35, ha='right')
+        fig.tight_layout(pad=2.0)
         fig.savefig(path, dpi=160, bbox_inches='tight')
     except Exception as exc:
         raise RuntimeError(f'Failed to render V2 training curves: {path}') from exc
@@ -431,7 +521,8 @@ class V2ExperimentReporter:
     def __init__(self, output_dir: str | Path, *, stage: str, model_type: str,
                  scenario: ScenarioConfig, rewards: RewardConfig,
                  uav_collision_radius: float, max_steps: int,
-                 progress_interval_seconds: float = 60.0,
+                 required_qualified_windows: int = 4,
+                 progress_interval_seconds: float = 600.0,
                  clock: Callable[[], float] = monotonic) -> None:
         if stage not in ('easy', 'medium', 'hard'):
             raise ValueError('stage must be easy, medium, or hard.')
@@ -439,6 +530,8 @@ class V2ExperimentReporter:
             raise ValueError('model_type must be ann or snn.')
         if not isinstance(scenario, ScenarioConfig) or not isinstance(rewards, RewardConfig):
             raise TypeError('scenario and rewards must use project config classes.')
+        if type(required_qualified_windows) is not int or required_qualified_windows <= 0:
+            raise ValueError('required_qualified_windows must be a positive integer.')
         interval = float(progress_interval_seconds)
         if not isfinite(interval) or interval <= 0.0:
             raise ValueError('progress_interval_seconds must be finite and positive.')
@@ -454,6 +547,9 @@ class V2ExperimentReporter:
         self.uav_collision_radius = float(uav_collision_radius)
         self._clock = clock
         self._interval = interval
+        self._required_qualified_windows = required_qualified_windows
+        self._seen_frozen_actor = False
+        self._actor_unfreeze_reported = False
         self._stage_started = clock()
         self._episode_started = self._stage_started
         self._window_started = self._stage_started
@@ -496,18 +592,24 @@ class V2ExperimentReporter:
               f"initialization={initialization.get('path')} "
               f"checkpoint={metadata.get('checkpoint_output')} "
               f"episodes={self.output_dir / 'episodes.jsonl'} "
-              f"images={self.output_dir / 'trajectories'}")
+              f"images={self.output_dir / 'trajectories'}", flush=True)
 
     def maybe_report_progress(self, *, stage_steps: int, completed_episodes: int,
                               current_episode_steps: int, actor_active: bool) -> bool:
         now = self._clock()
         if now - self._last_console < self._interval:
             return False
-        print(f"[V2 {self.model_type.upper()} {self.stage}] progress unfinished_episode "
-              f"stage_steps={stage_steps} episodes={completed_episodes} "
-              f"current_episode_steps={current_episode_steps} "
-              f"elapsed={now - self._stage_started:.1f}s "
-              f"actor={'active' if actor_active else 'frozen'}")
+        elapsed_seconds = now - self._stage_started
+        fraction = stage_steps / self._max_steps if self._max_steps else 0.0
+        if stage_steps > 0:
+            remaining = (self._max_steps - stage_steps) / (stage_steps / elapsed_seconds)
+            eta = _format_duration(max(remaining, 0.0))
+        else:
+            eta = 'n/a'
+        print(f"---- [V2 {self.model_type.upper()} {self.stage}] "
+              f"elapsed {_format_duration(elapsed_seconds)} | "
+              f"{stage_steps}/{self._max_steps} ({fraction * 100.0:.1f}%) | "
+              f"eta {eta} ----", flush=True)
         self._last_console = now
         return True
 
@@ -527,13 +629,21 @@ class V2ExperimentReporter:
         persisted['stage_elapsed_seconds'] = now - self._stage_started
         self._episodes.append(persisted)
         self._pending_episodes.append(persisted)
+        prefix = f"[V2 {self.model_type.upper()} {self.stage}]"
+        status = str(record.get('actor_update_status', 'not_updated'))
+        if status == 'frozen':
+            self._seen_frozen_actor = True
+        elif (status == 'updated' and self._seen_frozen_actor
+                and not self._actor_unfreeze_reported):
+            self._actor_unfreeze_reported = True
+            print(f"{prefix} actor unfrozen at step {record['stage_steps']}", flush=True)
         print(
-            f"[V2 {self.model_type.upper()} {self.stage}] "
-            f"episode={record['episode']} | step={record['stage_steps']}/{self._max_steps} "
-            f"| length={record['episode_length']} | outcome={record['outcome']} "
-            f"| return={record['episode_return']:.2f} "
-            f"| episode_time={persisted['episode_elapsed_seconds']:.2f}s "
-            f"| actor={record.get('actor_update_status', 'not_updated')}",
+            f"{prefix} ep {int(record['episode']):5d} "
+            f"| {record['stage_steps']}/{self._max_steps} "
+            f"| len {int(record['episode_length']):4d} "
+            f"| {str(record['outcome']):<9s} "
+            f"| ret {record['episode_return']:7.0f} "
+            f"|{persisted['episode_elapsed_seconds']:7.1f}s",
             flush=True,
         )
         selection = self._selector.select(
@@ -581,17 +691,24 @@ class V2ExperimentReporter:
         reported = self._reported_window(row, partial=False)
         self._windows.append(reported)
         self._window_rows.append(reported)
-        print(f"[V2 {self.model_type.upper()} {self.stage}] window "
-              f"episodes={reported['episode_start']}-{reported['episode_end']} "
-              f"stage_steps={reported['stage_steps']} "
-              f"global_steps={reported.get('global_steps', 'n/a')} "
-              f"goal_ratio={reported['goal_ratio']:.3f} "
-              f"return={reported['average_return']:.3f} length={reported['average_length']:.1f} "
-              f"actor_loss={reported['average_actor_loss']:.6f} "
-              f"critic_loss={reported['average_critic_loss']:.6f} "
-              f"qualified_streak={reported['consecutive_qualified_windows']} "
-              f"replay={reported.get('replay_size', 0)} "
-              f"elapsed={reported['window_elapsed_seconds']:.1f}s")
+        outcomes = '  '.join(
+            f"{outcome} {reported[f'{outcome}_count']}"
+            for outcome in V2_CONSOLE_OUTCOME_ORDER
+        )
+        print(f"=== [V2 {self.model_type.upper()} {self.stage}] "
+              f"window {reported['window_index']} "
+              f"| ep {reported['episode_start']}-{reported['episode_end']} "
+              f"| step {reported['stage_steps']} "
+              f"| goal {reported['goal_count']}/{reported['episode_count']} "
+              f"| streak {reported['consecutive_qualified_windows']}"
+              f"/{self._required_qualified_windows}", flush=True)
+        print(f"    outcomes  {outcomes}", flush=True)
+        print(f"    metrics   return {reported['average_return']:.0f} "
+              f"| length {reported['average_length']:.0f} "
+              f"| actor {reported['average_actor_loss']:.3f} "
+              f"| critic {_format_scientific(reported['average_critic_loss'])} "
+              f"| replay {reported.get('replay_size', 0)} "
+              f"| {reported['window_elapsed_seconds']:.0f}s", flush=True)
         now = self._clock()
         self._pending_episodes = []
         self._window_started = now
@@ -620,7 +737,8 @@ class V2ExperimentReporter:
         self._validation_completed = 0
         self._validation_started_at = self._clock()
         print(f"[V2 {self.model_type.upper()} {self.stage}] fixed validation "
-              f"candidate={candidate} level={curriculum_level} scenarios={scenario_count}")
+              f"candidate={candidate} level={curriculum_level} scenarios={scenario_count}",
+              flush=True)
 
     def record_validation_scenario(self, record: Mapping[str, Any], *,
                                    scenario_payload: Mapping[str, Any],
@@ -658,7 +776,7 @@ class V2ExperimentReporter:
                 or self._validation_completed == self._validation_total):
             print(f"[V2 {self.model_type.upper()} {self.stage}] validation progress "
                   f"candidate={self._pending_candidate} "
-                  f"{self._validation_completed}/{self._validation_total}")
+                  f"{self._validation_completed}/{self._validation_total}", flush=True)
 
     def finish_validation(self, result: Mapping[str, Any]) -> None:
         if self._validation_writer is None or self._validation_root is None:
@@ -672,7 +790,8 @@ class V2ExperimentReporter:
         _write_json(self._validation_root / 'summary.json', summary)
         print(f"[V2 {self.model_type.upper()} {self.stage}] validation complete "
               f"candidate={self._pending_candidate} outcomes={summary['outcome_counts']} "
-              f"passed={summary['passed']} elapsed={summary['elapsed_seconds']:.1f}s")
+              f"passed={summary['passed']} elapsed={summary['elapsed_seconds']:.1f}s",
+              flush=True)
         self._pending_candidate = None
         self._pending_validation_global_steps = None
         self._validation_selector = None
@@ -725,7 +844,7 @@ class V2ExperimentReporter:
         print(f"[V2 {self.model_type.upper()} {self.stage}] finish "
               f"status={result['status']} reason={result['stop_reason']} "
               f"steps={result['stage_steps']} elapsed={stage_elapsed_seconds:.1f}s "
-              f"report={self.output_dir}")
+              f"report={self.output_dir}", flush=True)
 
     def close(self) -> None:
         if self._closed:
