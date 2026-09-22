@@ -195,6 +195,8 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertFalse(args.cache_actor_loss_coefficients)
         self.assertFalse(args.compile_action_inference)
         self.assertFalse(args.aggregate_relation_values_first)
+        self.assertFalse(args.reduce_update_stat_syncs)
+        self.assertFalse(args.cuda_graph_updates)
         enabled_optimizations = parser.parse_args([
             '--stage', 'easy', '--init-checkpoint', 'x',
             '--output', 'x', '--metrics-out', 'x', '--validation-pool', 'x',
@@ -202,12 +204,15 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             '--cache-actor-loss-coefficients',
             '--compile-action-inference',
             '--aggregate-relation-values-first',
+            '--reduce-update-stat-syncs', '--cuda-graph-updates',
         ])
         self.assertTrue(enabled_optimizations.fused_adam)
         self.assertTrue(enabled_optimizations.compile_actor_loss)
         self.assertTrue(enabled_optimizations.cache_actor_loss_coefficients)
         self.assertTrue(enabled_optimizations.compile_action_inference)
         self.assertTrue(enabled_optimizations.aggregate_relation_values_first)
+        self.assertTrue(enabled_optimizations.reduce_update_stat_syncs)
+        self.assertTrue(enabled_optimizations.cuda_graph_updates)
         with self.assertRaises(SystemExit):
             parser.parse_args([
                 '--stage', 'easy_two_zone',
@@ -258,6 +263,10 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             warmup_action_inference_compile=lambda batches: calls.append(
                 ('action_inference_warmup', len(batches))
             ),
+            verify_update_cuda_graph_capture=lambda batches: (
+                calls.append(('cuda_graph_verify', len(batches)))
+                or {'cuda_graph_launch_count': 3}
+            ),
         )
         def fake_collate(observations):
             zone_count = max(0 if value == 'zero' else 7 for value in observations)
@@ -301,6 +310,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 compile_actor_loss=True,
                 cache_actor_loss_coefficients=True,
                 compile_action_inference=True,
+                cuda_graph_updates=True,
             )
         self.assertEqual(
             [entry[0] for entry in calls],
@@ -308,6 +318,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 'configure', 'actor_warmup', 'shared_warmup',
                 'full_warmup', 'actor_loss_warmup',
                 'action_inference_warmup',
+                'cuda_graph_verify',
             ],
         )
         self.assertTrue(calls[0][1]['compile_shared_relations'])
@@ -315,6 +326,8 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertTrue(calls[0][1]['compile_actor_loss'])
         self.assertTrue(calls[0][1]['cache_actor_loss_coefficients'])
         self.assertTrue(calls[0][1]['compile_action_inference'])
+        self.assertTrue(calls[0][1]['cuda_graph_updates'])
+        self.assertEqual(metadata['cuda_graph_evidence']['cuda_graph_launch_count'], 3)
         self.assertEqual(metadata['action_inference_warmup_shapes'], [[1, 0], [1, 7]])
         self.assertTrue(metadata['requested'])
         self.assertEqual(metadata['warmup_batch_shapes'], [[2, 0], [2, 7], [2, 7]])

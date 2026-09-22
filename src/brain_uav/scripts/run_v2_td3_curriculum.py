@@ -46,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--cache-actor-loss-coefficients', action='store_true')
     parser.add_argument('--compile-action-inference', action='store_true')
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
+    parser.add_argument('--reduce-update-stat-syncs', action='store_true')
+    parser.add_argument('--cuda-graph-updates', action='store_true')
     parser.add_argument('--compile-actors', action='store_true')
     parser.add_argument(
         '--frozen-critic-strategy',
@@ -132,6 +134,8 @@ def run_v2_curriculum(
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
+    reduce_update_stat_syncs: bool = False,
+    cuda_graph_updates: bool = False,
 ) -> dict[str, Any]:
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
@@ -139,6 +143,14 @@ def run_v2_curriculum(
         raise ValueError('model must be "ann" or "snn".')
     if cache_actor_loss_coefficients and not compile_actor_loss:
         raise ValueError('cache_actor_loss_coefficients requires compile_actor_loss.')
+    if type(reduce_update_stat_syncs) is not bool:
+        raise TypeError('reduce_update_stat_syncs must be a bool.')
+    if type(cuda_graph_updates) is not bool:
+        raise TypeError('cuda_graph_updates must be a bool.')
+    if cuda_graph_updates and not compile_critic_block:
+        raise ValueError('cuda_graph_updates requires compile_critic_block.')
+    if cuda_graph_updates and resolved_device != 'cuda':
+        raise ValueError('cuda_graph_updates requires a CUDA device.')
     if type(snn_time_window) is not int or snn_time_window <= 0:
         raise ValueError('snn_time_window must be a positive integer.')
     if model == 'snn':
@@ -244,6 +256,8 @@ def run_v2_curriculum(
             cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
             aggregate_relation_values_first=aggregate_relation_values_first,
+            reduce_update_stat_syncs=reduce_update_stat_syncs,
+            cuda_graph_updates=cuda_graph_updates,
         )
         summaries.append(summary)
         global_steps = int(summary.get('global_steps_end', global_steps + int(summary['steps'])))
@@ -290,7 +304,9 @@ def run_v2_curriculum(
             'cache_actor_loss_coefficients': cache_actor_loss_coefficients,
             'compile_action_inference': compile_action_inference,
             'aggregate_relation_values_first': aggregate_relation_values_first,
-            'cuda_graph': False,
+            'reduce_update_stat_syncs': reduce_update_stat_syncs,
+            'cuda_graph_updates': cuda_graph_updates,
+            'cuda_graph': cuda_graph_updates,
         },
     }
     _write_json(root / 'summary.json', payload)
@@ -329,6 +345,8 @@ def main(argv: list[str] | None = None) -> int:
         cache_actor_loss_coefficients=args.cache_actor_loss_coefficients,
         compile_action_inference=args.compile_action_inference,
         aggregate_relation_values_first=args.aggregate_relation_values_first,
+        reduce_update_stat_syncs=args.reduce_update_stat_syncs,
+        cuda_graph_updates=args.cuda_graph_updates,
     )
     print(json.dumps(summary, indent=2, allow_nan=False))
     return 0 if summary['passed'] else 1

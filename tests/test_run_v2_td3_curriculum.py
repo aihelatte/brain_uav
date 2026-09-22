@@ -118,6 +118,8 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertFalse(args.cache_actor_loss_coefficients)
         self.assertFalse(args.compile_action_inference)
         self.assertFalse(args.aggregate_relation_values_first)
+        self.assertFalse(args.reduce_update_stat_syncs)
+        self.assertFalse(args.cuda_graph_updates)
 
     def test_snn_curriculum_uses_distinct_outputs_and_forwards_model_contract(self):
         calls = []
@@ -162,13 +164,16 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
             ), mock.patch(
                 'brain_uav.scripts.run_v2_td3_curriculum.load_v2_validation_pool',
                 return_value=pool,
+            ), mock.patch(
+                'brain_uav.scripts.run_v2_td3_curriculum.resolve_training_device',
+                return_value='cuda',
             ):
                 result = run_v2_curriculum(
                     bc_checkpoint=checkpoint,
                     output_root=base / 'run',
                     validation_pool_dir=base / 'validation',
                     max_stage='easy',
-                    device='cpu',
+                    device='cuda',
                     model='snn',
                     snn_time_window=3,
                     stage_runner=fake_stage,
@@ -183,6 +188,8 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                     cache_actor_loss_coefficients=True,
                     compile_action_inference=True,
                     aggregate_relation_values_first=True,
+                    reduce_update_stat_syncs=True,
+                    cuda_graph_updates=True,
                 )
         initializer.assert_called_once()
         self.assertEqual(initializer.call_args.kwargs['init_checkpoint'], checkpoint)
@@ -204,6 +211,8 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertTrue(calls[0]['cache_actor_loss_coefficients'])
         self.assertTrue(calls[0]['compile_action_inference'])
         self.assertTrue(calls[0]['aggregate_relation_values_first'])
+        self.assertTrue(calls[0]['reduce_update_stat_syncs'])
+        self.assertTrue(calls[0]['cuda_graph_updates'])
         self.assertIs(calls[0]['prepared_initialization'], prepared)
         self.assertEqual(Path(calls[0]['output']).name, 'v2_snn_td3_easy.pt')
         self.assertEqual(
@@ -218,6 +227,8 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertTrue(result['compilation_request']['cache_actor_loss_coefficients'])
         self.assertTrue(result['compilation_request']['compile_action_inference'])
         self.assertTrue(result['compilation_request']['aggregate_relation_values_first'])
+        self.assertTrue(result['compilation_request']['reduce_update_stat_syncs'])
+        self.assertTrue(result['compilation_request']['cuda_graph_updates'])
         self.assertEqual(result['snn'], {
             'time_window': actor.time_window,
             'tau': actor.tau,

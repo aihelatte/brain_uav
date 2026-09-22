@@ -356,6 +356,7 @@ class V2TD3UpdateEngine:
         device: str | torch.device = 'cpu',
         fused_adam: bool = False,
         aggregate_relation_values_first: bool = False,
+        reduce_update_stat_syncs: bool = False,
     ) -> None:
         actor_model_type = _actor_model_type(actor)
         if not isinstance(critic1, V2ANNCritic) or not isinstance(critic2, V2ANNCritic):
@@ -385,10 +386,14 @@ class V2TD3UpdateEngine:
             raise TypeError('fused_adam must be a bool.')
         if type(aggregate_relation_values_first) is not bool:
             raise TypeError('aggregate_relation_values_first must be a bool.')
+        if type(reduce_update_stat_syncs) is not bool:
+            raise TypeError('reduce_update_stat_syncs must be a bool.')
         if fused_adam and self.device.type not in ('cpu', 'cuda'):
             raise ValueError(f'fused Adam is unsupported on {self.device.type}.')
         self.fused_adam = fused_adam
         self.aggregate_relation_values_first = aggregate_relation_values_first
+        self.reduce_update_stat_syncs = reduce_update_stat_syncs
+        self.cuda_graph_updates = False
         self.model_type = actor_model_type
         self.actor = actor.to(self.device)
         self.critic1 = critic1.to(self.device)
@@ -529,15 +534,21 @@ class V2TD3UpdateEngine:
         self,
         *,
         backend: str = 'inductor',
-        mode: str = 'default',
+        mode: str | None = 'default',
         fullgraph: bool = True,
         dynamic: bool = True,
+        options: dict[str, object] | None = None,
     ) -> tuple[str, ...]:
         if self._compiled_actor_loss is not None:
             raise RuntimeError('Actor loss tensor block is already compiled.')
+        compile_arguments: dict[str, object] = {
+            'backend': backend, 'mode': mode, 'fullgraph': fullgraph,
+            'dynamic': dynamic,
+        }
+        if options is not None:
+            compile_arguments['options'] = options
         self._compiled_actor_loss = torch.compile(
-            _actor_loss_tensor_block,
-            backend=backend, mode=mode, fullgraph=fullgraph, dynamic=dynamic,
+            _actor_loss_tensor_block, **compile_arguments,
         )
         return ('actor_loss.tensor_block',)
 
@@ -563,6 +574,7 @@ class V2TD3UpdateEngine:
             for batch in warmup_batches:
                 device_batch = batch.to(self.device)
                 for coefficient in (0.0, 1.5):
+                    self._mark_cuda_graph_step_begin()
                     actions = torch.zeros(
                         (device_batch.batch_size, self.action_dim),
                         device=self.device, dtype=torch.float32,
@@ -904,6 +916,7 @@ class V2TD3UpdateEngine:
         compile_actor_loss: bool = False,
         cache_actor_loss_coefficients: bool = False,
         compile_action_inference: bool = False,
+        cuda_graph_updates: bool = False,
         backend: str = 'inductor',
         mode: str = 'default',
         fullgraph: bool = True,
@@ -932,6 +945,18 @@ class V2TD3UpdateEngine:
             raise ValueError(
                 'cache_actor_loss_coefficients requires compile_actor_loss.'
             )
+        if type(cuda_graph_updates) is not bool:
+            raise TypeError('cuda_graph_updates must be a bool.')
+        if cuda_graph_updates and self.device.type != 'cuda':
+            raise ValueError('cuda_graph_updates requires a CUDA device.')
+        if cuda_graph_updates and backend != 'inductor':
+            raise ValueError("cuda_graph_updates requires backend='inductor'.")
+        if cuda_graph_updates and mode != 'default':
+            raise ValueError("cuda_graph_updates requires mode='default'.")
+        if cuda_graph_updates and not compile_critic_block:
+            raise ValueError(
+                'cuda_graph_updates requires compile_critic_block.'
+            )
         if compile_snn_target_encoder and not isinstance(
             self.actor_target, V2SNNPolicyActor
         ):
@@ -957,15 +982,25 @@ class V2TD3UpdateEngine:
             'fullgraph': fullgraph,
             'dynamic': dynamic,
         }
+        graph_options = (
+            {'triton.cudagraphs': True} if cuda_graph_updates else None
+        )
+        graph_mode = None if cuda_graph_updates else mode
         enabled: list[str] = []
         if compile_shared_relations:
             enabled.extend(self.enable_shared_relations_compile(**options))
         if compile_actor_loss:
-            enabled.extend(self.enable_actor_loss_compile(**options))
+            enabled.extend(self.enable_actor_loss_compile(
+                backend=backend, mode=graph_mode, fullgraph=fullgraph,
+                dynamic=dynamic, options=graph_options,
+            ))
         if compile_action_inference:
             enabled.extend(self.enable_action_inference_compile(**options))
         if compile_critic_block:
-            enabled.extend(self.enable_critic_loss_compile(**options))
+            enabled.extend(self.enable_critic_loss_compile(
+                backend=backend, mode=graph_mode, fullgraph=fullgraph,
+                dynamic=dynamic, options=graph_options,
+            ))
         elif compile_critic_encoder:
             enabled.extend(self.enable_online_critic_encoder_compile(**options))
         if (
@@ -976,13 +1011,17 @@ class V2TD3UpdateEngine:
         if compile_snn_target_encoder:
             enabled.extend(self.enable_snn_target_encoder_compile(**options))
         if compile_target_block:
-            enabled.extend(self.enable_target_block_compile(**options))
+            enabled.extend(self.enable_target_block_compile(
+                backend=backend, mode=graph_mode, fullgraph=fullgraph,
+                dynamic=dynamic, options=graph_options,
+            ))
         elif compile_target_encoders:
             enabled.extend(self.enable_target_encoder_compile(**options))
         if compile_actors:
             enabled.extend(self.enable_actor_compile(**options))
         self.set_frozen_critic_strategy(frozen_critic_strategy)
         self.cache_actor_loss_coefficients = cache_actor_loss_coefficients
+        self.cuda_graph_updates = cuda_graph_updates
         return {
             'enabled_objects': enabled,
             'critic_granularity': (
@@ -1032,7 +1071,22 @@ class V2TD3UpdateEngine:
             'mode': mode,
             'fullgraph': fullgraph,
             'dynamic': dynamic,
-            'cuda_graph': False,
+            'cuda_graph': cuda_graph_updates,
+            'cuda_graph_scope': (
+                [
+                    name for enabled_flag, name in (
+                        (compile_critic_block, 'twin_critic_forward_loss_backward'),
+                        (compile_target_block, 'target_forward_td_target'),
+                        (compile_actor_loss, 'actor_loss_forward_backward'),
+                    ) if enabled_flag
+                ] if cuda_graph_updates else []
+            ),
+            'cuda_graph_backend_options': graph_options or {},
+            'cuda_graph_compile_mode': None if cuda_graph_updates else mode,
+            'update_statistics_execution': (
+                'batched_device_readback'
+                if self.reduce_update_stat_syncs else 'per_scalar'
+            ),
         }
 
     def _compute_twin_critic_loss_tensors(
@@ -1071,9 +1125,10 @@ class V2TD3UpdateEngine:
         self,
         *,
         backend: str = 'inductor',
-        mode: str = 'default',
+        mode: str | None = 'default',
         fullgraph: bool = True,
         dynamic: bool = True,
+        options: dict[str, object] | None = None,
     ) -> tuple[str, str, str]:
         if self._compiled_critic_loss is not None:
             raise RuntimeError('Twin critic loss block is already compiled.')
@@ -1084,12 +1139,14 @@ class V2TD3UpdateEngine:
             raise RuntimeError(
                 'Full critic block forbids nested encoder compilation.'
             )
+        compile_arguments: dict[str, object] = {
+            'backend': backend, 'mode': mode, 'fullgraph': fullgraph,
+            'dynamic': dynamic,
+        }
+        if options is not None:
+            compile_arguments['options'] = options
         self._compiled_critic_loss = torch.compile(
-            self._compute_twin_critic_loss_tensors,
-            backend=backend,
-            mode=mode,
-            fullgraph=fullgraph,
-            dynamic=dynamic,
+            self._compute_twin_critic_loss_tensors, **compile_arguments,
         )
         return (
             'critic1.full_forward',
@@ -1187,9 +1244,10 @@ class V2TD3UpdateEngine:
         self,
         *,
         backend: str = 'inductor',
-        mode: str = 'default',
+        mode: str | None = 'default',
         fullgraph: bool = True,
         dynamic: bool = True,
+        options: dict[str, object] | None = None,
     ) -> tuple[str, str, str, str]:
         if (
             self.critic1_target.zone_set_encoder.compiled_tensor_forward_enabled
@@ -1203,12 +1261,15 @@ class V2TD3UpdateEngine:
                 'Full target block forbids nested encoder compilation.'
             )
         if isinstance(self.actor_target, V2ANNPolicyActor):
+            compile_arguments: dict[str, object] = {
+                'backend': backend, 'mode': mode, 'fullgraph': fullgraph,
+                'dynamic': dynamic,
+            }
+            if options is not None:
+                compile_arguments['options'] = options
             self._compiled_target_block = torch.compile(
                 self._compute_ann_target_block_tensors,
-                backend=backend,
-                mode=mode,
-                fullgraph=fullgraph,
-                dynamic=dynamic,
+                **compile_arguments,
             )
             return (
                 'actor_target.full_forward',
@@ -1216,12 +1277,15 @@ class V2TD3UpdateEngine:
                 'critic2_target.full_forward',
                 'td_target',
             )
+        compile_arguments = {
+            'backend': backend, 'mode': mode, 'fullgraph': fullgraph,
+            'dynamic': dynamic,
+        }
+        if options is not None:
+            compile_arguments['options'] = options
         self._compiled_target_critic_td = torch.compile(
             self._compute_target_critics_td_tensors,
-            backend=backend,
-            mode=mode,
-            fullgraph=fullgraph,
-            dynamic=dynamic,
+            **compile_arguments,
         )
         return (
             (
@@ -1548,6 +1612,7 @@ class V2TD3UpdateEngine:
         )
         try:
             for batch in warmup_batches:
+                self._mark_cuda_graph_step_begin()
                 device_batch = batch.to(self.device)
                 shared_relations = self._build_shared_relations(device_batch)
                 encoder_arguments = (
@@ -1753,6 +1818,320 @@ class V2TD3UpdateEngine:
         )
         if counts_after != counts_before:
             raise RuntimeError('Compile warmup must not change TD3 update counters.')
+
+    def _mark_cuda_graph_step_begin(self) -> None:
+        if self.cuda_graph_updates:
+            torch.compiler.cudagraph_mark_step_begin()
+
+    def _profile_cuda_graph_replay(
+        self,
+        replay: Callable[[], None],
+    ) -> dict[str, object]:
+        torch.cuda.synchronize(self.device)
+        with torch.profiler.profile(
+            activities=(
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ),
+            record_shapes=False,
+            profile_memory=False,
+            with_stack=False,
+        ) as replay_profile:
+            replay()
+        torch.cuda.synchronize(self.device)
+        graph_events = [
+            event for event in replay_profile.key_averages()
+            if 'cudagraphlaunch' in ''.join(
+                character.lower() for character in event.key
+                if character.isalnum()
+            )
+        ]
+        return {
+            'cuda_graph_launch_count': int(sum(
+                event.count for event in graph_events
+            )),
+            'event_names': sorted({event.key for event in graph_events}),
+        }
+
+    def _prepare_update_cuda_graph_verification_scope(
+        self,
+        batch: V2ObservationBatch,
+        scope: str,
+    ) -> Callable[[], None]:
+        device_batch = batch.to(self.device)
+        shared_relations = self._build_shared_relations(device_batch)
+        encoder_arguments = (
+            self.critic1.zone_set_encoder.prepare_tensor_forward_arguments(
+                device_batch.ego_features,
+                device_batch.goal_features,
+                device_batch.zone_features,
+                device_batch.presence_mask,
+                shared_relations=shared_relations,
+            )
+        )
+        action = torch.zeros(
+            (device_batch.batch_size, self.action_dim),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        target_q = torch.zeros(
+            (device_batch.batch_size, 1),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        self._mark_cuda_graph_step_begin()
+
+        if scope == 'critic_forward':
+            if self._compiled_critic_loss is None:
+                raise RuntimeError('Critic CUDA Graph verification was not configured.')
+
+            def replay_critic_forward() -> None:
+                self._compiled_critic_loss(
+                    *encoder_arguments,
+                    action,
+                    target_q,
+                )
+
+            return replay_critic_forward
+
+        if scope == 'critic_backward':
+            if self._compiled_critic_loss is None:
+                raise RuntimeError('Critic CUDA Graph verification was not configured.')
+            self.critic_optimizer.zero_grad(set_to_none=True)
+            _, _, critic_loss = self._compiled_critic_loss(
+                *encoder_arguments,
+                action,
+                target_q,
+            )
+
+            def replay_critic_backward() -> None:
+                try:
+                    critic_loss.backward()
+                finally:
+                    self.critic_optimizer.zero_grad(set_to_none=True)
+
+            return replay_critic_backward
+
+        if scope == 'target':
+            noise = torch.zeros_like(action)
+            reward = torch.zeros_like(target_q)
+            done = torch.zeros_like(target_q)
+            if self._compiled_target_block is not None:
+
+                def replay_ann_target() -> None:
+                    with torch.no_grad():
+                        self._compiled_target_block(
+                            *encoder_arguments,
+                            noise,
+                            reward,
+                            done,
+                        )
+
+                return replay_ann_target
+            if self._compiled_target_critic_td is None:
+                raise RuntimeError('Target CUDA Graph verification was not configured.')
+            with torch.no_grad():
+                next_action = self.actor_target(
+                    device_batch,
+                    shared_relations=shared_relations,
+                )
+
+            def replay_snn_target() -> None:
+                with torch.no_grad():
+                    self._compiled_target_critic_td(
+                        *encoder_arguments,
+                        next_action,
+                        reward,
+                        done,
+                    )
+
+            return replay_snn_target
+
+        if scope == 'actor_loss':
+            if self._compiled_actor_loss is None:
+                raise RuntimeError('Actor loss CUDA Graph verification was not configured.')
+            actor_actions = torch.zeros(
+                (device_batch.batch_size, self.action_dim),
+                device=self.device,
+                dtype=torch.float32,
+                requires_grad=True,
+            )
+            q_values = torch.ones(
+                (device_batch.batch_size, 1),
+                device=self.device,
+                dtype=torch.float32,
+                requires_grad=True,
+            )
+            reference = (
+                torch.zeros_like(actor_actions)
+                if self.bc_reference_actor is not None else None
+            )
+
+            def replay_actor_loss() -> None:
+                total, *_ = self._compiled_actor_loss(
+                    actor_actions,
+                    q_values,
+                    reference,
+                    device_batch.ego_features,
+                    device_batch.goal_features,
+                    torch.ones_like(q_values),
+                    self.action_low,
+                    self.action_high,
+                    torch.as_tensor(self.actor_rl_scale_alpha, device=self.device),
+                    torch.as_tensor(1.5, device=self.device),
+                    torch.as_tensor(
+                        self.terminal_geo_lambda
+                        if self.terminal_geo_regularization_enabled else 0.0,
+                        device=self.device,
+                    ),
+                    self.actor.scales.horizontal_span,
+                    self.actor.scales.vertical_span,
+                    self.actor.scales.gamma_max,
+                    self.terminal_geo_radius,
+                    self.terminal_geo_regularization_enabled,
+                )
+                total.backward()
+
+            return replay_actor_loss
+
+        raise ValueError(f'Unknown CUDA Graph verification scope: {scope!r}.')
+
+    def verify_update_cuda_graph_capture(
+        self,
+        batches: Sequence[V2ObservationBatch],
+    ) -> dict[str, object]:
+        """Verify each requested update graph replays for every warmup shape."""
+
+        if not self.cuda_graph_updates:
+            raise RuntimeError('CUDA Graph updates must be configured first.')
+        if self.device.type != 'cuda':
+            raise RuntimeError('CUDA Graph capture verification requires CUDA.')
+        warmup_batches = tuple(batches)
+        if not warmup_batches:
+            raise ValueError('CUDA Graph verification requires a warmup batch.')
+        distinct_batches: dict[tuple[int, int], V2ObservationBatch] = {}
+        for batch in warmup_batches:
+            distinct_batches.setdefault(
+                (batch.batch_size, batch.max_zone_count),
+                batch,
+            )
+        requested_scopes = ['critic_forward', 'critic_backward']
+        if (
+            self._compiled_target_block is not None
+            or self._compiled_target_critic_td is not None
+        ):
+            requested_scopes.append('target')
+        if self._compiled_actor_loss is not None:
+            requested_scopes.append('actor_loss')
+
+        critic_parameters = tuple(self.critic1.parameters()) + tuple(
+            self.critic2.parameters()
+        )
+        gradient_state = tuple(
+            (
+                parameter.grad,
+                None if parameter.grad is None else parameter.grad.detach().clone(),
+            )
+            for parameter in critic_parameters
+        )
+        torch_rng = torch.random.get_rng_state()
+        numpy_rng = np.random.get_state()
+        cuda_rng = torch.cuda.get_rng_state_all()
+        counters = (
+            self.update_count,
+            self.critic_update_count,
+            self.critic_target_update_count,
+            self.actor_update_count,
+            self.last_total_steps,
+        )
+        scope_evidence = {
+            scope: {'verified': True, 'shapes': []}
+            for scope in requested_scopes
+        }
+        missing: list[tuple[str, list[int]]] = []
+        try:
+            capture_batches = tuple(distinct_batches.values())
+            self.warmup_full_compile(capture_batches)
+            if self._compiled_actor_loss is not None:
+                self.warmup_actor_loss_compile(capture_batches)
+            for shape, batch in distinct_batches.items():
+                batch_shape = list(shape)
+                for scope in requested_scopes:
+                    replay = self._prepare_update_cuda_graph_verification_scope(
+                        batch,
+                        scope,
+                    )
+                    replay_evidence = self._profile_cuda_graph_replay(replay)
+                    launch_count = int(
+                        replay_evidence['cuda_graph_launch_count']
+                    )
+                    verified = launch_count > 0
+                    shape_evidence = {
+                        'batch_shape': batch_shape,
+                        'verified': verified,
+                        'cuda_graph_launch_count': launch_count,
+                        'event_names': replay_evidence['event_names'],
+                    }
+                    scope_evidence[scope]['shapes'].append(shape_evidence)
+                    if not verified:
+                        scope_evidence[scope]['verified'] = False
+                        missing.append((scope, batch_shape))
+        finally:
+            for parameter, (original_grad, saved_grad) in zip(
+                critic_parameters,
+                gradient_state,
+            ):
+                if original_grad is None:
+                    parameter.grad = None
+                else:
+                    original_grad.copy_(saved_grad)
+                    parameter.grad = original_grad
+            torch.random.set_rng_state(torch_rng)
+            np.random.set_state(numpy_rng)
+            torch.cuda.set_rng_state_all(cuda_rng)
+
+        if counters != (
+            self.update_count,
+            self.critic_update_count,
+            self.critic_target_update_count,
+            self.actor_update_count,
+            self.last_total_steps,
+        ):
+            raise RuntimeError(
+                'CUDA Graph verification must not change TD3 update counters.'
+            )
+        if missing:
+            details = '; '.join(
+                f'{scope} shape={shape}' for scope, shape in missing
+            )
+            raise RuntimeError(
+                'CUDA Graph updates were requested, but replay evidence is '
+                f'missing for: {details}. Re-run with TORCH_LOGS=perf_hints '
+                'to obtain the Inductor skip reason.'
+            )
+        launch_count = sum(
+            shape['cuda_graph_launch_count']
+            for scope in scope_evidence.values()
+            for shape in scope['shapes']
+        )
+        event_names = sorted({
+            event_name
+            for scope in scope_evidence.values()
+            for shape in scope['shapes']
+            for event_name in shape['event_names']
+        })
+        return {
+            'verified': True,
+            'evidence': (
+                'torch.profiler cudaGraphLaunch per requested scope and shape '
+                'outside measurement'
+            ),
+            'cuda_graph_launch_count': int(launch_count),
+            'event_names': event_names,
+            'batch_shape': list(next(iter(distinct_batches))),
+            'batch_shapes': [list(shape) for shape in distinct_batches],
+            'scope_evidence': scope_evidence,
+        }
 
     def enable_target_encoder_compile(
         self,
@@ -2075,6 +2454,8 @@ class V2TD3UpdateEngine:
         if self.bc_reference_actor is None and bc_lambda_value != 0.0:
             raise ValueError('bc_lambda must be 0 when no V2 BC reference actor exists.')
 
+        self._mark_cuda_graph_step_begin()
+
         with update_timing.section('replay_sample'):
             batch = self.replay.sample(self.batch_size)
         with update_timing.section('batch_preparation'):
@@ -2360,33 +2741,47 @@ class V2TD3UpdateEngine:
         self.critic_update_count += 1
         self.last_total_steps = total_steps_value
         if actor_terms is None:
+            statistic_values = self._read_update_statistics((
+                critic_loss,
+                batch.success.mean(),
+                batch.near_goal.mean(),
+            ))
             metrics = V2TD3UpdateMetrics(
-                critic_loss=float(critic_loss.item()),
-                sample_success_fraction=float(batch.success.mean().item()),
-                sample_near_goal_fraction=float(batch.near_goal.mean().item()),
+                critic_loss=statistic_values[0],
+                sample_success_fraction=statistic_values[1],
+                sample_near_goal_fraction=statistic_values[2],
                 critic_updated=True,
                 critic_targets_updated=critic_targets_updated,
                 actor_updated=False,
             )
         else:
+            statistic_values = self._read_update_statistics((
+                critic_loss,
+                actor_terms.actor_loss,
+                actor_terms.rl_actor_loss,
+                actor_terms.scaled_rl_actor_loss,
+                actor_terms.actor_rl_scale,
+                actor_terms.bc_loss,
+                actor_terms.terminal_geo_loss,
+                batch.success.mean(),
+                batch.near_goal.mean(),
+            ))
             metrics = V2TD3UpdateMetrics(
-                critic_loss=float(critic_loss.item()),
-                actor_loss=float(actor_terms.actor_loss.item()),
-                rl_actor_loss=float(actor_terms.rl_actor_loss.item()),
-                scaled_rl_actor_loss=float(
-                    actor_terms.scaled_rl_actor_loss.item()
-                ),
-                actor_rl_scale=float(actor_terms.actor_rl_scale.item()),
-                bc_loss=float(actor_terms.bc_loss.item()),
+                critic_loss=statistic_values[0],
+                actor_loss=statistic_values[1],
+                rl_actor_loss=statistic_values[2],
+                scaled_rl_actor_loss=statistic_values[3],
+                actor_rl_scale=statistic_values[4],
+                bc_loss=statistic_values[5],
                 bc_lambda=bc_lambda_value,
-                terminal_geo_loss=float(actor_terms.terminal_geo_loss.item()),
+                terminal_geo_loss=statistic_values[6],
                 terminal_geo_lambda=(
                     self.terminal_geo_lambda
                     if self.terminal_geo_regularization_enabled
                     else 0.0
                 ),
-                sample_success_fraction=float(batch.success.mean().item()),
-                sample_near_goal_fraction=float(batch.near_goal.mean().item()),
+                sample_success_fraction=statistic_values[7],
+                sample_near_goal_fraction=statistic_values[8],
                 critic_updated=True,
                 critic_targets_updated=critic_targets_updated,
                 actor_updated=True,
@@ -2394,6 +2789,15 @@ class V2TD3UpdateEngine:
         detail_timing.finish()
         update_timing.finish()
         return metrics
+
+    def _read_update_statistics(
+        self,
+        values: Sequence[torch.Tensor],
+    ) -> tuple[float, ...]:
+        if not self.reduce_update_stat_syncs:
+            return tuple(float(value.item()) for value in values)
+        packed = torch.stack(tuple(value.detach().reshape(()) for value in values))
+        return tuple(float(value) for value in packed.cpu().tolist())
 
     def _actor_loss_coefficient_tensor(
         self, name: str, value: float, like: torch.Tensor,

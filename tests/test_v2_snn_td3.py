@@ -395,6 +395,40 @@ class TestV2SNNTD3(unittest.TestCase):
         self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
         self.assertEqual(engine.actor_target.snn_head.lif2.v, 0.0)
 
+    def test_snn_cuda_graph_update_registration_keeps_lif_outside_graph(self) -> None:
+        engine = self.make_engine()
+        engine.device = torch.device('cuda')
+        compile_calls = []
+
+        def capture(function, **kwargs):
+            compile_calls.append((function, kwargs))
+            return function
+
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile', side_effect=capture,
+        ), mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile', side_effect=capture,
+        ):
+            metadata = engine.configure_compilation(
+                compile_actors=True,
+                compile_critic_block=True,
+                compile_target_block=True,
+                compile_actor_loss=True,
+                cuda_graph_updates=True,
+            )
+
+        graph_functions = {
+            function.__name__ for function, kwargs in compile_calls
+            if kwargs.get('options') == {'triton.cudagraphs': True}
+        }
+        self.assertEqual(graph_functions, {
+            '_actor_loss_tensor_block',
+            '_compute_twin_critic_loss_tensors',
+            '_compute_target_critics_td_tensors',
+        })
+        self.assertNotIn('actor_target.eager_snn', metadata['cuda_graph_scope'])
+        self.assertEqual(metadata['actor_granularity'], 'ann_full_forward_or_snn_encoder')
+
     def test_snn_full_target_scope_keeps_lif_actor_eager(self) -> None:
         engine = self.make_engine(bc=self.make_actor())
         with mock.patch(

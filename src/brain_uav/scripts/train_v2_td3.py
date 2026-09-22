@@ -61,6 +61,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--cache-actor-loss-coefficients', action='store_true')
     parser.add_argument('--compile-action-inference', action='store_true')
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
+    parser.add_argument('--reduce-update-stat-syncs', action='store_true')
+    parser.add_argument('--cuda-graph-updates', action='store_true')
     parser.add_argument('--compile-actors', action='store_true')
     parser.add_argument(
         '--frozen-critic-strategy',
@@ -104,6 +106,7 @@ def _configure_stage_compilation(
     compile_actor_loss: bool = False,
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
+    cuda_graph_updates: bool = False,
 ) -> dict[str, Any]:
     if cache_actor_loss_coefficients and not compile_actor_loss:
         raise ValueError('cache_actor_loss_coefficients requires compile_actor_loss.')
@@ -113,6 +116,7 @@ def _configure_stage_compilation(
         compile_shared_relations, compile_snn_target_encoder,
         compile_actor_loss,
         compile_action_inference,
+        cuda_graph_updates,
     ))
     if not requested:
         if frozen_critic_strategy != 'eager':
@@ -125,6 +129,7 @@ def _configure_stage_compilation(
             'frozen_critic_strategy': 'eager',
             'select_action_execution': 'eager',
             'cuda_graph': False,
+            'cuda_graph_evidence': None,
             'optimizer_execution': (
                 'fused_adam' if getattr(engine, 'fused_adam', False) else 'adam'
             ),
@@ -137,6 +142,14 @@ def _configure_stage_compilation(
             'actor_loss_coefficients_requested': False,
             'actor_loss_coefficient_execution': 'per_update',
             'action_inference_granularity': 'eager',
+            'update_statistics_execution': (
+                'batched_device_readback'
+                if getattr(engine, 'reduce_update_stat_syncs', False)
+                else 'per_scalar'
+            ),
+            'reduce_update_stat_syncs_requested': bool(
+                getattr(engine, 'reduce_update_stat_syncs', False)
+            ),
             'action_inference_warmup_shapes': [],
             'registration_wall_seconds': 0.0,
             'warmup_wall_seconds': 0.0,
@@ -155,9 +168,13 @@ def _configure_stage_compilation(
         compile_actor_loss=compile_actor_loss,
         cache_actor_loss_coefficients=cache_actor_loss_coefficients,
         compile_action_inference=compile_action_inference,
+        cuda_graph_updates=cuda_graph_updates,
         backend='inductor', mode='default', fullgraph=True, dynamic=True,
     )
     metadata['requested'] = True
+    metadata['reduce_update_stat_syncs_requested'] = bool(
+        getattr(engine, 'reduce_update_stat_syncs', False)
+    )
     metadata['actor_loss_coefficients_requested'] = cache_actor_loss_coefficients
     metadata['registration_wall_seconds'] = perf_counter() - registration_started
 
@@ -225,6 +242,10 @@ def _configure_stage_compilation(
             [batch.batch_size, int(batch.zone_features.shape[1])]
             for batch in action_inference_batches
         ]
+    if cuda_graph_updates:
+        metadata['cuda_graph_evidence'] = (
+            engine.verify_update_cuda_graph_capture(warmup_batches)
+        )
     metadata['warmup_wall_seconds'] = perf_counter() - warmup_started
     return metadata
 
@@ -268,6 +289,8 @@ def run_v2_td3_stage(
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
+    reduce_update_stat_syncs: bool = False,
+    cuda_graph_updates: bool = False,
 ) -> dict[str, Any]:
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
@@ -348,6 +371,7 @@ def run_v2_td3_stage(
         prepared_initialization=prepared_initialization,
         fused_adam=fused_adam,
         aggregate_relation_values_first=aggregate_relation_values_first,
+        reduce_update_stat_syncs=reduce_update_stat_syncs,
     )
     compilation_metadata = _configure_stage_compilation(
         components.engine,
@@ -364,6 +388,7 @@ def run_v2_td3_stage(
         compile_actor_loss=compile_actor_loss,
         cache_actor_loss_coefficients=cache_actor_loss_coefficients,
         compile_action_inference=compile_action_inference,
+        cuda_graph_updates=cuda_graph_updates,
     )
     reporter = (
         V2ExperimentReporter(
@@ -570,6 +595,8 @@ def main(argv: list[str] | None = None) -> int:
         cache_actor_loss_coefficients=args.cache_actor_loss_coefficients,
         compile_action_inference=args.compile_action_inference,
         aggregate_relation_values_first=args.aggregate_relation_values_first,
+        reduce_update_stat_syncs=args.reduce_update_stat_syncs,
+        cuda_graph_updates=args.cuda_graph_updates,
     )
     print(json.dumps(summary, indent=2, allow_nan=False))
     return 0 if summary['passed'] else 1

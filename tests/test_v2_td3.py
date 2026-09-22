@@ -113,6 +113,7 @@ class TestV2TD3(unittest.TestCase):
         critic_grad_clip_norm=1.0,
         fused_adam=False,
         aggregate_relation_values_first=False,
+        reduce_update_stat_syncs=False,
         device='cpu',
     ):
         if action_limit is None:
@@ -153,7 +154,261 @@ class TestV2TD3(unittest.TestCase):
             device=device,
             fused_adam=fused_adam,
             aggregate_relation_values_first=aggregate_relation_values_first,
+            reduce_update_stat_syncs=reduce_update_stat_syncs,
         )
+
+    def test_reduced_update_stat_syncs_batch_scalar_readback_and_match_updates(self):
+        legacy = self.make_engine(policy_delay=2)
+        reduced = self.make_engine(
+            policy_delay=2,
+            reduce_update_stat_syncs=True,
+        )
+        reduced.load_checkpoint_state_dict(legacy.checkpoint_state_dict())
+        self.fill_replay(legacy, counts=(0, 7), next_counts=(7, 0))
+        batch = legacy.replay.sample(2)
+        legacy.replay.sample = lambda batch_size: batch
+        reduced.replay.sample = lambda batch_size: batch
+
+        samples = tuple(torch.tensor(float(index)) for index in range(6))
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+        ) as legacy_profile:
+            self.assertEqual(
+                legacy._read_update_statistics(samples),
+                tuple(float(index) for index in range(6)),
+            )
+        with torch.profiler.profile(
+            activities=[torch.profiler.ProfilerActivity.CPU],
+        ) as reduced_profile:
+            self.assertEqual(
+                reduced._read_update_statistics(samples),
+                tuple(float(index) for index in range(6)),
+            )
+        legacy_items = sum(
+            event.count for event in legacy_profile.key_averages()
+            if event.key == 'aten::item'
+        )
+        reduced_items = sum(
+            event.count for event in reduced_profile.key_averages()
+            if event.key == 'aten::item'
+        )
+        self.assertEqual(legacy_items, 6)
+        self.assertEqual(reduced_items, 0)
+
+        for total_steps in (1, 2):
+            rng_state = torch.random.get_rng_state()
+            expected = legacy.update_once(total_steps=total_steps)
+            torch.random.set_rng_state(rng_state)
+            actual = reduced.update_once(total_steps=total_steps)
+            self.assertEqual(actual, expected)
+        for actual, expected in (
+            (reduced.critic_optimizer, legacy.critic_optimizer),
+            (reduced.actor_optimizer, legacy.actor_optimizer),
+        ):
+            actual_state = actual.state_dict()
+            expected_state = expected.state_dict()
+            self.assertEqual(actual_state['param_groups'], expected_state['param_groups'])
+            self.assertEqual(actual_state['state'].keys(), expected_state['state'].keys())
+            for parameter_id, expected_values in expected_state['state'].items():
+                for name, expected_value in expected_values.items():
+                    torch.testing.assert_close(
+                        actual_state['state'][parameter_id][name], expected_value,
+                    )
+
+    def test_cuda_graph_update_compile_is_explicit_and_excludes_action_inference(self):
+        engine = self.make_engine()
+        engine.device = torch.device('cuda')
+        compile_calls = []
+
+        def capture(function, **kwargs):
+            compile_calls.append((function, kwargs))
+            return function
+
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile', side_effect=capture,
+        ), mock.patch(
+            'brain_uav.models.v2_ann.torch.compile', side_effect=capture,
+        ):
+            metadata = engine.configure_compilation(
+                compile_critic_block=True,
+                compile_target_block=True,
+                compile_actor_loss=True,
+                compile_action_inference=True,
+                cuda_graph_updates=True,
+            )
+
+        graph_calls = [
+            kwargs for _, kwargs in compile_calls
+            if kwargs.get('options') == {'triton.cudagraphs': True}
+        ]
+        self.assertEqual(len(graph_calls), 3)
+        self.assertTrue(all(call['mode'] is None for call in graph_calls))
+        action_call = next(
+            kwargs for function, kwargs in compile_calls
+            if function.__name__ == '_action_inference_ann_tensors'
+        )
+        self.assertEqual(action_call['mode'], 'default')
+        self.assertNotIn('options', action_call)
+        self.assertTrue(metadata['cuda_graph'])
+        self.assertEqual(
+            metadata['cuda_graph_backend_options'],
+            {'triton.cudagraphs': True},
+        )
+        self.assertEqual(metadata['update_statistics_execution'], 'per_scalar')
+
+    def test_cuda_graph_update_compile_rejects_unsupported_combinations(self):
+        with self.assertRaisesRegex(ValueError, 'requires a CUDA device'):
+            self.make_engine().configure_compilation(
+                compile_critic_block=True,
+                cuda_graph_updates=True,
+            )
+        engine = self.make_engine()
+        engine.device = torch.device('cuda')
+        with self.assertRaisesRegex(ValueError, 'requires compile_critic_block'):
+            engine.configure_compilation(cuda_graph_updates=True)
+        with self.assertRaisesRegex(ValueError, 'requires backend=.inductor.'):
+            engine.configure_compilation(
+                compile_critic_block=True,
+                cuda_graph_updates=True,
+                backend='eager',
+            )
+
+    def _verify_cuda_graph_evidence(
+        self,
+        *,
+        batches,
+        launch_counts,
+        target=False,
+        actor_loss=False,
+    ):
+        engine = self.make_engine()
+        engine.device = torch.device('cuda')
+        engine.cuda_graph_updates = True
+        engine._compiled_critic_loss = mock.Mock()
+        engine._compiled_target_block = mock.Mock() if target else None
+        engine._compiled_target_critic_td = None
+        engine._compiled_actor_loss = mock.Mock() if actor_loss else None
+        aggregate_profile = mock.MagicMock()
+        aggregate_profile.__enter__.return_value = aggregate_profile
+        aggregate_profile.__exit__.return_value = False
+        aggregate_profile.key_averages.return_value = [
+            mock.Mock(key='cudaGraphLaunch', count=1),
+        ]
+        evidence = [
+            {
+                'cuda_graph_launch_count': count,
+                'event_names': ['cudaGraphLaunch'] if count else [],
+            }
+            for count in launch_counts
+        ]
+        with mock.patch.object(
+            engine, 'warmup_full_compile',
+        ), mock.patch.object(
+            engine, 'warmup_actor_loss_compile',
+        ), mock.patch.object(
+            engine,
+            '_prepare_update_cuda_graph_verification_scope',
+            create=True,
+            side_effect=lambda batch, scope: lambda: None,
+        ), mock.patch.object(
+            engine,
+            '_profile_cuda_graph_replay',
+            create=True,
+            side_effect=evidence,
+        ), mock.patch(
+            'brain_uav.trainers.v2_td3.torch.cuda.synchronize',
+        ), mock.patch(
+            'brain_uav.trainers.v2_td3.torch.profiler.profile',
+            return_value=aggregate_profile,
+        ):
+            return engine.verify_update_cuda_graph_capture(batches)
+
+    def test_cuda_graph_verification_does_not_substitute_actor_for_critic(self):
+        batch = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(0, scales=self.scales),
+        ])
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r'critic_forward.*\[2, 0\]',
+        ):
+            self._verify_cuda_graph_evidence(
+                batches=(batch,),
+                launch_counts=(0, 0, 1),
+                actor_loss=True,
+            )
+
+    def test_cuda_graph_verification_requires_every_shape_and_critic_backward(self):
+        empty = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(0, scales=self.scales),
+        ])
+        populated = collate_v2_observations([
+            _observation(7, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r'critic_forward.*\[2, 7\]',
+        ):
+            self._verify_cuda_graph_evidence(
+                batches=(empty, populated),
+                launch_counts=(1, 1, 0, 1),
+            )
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r'critic_backward.*\[2, 0\]',
+        ):
+            self._verify_cuda_graph_evidence(
+                batches=(empty,),
+                launch_counts=(1, 0),
+            )
+
+    def test_cuda_graph_verification_reports_each_requested_scope_and_shape(self):
+        empty = collate_v2_observations([
+            _observation(0, scales=self.scales),
+            _observation(0, scales=self.scales),
+        ])
+        populated = collate_v2_observations([
+            _observation(7, scales=self.scales),
+            _observation(7, scales=self.scales),
+        ])
+        result = self._verify_cuda_graph_evidence(
+            batches=(empty, populated),
+            launch_counts=tuple(range(1, 9)),
+            target=True,
+            actor_loss=True,
+        )
+
+        self.assertTrue(result['verified'])
+        self.assertEqual(result['cuda_graph_launch_count'], 36)
+        self.assertEqual(
+            tuple(result['scope_evidence']),
+            ('critic_forward', 'critic_backward', 'target', 'actor_loss'),
+        )
+        for scope in result['scope_evidence'].values():
+            self.assertTrue(scope['verified'])
+            self.assertEqual(
+                [item['batch_shape'] for item in scope['shapes']],
+                [[2, 0], [2, 7]],
+            )
+            self.assertTrue(all(item['verified'] for item in scope['shapes']))
+
+    def test_cuda_graph_verification_ignores_unrequested_scopes(self):
+        batch = collate_v2_observations([
+            _observation(3, scales=self.scales),
+            _observation(3, scales=self.scales),
+        ])
+        result = self._verify_cuda_graph_evidence(
+            batches=(batch,),
+            launch_counts=(2, 3),
+        )
+
+        self.assertEqual(
+            tuple(result['scope_evidence']),
+            ('critic_forward', 'critic_backward'),
+        )
+        self.assertEqual(result['cuda_graph_launch_count'], 5)
 
     def fill_replay(self, engine, counts=(2, 3), next_counts=None):
         if next_counts is None:
@@ -968,6 +1223,25 @@ class TestV2TD3(unittest.TestCase):
                 self.assertTrue(
                     all(parameter.grad is None for parameter in engine.critic1.parameters())
                 )
+
+    def test_reduced_update_stat_syncs_preserves_nonfinite_failure_timing(self):
+        engine = self.make_engine(reduce_update_stat_syncs=True)
+        self.fill_replay(engine)
+
+        def nonfinite_loss(current, target):
+            del target
+            return current.sum() * torch.as_tensor(float('nan'))
+
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.F.mse_loss', side_effect=nonfinite_loss,
+        ), mock.patch.object(
+            engine.critic_optimizer, 'step', wraps=engine.critic_optimizer.step,
+        ) as optimizer_step:
+            with self.assertRaisesRegex(
+                FloatingPointError, 'critic loss.*total_steps=1',
+            ):
+                engine.update_once(total_steps=1)
+        optimizer_step.assert_not_called()
 
     def test_nonfinite_critic_gradient_fails_before_step_with_and_without_clipping(self):
         for clip_norm in (1.0, None):

@@ -672,6 +672,8 @@ class TestProfileV2TD3(unittest.TestCase):
                         cache_actor_loss_coefficients=False,
                         compile_action_inference=False,
                         aggregate_relation_values_first=False,
+                        reduce_update_stat_syncs=False,
+                        cuda_graph_updates=False,
                         compiled_path_profiler_updates=0,
                         compiled_profiler_output_dir=None,
                         level='easy',
@@ -693,6 +695,7 @@ class TestProfileV2TD3(unittest.TestCase):
             set_target_noise=lambda **kwargs: None,
             fused_adam=fused_adam,
             aggregate_relation_values_first=aggregate_relation_values_first,
+            reduce_update_stat_syncs=reduce_update_stat_syncs,
         )
         submitted = []
         compile_calls = []
@@ -855,7 +858,11 @@ class TestProfileV2TD3(unittest.TestCase):
                 'select_action_execution': (
                     'compiled' if kwargs['compile_action_inference'] else 'eager'
                 ),
-                'cuda_graph': False,
+                'cuda_graph': kwargs['cuda_graph_updates'],
+                'update_statistics_execution': (
+                    'batched_device_readback'
+                    if reduce_update_stat_syncs else 'per_scalar'
+                ),
             }
 
         engine.configure_compilation = configure_compilation
@@ -865,6 +872,10 @@ class TestProfileV2TD3(unittest.TestCase):
         engine.warmup_snn_target_encoder_compile = lambda batches: None
         engine.warmup_actor_loss_compile = lambda batches: None
         engine.warmup_action_inference_compile = lambda batches: None
+        engine.verify_update_cuda_graph_capture = lambda batches: {
+            'verified': True,
+            'cuda_graph_launch_count': 2,
+        }
         synchronization_points = []
         event = mock.Mock()
         event.elapsed_time.return_value = 1.0
@@ -908,6 +919,8 @@ class TestProfileV2TD3(unittest.TestCase):
                 cache_actor_loss_coefficients=cache_actor_loss_coefficients,
                 compile_action_inference=compile_action_inference,
                 aggregate_relation_values_first=aggregate_relation_values_first,
+                reduce_update_stat_syncs=reduce_update_stat_syncs,
+                cuda_graph_updates=cuda_graph_updates,
                 compiled_path_profiler_updates=compiled_path_profiler_updates,
                 compiled_profiler_output_dir=compiled_profiler_output_dir,
                 environment_performance_diagnostic=(
@@ -959,6 +972,7 @@ class TestProfileV2TD3(unittest.TestCase):
             fused_adam=True, compile_actor_loss=True,
             cache_actor_loss_coefficients=True,
             aggregate_relation_values_first=True,
+            reduce_update_stat_syncs=True,
         )
         compile_info = result['critic_encoder_compile']
         self.assertEqual(compile_info['optimizer_execution'], 'fused_adam')
@@ -969,6 +983,21 @@ class TestProfileV2TD3(unittest.TestCase):
             compile_info['relation_value_execution'], 'aggregate_then_project',
         )
         self.assertIn('actor_loss.tensor_block', compile_info['enabled_objects'])
+        self.assertEqual(
+            compile_info['update_statistics_execution'],
+            'batched_device_readback',
+        )
+
+    def test_cuda_graph_update_scope_records_warmup_replay_evidence(self) -> None:
+        result, _, _ = self.run_small_level(
+            compile_critic_block=True,
+            cuda_graph_updates=True,
+        )
+        compile_info = result['critic_encoder_compile']
+        self.assertTrue(compile_info['cuda_graph'])
+        self.assertEqual(
+            compile_info['cuda_graph_evidence']['cuda_graph_launch_count'], 2,
+        )
 
     def test_warmup_reaches_update_minima_and_is_excluded_from_measurement(self) -> None:
         for minimum, actual, critic, actor in ((0, 7, 4, 2), (12, 12, 9, 5)):
@@ -1197,6 +1226,8 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertFalse(args.cache_actor_loss_coefficients)
         self.assertFalse(args.compile_action_inference)
         self.assertFalse(args.aggregate_relation_values_first)
+        self.assertFalse(args.reduce_update_stat_syncs)
+        self.assertFalse(args.cuda_graph_updates)
         self.assertFalse(args.check_compiled_numerics)
         self.assertFalse(args.compiled_numerics_only)
         self.assertIsNone(args.compiled_numerics_group)
@@ -1255,12 +1286,15 @@ class TestProfileV2TD3(unittest.TestCase):
             '--cache-actor-loss-coefficients',
             '--compile-action-inference',
             '--aggregate-relation-values-first',
+            '--reduce-update-stat-syncs', '--cuda-graph-updates',
         ])
         self.assertTrue(optimization_scopes.fused_adam)
         self.assertTrue(optimization_scopes.compile_actor_loss)
         self.assertTrue(optimization_scopes.cache_actor_loss_coefficients)
         self.assertTrue(optimization_scopes.compile_action_inference)
         self.assertTrue(optimization_scopes.aggregate_relation_values_first)
+        self.assertTrue(optimization_scopes.reduce_update_stat_syncs)
+        self.assertTrue(optimization_scopes.cuda_graph_updates)
 
     def test_grouped_compile_modes_have_only_declared_warmup_differences(self) -> None:
         expected = {
@@ -2513,6 +2547,20 @@ class TestProfileV2TD3(unittest.TestCase):
             run_v2_td3_timing_diagnostic(
                 **common,
                 compile_snn_target_encoder=True,
+            )
+        with self.assertRaisesRegex(ValueError, 'requires a CUDA diagnostic'):
+            run_v2_td3_timing_diagnostic(
+                **common,
+                compile_critic_block=True,
+                cuda_graph_updates=True,
+            )
+        with mock.patch(
+            'brain_uav.scripts.profile_v2_td3.resolve_training_device',
+            return_value='cuda',
+        ), self.assertRaisesRegex(ValueError, 'requires compile_critic_block'):
+            run_v2_td3_timing_diagnostic(
+                **common,
+                cuda_graph_updates=True,
             )
         with self.assertRaisesRegex(ValueError, 'mutually exclusive'):
             run_v2_td3_timing_diagnostic(
