@@ -129,9 +129,10 @@ class V2ANNPolicyActor(nn.Module):
         self,
         *,
         backend: str = 'inductor',
-        mode: str = 'default',
+        mode: str | None = 'default',
         fullgraph: bool = True,
         dynamic: bool = True,
+        options: dict[str, object] | None = None,
     ) -> None:
         if self.compiled_full_forward_enabled:
             raise RuntimeError('ANN actor full forward is already compiled.')
@@ -145,6 +146,7 @@ class V2ANNPolicyActor(nn.Module):
             mode=mode,
             fullgraph=fullgraph,
             dynamic=dynamic,
+            **({'options': options} if options is not None else {}),
         )
         self._compiled_full_forward_config = {
             'backend': backend,

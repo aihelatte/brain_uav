@@ -520,9 +520,10 @@ class ZoneSetEncoder(nn.Module):
         self,
         *,
         backend: str = 'inductor',
-        mode: str = 'default',
+        mode: str | None = 'default',
         fullgraph: bool = True,
         dynamic: bool = True,
+        options: dict[str, object] | None = None,
         role: str | None = None,
     ) -> None:
         if self.compiled_tensor_forward_enabled:
@@ -543,6 +544,7 @@ class ZoneSetEncoder(nn.Module):
             mode=mode,
             fullgraph=fullgraph,
             dynamic=dynamic,
+            **({'options': options} if options is not None else {}),
         )
         self._compiled_tensor_forward = compiled
         self._compiled_tensor_forward_config = {

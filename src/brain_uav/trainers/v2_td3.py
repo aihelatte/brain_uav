@@ -523,6 +523,7 @@ class V2TD3UpdateEngine:
         self.aggregate_relation_values_first = aggregate_relation_values_first
         self.reduce_update_stat_syncs = reduce_update_stat_syncs
         self.pinned_batch_transfer = pinned_batch_transfer
+        self.cuda_graph_actor_update = False
         self.cuda_graph_updates = False
         self.cuda_graph_action_inference = False
         self.model_type = actor_model_type
@@ -1058,6 +1059,7 @@ class V2TD3UpdateEngine:
         cache_actor_loss_coefficients: bool = False,
         compile_action_inference: bool = False,
         cuda_graph_action_inference: bool = False,
+        cuda_graph_actor_update: bool = False,
         cuda_graph_updates: bool = False,
         backend: str = 'inductor',
         mode: str = 'default',
@@ -1105,6 +1107,16 @@ class V2TD3UpdateEngine:
             raise ValueError(
                 "cuda_graph_action_inference requires mode='default'."
             )
+        if type(cuda_graph_actor_update) is not bool:
+            raise TypeError('cuda_graph_actor_update must be a bool.')
+        if cuda_graph_actor_update and not (
+            cuda_graph_updates and compile_actors
+            and frozen_critic_strategy == 'compiled_no_grad_context'
+        ):
+            raise ValueError(
+                'cuda_graph_actor_update requires cuda_graph_updates, '
+                'compile_actors and compiled_no_grad_context.'
+            )
         if type(cuda_graph_updates) is not bool:
             raise TypeError('cuda_graph_updates must be a bool.')
         if cuda_graph_updates and self.device.type != 'cuda':
@@ -1151,6 +1163,9 @@ class V2TD3UpdateEngine:
             if cuda_graph_action_inference else None
         )
         action_graph_mode = None if cuda_graph_action_inference else mode
+        actor_graph_options = dict(options)
+        if cuda_graph_actor_update:
+            actor_graph_options.update(mode=None, options={'triton.cudagraphs': True})
         enabled: list[str] = []
         if compile_shared_relations:
             enabled.extend(self.enable_shared_relations_compile(**options))
@@ -1178,7 +1193,7 @@ class V2TD3UpdateEngine:
             frozen_critic_strategy == 'compiled_no_grad_context'
             and compile_critic_block
         ):
-            enabled.extend(self.enable_actor_guidance_context_compile(**options))
+            enabled.extend(self.enable_actor_guidance_context_compile(**actor_graph_options))
         if compile_snn_target_encoder:
             enabled.extend(self.enable_snn_target_encoder_compile(**options))
         if compile_target_block:
@@ -1189,9 +1204,10 @@ class V2TD3UpdateEngine:
         elif compile_target_encoders:
             enabled.extend(self.enable_target_encoder_compile(**options))
         if compile_actors:
-            enabled.extend(self.enable_actor_compile(**options))
+            enabled.extend(self.enable_actor_compile(**actor_graph_options))
         self.set_frozen_critic_strategy(frozen_critic_strategy)
         self.cache_actor_loss_coefficients = cache_actor_loss_coefficients
+        self.cuda_graph_actor_update = cuda_graph_actor_update
         self.cuda_graph_updates = cuda_graph_updates
         self.cuda_graph_action_inference = cuda_graph_action_inference
         return {
@@ -1244,6 +1260,12 @@ class V2TD3UpdateEngine:
             'mode': mode,
             'fullgraph': fullgraph,
             'dynamic': dynamic,
+            'cuda_graph_actor_update': cuda_graph_actor_update,
+            'cuda_graph_actor_update_scopes': (
+                ['actor_forward', 'actor_backward', 'critic_guidance']
+                + (['bc_reference'] if self.bc_reference_actor is not None else [])
+                if cuda_graph_actor_update else []
+            ),
             'cuda_graph': cuda_graph_updates,
             'cuda_graph_action_inference': cuda_graph_action_inference,
             'cuda_graph_action_inference_backend_options': (
@@ -1340,9 +1362,10 @@ class V2TD3UpdateEngine:
         self,
         *,
         backend: str = 'inductor',
-        mode: str = 'default',
+        mode: str | None = 'default',
         fullgraph: bool = True,
         dynamic: bool = True,
+        options: dict[str, object] | None = None,
     ) -> tuple[str]:
         self.critic1.zone_set_encoder.enable_compiled_tensor_forward(
             role='critic_guidance',
@@ -1350,6 +1373,7 @@ class V2TD3UpdateEngine:
             mode=mode,
             fullgraph=fullgraph,
             dynamic=dynamic,
+            options=options,
         )
         return ('critic1.actor_guidance_context',)
 
@@ -1525,9 +1549,10 @@ class V2TD3UpdateEngine:
         self,
         *,
         backend: str = 'inductor',
-        mode: str = 'default',
+        mode: str | None = 'default',
         fullgraph: bool = True,
         dynamic: bool = True,
+        options: dict[str, object] | None = None,
     ) -> tuple[str, ...]:
         enabled: list[str] = []
         for name, actor in (
@@ -1542,6 +1567,7 @@ class V2TD3UpdateEngine:
                     mode=mode,
                     fullgraph=fullgraph,
                     dynamic=dynamic,
+                    options=options,
                 )
                 enabled.append(f'{name}.full_forward')
             else:
@@ -1551,6 +1577,7 @@ class V2TD3UpdateEngine:
                     mode=mode,
                     fullgraph=fullgraph,
                     dynamic=dynamic,
+                    options=options,
                 )
                 enabled.append(f'{name}.zone_set_encoder')
         return tuple(enabled)
@@ -1806,9 +1833,13 @@ class V2TD3UpdateEngine:
             self.actor_update_count,
             self.last_total_steps,
         )
+        snn_memories = self._actor_graph_snn_memory_snapshot()
+        python_rng = random.getstate()
         try:
             self.actor.train()
             for batch in warmup_batches:
+                if self.cuda_graph_actor_update:
+                    self._mark_cuda_graph_step_begin()
                 device_batch = batch.to(self.device)
                 shared_relations = self._build_shared_relations(device_batch)
                 self.actor_optimizer.zero_grad(set_to_none=True)
@@ -1825,6 +1856,9 @@ class V2TD3UpdateEngine:
                             shared_relations=shared_relations,
                         )
         finally:
+            random.setstate(python_rng)
+            for module, name, value in snn_memories:
+                setattr(module, name, value)
             for actor, training in zip(actors, training_modes):
                 actor.train(training)
             for parameter, required, (original_grad, saved_grad) in zip(
@@ -2099,6 +2133,19 @@ class V2TD3UpdateEngine:
         if counts_after != counts_before:
             raise RuntimeError('Compile warmup must not change TD3 update counters.')
 
+    def _actor_graph_snn_memory_snapshot(self):
+        if not self.cuda_graph_actor_update:
+            return ()
+        return tuple(
+            (module, name, value.detach().clone() if isinstance(value, torch.Tensor)
+             else deepcopy(value))
+            for actor in (self.actor, self.bc_reference_actor, self.actor_target)
+            if isinstance(actor, V2SNNPolicyActor)
+            for module in actor.snn_head.modules()
+            if hasattr(module, 'named_memories')
+            for name, value in module.named_memories()
+        )
+
     def _mark_cuda_graph_step_begin(self) -> None:
         if self.cuda_graph_updates:
             torch.compiler.cudagraph_mark_step_begin()
@@ -2142,6 +2189,52 @@ class V2TD3UpdateEngine:
         batch: V2ObservationBatch,
         scope: str,
     ) -> Callable[[], None]:
+        if scope in ('actor_forward', 'actor_backward', 'bc_reference', 'critic_guidance'):
+            # These probes own an independent forward/backward, never a live
+            # training graph. Build relations outside the measured scope.
+            self._mark_cuda_graph_step_begin()
+            device_batch = batch.to(self.device)
+            relations = self._build_shared_relations(device_batch)
+            if scope == 'critic_guidance':
+                def guidance_forward():
+                    with torch.no_grad():
+                        return self.critic1.encode_context(
+                            device_batch, shared_relations=relations,
+                        )
+                return guidance_forward
+            actor = self.bc_reference_actor if scope == 'bc_reference' else self.actor
+            if actor is None:
+                raise RuntimeError('BC reference graph requested without a reference actor.')
+
+            def actor_forward():
+                # SNN verification isolates the compiled encoder; the LIF head
+                # remains eager and is exercised by the normal numeric updates.
+                if isinstance(actor, V2ANNPolicyActor):
+                    return actor(device_batch, shared_relations=relations)
+                return actor.zone_set_encoder(
+                    device_batch.ego_features, device_batch.goal_features,
+                    device_batch.zone_features, device_batch.presence_mask,
+                    shared_relations=relations,
+                )
+
+            if scope == 'bc_reference':
+                def reference_forward():
+                    with torch.no_grad():
+                        return actor_forward()
+                return reference_forward
+            if scope == 'actor_forward':
+                return actor_forward
+            self.actor_optimizer.zero_grad(set_to_none=True)
+            output = actor_forward()
+            gradient = torch.ones_like(output)
+
+            def actor_backward():
+                try:
+                    output.backward(gradient)
+                finally:
+                    self.actor_optimizer.zero_grad(set_to_none=True)
+            return actor_backward
+
         device_batch = batch.to(self.device)
         shared_relations = self._build_shared_relations(device_batch)
         encoder_arguments = (
@@ -2307,10 +2400,16 @@ class V2TD3UpdateEngine:
             requested_scopes.append('target')
         if self._compiled_actor_loss is not None:
             requested_scopes.append('actor_loss')
+        if self.cuda_graph_actor_update:
+            requested_scopes.extend(('actor_forward', 'actor_backward', 'critic_guidance'))
+            if self.bc_reference_actor is not None:
+                requested_scopes.append('bc_reference')
 
         critic_parameters = tuple(self.critic1.parameters()) + tuple(
             self.critic2.parameters()
         )
+        if self.cuda_graph_actor_update:
+            critic_parameters += tuple(self.actor.parameters())
         gradient_state = tuple(
             (
                 parameter.grad,
@@ -2333,6 +2432,8 @@ class V2TD3UpdateEngine:
             for scope in requested_scopes
         }
         missing: list[tuple[str, list[int]]] = []
+        snn_memories = self._actor_graph_snn_memory_snapshot()
+        python_rng = random.getstate()
         try:
             capture_batches = tuple(distinct_batches.values())
             self.warmup_full_compile(capture_batches)
@@ -2341,11 +2442,18 @@ class V2TD3UpdateEngine:
             for shape, batch in distinct_batches.items():
                 batch_shape = list(shape)
                 for scope in requested_scopes:
+                    if scope in ('actor_forward', 'actor_backward', 'bc_reference', 'critic_guidance'):
+                        # Warm this exact isolated path before profiling replay.
+                        for _ in range(2):
+                            warmup = self._prepare_update_cuda_graph_verification_scope(batch, scope)
+                            warmup()
+                            del warmup
                     replay = self._prepare_update_cuda_graph_verification_scope(
                         batch,
                         scope,
                     )
                     replay_evidence = self._profile_cuda_graph_replay(replay)
+                    del replay
                     launch_count = int(
                         replay_evidence['cuda_graph_launch_count']
                     )
@@ -2361,6 +2469,9 @@ class V2TD3UpdateEngine:
                         scope_evidence[scope]['verified'] = False
                         missing.append((scope, batch_shape))
         finally:
+            random.setstate(python_rng)
+            for module, name, value in snn_memories:
+                setattr(module, name, value)
             for parameter, (original_grad, saved_grad) in zip(
                 critic_parameters,
                 gradient_state,

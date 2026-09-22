@@ -2729,6 +2729,7 @@ def _run_compiled_numerics_check(
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
     pinned_batch_transfer: bool = False,
+    cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
 ) -> dict[str, Any]:
     torch_rng_state = torch.random.get_rng_state()
@@ -2802,6 +2803,7 @@ def _run_compiled_numerics_check(
             compile_action_inference=compile_action_inference,
             cuda_graph_action_inference=cuda_graph_action_inference,
             cuda_graph_updates=cuda_graph_updates,
+            cuda_graph_actor_update=cuda_graph_actor_update,
             backend='inductor', mode='default', fullgraph=True, dynamic=True,
         )
         warmup_batches = _compile_warmup_batches(
@@ -3314,6 +3316,7 @@ def _run_diagnostic_level(
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
     pinned_batch_transfer: bool = False,
+    cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
     compiled_path_profiler_updates: int = 0,
     compiled_profiler_output_dir: Path | None = None,
@@ -3407,6 +3410,7 @@ def _run_diagnostic_level(
         'pinned_batch_transfer_requested': bool(pinned_batch_transfer),
         'reduce_update_stat_syncs_requested': bool(reduce_update_stat_syncs),
         'cuda_graph_updates_requested': bool(cuda_graph_updates),
+        'cuda_graph_actor_update_requested': bool(cuda_graph_actor_update),
         'optimizer_execution': 'fused_adam' if fused_adam else 'adam',
         'relation_value_execution': (
             'aggregate_then_project' if aggregate_relation_values_first
@@ -3469,6 +3473,7 @@ def _run_diagnostic_level(
             compile_action_inference=compile_action_inference,
             cuda_graph_action_inference=cuda_graph_action_inference,
             cuda_graph_updates=cuda_graph_updates,
+            cuda_graph_actor_update=cuda_graph_actor_update,
             backend='inductor', mode='default', fullgraph=True, dynamic=True,
         )
         compile_metadata.update(configured)
@@ -4073,6 +4078,7 @@ def run_v2_td3_timing_diagnostic(
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
     pinned_batch_transfer: bool = False,
+    cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
     check_compiled_numerics: bool = False,
     compiled_numerics_only: bool = False,
@@ -4118,6 +4124,7 @@ def run_v2_td3_timing_diagnostic(
         ('aggregate_relation_values_first', aggregate_relation_values_first),
         ('reduce_update_stat_syncs', reduce_update_stat_syncs),
         ('cuda_graph_updates', cuda_graph_updates),
+        ('cuda_graph_actor_update', cuda_graph_actor_update),
     ):
         if type(value) is not bool:
             raise TypeError(f'{name} must be a bool.')
@@ -4155,6 +4162,7 @@ def run_v2_td3_timing_diagnostic(
             or aggregate_relation_values_first
             or reduce_update_stat_syncs
             or cuda_graph_updates
+            or cuda_graph_actor_update
             or frozen_critic_strategy != 'eager'
             or check_compiled_numerics
             or compiled_numerics_only
@@ -4251,6 +4259,14 @@ def run_v2_td3_timing_diagnostic(
         raise ValueError('check_compiled_numerics requires a CUDA diagnostic.')
     if cuda_graph_updates and target_device.type != 'cuda':
         raise ValueError('cuda_graph_updates requires a CUDA diagnostic.')
+    if cuda_graph_actor_update and not (
+        cuda_graph_updates and compile_actors
+        and frozen_critic_strategy == 'compiled_no_grad_context'
+    ):
+        raise ValueError(
+            'cuda_graph_actor_update requires cuda_graph_updates, '
+            'compile_actors and compiled_no_grad_context.'
+        )
     if cuda_graph_updates and not compile_critic_block:
         raise ValueError('cuda_graph_updates requires compile_critic_block.')
     if cuda_graph_action_inference and not compile_action_inference:
@@ -4383,6 +4399,7 @@ def run_v2_td3_timing_diagnostic(
             reduce_update_stat_syncs=reduce_update_stat_syncs,
             pinned_batch_transfer=pinned_batch_transfer,
             cuda_graph_updates=cuda_graph_updates,
+            cuda_graph_actor_update=cuda_graph_actor_update,
         )
     if compiled_numerics_only:
         output.mkdir(parents=True, exist_ok=False)
@@ -4447,6 +4464,7 @@ def run_v2_td3_timing_diagnostic(
             reduce_update_stat_syncs=reduce_update_stat_syncs,
             pinned_batch_transfer=pinned_batch_transfer,
             cuda_graph_updates=cuda_graph_updates,
+            cuda_graph_actor_update=cuda_graph_actor_update,
             compiled_path_profiler_updates=(
                 compiled_profiler_updates if level == 'medium' else 0
             ),
@@ -4592,6 +4610,7 @@ def run_v2_td3_timing_diagnostic(
             ),
             'reduce_update_stat_syncs_requested': reduce_update_stat_syncs,
             'cuda_graph_updates_requested': cuda_graph_updates,
+            'cuda_graph_actor_update_requested': cuda_graph_actor_update,
             'cuda_graph': cuda_graph_updates,
             'check_compiled_numerics_requested': check_compiled_numerics,
             'compile_critic_encoder_backend': (
@@ -4715,6 +4734,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument('--reduce-update-stat-syncs', action='store_true')
     parser.add_argument('--cuda-graph-updates', action='store_true')
+    parser.add_argument('--cuda-graph-actor-update', action='store_true')
     parser.add_argument(
         '--check-compiled-numerics',
         action='store_true',
@@ -4784,6 +4804,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         reduce_update_stat_syncs=args.reduce_update_stat_syncs,
         pinned_batch_transfer=args.pinned_batch_transfer,
         cuda_graph_updates=args.cuda_graph_updates,
+        cuda_graph_actor_update=args.cuda_graph_actor_update,
         check_compiled_numerics=args.check_compiled_numerics,
         compiled_numerics_only=args.compiled_numerics_only,
         compiled_numerics_group=args.compiled_numerics_group,

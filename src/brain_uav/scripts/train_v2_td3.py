@@ -65,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument('--reduce-update-stat-syncs', action='store_true')
     parser.add_argument('--cuda-graph-updates', action='store_true')
+    parser.add_argument('--cuda-graph-actor-update', action='store_true')
     parser.add_argument('--compile-actors', action='store_true')
     parser.add_argument(
         '--frozen-critic-strategy',
@@ -109,8 +110,17 @@ def _configure_stage_compilation(
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
     cuda_graph_action_inference: bool = False,
+    cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
 ) -> dict[str, Any]:
+    if cuda_graph_actor_update and not (
+        cuda_graph_updates and compile_actors
+        and frozen_critic_strategy == 'compiled_no_grad_context'
+    ):
+        raise ValueError(
+            'cuda_graph_actor_update requires cuda_graph_updates, '
+            'compile_actors and compiled_no_grad_context.'
+        )
     if cache_actor_loss_coefficients and not compile_actor_loss:
         raise ValueError('cache_actor_loss_coefficients requires compile_actor_loss.')
     requested = any((
@@ -184,6 +194,7 @@ def _configure_stage_compilation(
         compile_action_inference=compile_action_inference,
         cuda_graph_action_inference=cuda_graph_action_inference,
         cuda_graph_updates=cuda_graph_updates,
+        cuda_graph_actor_update=cuda_graph_actor_update,
         backend='inductor', mode='default', fullgraph=True, dynamic=True,
     )
     metadata['requested'] = True
@@ -316,6 +327,7 @@ def run_v2_td3_stage(
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
     pinned_batch_transfer: bool = False,
+    cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
 ) -> dict[str, Any]:
     requested_device = device
@@ -417,6 +429,7 @@ def run_v2_td3_stage(
         compile_action_inference=compile_action_inference,
         cuda_graph_action_inference=cuda_graph_action_inference,
         cuda_graph_updates=cuda_graph_updates,
+        cuda_graph_actor_update=cuda_graph_actor_update,
     )
     reporter = (
         V2ExperimentReporter(
@@ -627,6 +640,7 @@ def main(argv: list[str] | None = None) -> int:
         reduce_update_stat_syncs=args.reduce_update_stat_syncs,
         pinned_batch_transfer=args.pinned_batch_transfer,
         cuda_graph_updates=args.cuda_graph_updates,
+        cuda_graph_actor_update=args.cuda_graph_actor_update,
     )
     print(json.dumps(summary, indent=2, allow_nan=False))
     return 0 if summary['passed'] else 1

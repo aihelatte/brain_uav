@@ -194,6 +194,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                     reduce_update_stat_syncs=True,
                     pinned_batch_transfer=True,
                     cuda_graph_updates=True,
+                cuda_graph_actor_update=True,
                 )
         initializer.assert_called_once()
         self.assertEqual(initializer.call_args.kwargs['init_checkpoint'], checkpoint)
@@ -219,6 +220,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertTrue(calls[0]['reduce_update_stat_syncs'])
         self.assertTrue(calls[0]['pinned_batch_transfer'])
         self.assertTrue(calls[0]['cuda_graph_updates'])
+        self.assertTrue(calls[0]['cuda_graph_actor_update'])
         self.assertIs(calls[0]['prepared_initialization'], prepared)
         self.assertEqual(Path(calls[0]['output']).name, 'v2_snn_td3_easy.pt')
         self.assertEqual(

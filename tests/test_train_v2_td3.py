@@ -322,6 +322,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 compile_action_inference=True,
                 cuda_graph_action_inference=True,
                 cuda_graph_updates=True,
+                cuda_graph_actor_update=True,
             )
         self.assertEqual(
             [entry[0] for entry in calls],
@@ -340,6 +341,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertTrue(calls[0][1]['compile_action_inference'])
         self.assertTrue(calls[0][1]['cuda_graph_action_inference'])
         self.assertTrue(calls[0][1]['cuda_graph_updates'])
+        self.assertTrue(calls[0][1]['cuda_graph_actor_update'])
         self.assertEqual(metadata['cuda_graph_evidence']['cuda_graph_launch_count'], 3)
         self.assertEqual(
             metadata['cuda_graph_action_inference_evidence'][

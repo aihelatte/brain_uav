@@ -50,6 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument('--reduce-update-stat-syncs', action='store_true')
     parser.add_argument('--cuda-graph-updates', action='store_true')
+    parser.add_argument('--cuda-graph-actor-update', action='store_true')
     parser.add_argument('--compile-actors', action='store_true')
     parser.add_argument(
         '--frozen-critic-strategy',
@@ -139,6 +140,7 @@ def run_v2_curriculum(
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
     pinned_batch_transfer: bool = False,
+    cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
 ) -> dict[str, Any]:
     requested_device = device
@@ -159,6 +161,14 @@ def run_v2_curriculum(
         raise ValueError('cuda_graph_action_inference requires a CUDA device.')
     if pinned_batch_transfer and resolved_device != 'cuda':
         raise ValueError('pinned_batch_transfer requires a CUDA device.')
+    if cuda_graph_actor_update and not (
+        cuda_graph_updates and compile_actors
+        and frozen_critic_strategy == 'compiled_no_grad_context'
+    ):
+        raise ValueError(
+            'cuda_graph_actor_update requires cuda_graph_updates, '
+            'compile_actors and compiled_no_grad_context.'
+        )
     if cuda_graph_updates and not compile_critic_block:
         raise ValueError('cuda_graph_updates requires compile_critic_block.')
     if cuda_graph_updates and resolved_device != 'cuda':
@@ -272,6 +282,7 @@ def run_v2_curriculum(
             reduce_update_stat_syncs=reduce_update_stat_syncs,
             pinned_batch_transfer=pinned_batch_transfer,
             cuda_graph_updates=cuda_graph_updates,
+            cuda_graph_actor_update=cuda_graph_actor_update,
         )
         summaries.append(summary)
         global_steps = int(summary.get('global_steps_end', global_steps + int(summary['steps'])))
@@ -322,6 +333,7 @@ def run_v2_curriculum(
             'reduce_update_stat_syncs': reduce_update_stat_syncs,
             'pinned_batch_transfer': pinned_batch_transfer,
             'cuda_graph_updates': cuda_graph_updates,
+            'cuda_graph_actor_update': cuda_graph_actor_update,
             'cuda_graph': cuda_graph_updates,
         },
     }
@@ -365,6 +377,7 @@ def main(argv: list[str] | None = None) -> int:
         reduce_update_stat_syncs=args.reduce_update_stat_syncs,
         pinned_batch_transfer=args.pinned_batch_transfer,
         cuda_graph_updates=args.cuda_graph_updates,
+        cuda_graph_actor_update=args.cuda_graph_actor_update,
     )
     print(json.dumps(summary, indent=2, allow_nan=False))
     return 0 if summary['passed'] else 1
