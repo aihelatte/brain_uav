@@ -1637,8 +1637,10 @@ class TestProfileV2TD3(unittest.TestCase):
             and bool(torch.count_nonzero(parameter.grad))
             for parameter in engine.actor.parameters()
         ))
-        self.assertTrue(any(count == 1 for count in actor_gradient_calls))
-        self.assertTrue(all(count <= 1 for count in actor_gradient_calls))
+        # Each independent regularizer probe completes actor backward, followed
+        # by exactly one real update. Partial backward changes graph liveness.
+        self.assertTrue(any(count == 3 for count in actor_gradient_calls))
+        self.assertTrue(all(count <= 3 for count in actor_gradient_calls))
         restored_actor_terms = engine._compute_actor_loss_terms
         self.assertIs(restored_actor_terms.__func__, original_actor_terms.__func__)
         self.assertIs(restored_actor_terms.__self__, original_actor_terms.__self__)
@@ -1648,6 +1650,11 @@ class TestProfileV2TD3(unittest.TestCase):
             critic_head_hooks_before,
         )
 
+        saved_gradients = [parameter.grad for parameter in engine.actor.parameters()]
+        saved_gradient_values = [
+            None if gradient is None else gradient.clone()
+            for gradient in saved_gradients
+        ]
         with mock.patch.object(
             engine,
             'update_once',
@@ -1660,6 +1667,12 @@ class TestProfileV2TD3(unittest.TestCase):
                 capture_regularizers=True,
                 regularizer_probe_batch=batch,
             )
+        for parameter, gradient, value in zip(
+            engine.actor.parameters(), saved_gradients, saved_gradient_values,
+        ):
+            self.assertIs(parameter.grad, gradient)
+            if value is not None:
+                torch.testing.assert_close(parameter.grad, value)
         restored_after_error = engine._compute_actor_loss_terms
         self.assertIs(restored_after_error.__func__, original_actor_terms.__func__)
         self.assertEqual(tuple(engine.actor._forward_hooks), actor_hooks_before)

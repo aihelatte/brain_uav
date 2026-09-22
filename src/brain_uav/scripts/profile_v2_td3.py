@@ -2347,15 +2347,24 @@ def _run_actor_update_with_rl_gradient_capture(
             loss = getattr(terms, name)
             if not loss.requires_grad or not actor_actions.requires_grad:
                 return None
-            gradient = torch.autograd.grad(
-                loss,
-                actor_actions,
-                allow_unused=True,
-            )[0]
-            return (
-                None if gradient is None
-                else gradient.detach().cpu().clone()
-            )
+            gradient = None
+
+            def save_action_gradient(value):
+                nonlocal gradient
+                gradient = value.detach().cpu().clone()
+
+            gradient_handle = actor_actions.register_hook(save_action_gradient)
+            # The hook must not keep the graph-owned output alive longer than
+            # the real update does; the backward hook itself owns no tensor.
+            actor_actions = None
+            try:
+                # Complete the actor backward as in training. Stopping at the
+                # actions leaves the compiled actor's saved tensors alive and
+                # changes CUDA Graph Trees' backward liveness invariants.
+                loss.backward()
+            finally:
+                gradient_handle.remove()
+            return gradient
         finally:
             if guidance_entered:
                 guidance.__exit__(None, None, None)
@@ -2370,6 +2379,8 @@ def _run_actor_update_with_rl_gradient_capture(
             output.register_hook(save_gradient)
 
     if capture_regularizers:
+        parameters = tuple(engine.actor.parameters())
+        saved_gradients = tuple(parameter.grad for parameter in parameters)
         python_rng_state = random.getstate()
         numpy_rng_state = np.random.get_state()
         torch_rng_state = torch.random.get_rng_state()
@@ -2378,11 +2389,17 @@ def _run_actor_update_with_rl_gradient_capture(
             if engine.device.type == 'cuda' else None
         )
         try:
+            for parameter in parameters:
+                parameter.grad = None
             bc_action_gradient = regularizer_action_gradient('bc_loss')
+            for parameter in parameters:
+                parameter.grad = None
             terminal_geo_action_gradient = regularizer_action_gradient(
                 'terminal_geo_loss'
             )
         finally:
+            for parameter, gradient in zip(parameters, saved_gradients):
+                parameter.grad = gradient
             random.setstate(python_rng_state)
             np.random.set_state(numpy_rng_state)
             torch.random.set_rng_state(torch_rng_state)
