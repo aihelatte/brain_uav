@@ -285,6 +285,26 @@ class TestV2SNNTD3(unittest.TestCase):
             compiled_action, eager_action, rtol=1e-4, atol=1e-5,
         )
 
+    def test_snn_action_inference_cuda_graph_wiring_keeps_lif_reset(self) -> None:
+        engine = self.make_engine(time_window=4)
+        engine.device = torch.device('cuda')
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            metadata = engine.configure_compilation(
+                compile_action_inference=True,
+                cuda_graph_action_inference=True,
+            )
+        engine.device = torch.device('cpu')
+        with mock.patch.object(
+            torch.compiler, 'cudagraph_mark_step_begin',
+        ):
+            engine.select_action(_observation(6, self.scales))
+        self.assertEqual(metadata['action_inference_granularity'], 'snn_encoder')
+        self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+        self.assertEqual(engine.actor.snn_head.lif2.v, 0.0)
+
     def test_snn_training_and_action_inference_have_separate_dynamo_code(self) -> None:
         engine = self.make_engine(time_window=4)
         engine.configure_compilation(

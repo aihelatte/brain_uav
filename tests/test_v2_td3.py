@@ -31,6 +31,7 @@ from brain_uav.trainers import (
     V2TD3UpdateEngine,
     V2TD3UpdateMetrics,
 )
+from brain_uav.trainers.v2_td3 import _ReusablePinnedReplayBatchTransfer
 
 
 def _observation(
@@ -114,6 +115,7 @@ class TestV2TD3(unittest.TestCase):
         fused_adam=False,
         aggregate_relation_values_first=False,
         reduce_update_stat_syncs=False,
+        pinned_batch_transfer=False,
         device='cpu',
     ):
         if action_limit is None:
@@ -155,7 +157,12 @@ class TestV2TD3(unittest.TestCase):
             fused_adam=fused_adam,
             aggregate_relation_values_first=aggregate_relation_values_first,
             reduce_update_stat_syncs=reduce_update_stat_syncs,
+            pinned_batch_transfer=pinned_batch_transfer,
         )
+
+    def test_pinned_batch_transfer_requires_cuda(self):
+        with self.assertRaisesRegex(ValueError, 'requires a CUDA device'):
+            self.make_engine(pinned_batch_transfer=True)
 
     def test_reduced_update_stat_syncs_batch_scalar_readback_and_match_updates(self):
         legacy = self.make_engine(policy_delay=2)
@@ -215,6 +222,45 @@ class TestV2TD3(unittest.TestCase):
                         actual_state['state'][parameter_id][name], expected_value,
                     )
 
+    def test_reusable_batch_transfer_preserves_fields_and_waits_before_reuse(self):
+        engine = self.make_engine(batch_size=2)
+        self.fill_replay(engine, counts=(0, 7), next_counts=(10, 2))
+        source = engine.replay.sample(2)
+        transfer = _ReusablePinnedReplayBatchTransfer(
+            device=torch.device('cpu'),
+            batch_size=2,
+            action_dim=2,
+            zone_storage_capacity=10,
+            pin_memory=False,
+        )
+        moved = transfer.transfer(source)
+        for actual, expected in (
+            (moved.obs.ego_features, source.obs.ego_features),
+            (moved.obs.goal_features, source.obs.goal_features),
+            (moved.obs.zone_features, source.obs.zone_features),
+            (moved.obs.presence_mask, source.obs.presence_mask),
+            (moved.next_obs.ego_features, source.next_obs.ego_features),
+            (moved.next_obs.zone_features, source.next_obs.zone_features),
+            (moved.action, source.action),
+            (moved.reward, source.reward),
+            (moved.done, source.done),
+            (moved.success, source.success),
+            (moved.near_goal, source.near_goal),
+            (moved.line_to_goal_safe, source.line_to_goal_safe),
+        ):
+            torch.testing.assert_close(actual, expected)
+
+        first_action_storage = moved.action.untyped_storage().data_ptr()
+        wait = mock.Mock()
+        wait.query.return_value = False
+        transfer._host_ready_event = wait
+        moved_again = transfer.transfer(engine.replay.sample(2))
+        wait.synchronize.assert_called_once_with()
+        self.assertEqual(
+            moved_again.action.untyped_storage().data_ptr(),
+            first_action_storage,
+        )
+
     def test_cuda_graph_update_compile_is_explicit_and_excludes_action_inference(self):
         engine = self.make_engine()
         engine.device = torch.device('cuda')
@@ -272,6 +318,104 @@ class TestV2TD3(unittest.TestCase):
                 cuda_graph_updates=True,
                 backend='eager',
             )
+
+    def test_action_inference_cuda_graph_is_independent_and_explicit(self):
+        with self.assertRaisesRegex(ValueError, 'requires compile_action_inference'):
+            engine = self.make_engine()
+            engine.device = torch.device('cuda')
+            engine.configure_compilation(cuda_graph_action_inference=True)
+        with self.assertRaisesRegex(ValueError, 'requires a CUDA device'):
+            self.make_engine().configure_compilation(
+                compile_action_inference=True,
+                cuda_graph_action_inference=True,
+            )
+
+        engine = self.make_engine()
+        engine.device = torch.device('cuda')
+        compile_calls = []
+
+        def capture(function, **kwargs):
+            compile_calls.append((function, kwargs))
+            return function
+
+        with mock.patch(
+            'brain_uav.trainers.v2_td3.torch.compile', side_effect=capture,
+        ):
+            metadata = engine.configure_compilation(
+                compile_action_inference=True,
+                cuda_graph_action_inference=True,
+            )
+
+        self.assertEqual(len(compile_calls), 1)
+        _, compile_kwargs = compile_calls[0]
+        self.assertIsNone(compile_kwargs['mode'])
+        self.assertEqual(
+            compile_kwargs['options'], {'triton.cudagraphs': True},
+        )
+        self.assertTrue(metadata['cuda_graph_action_inference'])
+        self.assertEqual(
+            metadata['select_action_execution'], 'compiled_cuda_graph',
+        )
+        self.assertFalse(metadata['cuda_graph'])
+        engine.device = torch.device('cpu')
+        observation = _observation(3, scales=self.scales)
+        with mock.patch.object(
+            torch.compiler, 'cudagraph_mark_step_begin',
+        ):
+            before = engine.select_action(observation)
+            with torch.no_grad():
+                engine.actor.head[4].bias.add_(0.05)
+            after = engine.select_action(observation)
+        self.assertFalse(np.array_equal(before, after))
+
+    def test_action_inference_cuda_graph_verifies_every_shape_independently(self):
+        engine = self.make_engine()
+        engine.device = torch.device('cuda')
+        engine.cuda_graph_action_inference = True
+        engine._compiled_action_inference = lambda *args: args[1]
+        batches = tuple(collate_v2_observations([
+            _observation(count, scales=self.scales)
+        ]) for count in (0, 7))
+
+        with mock.patch.object(
+            engine, 'warmup_action_inference_compile',
+        ) as warmup, mock.patch.object(
+            engine,
+            '_prepare_action_inference_cuda_graph_replay',
+            side_effect=lambda batch: lambda: batch.max_zone_count,
+        ), mock.patch.object(
+            engine,
+            '_profile_cuda_graph_replay',
+            side_effect=(
+                {'cuda_graph_launch_count': 2, 'event_names': ['cudaGraphLaunch']},
+                {'cuda_graph_launch_count': 0, 'event_names': []},
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, r'shape=\[1, 7\]'):
+                engine.verify_action_inference_cuda_graph_capture(batches)
+        warmup.assert_called_once_with(batches)
+
+        with mock.patch.object(
+            engine, 'warmup_action_inference_compile',
+        ), mock.patch.object(
+            engine,
+            '_prepare_action_inference_cuda_graph_replay',
+            side_effect=lambda batch: lambda: batch.max_zone_count,
+        ), mock.patch.object(
+            engine,
+            '_profile_cuda_graph_replay',
+            side_effect=(
+                {'cuda_graph_launch_count': 2, 'event_names': ['cudaGraphLaunch']},
+                {'cuda_graph_launch_count': 3, 'event_names': ['cudaGraphLaunch']},
+            ),
+        ):
+            evidence = engine.verify_action_inference_cuda_graph_capture(batches)
+        self.assertTrue(evidence['verified'])
+        self.assertEqual(evidence['cuda_graph_launch_count'], 5)
+        self.assertEqual(
+            [item['batch_shape'] for item in evidence['shapes']],
+            [[1, 0], [1, 7]],
+        )
 
     def _verify_cuda_graph_evidence(
         self,

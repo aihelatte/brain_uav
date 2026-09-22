@@ -671,8 +671,10 @@ class TestProfileV2TD3(unittest.TestCase):
                         compile_actor_loss=False,
                         cache_actor_loss_coefficients=False,
                         compile_action_inference=False,
+                        cuda_graph_action_inference=False,
                         aggregate_relation_values_first=False,
                         reduce_update_stat_syncs=False,
+                        pinned_batch_transfer=False,
                         cuda_graph_updates=False,
                         compiled_path_profiler_updates=0,
                         compiled_profiler_output_dir=None,
@@ -696,6 +698,7 @@ class TestProfileV2TD3(unittest.TestCase):
             fused_adam=fused_adam,
             aggregate_relation_values_first=aggregate_relation_values_first,
             reduce_update_stat_syncs=reduce_update_stat_syncs,
+            pinned_batch_transfer=pinned_batch_transfer,
         )
         submitted = []
         compile_calls = []
@@ -856,9 +859,14 @@ class TestProfileV2TD3(unittest.TestCase):
                 ),
                 'frozen_critic_strategy': kwargs['frozen_critic_strategy'],
                 'select_action_execution': (
+                    'compiled_cuda_graph'
+                    if kwargs['cuda_graph_action_inference'] else
                     'compiled' if kwargs['compile_action_inference'] else 'eager'
                 ),
                 'cuda_graph': kwargs['cuda_graph_updates'],
+                'cuda_graph_action_inference': kwargs[
+                    'cuda_graph_action_inference'
+                ],
                 'update_statistics_execution': (
                     'batched_device_readback'
                     if reduce_update_stat_syncs else 'per_scalar'
@@ -875,6 +883,10 @@ class TestProfileV2TD3(unittest.TestCase):
         engine.verify_update_cuda_graph_capture = lambda batches: {
             'verified': True,
             'cuda_graph_launch_count': 2,
+        }
+        engine.verify_action_inference_cuda_graph_capture = lambda batches: {
+            'verified': True,
+            'cuda_graph_launch_count': 3,
         }
         synchronization_points = []
         event = mock.Mock()
@@ -918,8 +930,10 @@ class TestProfileV2TD3(unittest.TestCase):
                 compile_actor_loss=compile_actor_loss,
                 cache_actor_loss_coefficients=cache_actor_loss_coefficients,
                 compile_action_inference=compile_action_inference,
+                cuda_graph_action_inference=cuda_graph_action_inference,
                 aggregate_relation_values_first=aggregate_relation_values_first,
                 reduce_update_stat_syncs=reduce_update_stat_syncs,
+                pinned_batch_transfer=pinned_batch_transfer,
                 cuda_graph_updates=cuda_graph_updates,
                 compiled_path_profiler_updates=compiled_path_profiler_updates,
                 compiled_profiler_output_dir=compiled_profiler_output_dir,
@@ -966,6 +980,23 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertEqual(compile_info['measurement_new_graph_count'], 2)
         self.assertFalse(compile_info['stable_timing'])
         self.assertFalse(compile_info['valid_for_speed_comparison'])
+
+    def test_action_graph_and_pinned_transfer_are_recorded_independently(self) -> None:
+        result, _, _ = self.run_small_level(
+            compile_action_inference=True,
+            cuda_graph_action_inference=True,
+            pinned_batch_transfer=True,
+        )
+        compile_info = result['critic_encoder_compile']
+        self.assertTrue(compile_info['cuda_graph_action_inference_requested'])
+        self.assertTrue(compile_info['pinned_batch_transfer_requested'])
+        self.assertTrue(compile_info['cuda_graph_action_inference'])
+        self.assertEqual(
+            compile_info['cuda_graph_action_inference_evidence'][
+                'cuda_graph_launch_count'
+            ],
+            3,
+        )
 
     def test_three_optimization_scopes_are_recorded_in_diagnostic(self) -> None:
         result, _, _ = self.run_small_level(
@@ -1225,6 +1256,8 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertFalse(args.compile_actor_loss)
         self.assertFalse(args.cache_actor_loss_coefficients)
         self.assertFalse(args.compile_action_inference)
+        self.assertFalse(args.cuda_graph_action_inference)
+        self.assertFalse(args.pinned_batch_transfer)
         self.assertFalse(args.aggregate_relation_values_first)
         self.assertFalse(args.reduce_update_stat_syncs)
         self.assertFalse(args.cuda_graph_updates)
@@ -1285,6 +1318,8 @@ class TestProfileV2TD3(unittest.TestCase):
             '--fused-adam', '--compile-actor-loss',
             '--cache-actor-loss-coefficients',
             '--compile-action-inference',
+            '--cuda-graph-action-inference',
+            '--pinned-batch-transfer',
             '--aggregate-relation-values-first',
             '--reduce-update-stat-syncs', '--cuda-graph-updates',
         ])
@@ -1292,6 +1327,8 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertTrue(optimization_scopes.compile_actor_loss)
         self.assertTrue(optimization_scopes.cache_actor_loss_coefficients)
         self.assertTrue(optimization_scopes.compile_action_inference)
+        self.assertTrue(optimization_scopes.cuda_graph_action_inference)
+        self.assertTrue(optimization_scopes.pinned_batch_transfer)
         self.assertTrue(optimization_scopes.aggregate_relation_values_first)
         self.assertTrue(optimization_scopes.reduce_update_stat_syncs)
         self.assertTrue(optimization_scopes.cuda_graph_updates)
@@ -1563,6 +1600,10 @@ class TestProfileV2TD3(unittest.TestCase):
         original_actor_terms = engine._compute_actor_loss_terms
         actor_hooks_before = tuple(engine.actor._forward_hooks)
         critic_head_hooks_before = tuple(engine.critic1.head._forward_hooks)
+        actor_forward_outputs = []
+        actor_forward_handle = engine.actor.register_forward_hook(
+            lambda _module, _inputs, output: actor_forward_outputs.append(output)
+        )
         actor_gradient_calls = [0 for _ in engine.actor.parameters()]
         gradient_handles = []
         for index, parameter in enumerate(engine.actor.parameters()):
@@ -1576,8 +1617,10 @@ class TestProfileV2TD3(unittest.TestCase):
                 total_steps=4,
                 bc_lambda=1.5,
                 capture_regularizers=True,
+                regularizer_probe_batch=batch,
             )
         finally:
+            actor_forward_handle.remove()
             for handle in gradient_handles:
                 handle.remove()
 
@@ -1587,6 +1630,8 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertTrue(bool(torch.count_nonzero(
             capture['terminal_geo_action_gradient']
         )))
+        self.assertEqual(len(actor_forward_outputs), 3)
+        self.assertEqual(len({id(output) for output in actor_forward_outputs}), 3)
         self.assertTrue(any(
             parameter.grad is not None
             and bool(torch.count_nonzero(parameter.grad))
@@ -1613,6 +1658,7 @@ class TestProfileV2TD3(unittest.TestCase):
                 total_steps=6,
                 bc_lambda=1.5,
                 capture_regularizers=True,
+                regularizer_probe_batch=batch,
             )
         restored_after_error = engine._compute_actor_loss_terms
         self.assertIs(restored_after_error.__func__, original_actor_terms.__func__)

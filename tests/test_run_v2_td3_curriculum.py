@@ -117,6 +117,8 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertFalse(args.compile_actor_loss)
         self.assertFalse(args.cache_actor_loss_coefficients)
         self.assertFalse(args.compile_action_inference)
+        self.assertFalse(args.cuda_graph_action_inference)
+        self.assertFalse(args.pinned_batch_transfer)
         self.assertFalse(args.aggregate_relation_values_first)
         self.assertFalse(args.reduce_update_stat_syncs)
         self.assertFalse(args.cuda_graph_updates)
@@ -187,8 +189,10 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                     compile_actor_loss=True,
                     cache_actor_loss_coefficients=True,
                     compile_action_inference=True,
+                    cuda_graph_action_inference=True,
                     aggregate_relation_values_first=True,
                     reduce_update_stat_syncs=True,
+                    pinned_batch_transfer=True,
                     cuda_graph_updates=True,
                 )
         initializer.assert_called_once()
@@ -210,8 +214,10 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertTrue(calls[0]['compile_actor_loss'])
         self.assertTrue(calls[0]['cache_actor_loss_coefficients'])
         self.assertTrue(calls[0]['compile_action_inference'])
+        self.assertTrue(calls[0]['cuda_graph_action_inference'])
         self.assertTrue(calls[0]['aggregate_relation_values_first'])
         self.assertTrue(calls[0]['reduce_update_stat_syncs'])
+        self.assertTrue(calls[0]['pinned_batch_transfer'])
         self.assertTrue(calls[0]['cuda_graph_updates'])
         self.assertIs(calls[0]['prepared_initialization'], prepared)
         self.assertEqual(Path(calls[0]['output']).name, 'v2_snn_td3_easy.pt')
@@ -226,8 +232,12 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertTrue(result['compilation_request']['compile_actor_loss'])
         self.assertTrue(result['compilation_request']['cache_actor_loss_coefficients'])
         self.assertTrue(result['compilation_request']['compile_action_inference'])
+        self.assertTrue(
+            result['compilation_request']['cuda_graph_action_inference']
+        )
         self.assertTrue(result['compilation_request']['aggregate_relation_values_first'])
         self.assertTrue(result['compilation_request']['reduce_update_stat_syncs'])
+        self.assertTrue(result['compilation_request']['pinned_batch_transfer'])
         self.assertTrue(result['compilation_request']['cuda_graph_updates'])
         self.assertEqual(result['snn'], {
             'time_window': actor.time_window,

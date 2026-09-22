@@ -60,6 +60,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--compile-actor-loss', action='store_true')
     parser.add_argument('--cache-actor-loss-coefficients', action='store_true')
     parser.add_argument('--compile-action-inference', action='store_true')
+    parser.add_argument('--cuda-graph-action-inference', action='store_true')
+    parser.add_argument('--pinned-batch-transfer', action='store_true')
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument('--reduce-update-stat-syncs', action='store_true')
     parser.add_argument('--cuda-graph-updates', action='store_true')
@@ -106,6 +108,7 @@ def _configure_stage_compilation(
     compile_actor_loss: bool = False,
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
+    cuda_graph_action_inference: bool = False,
     cuda_graph_updates: bool = False,
 ) -> dict[str, Any]:
     if cache_actor_loss_coefficients and not compile_actor_loss:
@@ -116,6 +119,7 @@ def _configure_stage_compilation(
         compile_shared_relations, compile_snn_target_encoder,
         compile_actor_loss,
         compile_action_inference,
+        cuda_graph_action_inference,
         cuda_graph_updates,
     ))
     if not requested:
@@ -130,6 +134,8 @@ def _configure_stage_compilation(
             'select_action_execution': 'eager',
             'cuda_graph': False,
             'cuda_graph_evidence': None,
+            'cuda_graph_action_inference': False,
+            'cuda_graph_action_inference_evidence': None,
             'optimizer_execution': (
                 'fused_adam' if getattr(engine, 'fused_adam', False) else 'adam'
             ),
@@ -150,6 +156,14 @@ def _configure_stage_compilation(
             'reduce_update_stat_syncs_requested': bool(
                 getattr(engine, 'reduce_update_stat_syncs', False)
             ),
+            'batch_transfer_execution': (
+                'reusable_pinned_non_blocking'
+                if getattr(engine, 'pinned_batch_transfer', False)
+                else 'blocking_to_device'
+            ),
+            'pinned_batch_transfer_requested': bool(
+                getattr(engine, 'pinned_batch_transfer', False)
+            ),
             'action_inference_warmup_shapes': [],
             'registration_wall_seconds': 0.0,
             'warmup_wall_seconds': 0.0,
@@ -168,12 +182,16 @@ def _configure_stage_compilation(
         compile_actor_loss=compile_actor_loss,
         cache_actor_loss_coefficients=cache_actor_loss_coefficients,
         compile_action_inference=compile_action_inference,
+        cuda_graph_action_inference=cuda_graph_action_inference,
         cuda_graph_updates=cuda_graph_updates,
         backend='inductor', mode='default', fullgraph=True, dynamic=True,
     )
     metadata['requested'] = True
     metadata['reduce_update_stat_syncs_requested'] = bool(
         getattr(engine, 'reduce_update_stat_syncs', False)
+    )
+    metadata['pinned_batch_transfer_requested'] = bool(
+        getattr(engine, 'pinned_batch_transfer', False)
     )
     metadata['actor_loss_coefficients_requested'] = cache_actor_loss_coefficients
     metadata['registration_wall_seconds'] = perf_counter() - registration_started
@@ -242,6 +260,12 @@ def _configure_stage_compilation(
             [batch.batch_size, int(batch.zone_features.shape[1])]
             for batch in action_inference_batches
         ]
+    if cuda_graph_action_inference:
+        metadata['cuda_graph_action_inference_evidence'] = (
+            engine.verify_action_inference_cuda_graph_capture(
+                action_inference_batches
+            )
+        )
     if cuda_graph_updates:
         metadata['cuda_graph_evidence'] = (
             engine.verify_update_cuda_graph_capture(warmup_batches)
@@ -288,8 +312,10 @@ def run_v2_td3_stage(
     compile_actor_loss: bool = False,
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
+    cuda_graph_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
+    pinned_batch_transfer: bool = False,
     cuda_graph_updates: bool = False,
 ) -> dict[str, Any]:
     requested_device = device
@@ -372,6 +398,7 @@ def run_v2_td3_stage(
         fused_adam=fused_adam,
         aggregate_relation_values_first=aggregate_relation_values_first,
         reduce_update_stat_syncs=reduce_update_stat_syncs,
+        pinned_batch_transfer=pinned_batch_transfer,
     )
     compilation_metadata = _configure_stage_compilation(
         components.engine,
@@ -388,6 +415,7 @@ def run_v2_td3_stage(
         compile_actor_loss=compile_actor_loss,
         cache_actor_loss_coefficients=cache_actor_loss_coefficients,
         compile_action_inference=compile_action_inference,
+        cuda_graph_action_inference=cuda_graph_action_inference,
         cuda_graph_updates=cuda_graph_updates,
     )
     reporter = (
@@ -594,8 +622,10 @@ def main(argv: list[str] | None = None) -> int:
         compile_actor_loss=args.compile_actor_loss,
         cache_actor_loss_coefficients=args.cache_actor_loss_coefficients,
         compile_action_inference=args.compile_action_inference,
+        cuda_graph_action_inference=args.cuda_graph_action_inference,
         aggregate_relation_values_first=args.aggregate_relation_values_first,
         reduce_update_stat_syncs=args.reduce_update_stat_syncs,
+        pinned_batch_transfer=args.pinned_batch_transfer,
         cuda_graph_updates=args.cuda_graph_updates,
     )
     print(json.dumps(summary, indent=2, allow_nan=False))

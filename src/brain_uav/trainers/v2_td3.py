@@ -30,7 +30,7 @@ from brain_uav.observations import (
     collate_v2_observations,
 )
 
-from .v2_replay_buffer import V2ReplayBuffer
+from .v2_replay_buffer import V2ReplayBatch, V2ReplayBuffer
 
 _GOAL_FORWARD_NORM_INDEX = int(GOAL_FEATURE_INDEX['goal_forward_norm'])
 _GOAL_RIGHT_NORM_INDEX = int(GOAL_FEATURE_INDEX['goal_right_norm'])
@@ -245,6 +245,130 @@ class _ActorLossTerms:
     terminal_geo_loss: torch.Tensor
 
 
+class _ReusablePinnedReplayBatchTransfer:
+    """One bounded staging/device buffer pair for TD3 replay batches."""
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        batch_size: int,
+        action_dim: int,
+        zone_storage_capacity: int,
+        pin_memory: bool = True,
+    ) -> None:
+        self.device = torch.device(device)
+        self.batch_size = batch_size
+        self.action_dim = action_dim
+        self.zone_storage_capacity = zone_storage_capacity
+        self._host = self._allocate(torch.device('cpu'), pin_memory=pin_memory)
+        self._device = self._allocate(self.device, pin_memory=False)
+        self._host_ready_event: Any | None = None
+
+    def _allocate(
+        self, device: torch.device, *, pin_memory: bool,
+    ) -> V2ReplayBatch:
+        def empty(shape: tuple[int, ...], dtype: torch.dtype) -> torch.Tensor:
+            return torch.empty(
+                shape, dtype=dtype, device=device,
+                pin_memory=pin_memory and device.type == 'cpu',
+            )
+
+        def observation() -> V2ObservationBatch:
+            return V2ObservationBatch(
+                ego_features=empty((self.batch_size, EGO_FEATURE_DIM), torch.float32),
+                goal_features=empty((self.batch_size, GOAL_FEATURE_DIM), torch.float32),
+                zone_features=empty((
+                    self.batch_size, self.zone_storage_capacity, ZONE_FEATURE_DIM,
+                ), torch.float32),
+                presence_mask=empty((
+                    self.batch_size, self.zone_storage_capacity,
+                ), torch.bool),
+            )
+
+        return V2ReplayBatch(
+            obs=observation(),
+            action=empty((self.batch_size, self.action_dim), torch.float32),
+            reward=empty((self.batch_size, 1), torch.float32),
+            next_obs=observation(),
+            done=empty((self.batch_size, 1), torch.float32),
+            success=empty((self.batch_size, 1), torch.float32),
+            near_goal=empty((self.batch_size, 1), torch.float32),
+            line_to_goal_safe=empty((self.batch_size, 1), torch.float32),
+        )
+
+    @staticmethod
+    def _view(
+        batch: V2ReplayBatch, obs_zones: int, next_zones: int,
+    ) -> V2ReplayBatch:
+        return V2ReplayBatch(
+            obs=V2ObservationBatch(
+                batch.obs.ego_features,
+                batch.obs.goal_features,
+                batch.obs.zone_features[:, :obs_zones],
+                batch.obs.presence_mask[:, :obs_zones],
+            ),
+            action=batch.action,
+            reward=batch.reward,
+            next_obs=V2ObservationBatch(
+                batch.next_obs.ego_features,
+                batch.next_obs.goal_features,
+                batch.next_obs.zone_features[:, :next_zones],
+                batch.next_obs.presence_mask[:, :next_zones],
+            ),
+            done=batch.done,
+            success=batch.success,
+            near_goal=batch.near_goal,
+            line_to_goal_safe=batch.line_to_goal_safe,
+        )
+
+    @staticmethod
+    def _copy(source: V2ReplayBatch, destination: V2ReplayBatch, *, non_blocking: bool) -> None:
+        for source_tensor, destination_tensor in (
+            (source.obs.ego_features, destination.obs.ego_features),
+            (source.obs.goal_features, destination.obs.goal_features),
+            (source.obs.zone_features, destination.obs.zone_features),
+            (source.obs.presence_mask, destination.obs.presence_mask),
+            (source.action, destination.action),
+            (source.reward, destination.reward),
+            (source.next_obs.ego_features, destination.next_obs.ego_features),
+            (source.next_obs.goal_features, destination.next_obs.goal_features),
+            (source.next_obs.zone_features, destination.next_obs.zone_features),
+            (source.next_obs.presence_mask, destination.next_obs.presence_mask),
+            (source.done, destination.done),
+            (source.success, destination.success),
+            (source.near_goal, destination.near_goal),
+            (source.line_to_goal_safe, destination.line_to_goal_safe),
+        ):
+            destination_tensor.copy_(source_tensor, non_blocking=non_blocking)
+
+    def transfer(self, batch: V2ReplayBatch) -> V2ReplayBatch:
+        if batch.batch_size != self.batch_size:
+            raise ValueError('Replay batch size does not match transfer buffers.')
+        if (
+            self.device.type == 'cuda'
+            and batch.obs.ego_features.device == self.device
+        ):
+            return batch
+        obs_zones = batch.obs.max_zone_count
+        next_zones = batch.next_obs.max_zone_count
+        if max(obs_zones, next_zones) > self.zone_storage_capacity:
+            raise ValueError('Replay batch exceeds zone_storage_capacity.')
+        if (
+            self._host_ready_event is not None
+            and not self._host_ready_event.query()
+        ):
+            self._host_ready_event.synchronize()
+        host = self._view(self._host, obs_zones, next_zones)
+        device = self._view(self._device, obs_zones, next_zones)
+        self._copy(batch, host, non_blocking=False)
+        self._copy(host, device, non_blocking=self.device.type == 'cuda')
+        if self.device.type == 'cuda':
+            self._host_ready_event = torch.cuda.Event()
+            self._host_ready_event.record(torch.cuda.current_stream(self.device))
+        return device
+
+
 class _OptionalUpdateWallTimer:
     """Collect diagnostic-only wall intervals without synchronizing CUDA."""
 
@@ -357,6 +481,7 @@ class V2TD3UpdateEngine:
         fused_adam: bool = False,
         aggregate_relation_values_first: bool = False,
         reduce_update_stat_syncs: bool = False,
+        pinned_batch_transfer: bool = False,
     ) -> None:
         actor_model_type = _actor_model_type(actor)
         if not isinstance(critic1, V2ANNCritic) or not isinstance(critic2, V2ANNCritic):
@@ -388,12 +513,18 @@ class V2TD3UpdateEngine:
             raise TypeError('aggregate_relation_values_first must be a bool.')
         if type(reduce_update_stat_syncs) is not bool:
             raise TypeError('reduce_update_stat_syncs must be a bool.')
+        if type(pinned_batch_transfer) is not bool:
+            raise TypeError('pinned_batch_transfer must be a bool.')
+        if pinned_batch_transfer and self.device.type != 'cuda':
+            raise ValueError('pinned_batch_transfer requires a CUDA device.')
         if fused_adam and self.device.type not in ('cpu', 'cuda'):
             raise ValueError(f'fused Adam is unsupported on {self.device.type}.')
         self.fused_adam = fused_adam
         self.aggregate_relation_values_first = aggregate_relation_values_first
         self.reduce_update_stat_syncs = reduce_update_stat_syncs
+        self.pinned_batch_transfer = pinned_batch_transfer
         self.cuda_graph_updates = False
+        self.cuda_graph_action_inference = False
         self.model_type = actor_model_type
         self.actor = actor.to(self.device)
         self.critic1 = critic1.to(self.device)
@@ -439,6 +570,15 @@ class V2TD3UpdateEngine:
         )
         self.policy_delay = _positive_int(policy_delay, name='policy_delay')
         self.batch_size = _positive_int(batch_size, name='batch_size')
+        self._replay_batch_transfer = (
+            _ReusablePinnedReplayBatchTransfer(
+                device=self.device,
+                batch_size=self.batch_size,
+                action_dim=self.action_dim,
+                zone_storage_capacity=self.replay.zone_storage_capacity,
+            )
+            if pinned_batch_transfer else None
+        )
         self.actor_freeze_steps = _nonnegative_int(
             actor_freeze_steps, name='actor_freeze_steps'
         )
@@ -853,9 +993,10 @@ class V2TD3UpdateEngine:
         self,
         *,
         backend: str = 'inductor',
-        mode: str = 'default',
+        mode: str | None = 'default',
         fullgraph: bool = True,
         dynamic: bool = True,
+        options: dict[str, object] | None = None,
     ) -> tuple[str, str]:
         enabled: list[str] = []
         for name, critic in (
@@ -916,6 +1057,7 @@ class V2TD3UpdateEngine:
         compile_actor_loss: bool = False,
         cache_actor_loss_coefficients: bool = False,
         compile_action_inference: bool = False,
+        cuda_graph_action_inference: bool = False,
         cuda_graph_updates: bool = False,
         backend: str = 'inductor',
         mode: str = 'default',
@@ -944,6 +1086,24 @@ class V2TD3UpdateEngine:
         if cache_actor_loss_coefficients and not compile_actor_loss:
             raise ValueError(
                 'cache_actor_loss_coefficients requires compile_actor_loss.'
+            )
+        if type(cuda_graph_action_inference) is not bool:
+            raise TypeError('cuda_graph_action_inference must be a bool.')
+        if cuda_graph_action_inference and not compile_action_inference:
+            raise ValueError(
+                'cuda_graph_action_inference requires compile_action_inference.'
+            )
+        if cuda_graph_action_inference and self.device.type != 'cuda':
+            raise ValueError(
+                'cuda_graph_action_inference requires a CUDA device.'
+            )
+        if cuda_graph_action_inference and backend != 'inductor':
+            raise ValueError(
+                "cuda_graph_action_inference requires backend='inductor'."
+            )
+        if cuda_graph_action_inference and mode != 'default':
+            raise ValueError(
+                "cuda_graph_action_inference requires mode='default'."
             )
         if type(cuda_graph_updates) is not bool:
             raise TypeError('cuda_graph_updates must be a bool.')
@@ -986,6 +1146,11 @@ class V2TD3UpdateEngine:
             {'triton.cudagraphs': True} if cuda_graph_updates else None
         )
         graph_mode = None if cuda_graph_updates else mode
+        action_graph_options = (
+            {'triton.cudagraphs': True}
+            if cuda_graph_action_inference else None
+        )
+        action_graph_mode = None if cuda_graph_action_inference else mode
         enabled: list[str] = []
         if compile_shared_relations:
             enabled.extend(self.enable_shared_relations_compile(**options))
@@ -995,7 +1160,13 @@ class V2TD3UpdateEngine:
                 dynamic=dynamic, options=graph_options,
             ))
         if compile_action_inference:
-            enabled.extend(self.enable_action_inference_compile(**options))
+            enabled.extend(self.enable_action_inference_compile(
+                backend=backend,
+                mode=action_graph_mode,
+                fullgraph=fullgraph,
+                dynamic=dynamic,
+                options=action_graph_options,
+            ))
         if compile_critic_block:
             enabled.extend(self.enable_critic_loss_compile(
                 backend=backend, mode=graph_mode, fullgraph=fullgraph,
@@ -1022,6 +1193,7 @@ class V2TD3UpdateEngine:
         self.set_frozen_critic_strategy(frozen_critic_strategy)
         self.cache_actor_loss_coefficients = cache_actor_loss_coefficients
         self.cuda_graph_updates = cuda_graph_updates
+        self.cuda_graph_action_inference = cuda_graph_action_inference
         return {
             'enabled_objects': enabled,
             'critic_granularity': (
@@ -1065,13 +1237,18 @@ class V2TD3UpdateEngine:
             ),
             'frozen_critic_strategy': frozen_critic_strategy,
             'select_action_execution': (
-                'compiled' if compile_action_inference else 'eager'
+                'compiled_cuda_graph' if cuda_graph_action_inference
+                else 'compiled' if compile_action_inference else 'eager'
             ),
             'backend': backend,
             'mode': mode,
             'fullgraph': fullgraph,
             'dynamic': dynamic,
             'cuda_graph': cuda_graph_updates,
+            'cuda_graph_action_inference': cuda_graph_action_inference,
+            'cuda_graph_action_inference_backend_options': (
+                action_graph_options or {}
+            ),
             'cuda_graph_scope': (
                 [
                     name for enabled_flag, name in (
@@ -1087,6 +1264,11 @@ class V2TD3UpdateEngine:
                 'batched_device_readback'
                 if self.reduce_update_stat_syncs else 'per_scalar'
             ),
+            'batch_transfer_execution': (
+                'reusable_pinned_non_blocking'
+                if self.pinned_batch_transfer else 'blocking_to_device'
+            ),
+            'pinned_batch_transfer_requested': self.pinned_batch_transfer,
         }
 
     def _compute_twin_critic_loss_tensors(
@@ -1377,9 +1559,10 @@ class V2TD3UpdateEngine:
         self,
         *,
         backend: str = 'inductor',
-        mode: str = 'default',
+        mode: str | None = 'default',
         fullgraph: bool = True,
         dynamic: bool = True,
+        options: dict[str, object] | None = None,
     ) -> tuple[str, ...]:
         if self._compiled_action_inference is not None:
             raise RuntimeError('Action inference is already compiled.')
@@ -1389,12 +1572,16 @@ class V2TD3UpdateEngine:
         else:
             tensor_forward = _action_inference_snn_encoder_tensors
             enabled = 'actor.action_inference_encoder'
+        compile_arguments: dict[str, object] = {
+            'backend': backend,
+            'mode': mode,
+            'fullgraph': fullgraph,
+            'dynamic': dynamic,
+        }
+        if options is not None:
+            compile_arguments['options'] = options
         self._compiled_action_inference = torch.compile(
-            tensor_forward,
-            backend=backend,
-            mode=mode,
-            fullgraph=fullgraph,
-            dynamic=dynamic,
+            tensor_forward, **compile_arguments,
         )
         self._compiled_action_inference_config = {
             'backend': backend,
@@ -1405,6 +1592,7 @@ class V2TD3UpdateEngine:
         return (enabled,)
 
     def _action_inference_tensor(self, batch: V2ObservationBatch) -> torch.Tensor:
+        self._mark_action_inference_cuda_graph_step_begin()
         if self._compiled_action_inference is None:
             actor_eager_context = (
                 self.actor.eager_full_forward()
@@ -1488,6 +1676,98 @@ class V2TD3UpdateEngine:
         )
         if counts_after != counts_before:
             raise RuntimeError('Action inference warmup must not change TD3 counters.')
+
+    def _prepare_action_inference_cuda_graph_replay(
+        self,
+        batch: V2ObservationBatch,
+    ) -> Callable[[], torch.Tensor]:
+        if self._compiled_action_inference is None:
+            raise RuntimeError('Action inference must be compiled first.')
+        device_batch = batch.to(self.device)
+        with torch.inference_mode(), self.actor.zone_set_encoder.eager_tensor_forward():
+            arguments = self.actor.zone_set_encoder.prepare_tensor_forward_arguments(
+                device_batch.ego_features,
+                device_batch.goal_features,
+                device_batch.zone_features,
+                device_batch.presence_mask,
+            )
+        module = (
+            self.actor
+            if isinstance(self.actor, V2ANNPolicyActor)
+            else self.actor.zone_set_encoder
+        )
+
+        def replay() -> torch.Tensor:
+            self._mark_action_inference_cuda_graph_step_begin()
+            return self._compiled_action_inference(module, *arguments)
+
+        return replay
+
+    def verify_action_inference_cuda_graph_capture(
+        self,
+        batches: Sequence[V2ObservationBatch],
+    ) -> dict[str, object]:
+        """Verify action-inference graph replay for every distinct shape."""
+
+        if not self.cuda_graph_action_inference:
+            raise RuntimeError(
+                'Action inference CUDA Graph must be configured first.'
+            )
+        if self.device.type != 'cuda':
+            raise RuntimeError(
+                'Action inference CUDA Graph verification requires CUDA.'
+            )
+        distinct: dict[tuple[int, int], V2ObservationBatch] = {}
+        for batch in batches:
+            if not isinstance(batch, V2ObservationBatch):
+                raise TypeError(
+                    'Action inference CUDA Graph batches must be '
+                    'V2ObservationBatch values.'
+                )
+            shape = (batch.batch_size, batch.max_zone_count)
+            distinct.setdefault(shape, batch)
+        if not distinct:
+            raise ValueError(
+                'Action inference CUDA Graph verification requires a warmup batch.'
+            )
+
+        warmup_batches = tuple(distinct.values())
+        self.warmup_action_inference_compile(warmup_batches)
+        shape_evidence: list[dict[str, object]] = []
+        missing: list[str] = []
+        for shape, batch in distinct.items():
+            replay = self._prepare_action_inference_cuda_graph_replay(batch)
+            with torch.inference_mode():
+                evidence = self._profile_cuda_graph_replay(replay)
+            launch_count = int(evidence['cuda_graph_launch_count'])
+            verified = launch_count > 0
+            shape_evidence.append({
+                'batch_shape': list(shape),
+                'verified': verified,
+                'cuda_graph_launch_count': launch_count,
+                'event_names': list(evidence['event_names']),
+            })
+            if not verified:
+                missing.append(f'shape={list(shape)}')
+        if missing:
+            raise RuntimeError(
+                'Action inference CUDA Graph replay evidence is missing for '
+                + ', '.join(missing)
+                + '. Set TORCH_LOGS=perf_hints for capture skip reasons.'
+            )
+        return {
+            'verified': True,
+            'scope': (
+                'ann_full_forward'
+                if isinstance(self.actor, V2ANNPolicyActor)
+                else 'snn_encoder'
+            ),
+            'shapes': shape_evidence,
+            'cuda_graph_launch_count': sum(
+                int(item['cuda_graph_launch_count'])
+                for item in shape_evidence
+            ),
+        }
 
     def warmup_actor_compile(
         self,
@@ -1821,6 +2101,10 @@ class V2TD3UpdateEngine:
 
     def _mark_cuda_graph_step_begin(self) -> None:
         if self.cuda_graph_updates:
+            torch.compiler.cudagraph_mark_step_begin()
+
+    def _mark_action_inference_cuda_graph_step_begin(self) -> None:
+        if self.cuda_graph_action_inference:
             torch.compiler.cudagraph_mark_step_begin()
 
     def _profile_cuda_graph_replay(
@@ -2459,7 +2743,11 @@ class V2TD3UpdateEngine:
         with update_timing.section('replay_sample'):
             batch = self.replay.sample(self.batch_size)
         with update_timing.section('batch_preparation'):
-            batch = batch.to(self.device)
+            batch = (
+                self._replay_batch_transfer.transfer(batch)
+                if self._replay_batch_transfer is not None
+                else batch.to(self.device)
+            )
         with update_timing.section('target_forward_and_td_target'):
             with torch.no_grad():
                 if (

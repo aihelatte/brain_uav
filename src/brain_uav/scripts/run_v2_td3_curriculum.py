@@ -45,6 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--compile-actor-loss', action='store_true')
     parser.add_argument('--cache-actor-loss-coefficients', action='store_true')
     parser.add_argument('--compile-action-inference', action='store_true')
+    parser.add_argument('--cuda-graph-action-inference', action='store_true')
+    parser.add_argument('--pinned-batch-transfer', action='store_true')
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument('--reduce-update-stat-syncs', action='store_true')
     parser.add_argument('--cuda-graph-updates', action='store_true')
@@ -133,8 +135,10 @@ def run_v2_curriculum(
     compile_actor_loss: bool = False,
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
+    cuda_graph_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
+    pinned_batch_transfer: bool = False,
     cuda_graph_updates: bool = False,
 ) -> dict[str, Any]:
     requested_device = device
@@ -147,6 +151,14 @@ def run_v2_curriculum(
         raise TypeError('reduce_update_stat_syncs must be a bool.')
     if type(cuda_graph_updates) is not bool:
         raise TypeError('cuda_graph_updates must be a bool.')
+    if cuda_graph_action_inference and not compile_action_inference:
+        raise ValueError(
+            'cuda_graph_action_inference requires compile_action_inference.'
+        )
+    if cuda_graph_action_inference and resolved_device != 'cuda':
+        raise ValueError('cuda_graph_action_inference requires a CUDA device.')
+    if pinned_batch_transfer and resolved_device != 'cuda':
+        raise ValueError('pinned_batch_transfer requires a CUDA device.')
     if cuda_graph_updates and not compile_critic_block:
         raise ValueError('cuda_graph_updates requires compile_critic_block.')
     if cuda_graph_updates and resolved_device != 'cuda':
@@ -255,8 +267,10 @@ def run_v2_curriculum(
             compile_actor_loss=compile_actor_loss,
             cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
+            cuda_graph_action_inference=cuda_graph_action_inference,
             aggregate_relation_values_first=aggregate_relation_values_first,
             reduce_update_stat_syncs=reduce_update_stat_syncs,
+            pinned_batch_transfer=pinned_batch_transfer,
             cuda_graph_updates=cuda_graph_updates,
         )
         summaries.append(summary)
@@ -303,8 +317,10 @@ def run_v2_curriculum(
             'compile_actor_loss': compile_actor_loss,
             'cache_actor_loss_coefficients': cache_actor_loss_coefficients,
             'compile_action_inference': compile_action_inference,
+            'cuda_graph_action_inference': cuda_graph_action_inference,
             'aggregate_relation_values_first': aggregate_relation_values_first,
             'reduce_update_stat_syncs': reduce_update_stat_syncs,
+            'pinned_batch_transfer': pinned_batch_transfer,
             'cuda_graph_updates': cuda_graph_updates,
             'cuda_graph': cuda_graph_updates,
         },
@@ -344,8 +360,10 @@ def main(argv: list[str] | None = None) -> int:
         compile_actor_loss=args.compile_actor_loss,
         cache_actor_loss_coefficients=args.cache_actor_loss_coefficients,
         compile_action_inference=args.compile_action_inference,
+        cuda_graph_action_inference=args.cuda_graph_action_inference,
         aggregate_relation_values_first=args.aggregate_relation_values_first,
         reduce_update_stat_syncs=args.reduce_update_stat_syncs,
+        pinned_batch_transfer=args.pinned_batch_transfer,
         cuda_graph_updates=args.cuda_graph_updates,
     )
     print(json.dumps(summary, indent=2, allow_nan=False))

@@ -10,6 +10,7 @@ import gc
 import json
 from math import isfinite
 from pathlib import Path
+import random
 from time import perf_counter
 from typing import Any, Callable, Mapping, Sequence
 
@@ -2301,15 +2302,64 @@ def _run_actor_update_with_rl_gradient_capture(
     total_steps: int,
     bc_lambda: float = 0.0,
     capture_regularizers: bool = False,
+    regularizer_probe_batch: V2ReplayBatch | None = None,
 ) -> tuple[Any, dict[str, Any]]:
     q_output_gradient: torch.Tensor | None = None
-    actor_actions: torch.Tensor | None = None
     bc_action_gradient: torch.Tensor | None = None
     terminal_geo_action_gradient: torch.Tensor | None = None
 
-    def capture_actor_actions(_module, _inputs, output):
-        nonlocal actor_actions
-        actor_actions = output
+    def regularizer_action_gradient(name: str) -> torch.Tensor | None:
+        if regularizer_probe_batch is None:
+            raise AssertionError(
+                'Regularizer gradient capture requires its fixed replay batch.'
+            )
+        batch = regularizer_probe_batch.to(engine.device)
+        engine._mark_cuda_graph_step_begin()
+        shared_relations = engine._build_shared_relations(batch.obs)
+        actor_actions: torch.Tensor | None = None
+
+        def capture_actor_actions(_module, _inputs, output):
+            nonlocal actor_actions
+            actor_actions = output
+
+        actor_handle = engine.actor.register_forward_hook(capture_actor_actions)
+        guidance = engine._actor_critic_guidance(
+            batch.obs,
+            shared_relations=shared_relations,
+            profile_sections=False,
+        )
+        guidance_entered = False
+        try:
+            critic_context = guidance.__enter__()
+            guidance_entered = True
+            terms = engine._compute_actor_loss_terms(
+                batch.obs,
+                batch.line_to_goal_safe,
+                bc_lambda=bc_lambda,
+                shared_relations=shared_relations,
+                critic_context=critic_context,
+            )
+            if actor_actions is None:
+                raise AssertionError(
+                    'Numeric diagnostic prerequisite not met: the actual actor '
+                    'forward output was not captured.'
+                )
+            loss = getattr(terms, name)
+            if not loss.requires_grad or not actor_actions.requires_grad:
+                return None
+            gradient = torch.autograd.grad(
+                loss,
+                actor_actions,
+                allow_unused=True,
+            )[0]
+            return (
+                None if gradient is None
+                else gradient.detach().cpu().clone()
+            )
+        finally:
+            if guidance_entered:
+                guidance.__exit__(None, None, None)
+            actor_handle.remove()
 
     def capture_frozen_q_gradient(_module, _inputs, output):
         if not any(parameter.requires_grad for parameter in engine.critic1.head.parameters()):
@@ -2319,56 +2369,38 @@ def _run_actor_update_with_rl_gradient_capture(
                 return gradient
             output.register_hook(save_gradient)
 
+    if capture_regularizers:
+        python_rng_state = random.getstate()
+        numpy_rng_state = np.random.get_state()
+        torch_rng_state = torch.random.get_rng_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state_all()
+            if engine.device.type == 'cuda' else None
+        )
+        try:
+            bc_action_gradient = regularizer_action_gradient('bc_loss')
+            terminal_geo_action_gradient = regularizer_action_gradient(
+                'terminal_geo_loss'
+            )
+        finally:
+            random.setstate(python_rng_state)
+            np.random.set_state(numpy_rng_state)
+            torch.random.set_rng_state(torch_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
+
     # Hook the Q head rather than the enclosing critic: the isolated-context
     # guidance path deliberately calls forward_from_context() and therefore
     # does not invoke the critic module's outer forward hooks.
     handle = engine.critic1.head.register_forward_hook(
         capture_frozen_q_gradient
     )
-    actor_handle = engine.actor.register_forward_hook(capture_actor_actions)
-    original_actor_terms = engine._compute_actor_loss_terms
-
-    def capture_actor_terms(*args, **kwargs):
-        terms = original_actor_terms(*args, **kwargs)
-        if capture_regularizers:
-            if actor_actions is None:
-                raise AssertionError(
-                    'Numeric diagnostic prerequisite not met: the actual actor '
-                    'forward output was not captured.'
-                )
-
-            def action_gradient(loss: torch.Tensor) -> torch.Tensor | None:
-                if not loss.requires_grad or not actor_actions.requires_grad:
-                    return None
-                gradient = torch.autograd.grad(
-                    loss,
-                    actor_actions,
-                    retain_graph=True,
-                    allow_unused=True,
-                )[0]
-                return (
-                    None
-                    if gradient is None
-                    else gradient.detach().cpu().clone()
-                )
-
-            nonlocal bc_action_gradient, terminal_geo_action_gradient
-            bc_action_gradient = action_gradient(terms.bc_loss)
-            terminal_geo_action_gradient = action_gradient(
-                terms.terminal_geo_loss
-            )
-        return terms
-
     try:
-        if capture_regularizers:
-            engine._compute_actor_loss_terms = capture_actor_terms
         metrics = engine.update_once(
             total_steps=total_steps,
             bc_lambda=bc_lambda,
         )
     finally:
-        engine._compute_actor_loss_terms = original_actor_terms
-        actor_handle.remove()
         handle.remove()
     actor_gradients = {
         name: parameter.grad.detach().cpu().clone()
@@ -2693,8 +2725,10 @@ def _run_compiled_numerics_check(
     compile_actor_loss: bool = False,
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
+    cuda_graph_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
+    pinned_batch_transfer: bool = False,
     cuda_graph_updates: bool = False,
 ) -> dict[str, Any]:
     torch_rng_state = torch.random.get_rng_state()
@@ -2732,6 +2766,7 @@ def _run_compiled_numerics_check(
             fused_adam=fused_adam,
             aggregate_relation_values_first=aggregate_relation_values_first,
             reduce_update_stat_syncs=reduce_update_stat_syncs,
+            pinned_batch_transfer=pinned_batch_transfer,
         )
         reference = reference_components.engine
         compiled = compiled_components.engine
@@ -2765,6 +2800,7 @@ def _run_compiled_numerics_check(
             compile_actor_loss=compile_actor_loss,
             cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
+            cuda_graph_action_inference=cuda_graph_action_inference,
             cuda_graph_updates=cuda_graph_updates,
             backend='inductor', mode='default', fullgraph=True, dynamic=True,
         )
@@ -2797,6 +2833,12 @@ def _run_compiled_numerics_check(
         )
         if compile_action_inference:
             compiled.warmup_action_inference_compile(action_inference_batches)
+        if cuda_graph_action_inference:
+            configured['cuda_graph_action_inference_evidence'] = (
+                compiled.verify_action_inference_cuda_graph_capture(
+                    action_inference_batches
+                )
+            )
         action_inference_comparison = []
         with torch.inference_mode():
             for batch in action_inference_batches:
@@ -2978,6 +3020,9 @@ def _run_compiled_numerics_check(
                         total_steps=total_steps,
                         bc_lambda=bc_lambda,
                         capture_regularizers=capture_regularizers,
+                        regularizer_probe_batch=(
+                            fixed_batch if capture_regularizers else None
+                        ),
                     )
                 )
             else:
@@ -2994,6 +3039,9 @@ def _run_compiled_numerics_check(
                         total_steps=total_steps,
                         bc_lambda=bc_lambda,
                         capture_regularizers=capture_regularizers,
+                        regularizer_probe_batch=(
+                            fixed_batch if capture_regularizers else None
+                        ),
                     )
                 )
             else:
@@ -3262,8 +3310,10 @@ def _run_diagnostic_level(
     compile_actor_loss: bool = False,
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
+    cuda_graph_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
+    pinned_batch_transfer: bool = False,
     cuda_graph_updates: bool = False,
     compiled_path_profiler_updates: int = 0,
     compiled_profiler_output_dir: Path | None = None,
@@ -3296,6 +3346,7 @@ def _run_diagnostic_level(
         fused_adam=fused_adam,
         aggregate_relation_values_first=aggregate_relation_values_first,
         reduce_update_stat_syncs=reduce_update_stat_syncs,
+        pinned_batch_transfer=pinned_batch_transfer,
     )
     engine = components.engine
     engine.actor.train()
@@ -3325,6 +3376,7 @@ def _run_diagnostic_level(
         compile_snn_target_encoder,
         compile_actor_loss,
         compile_action_inference,
+        cuda_graph_action_inference,
         cuda_graph_updates,
     ))
     extended_compile_requested = any((
@@ -3335,6 +3387,7 @@ def _run_diagnostic_level(
         compile_snn_target_encoder,
         compile_actor_loss,
         compile_action_inference,
+        cuda_graph_action_inference,
         frozen_critic_strategy != 'eager',
     ))
     compile_metadata: dict[str, Any] = {
@@ -3348,6 +3401,10 @@ def _run_diagnostic_level(
         'actor_loss_requested': bool(compile_actor_loss),
         'actor_loss_coefficients_requested': bool(cache_actor_loss_coefficients),
         'action_inference_requested': bool(compile_action_inference),
+        'cuda_graph_action_inference_requested': bool(
+            cuda_graph_action_inference
+        ),
+        'pinned_batch_transfer_requested': bool(pinned_batch_transfer),
         'reduce_update_stat_syncs_requested': bool(reduce_update_stat_syncs),
         'cuda_graph_updates_requested': bool(cuda_graph_updates),
         'optimizer_execution': 'fused_adam' if fused_adam else 'adam',
@@ -3362,6 +3419,10 @@ def _run_diagnostic_level(
             'batched_device_readback'
             if reduce_update_stat_syncs else 'per_scalar'
         ),
+        'batch_transfer_execution': (
+            'reusable_pinned_non_blocking'
+            if pinned_batch_transfer else 'blocking_to_device'
+        ),
         'enabled_objects': [],
         'backend': 'inductor',
         'mode': 'default',
@@ -3374,6 +3435,8 @@ def _run_diagnostic_level(
         'select_action_execution': 'eager',
         'cuda_graph': False,
         'cuda_graph_evidence': None,
+        'cuda_graph_action_inference': False,
+        'cuda_graph_action_inference_evidence': None,
         'registration_wall_seconds': 0.0,
         'warmup_wall_seconds': 0.0,
         'online_registration_wall_seconds': 0.0,
@@ -3404,6 +3467,7 @@ def _run_diagnostic_level(
             compile_actor_loss=compile_actor_loss,
             cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
+            cuda_graph_action_inference=cuda_graph_action_inference,
             cuda_graph_updates=cuda_graph_updates,
             backend='inductor', mode='default', fullgraph=True, dynamic=True,
         )
@@ -3445,6 +3509,12 @@ def _run_diagnostic_level(
                 [batch.batch_size, batch.max_zone_count]
                 for batch in action_batches
             ]
+            if cuda_graph_action_inference:
+                compile_metadata['cuda_graph_action_inference_evidence'] = (
+                    engine.verify_action_inference_cuda_graph_capture(
+                        action_batches
+                    )
+                )
         if cuda_graph_updates:
             compile_metadata['cuda_graph_evidence'] = (
                 engine.verify_update_cuda_graph_capture(warmup_batches)
@@ -3999,8 +4069,10 @@ def run_v2_td3_timing_diagnostic(
     compile_actor_loss: bool = False,
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
+    cuda_graph_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
+    pinned_batch_transfer: bool = False,
     cuda_graph_updates: bool = False,
     check_compiled_numerics: bool = False,
     compiled_numerics_only: bool = False,
@@ -4139,6 +4211,7 @@ def run_v2_td3_timing_diagnostic(
         compile_snn_target_encoder,
         compile_actor_loss,
         compile_action_inference,
+        cuda_graph_action_inference,
     ))
     if compile_requested and profiler_updates:
         raise ValueError(
@@ -4180,6 +4253,16 @@ def run_v2_td3_timing_diagnostic(
         raise ValueError('cuda_graph_updates requires a CUDA diagnostic.')
     if cuda_graph_updates and not compile_critic_block:
         raise ValueError('cuda_graph_updates requires compile_critic_block.')
+    if cuda_graph_action_inference and not compile_action_inference:
+        raise ValueError(
+            'cuda_graph_action_inference requires compile_action_inference.'
+        )
+    if cuda_graph_action_inference and target_device.type != 'cuda':
+        raise ValueError(
+            'cuda_graph_action_inference requires a CUDA diagnostic.'
+        )
+    if pinned_batch_transfer and target_device.type != 'cuda':
+        raise ValueError('pinned_batch_transfer requires a CUDA diagnostic.')
     if compiled_numerics_group is not None and target_device.type != 'cuda':
         raise ValueError('compiled_numerics_group requires a CUDA diagnostic.')
     if compiled_profiler_updates and target_device.type != 'cuda':
@@ -4295,8 +4378,10 @@ def run_v2_td3_timing_diagnostic(
             compile_actor_loss=compile_actor_loss,
             cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
+            cuda_graph_action_inference=cuda_graph_action_inference,
             aggregate_relation_values_first=aggregate_relation_values_first,
             reduce_update_stat_syncs=reduce_update_stat_syncs,
+            pinned_batch_transfer=pinned_batch_transfer,
             cuda_graph_updates=cuda_graph_updates,
         )
     if compiled_numerics_only:
@@ -4357,8 +4442,10 @@ def run_v2_td3_timing_diagnostic(
             compile_actor_loss=compile_actor_loss,
             cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
+            cuda_graph_action_inference=cuda_graph_action_inference,
             aggregate_relation_values_first=aggregate_relation_values_first,
             reduce_update_stat_syncs=reduce_update_stat_syncs,
+            pinned_batch_transfer=pinned_batch_transfer,
             cuda_graph_updates=cuda_graph_updates,
             compiled_path_profiler_updates=(
                 compiled_profiler_updates if level == 'medium' else 0
@@ -4496,6 +4583,10 @@ def run_v2_td3_timing_diagnostic(
             'compile_actor_loss_requested': compile_actor_loss,
             'cache_actor_loss_coefficients_requested': cache_actor_loss_coefficients,
             'compile_action_inference_requested': compile_action_inference,
+            'cuda_graph_action_inference_requested': (
+                cuda_graph_action_inference
+            ),
+            'pinned_batch_transfer_requested': pinned_batch_transfer,
             'aggregate_relation_values_first_requested': (
                 aggregate_relation_values_first
             ),
@@ -4619,6 +4710,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--compile-actor-loss', action='store_true')
     parser.add_argument('--cache-actor-loss-coefficients', action='store_true')
     parser.add_argument('--compile-action-inference', action='store_true')
+    parser.add_argument('--cuda-graph-action-inference', action='store_true')
+    parser.add_argument('--pinned-batch-transfer', action='store_true')
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument('--reduce-update-stat-syncs', action='store_true')
     parser.add_argument('--cuda-graph-updates', action='store_true')
@@ -4686,8 +4779,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         compile_actor_loss=args.compile_actor_loss,
         cache_actor_loss_coefficients=args.cache_actor_loss_coefficients,
         compile_action_inference=args.compile_action_inference,
+        cuda_graph_action_inference=args.cuda_graph_action_inference,
         aggregate_relation_values_first=args.aggregate_relation_values_first,
         reduce_update_stat_syncs=args.reduce_update_stat_syncs,
+        pinned_batch_transfer=args.pinned_batch_transfer,
         cuda_graph_updates=args.cuda_graph_updates,
         check_compiled_numerics=args.check_compiled_numerics,
         compiled_numerics_only=args.compiled_numerics_only,

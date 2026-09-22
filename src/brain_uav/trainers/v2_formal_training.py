@@ -894,6 +894,7 @@ def build_v2_stage_engine(
     fused_adam: bool = False,
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
+    pinned_batch_transfer: bool = False,
 ) -> V2StageComponents:
     if scenario is not None and not isinstance(scenario, ScenarioConfig):
         raise TypeError('scenario must be a ScenarioConfig when provided.')
@@ -1112,6 +1113,7 @@ def build_v2_stage_engine(
         fused_adam=fused_adam,
         aggregate_relation_values_first=aggregate_relation_values_first,
         reduce_update_stat_syncs=reduce_update_stat_syncs,
+        pinned_batch_transfer=pinned_batch_transfer,
     )
     if previous_engine_payload is not None:
         engine.load_network_state_dicts(dict(previous_engine_payload))
