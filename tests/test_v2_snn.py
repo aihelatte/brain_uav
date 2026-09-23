@@ -70,6 +70,31 @@ class TestV2SNNPolicyActor(unittest.TestCase):
         )
         self.assertEqual(self.actor(mixed).shape, (4, 2))
 
+    def test_forward_with_diagnostics_matches_forward_action_and_reports_firing_rates(self) -> None:
+        # A3/H9 in docs/无法早停排查文档.md: forward_with_diagnostics must
+        # reuse forward's exact computation (same action) and only add
+        # per-layer LIF firing-rate statistics.
+        batch = collate_v2_observations([_observation(3), _observation(0)])
+        expected_action = self.actor(batch)
+
+        action, diagnostics = self.actor.forward_with_diagnostics(batch)
+
+        torch.testing.assert_close(action, expected_action, atol=1e-6, rtol=1e-6)
+        self.assertEqual(set(diagnostics), {'spike_rate_l1', 'spike_rate_l2'})
+        for rate in diagnostics.values():
+            self.assertTrue(math.isfinite(rate))
+            self.assertGreaterEqual(rate, 0.0)
+            self.assertLessEqual(rate, 1.0)
+
+    def test_forward_with_diagnostics_does_not_leak_lif_state(self) -> None:
+        batch_a = collate_v2_observations([_observation(2)])
+        batch_b = collate_v2_observations([_observation(5, offset=3.0)])
+        self.actor.forward_with_diagnostics(batch_a)
+        first = self.actor(batch_b)
+        self.actor.forward_with_diagnostics(batch_a)
+        second = self.actor(batch_b)
+        torch.testing.assert_close(first, second, atol=1e-6, rtol=1e-6)
+
     def test_padding_garbage_and_masked_positions_do_not_change_output(self) -> None:
         batch = collate_v2_observations([_observation(1), _observation(6)])
         garbage = batch.zone_features.clone()

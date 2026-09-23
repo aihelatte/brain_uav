@@ -19,9 +19,11 @@ from brain_uav.trainers.v2_formal_training import (
     V2FormalTrainingConfig,
     V2PreparedStageInitialization,
     build_v2_formal_checkpoint,
+    build_v2_periodic_snapshot,
     build_v2_stage_engine,
     prepare_v2_stage_initialization,
     save_v2_formal_checkpoint,
+    save_v2_periodic_snapshot,
     validate_v2_prepared_stage_initialization,
 )
 from brain_uav.trainers.v2_validation import (
@@ -52,29 +54,119 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--consecutive-windows', type=int, default=4)
     parser.add_argument('--max-failures-per-window', type=int, default=1)
     parser.add_argument('--validation-max-failures', type=int, default=6)
+    # These default to the 2026-09-22-verified full compile + CUDA Graph
+    # combination (see default_v2_cuda_graph_compilation below) unless
+    # explicitly overridden with --no-<flag>. compile_critic_encoder,
+    # compile_target_encoders, pinned_batch_transfer, and
+    # aggregate_relation_values_first are not part of that verified
+    # combination and keep their plain False default.
     parser.add_argument('--compile-critic-encoder', action='store_true')
     parser.add_argument('--compile-target-encoders', action='store_true')
-    parser.add_argument('--compile-shared-relations', action='store_true')
-    parser.add_argument('--compile-snn-target-encoder', action='store_true')
-    parser.add_argument('--fused-adam', action='store_true')
-    parser.add_argument('--compile-actor-loss', action='store_true')
-    parser.add_argument('--cache-actor-loss-coefficients', action='store_true')
-    parser.add_argument('--compile-action-inference', action='store_true')
-    parser.add_argument('--cuda-graph-action-inference', action='store_true')
+    parser.add_argument(
+        '--compile-shared-relations', action=argparse.BooleanOptionalAction, default=None,
+    )
+    parser.add_argument(
+        '--compile-snn-target-encoder', action=argparse.BooleanOptionalAction, default=None,
+    )
+    parser.add_argument('--fused-adam', action=argparse.BooleanOptionalAction, default=None)
+    parser.add_argument(
+        '--compile-actor-loss', action=argparse.BooleanOptionalAction, default=None,
+    )
+    parser.add_argument(
+        '--cache-actor-loss-coefficients', action=argparse.BooleanOptionalAction, default=None,
+    )
+    parser.add_argument(
+        '--compile-action-inference', action=argparse.BooleanOptionalAction, default=None,
+    )
+    parser.add_argument(
+        '--cuda-graph-action-inference', action=argparse.BooleanOptionalAction, default=None,
+    )
     parser.add_argument('--pinned-batch-transfer', action='store_true')
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
-    parser.add_argument('--reduce-update-stat-syncs', action='store_true')
-    parser.add_argument('--cuda-graph-updates', action='store_true')
-    parser.add_argument('--cuda-graph-actor-update', action='store_true')
-    parser.add_argument('--compile-actors', action='store_true')
+    parser.add_argument(
+        '--reduce-update-stat-syncs', action=argparse.BooleanOptionalAction, default=None,
+    )
+    parser.add_argument(
+        '--cuda-graph-updates', action=argparse.BooleanOptionalAction, default=None,
+    )
+    parser.add_argument(
+        '--cuda-graph-actor-update', action=argparse.BooleanOptionalAction, default=None,
+    )
+    parser.add_argument('--compile-actors', action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument(
         '--frozen-critic-strategy',
         choices=('eager', 'compiled_no_grad_context'),
-        default='eager',
+        default=None,
     )
-    parser.add_argument('--compile-critic-block', action='store_true')
-    parser.add_argument('--compile-target-block', action='store_true')
+    parser.add_argument(
+        '--compile-critic-block', action=argparse.BooleanOptionalAction, default=None,
+    )
+    parser.add_argument(
+        '--compile-target-block', action=argparse.BooleanOptionalAction, default=None,
+    )
+    parser.add_argument(
+        '--periodic-snapshot-interval-steps',
+        type=int,
+        default=50_000,
+        help=(
+            'Purely observational: save a mid-stage checkpoint and run a '
+            'non-gating fixed validation every N steps. 0 disables both.'
+        ),
+    )
     return parser
+
+
+def default_v2_cuda_graph_compilation(
+    *, model: str, resolved_device: str,
+) -> dict[str, bool | str]:
+    """The 2026-09-22-verified full compile + CUDA Graph combination (D1).
+
+    Source: the diagnostic_actor_graph_{ann,snn}_actor_20260922_155254 runs
+    under train_result/, both of which passed
+    ``profile_v2_td3.py --check-compiled-numerics`` with exactly this
+    combination. ``cuda_graph_*`` flags require CUDA and are forced off on
+    CPU so ``--device cpu``/``auto`` without a GPU still works; every other
+    flag here is device-independent. ``compile_snn_target_encoder`` is only
+    valid for an SNN actor, so it tracks ``model``.
+    """
+
+    if model not in ('ann', 'snn'):
+        raise ValueError('model must be "ann" or "snn".')
+    if resolved_device not in ('cpu', 'cuda'):
+        raise ValueError('resolved_device must be "cpu" or "cuda".')
+    is_cuda = resolved_device == 'cuda'
+    return {
+        'compile_actors': True,
+        'frozen_critic_strategy': 'compiled_no_grad_context',
+        'compile_critic_block': True,
+        'compile_target_block': True,
+        'compile_shared_relations': True,
+        'compile_snn_target_encoder': model == 'snn',
+        'fused_adam': True,
+        'compile_actor_loss': True,
+        'cache_actor_loss_coefficients': True,
+        'compile_action_inference': True,
+        'cuda_graph_action_inference': is_cuda,
+        'reduce_update_stat_syncs': True,
+        'cuda_graph_updates': is_cuda,
+        'cuda_graph_actor_update': is_cuda,
+    }
+
+
+def _resolve_v2_cuda_graph_compilation(
+    args: argparse.Namespace, *, resolved_device: str,
+) -> dict[str, bool | str]:
+    """Apply CLI overrides (non-None) on top of the verified defaults."""
+
+    defaults = default_v2_cuda_graph_compilation(
+        model=args.model, resolved_device=resolved_device,
+    )
+    resolved = dict(defaults)
+    for name in defaults:
+        value = getattr(args, name)
+        if value is not None:
+            resolved[name] = value
+    return resolved
 
 
 def _failed_checkpoint_path(path: Path) -> Path:
@@ -329,6 +421,7 @@ def run_v2_td3_stage(
     pinned_batch_transfer: bool = False,
     cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
+    periodic_snapshot_interval_steps: int | None = None,
 ) -> dict[str, Any]:
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
@@ -376,12 +469,17 @@ def run_v2_td3_stage(
     effective_uav_collision_radius = (
         prepared_initialization.uav_collision_radius
     )
+    if periodic_snapshot_interval_steps is not None:
+        if type(periodic_snapshot_interval_steps) is not int or periodic_snapshot_interval_steps <= 0:
+            raise ValueError('periodic_snapshot_interval_steps must be a positive integer.')
     output_path = Path(output)
     metrics_path = Path(metrics_out)
     failed_output_path = _failed_checkpoint_path(output_path)
     report_path = metrics_path.with_name(f'{metrics_path.stem}_reports')
+    periodic_snapshot_dir = output_path.with_name(f'{output_path.stem}_periodic')
     if (output_path.exists() or failed_output_path.exists() or metrics_path.exists()
-            or (reporting and report_path.exists())):
+            or (reporting and report_path.exists())
+            or (periodic_snapshot_interval_steps is not None and periodic_snapshot_dir.exists())):
         raise FileExistsError('Formal V2 stage outputs already exist.')
     pool_path = Path(validation_pool)
     pool = load_v2_validation_pool(
@@ -481,6 +579,49 @@ def run_v2_td3_stage(
             reporter=reporter,
         )
 
+    periodic_snapshot_sink = None
+    periodic_validation_sink = None
+    if periodic_snapshot_interval_steps is not None:
+        # C1: purely observational mid-stage checkpoint + fixed-validation
+        # snapshots, so a manually interrupted run keeps usable weights and
+        # a periodic validation reading (P5早停判据离线回放结论_20260917.md
+        # section 6.1). Deliberately separate from `output_path`/`validate`
+        # above: this never calls record_validation and is never accepted
+        # as a stage predecessor by load_v2_formal_checkpoint.
+        def periodic_snapshot_sink(stage_steps: int) -> None:
+            payload = build_v2_periodic_snapshot(
+                components.engine,
+                config,
+                stage_steps=stage_steps,
+                scenario=scenario_config,
+                rewards=reward_config,
+                uav_collision_radius=effective_uav_collision_radius,
+                seed_manifest=components.seed_manifest,
+                initialization_source=components.initialization_source,
+            )
+            snapshot_path = periodic_snapshot_dir / f'step_{stage_steps:09d}.pt'
+            save_v2_periodic_snapshot(snapshot_path, payload)
+            print(
+                f"[V2 {model.upper()} {stage}] periodic snapshot "
+                f"stage_steps={stage_steps} path={snapshot_path}",
+                flush=True,
+            )
+
+        def periodic_validation_sink(stage_steps: int) -> None:
+            result = evaluate_v2_fixed_validation(
+                components.engine.actor,
+                pool,
+                reward_config,
+                max_failures=config.validation_max_failures,
+                device=resolved_device,
+                reporter=None,
+            )
+            if reporter is not None:
+                record = dict(result.to_dict())
+                record['stage_steps'] = stage_steps
+                record['global_steps'] = global_steps_start + stage_steps
+                reporter.record_periodic_validation(record)
+
     trainer = V2FormalStageTrainer(
         scenario_config,
         reward_config,
@@ -493,6 +634,9 @@ def run_v2_td3_stage(
         global_steps_start=global_steps_start,
         uav_collision_radius=effective_uav_collision_radius,
         reporter=reporter,
+        periodic_snapshot_interval_steps=periodic_snapshot_interval_steps,
+        periodic_snapshot_sink=periodic_snapshot_sink,
+        periodic_validation_sink=periodic_validation_sink,
     )
     try:
         result = trainer.run()
@@ -607,6 +751,8 @@ def main(argv: list[str] | None = None) -> int:
         'model_type': args.model,
         'snn_time_window': args.snn_time_window if args.model == 'snn' else None,
     }, indent=2))
+    compilation = _resolve_v2_cuda_graph_compilation(args, resolved_device=resolved_device)
+    print(json.dumps({'resolved_compilation_defaults': compilation}, indent=2))
     summary = run_v2_td3_stage(
         stage=args.stage,
         init_checkpoint=args.init_checkpoint,
@@ -625,22 +771,26 @@ def main(argv: list[str] | None = None) -> int:
         snn_time_window=args.snn_time_window,
         compile_critic_encoder=args.compile_critic_encoder,
         compile_target_encoders=args.compile_target_encoders,
-        compile_actors=args.compile_actors,
-        frozen_critic_strategy=args.frozen_critic_strategy,
-        compile_critic_block=args.compile_critic_block,
-        compile_target_block=args.compile_target_block,
-        compile_shared_relations=args.compile_shared_relations,
-        compile_snn_target_encoder=args.compile_snn_target_encoder,
-        fused_adam=args.fused_adam,
-        compile_actor_loss=args.compile_actor_loss,
-        cache_actor_loss_coefficients=args.cache_actor_loss_coefficients,
-        compile_action_inference=args.compile_action_inference,
-        cuda_graph_action_inference=args.cuda_graph_action_inference,
+        compile_actors=compilation['compile_actors'],
+        frozen_critic_strategy=compilation['frozen_critic_strategy'],
+        compile_critic_block=compilation['compile_critic_block'],
+        compile_target_block=compilation['compile_target_block'],
+        compile_shared_relations=compilation['compile_shared_relations'],
+        compile_snn_target_encoder=compilation['compile_snn_target_encoder'],
+        fused_adam=compilation['fused_adam'],
+        compile_actor_loss=compilation['compile_actor_loss'],
+        cache_actor_loss_coefficients=compilation['cache_actor_loss_coefficients'],
+        compile_action_inference=compilation['compile_action_inference'],
+        cuda_graph_action_inference=compilation['cuda_graph_action_inference'],
         aggregate_relation_values_first=args.aggregate_relation_values_first,
-        reduce_update_stat_syncs=args.reduce_update_stat_syncs,
+        reduce_update_stat_syncs=compilation['reduce_update_stat_syncs'],
         pinned_batch_transfer=args.pinned_batch_transfer,
-        cuda_graph_updates=args.cuda_graph_updates,
-        cuda_graph_actor_update=args.cuda_graph_actor_update,
+        cuda_graph_updates=compilation['cuda_graph_updates'],
+        cuda_graph_actor_update=compilation['cuda_graph_actor_update'],
+        periodic_snapshot_interval_steps=(
+            None if args.periodic_snapshot_interval_steps == 0
+            else args.periodic_snapshot_interval_steps
+        ),
     )
     print(json.dumps(summary, indent=2, allow_nan=False))
     return 0 if summary['passed'] else 1

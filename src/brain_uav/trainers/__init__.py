@@ -20,9 +20,12 @@ from .v2_formal_training import (
     V2FormalTrainingResult,
     V2StageComponents,
     build_v2_formal_checkpoint,
+    build_v2_periodic_snapshot,
     build_v2_stage_engine,
     load_v2_formal_checkpoint,
+    load_v2_periodic_snapshot,
     save_v2_formal_checkpoint,
+    save_v2_periodic_snapshot,
 )
 
 __all__ = [
@@ -47,7 +50,10 @@ __all__ = [
     'V2FormalTrainingResult',
     'V2StageComponents',
     'build_v2_formal_checkpoint',
+    'build_v2_periodic_snapshot',
     'build_v2_stage_engine',
     'load_v2_formal_checkpoint',
+    'load_v2_periodic_snapshot',
     'save_v2_formal_checkpoint',
+    'save_v2_periodic_snapshot',
 ]

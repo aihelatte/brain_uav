@@ -79,6 +79,13 @@ def _episode(number: int, outcome: str, stage_steps: int) -> dict:
         'replay_success_fraction': 0.0,
         'success_replay_size': 0,
         'batch_success_fraction': 0.0,
+        'critic_q1_mean': 10.0,
+        'critic_q1_std': 2.0,
+        'critic_q1_max_abs': 20.0,
+        'critic_target_q_mean': 11.0,
+        'critic_td_error_mean': 3.0,
+        'critic_failure_td_error_mean': 4.0,
+        'actor_grad_norm': 0.5,
         'actor_updated': True,
         'actor_update_status': 'updated',
     }
@@ -391,6 +398,10 @@ _EPISODE_KEYS = frozenset({
     'global_steps', 'noise_clip', 'outcome', 'policy_noise', 'policy_warmup_steps',
     'replay_size', 'replay_success_fraction', 'stage', 'stage_elapsed_seconds',
     'stage_steps', 'success_replay_size', 'terminal_geo_loss', 'weighted_bc_contribution',
+    # Diagnostic-only additions (A1/A2/A4 in this pass; H4/H5 in
+    # docs/无法早停排查文档.md).
+    'critic_q1_mean', 'critic_q1_std', 'critic_q1_max_abs', 'critic_target_q_mean',
+    'critic_td_error_mean', 'critic_failure_td_error_mean', 'actor_grad_norm',
 })
 _WINDOW_KEYS = frozenset({
     'actor_update_status', 'average_actor_loss', 'average_bc_loss', 'average_critic_loss',
@@ -401,6 +412,10 @@ _WINDOW_KEYS = frozenset({
     'goal_ratio', 'ground_count', 'noise_clip', 'partial', 'policy_noise', 'qualified',
     'replay_size', 'replay_success_fraction', 'stage', 'stage_steps',
     'success_replay_size', 'timeout_count', 'window_elapsed_seconds', 'window_index',
+    # A5 in this pass: a parallel "medium curriculum_level only" view of the
+    # same window (see P5早停判据离线回放结论_20260917.md).
+    'medium_only_goal_count', 'medium_only_episode_count', 'medium_only_goal_ratio',
+    'medium_only_failure_count',
 })
 _WINDOW_CSV_HEADER = [
     'window_index', 'episode_count', 'goal_count', 'failure_count', 'qualified',
@@ -408,7 +423,9 @@ _WINDOW_CSV_HEADER = [
     'episode_end', 'average_return', 'average_length', 'average_actor_loss',
     'average_critic_loss', 'bc_lambda', 'average_bc_loss',
     'average_weighted_bc_contribution', 'global_steps', 'exploration_noise',
-    'policy_noise', 'noise_clip', 'stage', 'partial', 'ground_count', 'boundary_count',
+    'policy_noise', 'noise_clip', 'medium_only_goal_count', 'medium_only_episode_count',
+    'medium_only_goal_ratio', 'medium_only_failure_count', 'stage', 'partial',
+    'ground_count', 'boundary_count',
     'collision_count', 'timeout_count', 'goal_ratio', 'replay_size',
     'replay_success_fraction', 'success_replay_size', 'batch_success_fraction',
     'actor_update_status', 'window_elapsed_seconds',
@@ -445,6 +462,10 @@ def _window_row(**overrides) -> dict:
         'exploration_noise': 0.01,
         'policy_noise': 0.01,
         'noise_clip': 0.02,
+        'medium_only_goal_count': 9,
+        'medium_only_episode_count': 15,
+        'medium_only_goal_ratio': 0.6,
+        'medium_only_failure_count': 6,
     }
     row.update(overrides)
     return row

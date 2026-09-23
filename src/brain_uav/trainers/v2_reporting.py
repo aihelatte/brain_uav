@@ -581,6 +581,7 @@ class V2ExperimentReporter:
         self._validation_total = 0
         self._validation_completed = 0
         self._validation_started_at = 0.0
+        self._periodic_validation_writer: _JsonlWriter | None = None
         self._closed = False
 
     def start_stage(self, metadata: Mapping[str, Any]) -> None:
@@ -823,6 +824,13 @@ class V2ExperimentReporter:
         stage_elapsed_seconds = self._clock() - self._stage_started
         if self._pending_episodes:
             episodes = self._pending_episodes
+            medium_only_episodes = [
+                item for item in episodes if item['curriculum_level'] == 'medium'
+            ]
+            medium_only_goal_count = sum(
+                item['outcome'] == 'goal' for item in medium_only_episodes
+            )
+            medium_only_episode_count = len(medium_only_episodes)
             partial = {
                 'window_index': len(self._window_rows) + 1,
                 'episode_start': episodes[0]['episode'],
@@ -844,6 +852,15 @@ class V2ExperimentReporter:
                 'exploration_noise': episodes[-1]['exploration_noise'],
                 'policy_noise': episodes[-1]['policy_noise'],
                 'noise_clip': episodes[-1]['noise_clip'],
+                'medium_only_goal_count': medium_only_goal_count,
+                'medium_only_episode_count': medium_only_episode_count,
+                'medium_only_goal_ratio': (
+                    medium_only_goal_count / medium_only_episode_count
+                    if medium_only_episode_count else 0.0
+                ),
+                'medium_only_failure_count': (
+                    medium_only_episode_count - medium_only_goal_count
+                ),
             }
             reported = self._reported_window(partial, partial=True)
             self._windows.append(reported)
@@ -861,12 +878,37 @@ class V2ExperimentReporter:
               f"steps={result['stage_steps']} elapsed={stage_elapsed_seconds:.1f}s "
               f"report={self.output_dir}", flush=True)
 
+    def record_periodic_validation(self, record: Mapping[str, Any]) -> None:
+        """Append one C1 periodic (non-gating) fixed-validation result.
+
+        This writes to its own ``periodic_validation.jsonl`` sibling file and
+        never touches ``windows.jsonl``/the early-stop controller; it exists
+        purely so a mid-stage checkpoint (see
+        ``build_v2_periodic_snapshot``) has a matching fixed-validation
+        reading without waiting for the next qualified-window candidate.
+        """
+
+        if self._periodic_validation_writer is None:
+            self._periodic_validation_writer = _JsonlWriter(
+                self.output_dir / 'periodic_validation.jsonl'
+            )
+        self._periodic_validation_writer.append(dict(record))
+        print(
+            f"[V2 {self.model_type.upper()} {self.stage}] periodic validation "
+            f"stage_steps={record.get('stage_steps')} "
+            f"outcomes={record.get('outcome_counts')} "
+            f"passed={record.get('passed')}",
+            flush=True,
+        )
+
     def close(self) -> None:
         if self._closed:
             return
         self.abort_validation()
         self._episodes.close()
         self._windows.close()
+        if self._periodic_validation_writer is not None:
+            self._periodic_validation_writer.close()
         self._closed = True
 
 

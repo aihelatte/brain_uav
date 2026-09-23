@@ -277,6 +277,59 @@ class TestV2SNNFormalTraining(unittest.TestCase):
             self.assertGreaterEqual(result.update_count, 1)
             self.assertEqual(first.engine.actor.snn_head.lif1.v, 0.0)
 
+    def test_episode_records_snn_firing_rate_diagnostics_without_leaking_lif_state(self) -> None:
+        # A3/H9 in docs/无法早停排查文档.md.
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint, scenario = self.make_snn_bc(Path(directory))
+            # scenario.max_steps (make_scenario_config) is 10, so max_steps
+            # must comfortably exceed it for at least one episode to
+            # actually complete and reach the `if done:` block below.
+            config = V2FormalTrainingConfig(
+                stage='easy',
+                seed=41,
+                max_steps=12,
+                replay_capacity=16,
+                batch_size=1,
+                warmup_steps=0,
+                actor_freeze_steps=0,
+                policy_delay=1,
+                early_stop_min_steps=99,
+                window_episode_count=2,
+                consecutive_qualified_windows=2,
+                validation_max_failures=0,
+            )
+            built = build_v2_stage_engine(
+                scenario,
+                config,
+                init_checkpoint=checkpoint,
+                model_type='snn',
+                snn_time_window=2,
+            )
+            trainer = V2FormalStageTrainer(
+                scenario,
+                RewardConfig(),
+                config,
+                built.engine,
+                scenario_sources={'easy': _Source(make_scenario_payload(0, 0))},
+                validation_runner=lambda actor: self.fail(
+                    'fixed validation must not run in this two-step smoke loop'
+                ),
+                selector=built.selector,
+                exploration_rng=built.exploration_rng,
+            )
+            result = trainer.run()
+            self.assertGreaterEqual(len(result.episodes), 1)
+            for episode in result.episodes:
+                self.assertIn('snn_spike_rate_l1', episode)
+                self.assertIn('snn_spike_rate_l2', episode)
+                for key in ('snn_spike_rate_l1', 'snn_spike_rate_l2'):
+                    self.assertGreaterEqual(episode[key], 0.0)
+                    self.assertLessEqual(episode[key], 1.0)
+            # Must not leak LIF membrane state into the next real
+            # rollout/update step (same invariant the un-instrumented loop
+            # above checks).
+            self.assertEqual(built.engine.actor.snn_head.lif1.v, 0.0)
+
 
 if __name__ == '__main__':
     unittest.main()

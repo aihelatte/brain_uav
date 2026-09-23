@@ -233,6 +233,15 @@ class V2TD3UpdateMetrics:
     critic_updated: bool = False
     critic_targets_updated: bool = False
     actor_updated: bool = False
+    # Diagnostic-only fields (H5/H4 in docs/无法早停排查文档.md): never consumed
+    # by early-stop, replay sampling, or loss computation.
+    critic_q1_mean: float = 0.0
+    critic_q1_std: float = 0.0
+    critic_q1_max_abs: float = 0.0
+    critic_target_q_mean: float = 0.0
+    critic_td_error_mean: float = 0.0
+    critic_failure_td_error_mean: float = 0.0
+    actor_grad_norm: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -2785,7 +2794,14 @@ class V2TD3UpdateEngine:
         max_norm: float | None,
         component: str,
         total_steps: int,
-    ) -> None:
+    ) -> torch.Tensor | None:
+        """Clip gradients as before; additionally return the pre-clip norm.
+
+        The returned tensor is diagnostic-only (see ``actor_grad_norm`` on
+        ``V2TD3UpdateMetrics``): capturing ``clip_grad_norm_``'s existing
+        return value does not change which gradients are clipped or how.
+        """
+
         gradients = [
             parameter.grad
             for parameter in parameters
@@ -2793,7 +2809,7 @@ class V2TD3UpdateEngine:
         ]
         if max_norm is not None:
             try:
-                torch.nn.utils.clip_grad_norm_(
+                total_norm = torch.nn.utils.clip_grad_norm_(
                     parameters,
                     max_norm=max_norm,
                     error_if_nonfinite=True,
@@ -2803,7 +2819,7 @@ class V2TD3UpdateEngine:
                     f'Non-finite {component} gradient at '
                     f'total_steps={total_steps}.'
                 ) from exc
-            return
+            return total_norm
         if gradients:
             finite = torch.stack(
                 [torch.isfinite(gradient).all() for gradient in gradients]
@@ -2813,6 +2829,7 @@ class V2TD3UpdateEngine:
                     f'Non-finite {component} gradient at '
                     f'total_steps={total_steps}.'
                 )
+        return None
 
     def update_once(
         self,
@@ -3026,6 +3043,19 @@ class V2TD3UpdateEngine:
                 component='critic',
                 total_steps=total_steps_value,
             )
+            with torch.no_grad():
+                current_q1_detached = current_q1.detach()
+                td_error = (current_q1_detached - target_q.detach()).abs()
+                failure_mask = (batch.success < 0.5).to(td_error.dtype)
+                diagnostic_q1_mean = current_q1_detached.mean()
+                diagnostic_q1_std = current_q1_detached.std(unbiased=False)
+                diagnostic_q1_max_abs = current_q1_detached.abs().max()
+                diagnostic_target_q_mean = target_q.detach().mean()
+                diagnostic_td_error_mean = td_error.mean()
+                diagnostic_failure_td_error_mean = (
+                    (td_error * failure_mask).sum()
+                    / failure_mask.sum().clamp_min(1.0)
+                )
         with update_timing.section('critic_backward'):
             with (
                 record_function('v2_td3.critic_backward')
@@ -3082,6 +3112,7 @@ class V2TD3UpdateEngine:
                 self.critic_target_update_count += 1
 
         actor_terms: _ActorLossTerms | None = None
+        actor_grad_norm_tensor = torch.zeros((), device=current_q1_detached.device)
         if actor_updated:
             with update_timing.section('actor_update'):
                 guidance = self._actor_critic_guidance(
@@ -3124,12 +3155,14 @@ class V2TD3UpdateEngine:
                     actor_terms.actor_loss.backward()
                 with detail_timing.section('actor_gradient_check_and_clip'):
                     actor_parameters = list(self.actor.parameters())
-                    self._validate_and_clip_gradients(
+                    clipped_norm = self._validate_and_clip_gradients(
                         actor_parameters,
                         max_norm=self.actor_grad_clip_norm,
                         component='actor',
                         total_steps=total_steps_value,
                     )
+                    if clipped_norm is not None:
+                        actor_grad_norm_tensor = clipped_norm
                 with detail_timing.section('actor_optimizer_step'):
                     self.actor_optimizer.step()
             with update_timing.section('target_soft_update'):
@@ -3144,6 +3177,13 @@ class V2TD3UpdateEngine:
                 critic_loss,
                 batch.success.mean(),
                 batch.near_goal.mean(),
+                diagnostic_q1_mean,
+                diagnostic_q1_std,
+                diagnostic_q1_max_abs,
+                diagnostic_target_q_mean,
+                diagnostic_td_error_mean,
+                diagnostic_failure_td_error_mean,
+                actor_grad_norm_tensor,
             ))
             metrics = V2TD3UpdateMetrics(
                 critic_loss=statistic_values[0],
@@ -3152,6 +3192,13 @@ class V2TD3UpdateEngine:
                 critic_updated=True,
                 critic_targets_updated=critic_targets_updated,
                 actor_updated=False,
+                critic_q1_mean=statistic_values[3],
+                critic_q1_std=statistic_values[4],
+                critic_q1_max_abs=statistic_values[5],
+                critic_target_q_mean=statistic_values[6],
+                critic_td_error_mean=statistic_values[7],
+                critic_failure_td_error_mean=statistic_values[8],
+                actor_grad_norm=statistic_values[9],
             )
         else:
             statistic_values = self._read_update_statistics((
@@ -3164,6 +3211,13 @@ class V2TD3UpdateEngine:
                 actor_terms.terminal_geo_loss,
                 batch.success.mean(),
                 batch.near_goal.mean(),
+                diagnostic_q1_mean,
+                diagnostic_q1_std,
+                diagnostic_q1_max_abs,
+                diagnostic_target_q_mean,
+                diagnostic_td_error_mean,
+                diagnostic_failure_td_error_mean,
+                actor_grad_norm_tensor,
             ))
             metrics = V2TD3UpdateMetrics(
                 critic_loss=statistic_values[0],
@@ -3184,6 +3238,13 @@ class V2TD3UpdateEngine:
                 critic_updated=True,
                 critic_targets_updated=critic_targets_updated,
                 actor_updated=True,
+                critic_q1_mean=statistic_values[9],
+                critic_q1_std=statistic_values[10],
+                critic_q1_max_abs=statistic_values[11],
+                critic_target_q_mean=statistic_values[12],
+                critic_td_error_mean=statistic_values[13],
+                critic_failure_td_error_mean=statistic_values[14],
+                actor_grad_norm=statistic_values[15],
             )
         detail_timing.finish()
         update_timing.finish()

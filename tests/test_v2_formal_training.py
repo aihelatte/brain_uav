@@ -24,16 +24,20 @@ from brain_uav.trainers.v2_formal_training import (
     V2BCFormalInitialization,
     V2PreparedStageInitialization,
     V2_FORMAL_CHECKPOINT_FORMAT,
+    V2_PERIODIC_SNAPSHOT_FORMAT,
     V2EarlyStopController,
     V2FormalStageTrainer,
     V2FormalTrainingConfig,
     V2FormalTrainingResult,
     build_v2_formal_checkpoint,
+    build_v2_periodic_snapshot,
     build_v2_stage_engine,
     load_v2_bc_formal_initialization,
     load_v2_formal_checkpoint,
+    load_v2_periodic_snapshot,
     prepare_v2_stage_initialization,
     save_v2_formal_checkpoint,
+    save_v2_periodic_snapshot,
 )
 from brain_uav.trainers.v2_validation import V2ValidationResult
 from brain_uav.trainers.v2_reporting import V2ExperimentReporter
@@ -470,6 +474,156 @@ class TestV2FormalTraining(unittest.TestCase):
         self.assertEqual(engine.replay.success_count, 1)
         self.assertEqual(engine.replay.success_size, 1)
 
+    def test_episode_records_expose_critic_q_td_error_and_actor_grad_norm_diagnostics(self):
+        # A1/A2/A4 in this diagnostic pass (H4/H5 in docs/无法早停排查文档.md):
+        # per-episode aggregates of the new V2TD3UpdateMetrics fields.
+        scenario = ScenarioConfig(max_steps=1)
+        engine = _engine(scenario)
+        # _engine() hardcodes actor_freeze_steps=25_000 on the engine itself
+        # (independent of config.actor_freeze_steps below, which only takes
+        # effect when build_v2_stage_engine constructs a fresh engine from
+        # it); override it directly so the 3-step loop actually updates the
+        # actor and exercises actor_grad_norm.
+        engine.actor_freeze_steps = 0
+        config = V2FormalTrainingConfig(
+            stage='easy',
+            max_steps=3,
+            replay_capacity=16,
+            batch_size=2,
+            warmup_steps=0,
+            actor_freeze_steps=0,
+            policy_delay=1,
+            window_episode_count=3,
+            consecutive_qualified_windows=1,
+            early_stop_min_steps=99,
+        )
+        trainer = V2FormalStageTrainer(
+            scenario,
+            RewardConfig(),
+            config,
+            engine,
+            scenario_sources={'easy': _Source(_scenario_payload(0))},
+            validation_runner=lambda actor: _validation_result(False),
+        )
+        result = trainer.run()
+        self.assertEqual(len(result.episodes), 3)
+        for episode in result.episodes:
+            for key in (
+                'critic_q1_mean', 'critic_q1_std', 'critic_q1_max_abs',
+                'critic_target_q_mean', 'critic_td_error_mean',
+                'critic_failure_td_error_mean', 'actor_grad_norm',
+            ):
+                self.assertIn(key, episode)
+        self.assertTrue(any(episode['actor_grad_norm'] > 0.0 for episode in result.episodes))
+
+    def test_window_medium_only_stats_isolate_medium_curriculum_level_episodes(self):
+        scenario = ScenarioConfig(max_steps=1)
+        for mix_level, all_medium in (('medium', True), ('easy', False)):
+            with self.subTest(mix_level=mix_level):
+                engine = _engine(scenario)
+                config = V2FormalTrainingConfig(
+                    stage='medium',
+                    max_steps=2,
+                    replay_capacity=16,
+                    batch_size=2,
+                    window_episode_count=2,
+                    max_failures_per_window=1,
+                    consecutive_qualified_windows=1,
+                    early_stop_min_steps=99,
+                    curriculum_mix={mix_level: 1.0},
+                )
+                payload = dict(_scenario_payload(0))
+                payload['curriculum_level'] = mix_level
+                trainer = V2FormalStageTrainer(
+                    scenario,
+                    RewardConfig(),
+                    config,
+                    engine,
+                    scenario_sources={mix_level: _Source(payload)},
+                    validation_runner=lambda actor: _validation_result(False),
+                )
+                result = trainer.run()
+                self.assertEqual(len(result.windows), 1)
+                window = result.windows[0]
+                if all_medium:
+                    self.assertEqual(window['medium_only_episode_count'], window['episode_count'])
+                    self.assertEqual(window['medium_only_goal_count'], window['goal_count'])
+                    self.assertEqual(window['medium_only_failure_count'], window['failure_count'])
+                    self.assertAlmostEqual(
+                        window['medium_only_goal_ratio'],
+                        window['goal_count'] / window['episode_count'],
+                    )
+                else:
+                    self.assertEqual(window['medium_only_episode_count'], 0)
+                    self.assertEqual(window['medium_only_goal_count'], 0)
+                    self.assertEqual(window['medium_only_failure_count'], 0)
+                    self.assertEqual(window['medium_only_goal_ratio'], 0.0)
+                # Unaffected by A5: qualified/candidate still use every
+                # episode in the window, not the medium_only subset.
+                self.assertEqual(window['episode_count'], 2)
+
+    def test_periodic_snapshot_and_validation_sinks_fire_at_step_boundaries_without_touching_early_stop(self):
+        # C1 in this diagnostic pass: purely observational, must never call
+        # controller.record_validation or otherwise affect early-stop state.
+        scenario = ScenarioConfig(max_steps=1)
+        engine = _engine(scenario)
+        config = V2FormalTrainingConfig(
+            stage='easy',
+            max_steps=6,
+            replay_capacity=16,
+            batch_size=2,
+            window_episode_count=99,
+            consecutive_qualified_windows=1,
+            early_stop_min_steps=99,
+        )
+        snapshot_calls: list[int] = []
+        validation_calls: list[int] = []
+        trainer = V2FormalStageTrainer(
+            scenario,
+            RewardConfig(),
+            config,
+            engine,
+            scenario_sources={'easy': _Source(_scenario_payload(0))},
+            validation_runner=lambda actor: self.fail(
+                'candidate validation must not run: the window never completes'
+            ),
+            periodic_snapshot_interval_steps=2,
+            periodic_snapshot_sink=snapshot_calls.append,
+            periodic_validation_sink=validation_calls.append,
+        )
+        result = trainer.run()
+        self.assertEqual(result.stage_steps, 6)
+        self.assertEqual(snapshot_calls, [2, 4, 6])
+        self.assertEqual(validation_calls, [2, 4, 6])
+        self.assertEqual(trainer.controller.completed_windows, 0)
+        self.assertEqual(trainer.controller.consecutive_qualified, 0)
+        self.assertEqual(trainer.controller.candidate_count, 0)
+
+    def test_periodic_snapshot_disabled_by_default(self):
+        scenario = ScenarioConfig(max_steps=1)
+        engine = _engine(scenario)
+        config = V2FormalTrainingConfig(
+            stage='easy',
+            max_steps=2,
+            replay_capacity=16,
+            batch_size=2,
+            window_episode_count=99,
+            consecutive_qualified_windows=1,
+            early_stop_min_steps=99,
+        )
+        sink_calls: list[int] = []
+        trainer = V2FormalStageTrainer(
+            scenario,
+            RewardConfig(),
+            config,
+            engine,
+            scenario_sources={'easy': _Source(_scenario_payload(0))},
+            validation_runner=lambda actor: _validation_result(False),
+            periodic_snapshot_sink=sink_calls.append,
+        )
+        trainer.run()
+        self.assertEqual(sink_calls, [])
+
     def test_line_to_goal_safety_is_measured_before_the_action(self):
         scenario = ScenarioConfig(max_steps=1)
         engine = _engine(scenario)
@@ -783,7 +937,7 @@ class TestV2FormalTraining(unittest.TestCase):
         self.assertEqual(payload['seed_manifest'], {'base_seed': 7})
         self.assertEqual(
             payload['bc_schedule']['boundaries'],
-            [0, 75_000, 150_000, 250_000],
+            [0, 75_000, 150_000, 250_000, 300_000],
         )
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'easy.pt'
@@ -798,6 +952,64 @@ class TestV2FormalTraining(unittest.TestCase):
             load_v2_formal_checkpoint(failed, expected_stage='easy', require_passed=True)
         with self.assertRaisesRegex(ValueError, 'predecessor'):
             load_v2_formal_checkpoint(payload, next_stage='hard', require_passed=True)
+
+    def test_periodic_snapshot_round_trips_and_is_rejected_by_formal_checkpoint_loader(self):
+        # C1 in this diagnostic pass: a separate, non-terminal format from
+        # the formal per-stage checkpoint above (no status/passed_validation/
+        # training_result), so it must never be usable as a stage
+        # predecessor via load_v2_formal_checkpoint.
+        scenario = ScenarioConfig(max_steps=1)
+        engine = _engine(scenario)
+        config = V2FormalTrainingConfig(stage='easy', max_steps=1)
+        payload = build_v2_periodic_snapshot(
+            engine,
+            config,
+            stage_steps=42,
+            scenario=scenario,
+            rewards=RewardConfig(),
+            uav_collision_radius=0.0,
+            seed_manifest={'base_seed': 7},
+            initialization_source={'kind': 'v2_bc_best', 'path': 'bc.pt'},
+        )
+        self.assertEqual(payload['format'], V2_PERIODIC_SNAPSHOT_FORMAT)
+        self.assertEqual(payload['stage_steps'], 42)
+        self.assertNotIn('status', payload)
+        self.assertNotIn('passed_validation', payload)
+        self.assertNotIn('training_result', payload)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'snapshot.pt'
+            save_v2_periodic_snapshot(path, payload)
+            loaded = load_v2_periodic_snapshot(path, expected_stage='easy')
+        self.assertEqual(loaded['stage_steps'], 42)
+        with self.assertRaisesRegex(ValueError, 'format is incompatible'):
+            load_v2_formal_checkpoint(payload)
+
+        formal_result = V2FormalTrainingResult.empty('easy', global_steps_start=0)
+        formal_result.status = 'passed'
+        formal_result.passed_validation = True
+        formal_result.stop_reason = 'fixed_validation_passed'
+        formal_result.validation_records.append(_validation_result(True).to_dict())
+        formal_payload = build_v2_formal_checkpoint(
+            engine,
+            formal_result,
+            config,
+            scenario=scenario,
+            rewards=RewardConfig(),
+            uav_collision_radius=0.0,
+            seed_manifest={'base_seed': 7},
+            validation_pool_metadata={
+                'path': 'easy.json',
+                'format_version': 1,
+                'curriculum_level': 'easy',
+                'master_seed': 20260904,
+                'stage_seed': 11,
+                'scenario_count': 100,
+                'content_digest': 'abc',
+            },
+            initialization_source={'kind': 'v2_bc_best', 'path': 'bc.pt'},
+        )
+        with self.assertRaisesRegex(ValueError, 'format is incompatible'):
+            load_v2_periodic_snapshot(formal_payload)
 
     def test_medium_handoff_inherits_networks_but_not_optimizer_replay_or_old_bc_reference(self):
         scenario = ScenarioConfig(max_steps=1)

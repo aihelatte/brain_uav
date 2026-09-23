@@ -132,6 +132,15 @@ class V2CurriculumSelector:
 
 
 def v2_bc_lambda(stage_local_step: int) -> float:
+    """V2-only BC weight schedule; V1's td3.py `_bc_lambda` is unchanged.
+
+    H10 in docs/P5早停判据离线回放结论_20260917.md: the original 30->5 step at
+    250k was a 6x cliff that coincided with a training collapse in both the
+    ANN and SNN medium runs. This inserts one intermediate 15 tier so the
+    last drop is two 2-3x steps instead of one 6x step; the earlier
+    boundaries and values are unchanged.
+    """
+
     step = _nonnegative_int(stage_local_step, name='stage_local_step')
     if step < 75_000:
         return 500.0
@@ -139,6 +148,8 @@ def v2_bc_lambda(stage_local_step: int) -> float:
         return 150.0
     if step < 250_000:
         return 30.0
+    if step < 300_000:
+        return 15.0
     return 5.0
 
 

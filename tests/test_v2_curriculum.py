@@ -75,7 +75,9 @@ class TestV2Curriculum(unittest.TestCase):
             149_999: 150.0,
             150_000: 30.0,
             249_999: 30.0,
-            250_000: 5.0,
+            250_000: 15.0,
+            299_999: 15.0,
+            300_000: 5.0,
         }
         for step, value in expected.items():
             with self.subTest(step=step):

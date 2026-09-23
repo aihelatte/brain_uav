@@ -1340,6 +1340,70 @@ class TestV2TD3(unittest.TestCase):
         )
         self.assertTrue(any(not torch.equal(target_before[name], p) for name, p in engine.actor_target.named_parameters()))
 
+    def test_update_once_reports_critic_q_td_error_and_actor_grad_norm_diagnostics(self):
+        # A1/A4 diagnostic-only fields (H4/H5 in docs/无法早停排查文档.md).
+        engine = self.make_engine(policy_delay=1, actor_freeze_steps=0)
+        self.fill_replay(engine, counts=(3, 4))
+
+        metrics = engine.update_once(total_steps=1)
+
+        self.assertTrue(metrics.actor_updated)
+        for value in (
+            metrics.critic_q1_mean, metrics.critic_q1_std, metrics.critic_q1_max_abs,
+            metrics.critic_target_q_mean, metrics.critic_td_error_mean,
+            metrics.critic_failure_td_error_mean,
+        ):
+            self.assertTrue(math.isfinite(value))
+        self.assertGreaterEqual(metrics.critic_q1_std, 0.0)
+        self.assertGreaterEqual(metrics.critic_q1_max_abs, 0.0)
+        self.assertGreaterEqual(metrics.critic_td_error_mean, 0.0)
+        self.assertGreaterEqual(metrics.critic_failure_td_error_mean, 0.0)
+        self.assertGreater(metrics.actor_grad_norm, 0.0)
+
+    def test_critic_only_update_still_reports_q_diagnostics_but_zero_actor_grad_norm(self):
+        engine = self.make_engine(policy_delay=2)
+        self.fill_replay(engine)
+
+        metrics = engine.update_once(total_steps=1)
+
+        self.assertFalse(metrics.actor_updated)
+        self.assertTrue(math.isfinite(metrics.critic_q1_mean))
+        self.assertTrue(math.isfinite(metrics.critic_td_error_mean))
+        self.assertEqual(metrics.actor_grad_norm, 0.0)
+
+    def test_failure_td_error_mean_is_zero_when_batch_is_entirely_success(self):
+        # A2: critic_failure_td_error_mean only averages non-success samples
+        # (batch.success < 0.5); an all-success batch has no such samples.
+        engine = self.make_engine(policy_delay=2, batch_size=2)
+        self.fill_replay(engine, counts=(3, 4))
+        all_success_batch = engine.replay.sample(2)
+        all_success_batch = replace(
+            all_success_batch,
+            success=torch.ones_like(all_success_batch.success),
+        )
+        engine.replay.sample = lambda batch_size: all_success_batch
+
+        metrics = engine.update_once(total_steps=1)
+
+        self.assertEqual(metrics.critic_failure_td_error_mean, 0.0)
+        self.assertGreaterEqual(metrics.critic_td_error_mean, 0.0)
+
+    def test_validate_and_clip_gradients_returns_pre_clip_norm_or_none(self):
+        clipped_parameters = [torch.nn.Parameter(torch.zeros(2))]
+        clipped_parameters[0].grad = torch.tensor([3.0, 4.0])
+        norm = V2TD3UpdateEngine._validate_and_clip_gradients(
+            clipped_parameters, max_norm=10.0, component='test', total_steps=1,
+        )
+        self.assertIsNotNone(norm)
+        self.assertAlmostEqual(float(norm), 5.0, places=5)
+
+        unclipped_parameters = [torch.nn.Parameter(torch.zeros(2))]
+        unclipped_parameters[0].grad = torch.tensor([3.0, 4.0])
+        result = V2TD3UpdateEngine._validate_and_clip_gradients(
+            unclipped_parameters, max_norm=None, component='test', total_steps=1,
+        )
+        self.assertIsNone(result)
+
     def test_nonfinite_critic_loss_fails_before_backward_and_optimizer_step(self):
         for clip_norm in (1.0, None):
             with self.subTest(critic_grad_clip_norm=clip_norm):

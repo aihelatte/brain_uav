@@ -113,7 +113,9 @@ class V2SNNPolicyHead(nn.Module):
         nn.init.uniform_(self.action_layer.weight, -1e-3, 1e-3)
         nn.init.uniform_(self.action_layer.bias, -1e-3, 1e-3)
 
-    def forward(self, context: torch.Tensor) -> torch.Tensor:
+    def _forward_impl(
+        self, context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if not isinstance(context, torch.Tensor):
             raise TypeError('context must be a torch.Tensor.')
         if context.dtype != torch.float32:
@@ -138,7 +140,30 @@ class V2SNNPolicyHead(nn.Module):
                 'SpikingJelly LIF membrane state has an incompatible shape.'
             )
         readout = 0.5 * (second_spikes.mean(dim=0) + final_membrane)
-        return self.action_layer(readout)
+        action = self.action_layer(readout)
+        return action, first_spikes, second_spikes
+
+    def forward(self, context: torch.Tensor) -> torch.Tensor:
+        action, _, _ = self._forward_impl(context)
+        return action
+
+    def forward_with_diagnostics(
+        self, context: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Forward pass plus per-layer firing-rate statistics (H9 in docs).
+
+        Reuses the exact same computation as :meth:`forward` (via
+        ``_forward_impl``) so the returned action and the training numerics
+        are unaffected; this only additionally exposes the spike tensors
+        that ``forward`` already computes and discards.
+        """
+
+        action, first_spikes, second_spikes = self._forward_impl(context)
+        diagnostics = {
+            'spike_rate_l1': float(first_spikes.mean().detach().cpu()),
+            'spike_rate_l2': float(second_spikes.mean().detach().cpu()),
+        }
+        return action, diagnostics
 
 
 class V2SNNPolicyActor(nn.Module):
@@ -211,6 +236,12 @@ class V2SNNPolicyActor(nn.Module):
     def action_from_context(self, context: torch.Tensor) -> torch.Tensor:
         return torch.tanh(self.snn_head(context)) * self.action_limit
 
+    def action_from_context_with_diagnostics(
+        self, context: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        raw_action, diagnostics = self.snn_head.forward_with_diagnostics(context)
+        return torch.tanh(raw_action) * self.action_limit, diagnostics
+
     def forward(
         self,
         observation: V2ObservationBatch,
@@ -230,6 +261,33 @@ class V2SNNPolicyActor(nn.Module):
                 profile_sections=profile_sections,
             )
             return self.action_from_context(context)
+
+    def forward_with_diagnostics(
+        self,
+        observation: V2ObservationBatch,
+        *,
+        shared_relations: ZoneSetSharedRelations | None = None,
+        profile_sections: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        """Forward pass plus LIF firing-rate diagnostics (H9 in docs).
+
+        Diagnostic-only: does not change ``forward``'s computation path or
+        numerics. Intended for low-frequency, offline instrumentation, not
+        the per-step training hot path.
+        """
+
+        if not isinstance(observation, V2ObservationBatch):
+            raise TypeError('observation must be a V2ObservationBatch.')
+        with self.reset_state_context():
+            context = self.zone_set_encoder(
+                observation.ego_features,
+                observation.goal_features,
+                observation.zone_features,
+                observation.presence_mask,
+                shared_relations=shared_relations,
+                profile_sections=profile_sections,
+            )
+            return self.action_from_context_with_diagnostics(context)
 
 
 __all__ = [

@@ -16,7 +16,9 @@ from brain_uav.observations import V2ObservationScales
 from brain_uav.scripts.common import resolve_training_device
 from brain_uav.scripts.train_v2_td3 import (
     _configure_stage_compilation,
+    _resolve_v2_cuda_graph_compilation,
     build_parser,
+    default_v2_cuda_graph_compilation,
     run_v2_td3_stage,
 )
 from brain_uav.trainers.v2_formal_training import (
@@ -184,41 +186,57 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertEqual(args.validation_max_failures, 6)
         self.assertFalse(args.compile_critic_encoder)
         self.assertFalse(args.compile_target_encoders)
-        self.assertFalse(args.compile_actors)
-        self.assertEqual(args.frozen_critic_strategy, 'eager')
-        self.assertFalse(args.compile_critic_block)
-        self.assertFalse(args.compile_target_block)
-        self.assertFalse(args.compile_shared_relations)
-        self.assertFalse(args.compile_snn_target_encoder)
-        self.assertFalse(args.fused_adam)
-        self.assertFalse(args.compile_actor_loss)
-        self.assertFalse(args.cache_actor_loss_coefficients)
-        self.assertFalse(args.compile_action_inference)
-        self.assertFalse(args.cuda_graph_action_inference)
         self.assertFalse(args.pinned_batch_transfer)
         self.assertFalse(args.aggregate_relation_values_first)
-        self.assertFalse(args.reduce_update_stat_syncs)
-        self.assertFalse(args.cuda_graph_updates)
+        self.assertEqual(args.periodic_snapshot_interval_steps, 50_000)
+        # D1 (this diagnostic pass): the CUDA Graph/compile flags below are
+        # tri-state (None = "use the 2026-09-22-verified default", see
+        # default_v2_cuda_graph_compilation) so --no-<flag> can still force
+        # them off; they are resolved by _resolve_v2_cuda_graph_compilation
+        # in main(), not by argparse defaults directly.
+        for name in (
+            'compile_actors', 'frozen_critic_strategy', 'compile_critic_block',
+            'compile_target_block', 'compile_shared_relations',
+            'compile_snn_target_encoder', 'fused_adam', 'compile_actor_loss',
+            'cache_actor_loss_coefficients', 'compile_action_inference',
+            'cuda_graph_action_inference', 'reduce_update_stat_syncs',
+            'cuda_graph_updates', 'cuda_graph_actor_update',
+        ):
+            with self.subTest(flag=name):
+                self.assertIsNone(getattr(args, name))
+        disabled = parser.parse_args([
+            '--stage', 'easy', '--init-checkpoint', 'x',
+            '--output', 'x', '--metrics-out', 'x', '--validation-pool', 'x',
+            '--no-fused-adam', '--no-compile-actor-loss',
+            '--no-cache-actor-loss-coefficients',
+            '--no-compile-action-inference',
+            '--no-cuda-graph-action-inference',
+            '--no-reduce-update-stat-syncs', '--no-cuda-graph-updates',
+            '--no-compile-actors', '--no-compile-critic-block',
+            '--no-compile-target-block', '--no-compile-shared-relations',
+            '--no-compile-snn-target-encoder', '--no-cuda-graph-actor-update',
+        ])
+        self.assertFalse(disabled.fused_adam)
+        self.assertFalse(disabled.compile_actor_loss)
+        self.assertFalse(disabled.cache_actor_loss_coefficients)
+        self.assertFalse(disabled.compile_action_inference)
+        self.assertFalse(disabled.cuda_graph_action_inference)
+        self.assertFalse(disabled.reduce_update_stat_syncs)
+        self.assertFalse(disabled.cuda_graph_updates)
+        self.assertFalse(disabled.compile_actors)
+        self.assertFalse(disabled.compile_critic_block)
+        self.assertFalse(disabled.compile_target_block)
+        self.assertFalse(disabled.compile_shared_relations)
+        self.assertFalse(disabled.compile_snn_target_encoder)
+        self.assertFalse(disabled.cuda_graph_actor_update)
         enabled_optimizations = parser.parse_args([
             '--stage', 'easy', '--init-checkpoint', 'x',
             '--output', 'x', '--metrics-out', 'x', '--validation-pool', 'x',
-            '--fused-adam', '--compile-actor-loss',
-            '--cache-actor-loss-coefficients',
-            '--compile-action-inference',
-            '--cuda-graph-action-inference',
             '--pinned-batch-transfer',
             '--aggregate-relation-values-first',
-            '--reduce-update-stat-syncs', '--cuda-graph-updates',
         ])
-        self.assertTrue(enabled_optimizations.fused_adam)
-        self.assertTrue(enabled_optimizations.compile_actor_loss)
-        self.assertTrue(enabled_optimizations.cache_actor_loss_coefficients)
-        self.assertTrue(enabled_optimizations.compile_action_inference)
-        self.assertTrue(enabled_optimizations.cuda_graph_action_inference)
         self.assertTrue(enabled_optimizations.pinned_batch_transfer)
         self.assertTrue(enabled_optimizations.aggregate_relation_values_first)
-        self.assertTrue(enabled_optimizations.reduce_update_stat_syncs)
-        self.assertTrue(enabled_optimizations.cuda_graph_updates)
         with self.assertRaises(SystemExit):
             parser.parse_args([
                 '--stage', 'easy_two_zone',
@@ -237,6 +255,40 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             '--snn-time-window', '3',
         ])
         self.assertEqual((snn.model, snn.snn_time_window), ('snn', 3))
+
+    def test_default_v2_cuda_graph_compilation_is_device_and_model_aware(self):
+        cuda_combo = default_v2_cuda_graph_compilation(model='ann', resolved_device='cuda')
+        self.assertTrue(cuda_combo['cuda_graph_updates'])
+        self.assertTrue(cuda_combo['cuda_graph_action_inference'])
+        self.assertTrue(cuda_combo['cuda_graph_actor_update'])
+        self.assertFalse(cuda_combo['compile_snn_target_encoder'])
+        self.assertEqual(cuda_combo['frozen_critic_strategy'], 'compiled_no_grad_context')
+
+        cpu_combo = default_v2_cuda_graph_compilation(model='ann', resolved_device='cpu')
+        self.assertFalse(cpu_combo['cuda_graph_updates'])
+        self.assertFalse(cpu_combo['cuda_graph_action_inference'])
+        self.assertFalse(cpu_combo['cuda_graph_actor_update'])
+        self.assertTrue(cpu_combo['compile_actors'])
+        self.assertTrue(cpu_combo['compile_critic_block'])
+
+        snn_combo = default_v2_cuda_graph_compilation(model='snn', resolved_device='cuda')
+        self.assertTrue(snn_combo['compile_snn_target_encoder'])
+
+        with self.assertRaises(ValueError):
+            default_v2_cuda_graph_compilation(model='bad', resolved_device='cuda')
+        with self.assertRaises(ValueError):
+            default_v2_cuda_graph_compilation(model='ann', resolved_device='auto')
+
+    def test_resolve_v2_cuda_graph_compilation_lets_cli_flags_override(self):
+        parser = build_parser()
+        args = parser.parse_args([
+            '--stage', 'easy', '--init-checkpoint', 'x',
+            '--output', 'x', '--metrics-out', 'x', '--validation-pool', 'x',
+            '--no-cuda-graph-updates',
+        ])
+        resolved = _resolve_v2_cuda_graph_compilation(args, resolved_device='cuda')
+        self.assertFalse(resolved['cuda_graph_updates'])
+        self.assertTrue(resolved['compile_actors'])
 
     def test_formal_compile_setup_registers_and_warms_requested_full_paths(self):
         calls = []

@@ -107,21 +107,22 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertEqual(args.device, 'auto')
         self.assertEqual(args.model, 'ann')
         self.assertEqual(args.snn_time_window, 4)
-        self.assertFalse(args.compile_actors)
-        self.assertEqual(args.frozen_critic_strategy, 'eager')
-        self.assertFalse(args.compile_critic_block)
-        self.assertFalse(args.compile_target_block)
-        self.assertFalse(args.compile_shared_relations)
-        self.assertFalse(args.compile_snn_target_encoder)
-        self.assertFalse(args.fused_adam)
-        self.assertFalse(args.compile_actor_loss)
-        self.assertFalse(args.cache_actor_loss_coefficients)
-        self.assertFalse(args.compile_action_inference)
-        self.assertFalse(args.cuda_graph_action_inference)
         self.assertFalse(args.pinned_batch_transfer)
         self.assertFalse(args.aggregate_relation_values_first)
-        self.assertFalse(args.reduce_update_stat_syncs)
-        self.assertFalse(args.cuda_graph_updates)
+        self.assertEqual(args.periodic_snapshot_interval_steps, 50_000)
+        # D1 (this diagnostic pass): tri-state, resolved by
+        # _resolve_v2_cuda_graph_compilation in main() against the
+        # 2026-09-22-verified default combination, same as train_v2_td3.py.
+        for name in (
+            'compile_actors', 'frozen_critic_strategy', 'compile_critic_block',
+            'compile_target_block', 'compile_shared_relations',
+            'compile_snn_target_encoder', 'fused_adam', 'compile_actor_loss',
+            'cache_actor_loss_coefficients', 'compile_action_inference',
+            'cuda_graph_action_inference', 'reduce_update_stat_syncs',
+            'cuda_graph_updates', 'cuda_graph_actor_update',
+        ):
+            with self.subTest(flag=name):
+                self.assertIsNone(getattr(args, name))
 
     def test_snn_curriculum_uses_distinct_outputs_and_forwards_model_contract(self):
         calls = []

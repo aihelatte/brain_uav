@@ -23,7 +23,11 @@ from brain_uav.config import RewardConfig, ScenarioConfig
 from brain_uav.envs import V2ScenarioGenerator, V2StaticNoFlyTrajectoryEnv
 from brain_uav.models import V2ANNCritic, V2ANNPolicyActor, V2SNNPolicyActor
 from brain_uav.models.zone_set_encoder import ZoneSetEncoderConfig
-from brain_uav.observations import V2Observation, V2ObservationScales
+from brain_uav.observations import (
+    V2Observation,
+    V2ObservationScales,
+    collate_v2_observations,
+)
 from brain_uav.trainers.v2_bc import (
     V2_BC_CHECKPOINT_FORMAT,
     V2_BC_CHECKPOINT_VERSION,
@@ -83,12 +87,34 @@ _FORMAL_CHECKPOINT_FIELDS = {
     'initialization_source',
 }
 _SNN_FORMAL_CHECKPOINT_FIELDS = _FORMAL_CHECKPOINT_FIELDS | {'model_type'}
+# Periodic, non-terminal, purely observational snapshots (C1 in this
+# diagnostic pass). Distinct format/fields from the formal per-stage
+# checkpoint above: a periodic snapshot is never terminal (no
+# passed_validation/training_result) and must never be accepted by
+# load_v2_formal_checkpoint as a stage predecessor.
+V2_PERIODIC_SNAPSHOT_FORMAT = 'v2_formal_periodic_snapshot'
+V2_PERIODIC_SNAPSHOT_VERSION = 1
+_PERIODIC_SNAPSHOT_FIELDS = {
+    'format',
+    'format_version',
+    'stage',
+    'stage_steps',
+    'engine_checkpoint',
+    'formal_config',
+    'scenario_config',
+    'reward_config',
+    'uav_collision_radius',
+    'seed_manifest',
+    'bc_schedule',
+    'initialization_source',
+}
+_SNN_PERIODIC_SNAPSHOT_FIELDS = _PERIODIC_SNAPSHOT_FIELDS | {'model_type'}
 _PREVIOUS_STAGE = {'medium': 'easy', 'hard': 'medium'}
 _OUTCOMES = ('goal', 'ground', 'boundary', 'collision', 'timeout')
 V2_BC_SCHEDULE_METADATA = {
     'kind': 'stage_local_piecewise_constant',
-    'boundaries': [0, 75_000, 150_000, 250_000],
-    'values': [500.0, 150.0, 30.0, 5.0],
+    'boundaries': [0, 75_000, 150_000, 250_000, 300_000],
+    'values': [500.0, 150.0, 30.0, 15.0, 5.0],
 }
 
 
@@ -1165,6 +1191,9 @@ class V2FormalStageTrainer:
         global_steps_start: int = 0,
         uav_collision_radius: float = 0.0,
         reporter: V2ExperimentReporter | None = None,
+        periodic_snapshot_interval_steps: int | None = None,
+        periodic_snapshot_sink: Callable[[int], None] | None = None,
+        periodic_validation_sink: Callable[[int], None] | None = None,
     ) -> None:
         if not isinstance(scenario, ScenarioConfig) or not isinstance(rewards, RewardConfig):
             raise TypeError('scenario and rewards must use project config classes.')
@@ -1176,6 +1205,15 @@ class V2FormalStageTrainer:
             raise TypeError('validation_runner must be callable.')
         if reporter is not None and not isinstance(reporter, V2ExperimentReporter):
             raise TypeError('reporter must be a V2ExperimentReporter when provided.')
+        if periodic_snapshot_interval_steps is not None:
+            periodic_snapshot_interval_steps = _positive_int(
+                periodic_snapshot_interval_steps,
+                name='periodic_snapshot_interval_steps',
+            )
+        if periodic_snapshot_sink is not None and not callable(periodic_snapshot_sink):
+            raise TypeError('periodic_snapshot_sink must be callable when provided.')
+        if periodic_validation_sink is not None and not callable(periodic_validation_sink):
+            raise TypeError('periodic_validation_sink must be callable when provided.')
         if set(scenario_sources) != set(config.curriculum_mix):
             raise ValueError('scenario_sources must exactly match curriculum_mix levels.')
         for level, source in scenario_sources.items():
@@ -1197,6 +1235,10 @@ class V2FormalStageTrainer:
         self.scenario_sources = dict(scenario_sources)
         self.validation_runner = validation_runner
         self.reporter = reporter
+        self.periodic_snapshot_interval_steps = periodic_snapshot_interval_steps
+        self.periodic_snapshot_sink = periodic_snapshot_sink
+        self.periodic_validation_sink = periodic_validation_sink
+        self._next_periodic_step = periodic_snapshot_interval_steps
         self.selector = selector or V2CurriculumSelector(
             config.curriculum_mix,
             seed=derive_v2_component_seed(config.seed, config.stage, 'curriculum'),
@@ -1363,7 +1405,40 @@ class V2FormalStageTrainer:
                     'replay_success_fraction': self.engine.replay.success_fraction(),
                     'success_replay_size': self.engine.replay.success_size,
                     'batch_success_fraction': update_metrics[-1].sample_success_fraction if update_metrics else 0.0,
+                    # Diagnostic-only additions (H4/H5 in docs/无法早停排查文档.md):
+                    # critic Q/TD-error statistics and the actor gradient norm,
+                    # aggregated at the same per-episode grain as critic_loss.
+                    'critic_q1_mean': mean([value.critic_q1_mean for value in update_metrics]) if update_metrics else 0.0,
+                    'critic_q1_std': mean([value.critic_q1_std for value in update_metrics]) if update_metrics else 0.0,
+                    'critic_q1_max_abs': mean([value.critic_q1_max_abs for value in update_metrics]) if update_metrics else 0.0,
+                    'critic_target_q_mean': mean([value.critic_target_q_mean for value in update_metrics]) if update_metrics else 0.0,
+                    'critic_td_error_mean': mean([value.critic_td_error_mean for value in update_metrics]) if update_metrics else 0.0,
+                    'critic_failure_td_error_mean': mean([value.critic_failure_td_error_mean for value in update_metrics]) if update_metrics else 0.0,
+                    'actor_grad_norm': mean([value.actor_grad_norm for value in actor_updates]) if actor_updates else 0.0,
                 }
+                if isinstance(self.engine.actor, V2SNNPolicyActor):
+                    # H9 in docs/无法早停排查文档.md: per-layer LIF firing rate,
+                    # sampled once per episode from the terminal observation.
+                    # This is a separate, side-effect-free forward pass (SNN
+                    # membrane state is fully reset before and after by
+                    # V2SNNPolicyActor.reset_state_context); it does not read
+                    # or alter the training rollout/update path above.
+                    was_training = self.engine.actor.training
+                    self.engine.actor.eval()
+                    try:
+                        with torch.no_grad():
+                            diagnostic_batch = collate_v2_observations(
+                                [observation]
+                            ).to(self.engine.device)
+                            _, snn_spike_diagnostics = (
+                                self.engine.actor.forward_with_diagnostics(
+                                    diagnostic_batch
+                                )
+                            )
+                    finally:
+                        self.engine.actor.train(was_training)
+                    episode_record['snn_spike_rate_l1'] = snn_spike_diagnostics['spike_rate_l1']
+                    episode_record['snn_spike_rate_l2'] = snn_spike_diagnostics['spike_rate_l2']
                 self.result.episodes.append(episode_record)
                 if self.reporter is not None:
                     reporting_record = dict(episode_record)
@@ -1387,6 +1462,14 @@ class V2FormalStageTrainer:
                 window = self.controller.add_episode(outcome, stage_steps=self.result.stage_steps)
                 if window is not None:
                     window_episodes = self.result.episodes[-self.config.window_episode_count:]
+                    medium_only_episodes = [
+                        value for value in window_episodes
+                        if value['curriculum_level'] == 'medium'
+                    ]
+                    medium_only_goal_count = sum(
+                        value['outcome'] == 'goal' for value in medium_only_episodes
+                    )
+                    medium_only_episode_count = len(medium_only_episodes)
                     window.update({
                         'episode_start': window_episodes[0]['episode'],
                         'episode_end': window_episodes[-1]['episode'],
@@ -1401,6 +1484,21 @@ class V2FormalStageTrainer:
                         'exploration_noise': exploration_noise,
                         'policy_noise': policy_noise,
                         'noise_clip': noise_clip,
+                        # A5 in this diagnostic pass: a parallel "medium
+                        # curriculum_level only" view of the same window, so
+                        # the curriculum_mix easy-episode dilution noted in
+                        # P5早停判据离线回放结论_20260917.md can be inspected
+                        # without changing goal_ratio/qualified/candidate,
+                        # which still use every episode in the window.
+                        'medium_only_goal_count': medium_only_goal_count,
+                        'medium_only_episode_count': medium_only_episode_count,
+                        'medium_only_goal_ratio': (
+                            medium_only_goal_count / medium_only_episode_count
+                            if medium_only_episode_count else 0.0
+                        ),
+                        'medium_only_failure_count': (
+                            medium_only_episode_count - medium_only_goal_count
+                        ),
                     })
                     self.result.windows.append(window)
                     if self.reporter is not None:
@@ -1437,6 +1535,22 @@ class V2FormalStageTrainer:
                             self.result.passed_validation = True
                             self.result.stop_reason = 'fixed_validation_passed'
                             break
+                # C1 in this diagnostic pass: purely observational periodic
+                # checkpoint + fixed-validation snapshots. Deliberately
+                # checked at episode boundaries only (like the candidate
+                # validation above), and deliberately does not touch
+                # self.controller (no record_validation call), so early-stop
+                # consecutive_qualified accounting is unaffected.
+                while (
+                    self.periodic_snapshot_interval_steps is not None
+                    and self.result.stage_steps >= self._next_periodic_step
+                ):
+                    periodic_step = self._next_periodic_step
+                    if self.periodic_snapshot_sink is not None:
+                        self.periodic_snapshot_sink(periodic_step)
+                    if self.periodic_validation_sink is not None:
+                        self.periodic_validation_sink(periodic_step)
+                    self._next_periodic_step += self.periodic_snapshot_interval_steps
                 if self.result.stage_steps >= self.config.max_steps:
                     break
                 if self.reporter is not None:
@@ -1518,6 +1632,135 @@ def build_v2_formal_checkpoint(
     }
     if model_type == 'snn':
         payload['model_type'] = 'snn'
+    return payload
+
+
+def build_v2_periodic_snapshot(
+    engine: V2TD3UpdateEngine,
+    config: V2FormalTrainingConfig,
+    *,
+    stage_steps: int,
+    scenario: ScenarioConfig,
+    rewards: RewardConfig,
+    uav_collision_radius: float,
+    seed_manifest: Mapping[str, Any],
+    initialization_source: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build one non-terminal, purely observational mid-stage snapshot (C1).
+
+    This is a preparedness change for the next BC->medium run: previously
+    ``save_v2_formal_checkpoint`` was only ever called after
+    ``trainer.run()`` returned, so a manually interrupted run (as happened
+    for both the ANN and SNN medium runs analyzed in
+    P5早停判据离线回放结论_20260917.md section 6.1) lost its weights. This
+    does not touch stage completion, early-stop, or the formal checkpoint
+    format above; ``load_v2_formal_checkpoint`` will refuse this payload.
+    """
+
+    if not isinstance(engine, V2TD3UpdateEngine):
+        raise TypeError('engine must be V2TD3UpdateEngine.')
+    if not isinstance(config, V2FormalTrainingConfig):
+        raise TypeError('config must be a V2FormalTrainingConfig.')
+    if not isinstance(scenario, ScenarioConfig) or not isinstance(rewards, RewardConfig):
+        raise TypeError('scenario and rewards must use project config classes.')
+    steps = _nonnegative_int(stage_steps, name='stage_steps')
+    radius = _nonnegative_float(uav_collision_radius, name='uav_collision_radius')
+    model_type = engine.model_type
+    payload = {
+        'format': V2_PERIODIC_SNAPSHOT_FORMAT,
+        'format_version': V2_PERIODIC_SNAPSHOT_VERSION,
+        'stage': config.stage,
+        'stage_steps': steps,
+        'engine_checkpoint': engine.checkpoint_state_dict(),
+        'formal_config': config.to_dict(),
+        'scenario_config': scenario_config_snapshot(scenario),
+        'reward_config': _strict_json_copy(asdict(rewards)),
+        'uav_collision_radius': radius,
+        'seed_manifest': _strict_json_copy(seed_manifest),
+        'bc_schedule': _strict_json_copy(V2_BC_SCHEDULE_METADATA),
+        'initialization_source': _strict_json_copy(initialization_source),
+    }
+    if model_type == 'snn':
+        payload['model_type'] = 'snn'
+    return payload
+
+
+def save_v2_periodic_snapshot(path: str | Path, payload: Mapping[str, Any]) -> None:
+    validated = load_v2_periodic_snapshot(payload)
+    output = Path(path)
+    if output.exists():
+        raise FileExistsError(f'Periodic V2 snapshot already exists: {output}')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(validated, output)
+
+
+def load_v2_periodic_snapshot(
+    source: str | Path | Mapping[str, Any],
+    *,
+    expected_stage: str | None = None,
+    expected_model_type: str | None = None,
+) -> dict[str, Any]:
+    if isinstance(source, Mapping):
+        payload = dict(source)
+    else:
+        path = Path(source)
+        if not path.is_file():
+            raise FileNotFoundError(f'Periodic V2 snapshot does not exist: {path}')
+        payload = torch.load(path, map_location='cpu', weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError('Periodic V2 snapshot payload must be a mapping.')
+    if payload.get('format') != V2_PERIODIC_SNAPSHOT_FORMAT:
+        raise ValueError('Periodic V2 snapshot format is incompatible.')
+    if payload.get('format_version') != V2_PERIODIC_SNAPSHOT_VERSION:
+        raise ValueError('Periodic V2 snapshot format_version is incompatible.')
+    model_type = 'snn' if 'model_type' in payload else 'ann'
+    expected_fields = (
+        _SNN_PERIODIC_SNAPSHOT_FIELDS if model_type == 'snn' else _PERIODIC_SNAPSHOT_FIELDS
+    )
+    if set(payload) != expected_fields:
+        raise ValueError('Periodic V2 snapshot has missing or unknown fields.')
+    if expected_model_type is not None:
+        if expected_model_type not in ('ann', 'snn'):
+            raise ValueError('expected_model_type must be "ann" or "snn".')
+        if model_type != expected_model_type:
+            raise ValueError('Periodic V2 snapshot model type is incompatible.')
+    stage = payload['stage']
+    if stage not in V2_TD3_STAGES:
+        raise ValueError('Periodic V2 snapshot stage is invalid.')
+    if expected_stage is not None and stage != expected_stage:
+        raise ValueError('Periodic V2 snapshot stage is incompatible.')
+    _nonnegative_int(payload['stage_steps'], name='stage_steps')
+    engine_payload = payload['engine_checkpoint']
+    expected_engine_format = (
+        V2_TD3_CHECKPOINT_FORMAT if model_type == 'ann' else V2_SNN_TD3_CHECKPOINT_FORMAT
+    )
+    expected_engine_version = (
+        V2_TD3_CHECKPOINT_VERSION if model_type == 'ann' else V2_SNN_TD3_CHECKPOINT_VERSION
+    )
+    if (
+        not isinstance(engine_payload, dict)
+        or engine_payload.get('format') != expected_engine_format
+        or engine_payload.get('format_version') != expected_engine_version
+    ):
+        raise ValueError('Periodic V2 snapshot engine payload is incompatible.')
+    formal_config = payload['formal_config']
+    if not isinstance(formal_config, dict) or formal_config.get('stage') != stage:
+        raise ValueError('Periodic V2 snapshot config is incompatible.')
+    scenario_config_from_snapshot(payload['scenario_config'])
+    reward_config = payload['reward_config']
+    if not isinstance(reward_config, dict):
+        raise ValueError('Periodic V2 snapshot RewardConfig is invalid.')
+    try:
+        RewardConfig(**reward_config)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('Periodic V2 snapshot RewardConfig is invalid.') from exc
+    _nonnegative_float(payload['uav_collision_radius'], name='uav_collision_radius')
+    if not isinstance(payload['seed_manifest'], dict) or not payload['seed_manifest']:
+        raise ValueError('Periodic V2 snapshot seed_manifest is invalid.')
+    if payload['bc_schedule'] != V2_BC_SCHEDULE_METADATA:
+        raise ValueError('Periodic V2 snapshot BC schedule is incompatible.')
+    if not isinstance(payload['initialization_source'], dict):
+        raise ValueError('Periodic V2 snapshot initialization source is invalid.')
     return payload
 
 
@@ -1684,6 +1927,8 @@ __all__ = [
     'V2_BC_SCHEDULE_METADATA',
     'V2_FORMAL_CHECKPOINT_FORMAT',
     'V2_FORMAL_CHECKPOINT_VERSION',
+    'V2_PERIODIC_SNAPSHOT_FORMAT',
+    'V2_PERIODIC_SNAPSHOT_VERSION',
     'V2_SNN_FORMAL_CHECKPOINT_FORMAT',
     'V2_SNN_FORMAL_CHECKPOINT_VERSION',
     'V2EarlyStopController',
@@ -1694,10 +1939,13 @@ __all__ = [
     'V2PreparedStageInitialization',
     'V2StageComponents',
     'build_v2_formal_checkpoint',
+    'build_v2_periodic_snapshot',
     'build_v2_stage_engine',
     'load_v2_formal_checkpoint',
     'load_v2_bc_formal_initialization',
+    'load_v2_periodic_snapshot',
     'prepare_v2_stage_initialization',
     'save_v2_formal_checkpoint',
+    'save_v2_periodic_snapshot',
     'validate_v2_prepared_stage_initialization',
 ]
