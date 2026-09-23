@@ -172,17 +172,49 @@ class TestV2SNNTD3(unittest.TestCase):
         ):
             engine.enable_shared_relations_compile()
         encoder = engine.actor.zone_set_encoder
-        compiled = mock.Mock(wraps=encoder._compiled_shared_relations)
-        encoder._compiled_shared_relations = compiled
+        entry_mocks = {
+            role: mock.Mock(wraps=entry)
+            for role, entry in encoder._compiled_shared_relations.items()
+        }
+        encoder._compiled_shared_relations = entry_mocks
+
+        def compiled_calls():
+            return sum(entry.call_count for entry in entry_mocks.values())
 
         engine.select_action(_observation(10, self.scales))
-        self.assertEqual(compiled.call_count, 0)
+        self.assertEqual(compiled_calls(), 0)
         batch = collate_v2_observations([
             _observation(0, self.scales),
             _observation(10, self.scales),
         ])
         engine._build_shared_relations(batch)
-        self.assertEqual(compiled.call_count, 1)
+        self.assertEqual(compiled_calls(), 1)
+
+    def test_snn_monitor_and_validation_use_distinct_relation_entries(self) -> None:
+        engine = self.make_engine()
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ):
+            engine.enable_shared_relations_compile()
+        encoder = engine.actor.zone_set_encoder
+        calls = {role: 0 for role in encoder._compiled_shared_relations}
+        for role, entry in tuple(encoder._compiled_shared_relations.items()):
+            def observe(*arguments, _role=role, _entry=entry):
+                calls[_role] += 1
+                return _entry(*arguments)
+            encoder._compiled_shared_relations[role] = observe
+        batch = collate_v2_observations([_observation(10, self.scales)])
+        with torch.no_grad():
+            engine._build_shared_relations(batch)
+            engine.actor.forward_with_diagnostics(batch)
+        with torch.inference_mode():
+            engine.actor(batch)
+        self.assertEqual(calls['no_grad'], 1)
+        self.assertEqual(calls['monitor'], 1)
+        self.assertEqual(calls['inference_mode'], 1)
+        self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+        self.assertEqual(engine.actor.snn_head.lif2.v, 0.0)
 
     def test_snn_action_inference_compile_is_encoder_only_and_matches_eager(self) -> None:
         torch.manual_seed(1301)

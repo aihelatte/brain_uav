@@ -1724,17 +1724,23 @@ class TestV2TD3(unittest.TestCase):
         ):
             engine.enable_shared_relations_compile()
         encoder = engine.actor.zone_set_encoder
-        compiled = mock.Mock(wraps=encoder._compiled_shared_relations)
-        encoder._compiled_shared_relations = compiled
+        entry_mocks = {
+            role: mock.Mock(wraps=entry)
+            for role, entry in encoder._compiled_shared_relations.items()
+        }
+        encoder._compiled_shared_relations = entry_mocks
+
+        def compiled_calls():
+            return sum(entry.call_count for entry in entry_mocks.values())
 
         engine.select_action(_observation(7, scales=self.scales))
-        self.assertEqual(compiled.call_count, 0)
+        self.assertEqual(compiled_calls(), 0)
         batch = collate_v2_observations([
             _observation(0, scales=self.scales),
             _observation(7, scales=self.scales),
         ])
         engine._build_shared_relations(batch)
-        self.assertEqual(compiled.call_count, 1)
+        self.assertEqual(compiled_calls(), 1)
 
     def test_compile_enables_only_online_critic_encoders_and_preserves_training_bindings(self):
         engine = self.make_engine(policy_delay=1)
@@ -2317,7 +2323,20 @@ class TestV2TD3(unittest.TestCase):
             side_effect=lambda function, **kwargs: function,
         ):
             metadata = engine.configure_compilation(compile_shared_relations=True)
+        encoder = engine.actor.zone_set_encoder
+        warmed = {role: [] for role in encoder._compiled_shared_relations}
+        for role, entry in tuple(encoder._compiled_shared_relations.items()):
+            def observe(*arguments, _role=role, _entry=entry):
+                warmed[_role].append((arguments[0].shape[0], arguments[1].shape[1]))
+                return _entry(*arguments)
+            encoder._compiled_shared_relations[role] = observe
         engine.warmup_shared_relations_compile((batch,))
+        self.assertIn((2, 7), warmed['grad'])
+        self.assertIn((2, 7), warmed['no_grad'])
+        self.assertIn((1, 7), warmed['monitor'])
+        self.assertIn((1, 0), warmed['monitor'])
+        self.assertIn((1, 7), warmed['inference_mode'])
+        self.assertIn((1, 0), warmed['inference_mode'])
         self.assertEqual(metadata['shared_relations_granularity'], 'compiled_tensor_build')
         self.assert_state_dict_equal(engine.actor.state_dict(), state_before)
         self.assertEqual(counts_before, (

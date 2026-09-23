@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 import math
 from types import MethodType
@@ -22,6 +22,7 @@ from brain_uav.models import (
     ZoneSetEncoderConfig,
     ZoneSetEncoderDiagnostics,
 )
+from brain_uav.models.zone_set_encoder import SHARED_RELATION_COMPILE_ROLES
 from brain_uav.observations import (
     EGO_FEATURE_DIM,
     EGO_FEATURE_INDEX,
@@ -1169,22 +1170,28 @@ class TestZoneSetEncoder(unittest.TestCase):
             side_effect=lambda function, **kwargs: function,
         ):
             self.model.enable_compiled_shared_relations()
-        compiled = mock.Mock(wraps=self.model._compiled_shared_relations)
-        self.model._compiled_shared_relations = compiled
+        entry_mocks = {
+            role: mock.Mock(wraps=entry)
+            for role, entry in self.model._compiled_shared_relations.items()
+        }
+        self.model._compiled_shared_relations = entry_mocks
+
+        def compiled_calls():
+            return sum(entry.call_count for entry in entry_mocks.values())
 
         self.model.build_shared_relations(*inputs)
-        self.assertEqual(compiled.call_count, 1)
+        self.assertEqual(compiled_calls(), 1)
         with self.model.eager_tensor_forward():
             self.model.build_shared_relations(*inputs)
-        self.assertEqual(compiled.call_count, 1)
+        self.assertEqual(compiled_calls(), 1)
 
         with self.assertRaisesRegex(RuntimeError, 'controlled eager failure'):
             with self.model.eager_tensor_forward():
                 self.model.build_shared_relations(*inputs)
                 raise RuntimeError('controlled eager failure')
-        self.assertEqual(compiled.call_count, 1)
+        self.assertEqual(compiled_calls(), 1)
         self.model.build_shared_relations(*inputs)
-        self.assertEqual(compiled.call_count, 2)
+        self.assertEqual(compiled_calls(), 2)
 
     def test_profiled_forward_marks_only_major_encoder_sections(self):
         inputs = self.inputs([0, 3, 7])
@@ -1537,6 +1544,29 @@ class TestZoneSetEncoder(unittest.TestCase):
                     torch.testing.assert_close(compiled_inputs[0].grad, eager_inputs[0].grad)
                     torch.testing.assert_close(compiled_inputs[2].grad, eager_inputs[2].grad)
 
+        for context in (torch.no_grad(), torch.inference_mode()):
+            with context:
+                for counts in ([0], [6], [10]):
+                    inputs = self.inputs(counts)
+                    expected = eager.build_shared_relations(*inputs)
+                    actual = compiled.build_shared_relations(*inputs)
+                    for name in (
+                        'clean_zone_features', 'pair_relations',
+                        'valid_token_mask', 'token_pair_relations',
+                        'relation_pair_mask',
+                    ):
+                        torch.testing.assert_close(
+                            getattr(actual, name), getattr(expected, name),
+                        )
+        with torch.no_grad(), compiled.monitor_shared_relations():
+            for counts in ([0], [6], [10]):
+                inputs = self.inputs(counts)
+                expected = eager.build_shared_relations(*inputs)
+                actual = compiled.build_shared_relations(*inputs)
+                torch.testing.assert_close(
+                    actual.pair_relations, expected.pair_relations,
+                )
+
     def test_compiled_shared_relations_do_not_access_contract_mappings_during_trace(self):
         inputs = self.inputs([0, 3, 7])
         torch._dynamo.reset()
@@ -1575,6 +1605,87 @@ class TestZoneSetEncoder(unittest.TestCase):
             second.relation_pair_mask,
         ), eager_second):
             torch.testing.assert_close(actual, expected)
+
+    def test_compiled_shared_relation_entries_are_isolated_by_grad_mode(self):
+        eager = ZoneSetEncoder(self.scales)
+        compiled = ZoneSetEncoder(self.scales)
+        compiled.load_state_dict(eager.state_dict(), strict=True)
+        with mock.patch(
+            'brain_uav.models.zone_set_encoder.torch.compile',
+            side_effect=lambda function, **kwargs: function,
+        ) as compile_call:
+            compiled.enable_compiled_shared_relations()
+        self.assertEqual(compile_call.call_count, 4)
+        entries = compiled._compiled_shared_relations
+        self.assertEqual(tuple(entries), SHARED_RELATION_COMPILE_ROLES)
+        self.assertEqual(
+            compiled.compiled_shared_relations_config['roles'],
+            list(SHARED_RELATION_COMPILE_ROLES),
+        )
+        # Dynamo sees distinct top-level code objects for every role.
+        entry_codes = {
+            entry.__func__.__code__ for entry in entries.values()
+        }
+        self.assertEqual(len(entry_codes), 4)
+        self.assertNotIn(
+            ZoneSetEncoder._compute_shared_relation_tensors.__code__, entry_codes,
+        )
+
+        entry_mocks = {
+            role: mock.Mock(wraps=entry)
+            for role, entry in entries.items()
+        }
+        compiled._compiled_shared_relations = entry_mocks
+
+        # Grad mode selects the update, target and validation entries;
+        # the SNN monitor explicitly selects its own no-grad entry.
+        field_names = (
+            'clean_zone_features', 'pair_relations', 'valid_token_mask',
+            'token_pair_relations', 'relation_pair_mask',
+        )
+        for context in (
+            nullcontext(),
+            torch.no_grad(),
+            torch.inference_mode(),
+        ):
+            with (
+                self.subTest(context=type(context).__name__),
+                context,
+            ):
+                eager_inputs = tuple(value.clone() for value in self.inputs([0, 3, 7]))
+                compiled_inputs = tuple(value.clone() for value in self.inputs([0, 3, 7]))
+                expected = eager.build_shared_relations(*eager_inputs)
+                actual = compiled.build_shared_relations(*compiled_inputs)
+                for name in field_names:
+                    torch.testing.assert_close(
+                        getattr(actual, name), getattr(expected, name),
+                    )
+
+        self.assertEqual(entry_mocks['grad'].call_count, 1)
+        self.assertEqual(entry_mocks['no_grad'].call_count, 1)
+        self.assertEqual(entry_mocks['monitor'].call_count, 0)
+        self.assertEqual(entry_mocks['inference_mode'].call_count, 1)
+
+        # Training forwards still need gradients through the compiled build.
+        eager_inputs = tuple(value.clone() for value in self.inputs([3, 7]))
+        compiled_inputs = tuple(value.clone() for value in self.inputs([3, 7]))
+        for index in (0, 2):
+            eager_inputs[index].requires_grad_()
+            compiled_inputs[index].requires_grad_()
+        expected = eager.build_shared_relations(*eager_inputs)
+        actual = compiled.build_shared_relations(*compiled_inputs)
+        self.assertEqual(entry_mocks['grad'].call_count, 2)
+        (expected.clean_zone_features.sum() + expected.pair_relations.sum()).backward()
+        (actual.clean_zone_features.sum() + actual.pair_relations.sum()).backward()
+        torch.testing.assert_close(compiled_inputs[0].grad, eager_inputs[0].grad)
+        torch.testing.assert_close(compiled_inputs[2].grad, eager_inputs[2].grad)
+
+        # The eager escape hatch still bypasses every compiled entry.
+        with compiled.eager_tensor_forward():
+            compiled.build_shared_relations(*self.inputs([2]))
+        self.assertEqual(entry_mocks['grad'].call_count, 2)
+        self.assertEqual(entry_mocks['no_grad'].call_count, 1)
+        self.assertEqual(entry_mocks['inference_mode'].call_count, 1)
 
     def test_input_validation_rejects_bad_shapes_dtypes_and_devices(self):
         ego, goal, zones, mask = self.inputs([2, 3])

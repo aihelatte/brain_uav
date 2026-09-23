@@ -70,6 +70,26 @@ def _action_inference_snn_encoder_tensors(
     )
 
 
+def _single_observation_batch(batch: V2ObservationBatch) -> V2ObservationBatch:
+    """Slice one observation off a collated batch (validation step shape)."""
+    return V2ObservationBatch(
+        ego_features=batch.ego_features[:1],
+        goal_features=batch.goal_features[:1],
+        zone_features=batch.zone_features[:1],
+        presence_mask=batch.presence_mask[:1],
+    )
+
+
+def _empty_zone_batch(batch: V2ObservationBatch) -> V2ObservationBatch:
+    """Drop the zone axis so the empty-scene specialization gets warmed."""
+    return V2ObservationBatch(
+        ego_features=batch.ego_features[:1],
+        goal_features=batch.goal_features[:1],
+        zone_features=batch.zone_features[:1, :0, :],
+        presence_mask=batch.presence_mask[:1, :0],
+    )
+
+
 def _actor_loss_tensor_block(
     actor_actions: torch.Tensor,
     q_values: torch.Tensor,
@@ -2602,8 +2622,31 @@ class V2TD3UpdateEngine:
             self.last_total_steps,
         )
         try:
+            # Warm the update, target, episode monitor, and validation entries
+            # with their actual gradient modes and batch sizes.
             for batch in warmup_batches:
                 self._build_shared_relations(batch.to(self.device))
+            with torch.no_grad():
+                for batch in warmup_batches:
+                    self._build_shared_relations(batch.to(self.device))
+                with self.actor.zone_set_encoder.monitor_shared_relations():
+                    for batch in warmup_batches:
+                        self._build_shared_relations(
+                            _single_observation_batch(batch).to(self.device)
+                        )
+                    if all(batch.max_zone_count != 0 for batch in warmup_batches):
+                        self._build_shared_relations(
+                            _empty_zone_batch(warmup_batches[0]).to(self.device)
+                        )
+            with torch.inference_mode():
+                for batch in warmup_batches:
+                    self._build_shared_relations(
+                        _single_observation_batch(batch).to(self.device)
+                    )
+                if all(batch.max_zone_count != 0 for batch in warmup_batches):
+                    self._build_shared_relations(
+                        _empty_zone_batch(warmup_batches[0]).to(self.device)
+                    )
         finally:
             torch.random.set_rng_state(torch_rng_state)
             np.random.set_state(numpy_rng_state)

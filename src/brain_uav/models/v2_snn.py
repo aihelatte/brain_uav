@@ -278,7 +278,7 @@ class V2SNNPolicyActor(nn.Module):
 
         if not isinstance(observation, V2ObservationBatch):
             raise TypeError('observation must be a V2ObservationBatch.')
-        with self.reset_state_context():
+        with self.reset_state_context(), self.zone_set_encoder.monitor_shared_relations():
             context = self.zone_set_encoder(
                 observation.ego_features,
                 observation.goal_features,

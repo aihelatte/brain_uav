@@ -21,6 +21,18 @@ from brain_uav.observations import (
     ZONE_FEATURE_DIM,
 )
 
+SHARED_RELATION_COMPILE_ROLES = (
+    'grad', 'no_grad', 'monitor', 'inference_mode',
+)
+
+
+def _shared_relation_role_for_current_grad_mode(*, monitor: bool = False) -> str:
+    if torch.is_inference_mode_enabled():
+        return 'inference_mode'
+    if torch.is_grad_enabled():
+        return 'grad'
+    return 'monitor' if monitor else 'no_grad'
+
 
 @dataclass(frozen=True, slots=True)
 class ZoneSetEncoderConfig:
@@ -465,8 +477,11 @@ class ZoneSetEncoder(nn.Module):
         self._compiled_tensor_forward: Callable[..., torch.Tensor] | None = None
         self._compiled_tensor_forward_config: dict[str, object] | None = None
         self._force_eager_tensor_forward = False
-        self._compiled_shared_relations: Callable[..., tuple[torch.Tensor, ...]] | None = None
+        self._compiled_shared_relations: (
+            dict[str, Callable[..., tuple[torch.Tensor, ...]]] | None
+        ) = None
         self._compiled_shared_relations_config: dict[str, object] | None = None
+        self._monitor_shared_relations = False
 
     @property
     def output_dim(self) -> int:
@@ -502,18 +517,30 @@ class ZoneSetEncoder(nn.Module):
     ) -> None:
         if self.compiled_shared_relations_enabled:
             raise RuntimeError('ZoneSetEncoder shared relations are already compiled.')
-        self._compiled_shared_relations = torch.compile(
-            self._compute_shared_relation_tensors,
-            backend=backend,
-            mode=mode,
-            fullgraph=fullgraph,
-            dynamic=dynamic,
-        )
+        wrappers = {
+            'grad': self._grad_shared_relation_tensors,
+            'no_grad': self._no_grad_shared_relation_tensors,
+            'monitor': self._monitor_shared_relation_tensors,
+            'inference_mode': self._inference_mode_shared_relation_tensors,
+        }
+        # Distinct code objects isolate updates, target, monitor and validation
+        # from each other's Dynamo cache entries.
+        self._compiled_shared_relations = {
+            role: torch.compile(
+                wrappers[role],
+                backend=backend,
+                mode=mode,
+                fullgraph=fullgraph,
+                dynamic=dynamic,
+            )
+            for role in SHARED_RELATION_COMPILE_ROLES
+        }
         self._compiled_shared_relations_config = {
             'backend': backend,
             'mode': mode,
             'fullgraph': bool(fullgraph),
             'dynamic': bool(dynamic),
+            'roles': list(SHARED_RELATION_COMPILE_ROLES),
         }
 
     def enable_compiled_tensor_forward(
@@ -566,6 +593,26 @@ class ZoneSetEncoder(nn.Module):
     def _critic_guidance_context_tensors(self, *arguments: torch.Tensor) -> torch.Tensor:
         return self._compute_policy_context_tensors(*arguments)
 
+    def _grad_shared_relation_tensors(
+        self, *arguments: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        return self._compute_shared_relation_tensors(*arguments)
+
+    def _no_grad_shared_relation_tensors(
+        self, *arguments: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        return self._compute_shared_relation_tensors(*arguments)
+
+    def _monitor_shared_relation_tensors(
+        self, *arguments: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        return self._compute_shared_relation_tensors(*arguments)
+
+    def _inference_mode_shared_relation_tensors(
+        self, *arguments: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        return self._compute_shared_relation_tensors(*arguments)
+
     @contextmanager
     def eager_tensor_forward(self) -> Iterator[None]:
         """Temporarily select the original tensor path without disabling compile."""
@@ -576,6 +623,15 @@ class ZoneSetEncoder(nn.Module):
             yield
         finally:
             self._force_eager_tensor_forward = previous
+
+    @contextmanager
+    def monitor_shared_relations(self) -> Iterator[None]:
+        previous = self._monitor_shared_relations
+        self._monitor_shared_relations = True
+        try:
+            yield
+        finally:
+            self._monitor_shared_relations = previous
 
     def _validate_inputs(
         self,
@@ -668,14 +724,23 @@ class ZoneSetEncoder(nn.Module):
         batch_size: int,
         zone_count: int,
     ) -> ZoneSetSharedRelations:
-        tensor_build = (
-            self._compiled_shared_relations
-            if (
-                self._compiled_shared_relations is not None
-                and not self._force_eager_tensor_forward
+        if (
+            self._compiled_shared_relations is not None
+            and not self._force_eager_tensor_forward
+        ):
+            role = _shared_relation_role_for_current_grad_mode(
+                monitor=self._monitor_shared_relations,
             )
-            else self._compute_shared_relation_tensors
-        )
+            compiled_build = self._compiled_shared_relations.get(role)
+            if compiled_build is None:
+                raise RuntimeError(
+                    'Compiled shared relations are missing the '
+                    f'{role!r} entry; shared relations must be compiled for '
+                    f'all of {SHARED_RELATION_COMPILE_ROLES} or not at all.'
+                )
+            tensor_build = compiled_build
+        else:
+            tensor_build = self._compute_shared_relation_tensors
         (
             clean_zone_features,
             pair_relations,
