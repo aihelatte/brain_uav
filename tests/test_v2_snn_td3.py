@@ -387,6 +387,80 @@ class TestV2SNNTD3(unittest.TestCase):
         self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
         self.assertEqual(engine.actor.snn_head.lif2.v, 0.0)
 
+    def test_snn_online_encoder_compile_separates_update_monitor_validation(self) -> None:
+        engine = self.make_engine(time_window=4)
+        engine.enable_actor_compile(backend='eager')
+        encoder = engine.actor.zone_set_encoder
+        entries = encoder._compiled_online_actor_contexts
+        codes = {
+            'training': inspect.unwrap(encoder._compiled_tensor_forward).__code__,
+            **{
+            role: inspect.unwrap(entry).__code__
+            for role, entry in entries.items()
+            },
+        }
+        self.assertEqual(set(codes), {'training', 'monitor', 'validation'})
+        self.assertEqual(len(set(codes.values())), 3)
+        self.assertIs(codes['training'], encoder._online_actor_context_tensors.__code__)
+
+        calls = {role: 0 for role in codes}
+        training_entry = encoder._compiled_tensor_forward
+        def observe_training(*arguments):
+            calls['training'] += 1
+            return training_entry(*arguments)
+        encoder._compiled_tensor_forward = observe_training
+        for role, entry in tuple(entries.items()):
+            def observe(*arguments, _role=role, _entry=entry):
+                calls[_role] += 1
+                return _entry(*arguments)
+            entries[role] = observe
+        for count in (0, 6, 10):
+            batch = collate_v2_observations([_observation(count, self.scales)])
+            engine.actor(batch).sum().backward()
+            with torch.no_grad():
+                monitor_action, monitor_diagnostics = engine.actor.forward_with_diagnostics(batch)
+            with torch.inference_mode():
+                validation_action = engine.actor(batch)
+            with encoder.eager_tensor_forward():
+                with torch.no_grad():
+                    eager_monitor_action, eager_diagnostics = engine.actor.forward_with_diagnostics(batch)
+                with torch.inference_mode():
+                    eager_validation_action = engine.actor(batch)
+            torch.testing.assert_close(monitor_action, eager_monitor_action, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(validation_action, eager_validation_action, rtol=1e-4, atol=1e-5)
+            self.assertEqual(monitor_diagnostics, eager_diagnostics)
+            self.assertEqual(engine.actor.snn_head.lif1.v, 0.0)
+            self.assertEqual(engine.actor.snn_head.lif2.v, 0.0)
+        self.assertEqual(calls, {'training': 3, 'monitor': 3, 'validation': 3})
+        self.assertTrue(any(parameter.grad is not None for parameter in encoder.parameters()))
+
+    def test_snn_online_encoder_warmup_covers_monitor_validation_without_side_effects(self) -> None:
+        engine = self.make_engine(time_window=4)
+        engine.enable_actor_compile(backend='eager')
+        encoder = engine.actor.zone_set_encoder
+        calls = {'monitor': [], 'validation': []}
+        for role in calls:
+            entry = encoder._compiled_online_actor_contexts[role]
+            def observe(*arguments, _role=role, _entry=entry):
+                calls[_role].append((arguments[0].shape[0], arguments[2].shape[1]))
+                return _entry(*arguments)
+            encoder._compiled_online_actor_contexts[role] = observe
+        batches = tuple(collate_v2_observations([
+            _observation(count, self.scales), _observation(count, self.scales),
+        ]) for count in (6, 10))
+        engine.actor.snn_head.lif1.v = torch.tensor([3.0])
+        before = deepcopy(engine.actor.state_dict())
+        torch_rng = torch.random.get_rng_state().clone()
+        engine.warmup_actor_compile(batches)
+        self.assertEqual(set(calls['monitor']), {(1, 0), (1, 6), (1, 10)})
+        self.assertEqual(set(calls['validation']), {(1, 0), (1, 6), (1, 10)})
+        for name, value in engine.actor.state_dict().items():
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+        torch.testing.assert_close(torch.random.get_rng_state(), torch_rng)
+        torch.testing.assert_close(engine.actor.snn_head.lif1.v, torch.tensor([3.0]))
+        self.assertEqual(engine.update_count, 0)
+        self.assertEqual(engine.actor_optimizer.state, {})
+
     def test_snn_action_inference_warmup_restores_persistent_state(self) -> None:
         engine = self.make_engine(time_window=4)
         batches = tuple(collate_v2_observations([

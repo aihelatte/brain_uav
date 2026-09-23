@@ -1862,7 +1862,14 @@ class V2TD3UpdateEngine:
             self.actor_update_count,
             self.last_total_steps,
         )
-        snn_memories = self._actor_graph_snn_memory_snapshot()
+        snn_memories = tuple(
+            (module, name, value.detach().clone() if isinstance(value, torch.Tensor)
+             else deepcopy(value))
+            for actor in actors if isinstance(actor, V2SNNPolicyActor)
+            for module in actor.snn_head.modules()
+            if hasattr(module, 'named_memories')
+            for name, value in module.named_memories()
+        )
         python_rng = random.getstate()
         try:
             self.actor.train()
@@ -1884,6 +1891,23 @@ class V2TD3UpdateEngine:
                             device_batch,
                             shared_relations=shared_relations,
                         )
+            if isinstance(self.actor, V2SNNPolicyActor):
+                self.actor.eval()
+                single_batches = tuple(
+                    _single_observation_batch(batch).to(self.device)
+                    for batch in warmup_batches
+                )
+                if all(batch.max_zone_count != 0 for batch in single_batches):
+                    single_batches = (
+                        _empty_zone_batch(warmup_batches[0]).to(self.device),
+                        *single_batches,
+                    )
+                with torch.no_grad():
+                    for batch in single_batches:
+                        self.actor.forward_with_diagnostics(batch)
+                with torch.inference_mode():
+                    for batch in single_batches:
+                        self.actor(batch)
         finally:
             random.setstate(python_rng)
             for module, name, value in snn_memories:

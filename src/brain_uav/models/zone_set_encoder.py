@@ -475,6 +475,7 @@ class ZoneSetEncoder(nn.Module):
         )
         nn.init.normal_(self.empty_scene_token, mean=0.0, std=0.02)
         self._compiled_tensor_forward: Callable[..., torch.Tensor] | None = None
+        self._compiled_online_actor_contexts: dict[str, Callable[..., torch.Tensor]] = {}
         self._compiled_tensor_forward_config: dict[str, object] | None = None
         self._force_eager_tensor_forward = False
         self._compiled_shared_relations: (
@@ -574,6 +575,21 @@ class ZoneSetEncoder(nn.Module):
             **({'options': options} if options is not None else {}),
         )
         self._compiled_tensor_forward = compiled
+        if role == 'online_actor':
+            self._compiled_online_actor_contexts = {
+                'monitor': torch.compile(
+                    self._online_actor_monitor_context_tensors,
+                    backend=backend, mode=mode, fullgraph=fullgraph,
+                    dynamic=dynamic,
+                    **({'options': options} if options is not None else {}),
+                ),
+                'validation': torch.compile(
+                    self._online_actor_validation_context_tensors,
+                    backend=backend, mode=mode, fullgraph=fullgraph,
+                    dynamic=dynamic,
+                    **({'options': options} if options is not None else {}),
+                ),
+            }
         self._compiled_tensor_forward_config = {
             'backend': backend,
             'mode': mode,
@@ -582,6 +598,12 @@ class ZoneSetEncoder(nn.Module):
         }
 
     def _online_actor_context_tensors(self, *arguments: torch.Tensor) -> torch.Tensor:
+        return self._compute_policy_context_tensors(*arguments)
+
+    def _online_actor_monitor_context_tensors(self, *arguments: torch.Tensor) -> torch.Tensor:
+        return self._compute_policy_context_tensors(*arguments)
+
+    def _online_actor_validation_context_tensors(self, *arguments: torch.Tensor) -> torch.Tensor:
         return self._compute_policy_context_tensors(*arguments)
 
     def _bc_reference_context_tensors(self, *arguments: torch.Tensor) -> torch.Tensor:
@@ -1103,14 +1125,18 @@ class ZoneSetEncoder(nn.Module):
             relation_pair_mask,
         )
         if not diagnostics and not profile_sections:
-            tensor_forward = (
-                self._compiled_tensor_forward
-                if (
-                    self._compiled_tensor_forward is not None
-                    and not self._force_eager_tensor_forward
-                )
-                else self._compute_policy_context_tensors
-            )
+            if self._compiled_tensor_forward is None or self._force_eager_tensor_forward:
+                tensor_forward = self._compute_policy_context_tensors
+            elif self._compiled_online_actor_contexts and torch.is_inference_mode_enabled():
+                tensor_forward = self._compiled_online_actor_contexts['validation']
+            elif (
+                self._compiled_online_actor_contexts
+                and self._monitor_shared_relations
+                and not torch.is_grad_enabled()
+            ):
+                tensor_forward = self._compiled_online_actor_contexts['monitor']
+            else:
+                tensor_forward = self._compiled_tensor_forward
             return tensor_forward(*tensor_arguments)
 
         if profile_sections:
