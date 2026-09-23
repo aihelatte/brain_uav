@@ -472,7 +472,7 @@ def load_v2_validation_pool(
     return pool
 
 
-def validation_passes(failure_count: int, *, max_failures: int = 6) -> bool:
+def validation_passes(failure_count: int, *, max_failures: int = 5) -> bool:
     failures = _nonnegative_int(failure_count, name='failure_count')
     maximum = _nonnegative_int(max_failures, name='max_failures')
     return failures <= maximum
@@ -498,7 +498,7 @@ def evaluate_v2_fixed_validation(
     pool: V2ValidationPool,
     rewards: RewardConfig,
     *,
-    max_failures: int = 6,
+    max_failures: int = 5,
     device: str | torch.device = 'cpu',
     reporter: V2ExperimentReporter | None = None,
 ) -> V2ValidationResult:

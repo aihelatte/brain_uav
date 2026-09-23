@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--window-episodes', type=int, default=15)
     parser.add_argument('--consecutive-windows', type=int, default=4)
     parser.add_argument('--max-failures-per-window', type=int, default=1)
-    parser.add_argument('--validation-max-failures', type=int, default=6)
+    parser.add_argument('--validation-max-failures', type=int, default=5)
     # These default to the 2026-09-22-verified full compile + CUDA Graph
     # combination (see default_v2_cuda_graph_compilation below) unless
     # explicitly overridden with --no-<flag>. compile_critic_encoder,
@@ -391,7 +391,7 @@ def run_v2_td3_stage(
     window_episodes: int = 15,
     consecutive_windows: int = 4,
     max_failures_per_window: int = 1,
-    validation_max_failures: int = 6,
+    validation_max_failures: int = 5,
     scenario: ScenarioConfig | None = None,
     rewards: RewardConfig | None = None,
     uav_collision_radius: float | None = None,

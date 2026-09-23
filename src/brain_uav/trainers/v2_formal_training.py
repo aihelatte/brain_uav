@@ -211,7 +211,7 @@ class V2FormalTrainingConfig:
     max_failures_per_window: int = 1
     consecutive_qualified_windows: int = 4
     early_stop_min_steps: int = 125_000
-    validation_max_failures: int = 6
+    validation_max_failures: int = 5
 
     def __post_init__(self) -> None:
         if self.stage not in V2_TD3_STAGES:

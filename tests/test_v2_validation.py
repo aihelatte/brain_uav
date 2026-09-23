@@ -234,6 +234,8 @@ class TestV2Validation(unittest.TestCase):
                 load_v2_validation_pool(path, expected_level='easy')
 
     def test_validation_threshold_is_only_failure_count(self):
+        self.assertTrue(validation_passes(5))
+        self.assertFalse(validation_passes(6))
         self.assertTrue(validation_passes(6, max_failures=6))
         self.assertFalse(validation_passes(7, max_failures=6))
         with self.assertRaises(ValueError):

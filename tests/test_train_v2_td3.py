@@ -183,7 +183,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertEqual(args.window_episodes, 15)
         self.assertEqual(args.consecutive_windows, 4)
         self.assertEqual(args.max_failures_per_window, 1)
-        self.assertEqual(args.validation_max_failures, 6)
+        self.assertEqual(args.validation_max_failures, 5)
         self.assertFalse(args.compile_critic_encoder)
         self.assertFalse(args.compile_target_encoders)
         self.assertFalse(args.pinned_batch_transfer)

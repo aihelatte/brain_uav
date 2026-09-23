@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +17,7 @@ from brain_uav.models import V2ANNPolicyActor, V2SNNPolicyActor
 from brain_uav.observations import V2ObservationScales
 from brain_uav.scripts.run_v2_td3_curriculum import (
     build_parser,
+    main,
     prepare_v2_validation_pools,
     run_v2_curriculum,
 )
@@ -109,7 +112,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertEqual(args.snn_time_window, 4)
         self.assertFalse(args.pinned_batch_transfer)
         self.assertFalse(args.aggregate_relation_values_first)
-        self.assertEqual(args.periodic_snapshot_interval_steps, 50_000)
+        self.assertEqual(args.periodic_snapshot_interval_steps, 150_000)
         # D1 (this diagnostic pass): tri-state, resolved by
         # _resolve_v2_cuda_graph_compilation in main() against the
         # 2026-09-22-verified default combination, same as train_v2_td3.py.
@@ -123,6 +126,61 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         ):
             with self.subTest(flag=name):
                 self.assertIsNone(getattr(args, name))
+
+    def test_periodic_snapshot_interval_explicit_and_zero_parsing(self):
+        parser = build_parser()
+        base = [
+            '--bc-checkpoint', 'bc.pt',
+            '--output-root', 'run',
+            '--validation-pool-dir', 'validation',
+        ]
+        self.assertEqual(
+            parser.parse_args(
+                base + ['--periodic-snapshot-interval-steps', '123456']
+            ).periodic_snapshot_interval_steps,
+            123456,
+        )
+        self.assertEqual(
+            parser.parse_args(
+                base + ['--periodic-snapshot-interval-steps', '0']
+            ).periodic_snapshot_interval_steps,
+            0,
+        )
+
+    def test_main_passes_explicit_periodic_interval_through_and_zero_disables_both(self):
+        base = [
+            '--bc-checkpoint', 'bc.pt',
+            '--output-root', 'run',
+            '--validation-pool-dir', 'validation',
+        ]
+        for raw, expected in (('0', None), ('123456', 123456)):
+            with self.subTest(raw=raw):
+                captured = {}
+
+                def fake_curriculum(**kwargs):
+                    captured.update(kwargs)
+                    return {'passed': True}
+
+                buffer = io.StringIO()
+                with mock.patch(
+                    'brain_uav.scripts.run_v2_td3_curriculum.resolve_training_device',
+                    return_value='cpu',
+                ), mock.patch(
+                    'brain_uav.scripts.run_v2_td3_curriculum.run_v2_curriculum',
+                    side_effect=fake_curriculum,
+                ), contextlib.redirect_stdout(buffer):
+                    exit_code = main(base + [
+                        '--periodic-snapshot-interval-steps', raw,
+                    ])
+                self.assertEqual(exit_code, 0)
+                if expected is None:
+                    self.assertIsNone(
+                        captured['periodic_snapshot_interval_steps']
+                    )
+                else:
+                    self.assertEqual(
+                        captured['periodic_snapshot_interval_steps'], expected
+                    )
 
     def test_snn_curriculum_uses_distinct_outputs_and_forwards_model_contract(self):
         calls = []

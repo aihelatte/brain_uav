@@ -91,7 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--periodic-snapshot-interval-steps',
         type=int,
-        default=50_000,
+        default=150_000,
         help=(
             'Purely observational: save a mid-stage checkpoint and run a '
             'non-gating fixed validation every N steps in each stage. '
