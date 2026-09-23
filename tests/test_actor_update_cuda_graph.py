@@ -34,12 +34,52 @@ class TestActorUpdateGraph(unittest.TestCase):
         engine.device = torch.device('cpu')
         return calls, metadata
 
+    def test_snn_monitor_validation_compile_without_cudagraphs(self):
+        for snn in (False, True):
+            with self.subTest(snn=snn):
+                engine = self.make_engine(snn)
+                calls, _ = self.configure(engine)
+                actor_calls = {
+                    fn.__name__: (fn, kwargs)
+                    for fn, kwargs in calls
+                    if fn.__name__ in (
+                        '_online_actor_context_tensors',
+                        '_online_actor_monitor_context_tensors',
+                        '_online_actor_validation_context_tensors',
+                        '_compute_full_forward_tensors',
+                    )
+                }
+                if snn:
+                    self.assertEqual(set(actor_calls), {
+                        '_online_actor_context_tensors',
+                        '_online_actor_monitor_context_tensors',
+                        '_online_actor_validation_context_tensors',
+                    })
+                    self.assertEqual(len({fn.__code__ for fn, _ in actor_calls.values()}), 3)
+                    self.assertEqual(
+                        actor_calls['_online_actor_context_tensors'][1]['options'],
+                        {'triton.cudagraphs': True},
+                    )
+                    for role in ('monitor', 'validation'):
+                        kwargs = actor_calls[f'_online_actor_{role}_context_tensors'][1]
+                        self.assertEqual(kwargs['backend'], 'inductor')
+                        self.assertEqual(kwargs['options'], {'triton.cudagraphs': False})
+                else:
+                    self.assertEqual(set(actor_calls), {'_compute_full_forward_tensors'})
+                    self.assertEqual(
+                        actor_calls['_compute_full_forward_tensors'][1]['options'],
+                        {'triton.cudagraphs': True},
+                    )
+
     def test_wiring_and_real_cpu_gradient_boundaries(self):
         for snn in (False, True):
             with self.subTest(snn=snn):
                 engine = self.make_engine(snn)
                 calls, metadata = self.configure(engine)
-                graph_calls = [kw for _, kw in calls if kw.get('options')]
+                graph_calls = [
+                    kw for _, kw in calls
+                    if kw.get('options') == {'triton.cudagraphs': True}
+                ]
                 self.assertEqual(len(graph_calls), 4)  # critic + three new blocks
                 self.assertTrue(metadata['cuda_graph_actor_update'])
                 self.assertIsNone(engine._compiled_action_inference)

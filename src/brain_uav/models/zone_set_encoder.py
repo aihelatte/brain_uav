@@ -576,18 +576,22 @@ class ZoneSetEncoder(nn.Module):
         )
         self._compiled_tensor_forward = compiled
         if role == 'online_actor':
+            observation_options = (
+                {**(options or {}), 'triton.cudagraphs': False}
+                if backend == 'inductor' else options
+            )
             self._compiled_online_actor_contexts = {
                 'monitor': torch.compile(
                     self._online_actor_monitor_context_tensors,
                     backend=backend, mode=mode, fullgraph=fullgraph,
                     dynamic=dynamic,
-                    **({'options': options} if options is not None else {}),
+                    **({'options': observation_options} if observation_options is not None else {}),
                 ),
                 'validation': torch.compile(
                     self._online_actor_validation_context_tensors,
                     backend=backend, mode=mode, fullgraph=fullgraph,
                     dynamic=dynamic,
-                    **({'options': options} if options is not None else {}),
+                    **({'options': observation_options} if observation_options is not None else {}),
                 ),
             }
         self._compiled_tensor_forward_config = {
