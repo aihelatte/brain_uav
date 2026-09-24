@@ -38,6 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--validation-seed', type=int, default=20260904)
     parser.add_argument('--max-stage', choices=('easy', 'medium', 'hard'), default='hard')
+    parser.add_argument('--easy-max-stage-steps', type=int, default=None)
+    parser.add_argument('--medium-max-stage-steps', type=int, default=None)
     parser.add_argument('--medium-gamma', type=float, default=0.99)
     parser.add_argument('--medium-failure-sample-bias', type=float, default=1.0)
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
@@ -103,6 +105,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _stage_training_parameters(
+    *,
+    max_stage: str,
+    easy_max_stage_steps: int | None,
+    medium_max_stage_steps: int | None,
+    medium_gamma: float,
+    medium_failure_sample_bias: float,
+) -> dict[str, dict[str, int | float]]:
+    configs = {
+        'easy': V2FormalTrainingConfig(
+            stage='easy', max_steps=easy_max_stage_steps,
+        ),
+        'medium': V2FormalTrainingConfig(
+            stage='medium',
+            max_steps=medium_max_stage_steps,
+            gamma=medium_gamma,
+            failure_sample_bias=medium_failure_sample_bias,
+        ),
+        'hard': V2FormalTrainingConfig(stage='hard'),
+    }
+    return {
+        stage: {
+            'max_stage_steps': configs[stage].max_steps,
+            'gamma': configs[stage].gamma,
+            'failure_sample_bias': configs[stage].failure_sample_bias,
+        }
+        for stage in v2_stage_sequence(max_stage)
+    }
+
+
 def _write_json(path: Path, payload: Any) -> None:
     if path.exists():
         raise FileExistsError(f'Curriculum summary already exists: {path}')
@@ -161,6 +193,8 @@ def run_v2_curriculum(
     seed: int = 7,
     validation_seed: int = 20260904,
     max_stage: str = 'hard',
+    easy_max_stage_steps: int | None = None,
+    medium_max_stage_steps: int | None = None,
     medium_gamma: float = 0.99,
     medium_failure_sample_bias: float = 1.0,
     device: str = 'auto',
@@ -222,20 +256,13 @@ def run_v2_curriculum(
     if model == 'snn':
         require_v2_spikingjelly()
     stages = v2_stage_sequence(max_stage)
-    medium_config = V2FormalTrainingConfig(
-        stage='medium',
-        gamma=medium_gamma,
-        failure_sample_bias=medium_failure_sample_bias,
+    stage_training_parameters = _stage_training_parameters(
+        max_stage=max_stage,
+        easy_max_stage_steps=easy_max_stage_steps,
+        medium_max_stage_steps=medium_max_stage_steps,
+        medium_gamma=medium_gamma,
+        medium_failure_sample_bias=medium_failure_sample_bias,
     )
-    stage_training_parameters = {
-        stage: {
-            'gamma': medium_config.gamma if stage == 'medium' else 0.99,
-            'failure_sample_bias': (
-                medium_config.failure_sample_bias if stage == 'medium' else 1.0
-            ),
-        }
-        for stage in stages
-    }
     bc_path = Path(bc_checkpoint)
     if not bc_path.is_file():
         raise FileNotFoundError(f'V2 BC checkpoint does not exist: {bc_path}')
@@ -320,6 +347,11 @@ def run_v2_curriculum(
             global_steps_start=global_steps,
             model=model,
             snn_time_window=effective_snn_time_window,
+            max_stage_steps=(
+                easy_max_stage_steps if stage == 'easy'
+                else medium_max_stage_steps if stage == 'medium'
+                else None
+            ),
             gamma=stage_training_parameters[stage]['gamma'],
             failure_sample_bias=(
                 stage_training_parameters[stage]['failure_sample_bias']
@@ -407,6 +439,13 @@ def run_v2_curriculum(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    stage_training_parameters = _stage_training_parameters(
+        max_stage=args.max_stage,
+        easy_max_stage_steps=args.easy_max_stage_steps,
+        medium_max_stage_steps=args.medium_max_stage_steps,
+        medium_gamma=args.medium_gamma,
+        medium_failure_sample_bias=args.medium_failure_sample_bias,
+    )
     resolved_device = resolve_training_device(args.device)
     print(json.dumps({
         'requested_device': args.device,
@@ -417,6 +456,7 @@ def main(argv: list[str] | None = None) -> int:
             'gamma': args.medium_gamma,
             'failure_sample_bias': args.medium_failure_sample_bias,
         },
+        'stage_training_parameters': stage_training_parameters,
     }, indent=2))
     compilation = _resolve_v2_cuda_graph_compilation(args, resolved_device=resolved_device)
     print(json.dumps({'resolved_compilation_defaults': compilation}, indent=2))
@@ -427,6 +467,8 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         validation_seed=args.validation_seed,
         max_stage=args.max_stage,
+        easy_max_stage_steps=args.easy_max_stage_steps,
+        medium_max_stage_steps=args.medium_max_stage_steps,
         medium_gamma=args.medium_gamma,
         medium_failure_sample_bias=args.medium_failure_sample_bias,
         device=args.device,

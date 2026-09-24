@@ -5,6 +5,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 import contextlib
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -24,6 +25,7 @@ from brain_uav.scripts.run_v2_td3_curriculum import (
 from brain_uav.trainers.v2_validation import derive_validation_stage_seed
 from brain_uav.trainers.v2_formal_training import (
     V2BCFormalInitialization,
+    V2FormalTrainingConfig,
     V2PreparedStageInitialization,
 )
 from brain_uav.v2_curriculum import derive_v2_component_seed
@@ -112,6 +114,8 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertEqual(args.snn_time_window, 4)
         self.assertEqual(args.medium_gamma, 0.99)
         self.assertEqual(args.medium_failure_sample_bias, 1.0)
+        self.assertIsNone(args.easy_max_stage_steps)
+        self.assertIsNone(args.medium_max_stage_steps)
         self.assertFalse(args.pinned_batch_transfer)
         self.assertFalse(args.aggregate_relation_values_first)
         self.assertEqual(args.periodic_snapshot_interval_steps, 150_000)
@@ -128,6 +132,17 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         ):
             with self.subTest(flag=name):
                 self.assertIsNone(getattr(args, name))
+
+    def test_parser_accepts_explicit_easy_and_medium_step_limits(self):
+        args = build_parser().parse_args([
+            '--bc-checkpoint', 'bc.pt',
+            '--output-root', 'run',
+            '--validation-pool-dir', 'validation',
+            '--easy-max-stage-steps', '500000',
+            '--medium-max-stage-steps', '500000',
+        ])
+        self.assertEqual(args.easy_max_stage_steps, 500_000)
+        self.assertEqual(args.medium_max_stage_steps, 500_000)
 
     def test_periodic_snapshot_interval_explicit_and_zero_parsing(self):
         parser = build_parser()
@@ -457,8 +472,18 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertEqual(calls[0]['device'], 'cpu')
         self.assertEqual(calls[0]['gamma'], 0.99)
         self.assertEqual(calls[0]['failure_sample_bias'], 1.0)
+        self.assertIsNone(calls[0]['max_stage_steps'])
         self.assertEqual(calls[1]['gamma'], 0.995)
         self.assertEqual(calls[1]['failure_sample_bias'], 3.0)
+        self.assertIsNone(calls[1]['max_stage_steps'])
+        self.assertEqual(
+            summary['stage_training_parameters']['easy']['max_stage_steps'],
+            V2FormalTrainingConfig(stage='easy').max_steps,
+        )
+        self.assertEqual(
+            summary['stage_training_parameters']['medium']['max_stage_steps'],
+            V2FormalTrainingConfig(stage='medium').max_steps,
+        )
         self.assertFalse(summary['passed'])
         self.assertEqual(summary['failed_stage'], 'medium')
         self.assertEqual(len(summary['stages']), 2)
@@ -472,26 +497,48 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         )
 
     def test_main_forwards_medium_only_experiment_parameters(self):
+        stdout = io.StringIO()
         with mock.patch(
             'brain_uav.scripts.run_v2_td3_curriculum.resolve_training_device',
             return_value='cpu',
         ), mock.patch(
             'brain_uav.scripts.run_v2_td3_curriculum.run_v2_curriculum',
             return_value={'passed': True},
-        ) as curriculum_runner:
+        ) as curriculum_runner, contextlib.redirect_stdout(stdout):
             result = main([
                 '--bc-checkpoint', 'bc.pt',
                 '--output-root', 'run',
                 '--validation-pool-dir', 'validation',
                 '--device', 'cpu',
-                '--medium-gamma', '0.995',
-                '--medium-failure-sample-bias', '3.0',
+                '--easy-max-stage-steps', '500000',
+                '--medium-max-stage-steps', '500000',
+                '--medium-gamma', '0.99',
+                '--medium-failure-sample-bias', '1.5',
             ])
         self.assertEqual(result, 0)
-        self.assertEqual(curriculum_runner.call_args.kwargs['medium_gamma'], 0.995)
+        self.assertEqual(curriculum_runner.call_args.kwargs['easy_max_stage_steps'], 500_000)
+        self.assertEqual(curriculum_runner.call_args.kwargs['medium_max_stage_steps'], 500_000)
+        self.assertEqual(curriculum_runner.call_args.kwargs['medium_gamma'], 0.99)
         self.assertEqual(
             curriculum_runner.call_args.kwargs['medium_failure_sample_bias'],
-            3.0,
+            1.5,
+        )
+        startup, _ = json.JSONDecoder().raw_decode(stdout.getvalue())
+        self.assertEqual(
+            startup['stage_training_parameters']['easy'],
+            {
+                'max_stage_steps': 500_000,
+                'gamma': 0.99,
+                'failure_sample_bias': 1.0,
+            },
+        )
+        self.assertEqual(
+            startup['stage_training_parameters']['medium'],
+            {
+                'max_stage_steps': 500_000,
+                'gamma': 0.99,
+                'failure_sample_bias': 1.5,
+            },
         )
 
     def test_existing_validation_pool_is_loaded_with_command_seed_contract(self):
@@ -517,7 +564,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
             derive_validation_stage_seed(81, 'easy'),
         )
 
-    def test_auto_device_is_resolved_before_stage_runner(self):
+    def test_stage_specific_limits_and_medium_bias_reach_only_their_stages(self):
         calls = []
 
         def fake_stage(**kwargs):
@@ -572,15 +619,60 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                     bc_checkpoint=bc,
                     output_root=root / 'run',
                     validation_pool_dir=root / 'pools',
-                    max_stage='easy',
+                    max_stage='hard',
                     device='auto',
+                    easy_max_stage_steps=500_000,
+                    medium_max_stage_steps=400_000,
+                    medium_failure_sample_bias=1.5,
                     stage_runner=fake_stage,
                 )
 
+        self.assertEqual([call['stage'] for call in calls], ['easy', 'medium', 'hard'])
+        self.assertEqual([call['max_stage_steps'] for call in calls], [500_000, 400_000, None])
+        self.assertEqual([call['gamma'] for call in calls], [0.99, 0.99, 0.99])
+        self.assertEqual([call['failure_sample_bias'] for call in calls], [1.0, 1.5, 1.0])
+        self.assertEqual(
+            [
+                summary['stage_training_parameters'][stage]['max_stage_steps']
+                for stage in ('easy', 'medium', 'hard')
+            ],
+            [500_000, 400_000, V2FormalTrainingConfig(stage='hard').max_steps],
+        )
+        self.assertEqual(
+            [
+                summary['stage_training_parameters'][stage]['gamma']
+                for stage in ('easy', 'medium', 'hard')
+            ],
+            [0.99, 0.99, 0.99],
+        )
+        self.assertEqual(
+            [
+                summary['stage_training_parameters'][stage]['failure_sample_bias']
+                for stage in ('easy', 'medium', 'hard')
+            ],
+            [1.0, 1.5, 1.0],
+        )
         self.assertEqual(calls[0]['device'], 'cuda')
         self.assertNotEqual(calls[0]['device'], 'auto')
         self.assertEqual(summary['requested_device'], 'auto')
         self.assertEqual(summary['resolved_device'], 'cuda')
+
+    def test_stage_step_limits_reject_nonpositive_or_noninteger_values(self):
+        for overrides in (
+            {'easy_max_stage_steps': 0},
+            {'medium_max_stage_steps': 1.5},
+        ):
+            with self.subTest(overrides=overrides), self.assertRaisesRegex(
+                ValueError,
+                'max_steps',
+            ):
+                run_v2_curriculum(
+                    bc_checkpoint='missing.pt',
+                    output_root='run',
+                    validation_pool_dir='validation',
+                    max_stage='easy',
+                    **overrides,
+                )
 
     def test_curriculum_has_no_candidate_racing_or_automatic_seed_change(self):
         parser = build_parser()
