@@ -65,6 +65,9 @@ def _payload(
     goal=(5.0, 0.0, 10.0),
     zones=(),
     scenario_seed=17,
+    requested_direct_path_blocker=False,
+    direct_path_blocker_count=None,
+    feasibility_check='direct_safe_corridor',
 ) -> dict[str, object]:
     return {
         'format': V2_ENV_SCENARIO_FORMAT,
@@ -90,9 +93,14 @@ def _payload(
             'shape_counts': {},
             'overlap_allowed': False,
             'aabb_overlap_pair_count': 0,
-            'direct_path_blocker_count': 0,
+            'requested_direct_path_blocker': requested_direct_path_blocker,
+            'direct_path_blocker_count': (
+                (1 if requested_direct_path_blocker else 0)
+                if direct_path_blocker_count is None
+                else direct_path_blocker_count
+            ),
             'feasibility_passed': True,
-            'feasibility_check': 'direct_safe_corridor',
+            'feasibility_check': feasibility_check,
         },
     }
 
@@ -242,6 +250,51 @@ class TestEasyScenarioPool(unittest.TestCase):
                     path,
                     _pool([payload], scenario=scenario),
                 )
+            self.assertFalse(path.exists())
+
+    def test_blocked_easy_scenario_is_accepted_when_metadata_matches_geometry(self) -> None:
+        scenario = _config(corridor_blocking_margin=0.5)
+        payload = _payload(
+            zones=(NoFlyZone('blocker', Sphere([0.0, 0.0, 10.0], 0.4)),),
+            requested_direct_path_blocker=True,
+            feasibility_check='sparse_visibility_graph',
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'blocked.json'
+            save_easy_scenario_pool(path, _pool([payload], scenario=scenario))
+            loaded = load_easy_scenario_pool(path)
+        self.assertEqual(
+            loaded['scenarios'][0]['payload']['metadata'][
+                'direct_path_blocker_count'
+            ],
+            1,
+        )
+
+    def test_blocked_easy_without_actual_blocker_is_rejected(self) -> None:
+        scenario = _config(corridor_blocking_margin=0.5)
+        payload = _payload(
+            zones=(NoFlyZone('side-zone', Sphere([0.0, 5.0, 10.0], 1.0)),),
+            requested_direct_path_blocker=True,
+            feasibility_check='sparse_visibility_graph',
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'forged-blocked.json'
+            with self.assertRaisesRegex(ValueError, 'actual direct path blocker'):
+                save_easy_scenario_pool(path, _pool([payload], scenario=scenario))
+            self.assertFalse(path.exists())
+
+    def test_blocked_easy_cannot_claim_direct_safe_corridor(self) -> None:
+        scenario = _config(corridor_blocking_margin=0.5)
+        payload = _payload(
+            zones=(NoFlyZone('blocker', Sphere([0.0, 0.0, 10.0], 0.4)),),
+            requested_direct_path_blocker=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'bad-feasibility.json'
+            with self.assertRaisesRegex(
+                ValueError, 'direct_safe_corridor feasibility_check'
+            ):
+                save_easy_scenario_pool(path, _pool([payload], scenario=scenario))
             self.assertFalse(path.exists())
 
     def test_actual_aabb_overlap_cannot_hide_behind_zero_metadata(self) -> None:

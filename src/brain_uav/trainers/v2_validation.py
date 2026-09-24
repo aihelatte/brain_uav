@@ -74,6 +74,7 @@ _METADATA_FIELDS = {
     'requested_reference_scales',
     'overlap_allowed',
     'aabb_overlap_pair_count',
+    'requested_direct_path_blocker',
     'direct_path_blocker_count',
     'feasibility_check',
     'feasibility_passed',
@@ -177,7 +178,12 @@ def scenario_config_from_snapshot(value: Any) -> ScenarioConfig:
     return result
 
 
-def _validate_scenario_payload(payload: Any, *, stage: str) -> dict[str, Any]:
+def _validate_scenario_payload(
+    payload: Any,
+    *,
+    stage: str,
+    corridor_blocking_margin: float,
+) -> dict[str, Any]:
     copied = _strict_json_copy(payload)
     if not isinstance(copied, dict) or set(copied) != _PAYLOAD_FIELDS:
         raise ValueError('Validation scenario payload has missing or unknown fields.')
@@ -238,6 +244,10 @@ def _validate_scenario_payload(payload: Any, *, stage: str) -> dict[str, Any]:
         raise ValueError('Validation scenario shape_counts are inconsistent.')
     if type(metadata['overlap_allowed']) is not bool:
         raise ValueError('Validation scenario overlap_allowed must be bool.')
+    if type(metadata['requested_direct_path_blocker']) is not bool:
+        raise ValueError(
+            'Validation scenario requested_direct_path_blocker must be bool.'
+        )
     for name in (
         'aabb_overlap_pair_count',
         'direct_path_blocker_count',
@@ -259,13 +269,54 @@ def _validate_scenario_payload(payload: Any, *, stage: str) -> dict[str, Any]:
     ):
         raise ValueError('Validation scenario rejection_counts is invalid.')
     scenario_seed = _nonnegative_int(metadata['scenario_seed'], name='scenario_seed')
-    if stage == 'easy':
-        if metadata['overlap_allowed'] or metadata['direct_path_blocker_count'] != 0:
-            raise ValueError('Easy validation scenarios must preserve direct safe corridors.')
+    if stage == 'easy' and metadata['overlap_allowed']:
+        raise ValueError('Easy validation scenarios must not allow zone overlap.')
     if stage == 'hard' and not metadata['overlap_allowed']:
         raise ValueError('Hard validation scenarios must allow natural overlap.')
-    if stage in ('medium', 'hard') and len(zones) > 0 and metadata['direct_path_blocker_count'] < 1:
-        raise ValueError('Non-empty medium/hard validation scenarios require a blocker.')
+    requested_blocker = metadata['requested_direct_path_blocker']
+    blocker_count = metadata['direct_path_blocker_count']
+    if requested_blocker and blocker_count < 1:
+        raise ValueError(
+            'Validation scenarios requesting a blocker need '
+            'direct_path_blocker_count >= 1.'
+        )
+    if not requested_blocker and blocker_count != 0:
+        raise ValueError(
+            'Validation scenarios without a requested blocker need '
+            'direct_path_blocker_count == 0.'
+        )
+    if (
+        not requested_blocker
+        and metadata['feasibility_check'] != 'direct_safe_corridor'
+    ):
+        raise ValueError(
+            'Validation scenarios without a requested blocker must use the '
+            'direct_safe_corridor feasibility check.'
+        )
+    if (
+        requested_blocker
+        and metadata['feasibility_check'] == 'direct_safe_corridor'
+    ):
+        raise ValueError(
+            'Validation scenarios requesting a blocker must not use the '
+            'direct_safe_corridor feasibility check.'
+        )
+    if stage == 'hard' and len(zones) > 0 and blocker_count < 1:
+        raise ValueError('Non-empty hard validation scenarios require a blocker.')
+    actual_blocker_count = sum(
+        zone.violates_segment(
+            np.asarray(copied['state'], dtype=np.float64)[:3],
+            np.asarray(copied['goal'], dtype=np.float64),
+            uav_radius=corridor_blocking_margin,
+        )
+        for zone in zones
+    )
+    if actual_blocker_count != blocker_count:
+        raise ValueError(
+            'actual direct path blocker count '
+            f'{actual_blocker_count} does not match metadata '
+            f'direct_path_blocker_count={blocker_count}.'
+        )
     copied['metadata']['scenario_seed'] = scenario_seed
     return copied
 
@@ -315,7 +366,11 @@ class V2ValidationPool:
             if sequence_index != expected_index:
                 raise ValueError('Validation scenario sequence_index is not contiguous.')
             scenario_seed = _nonnegative_int(copied['scenario_seed'], name='scenario_seed')
-            payload = _validate_scenario_payload(copied['payload'], stage=self.curriculum_level)
+            payload = _validate_scenario_payload(
+                copied['payload'],
+                stage=self.curriculum_level,
+                corridor_blocking_margin=float(scenario.corridor_blocking_margin),
+            )
             if payload['metadata']['scenario_seed'] != scenario_seed:
                 raise ValueError('Validation scenario_seed disagrees with payload metadata.')
             records.append({

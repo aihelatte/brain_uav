@@ -265,9 +265,7 @@ def _validate_easy_scenario_payload(
         'effective_curriculum_level': 'easy',
         'overlap_allowed': False,
         'aabb_overlap_pair_count': 0,
-        'direct_path_blocker_count': 0,
         'feasibility_passed': True,
-        'feasibility_check': 'direct_safe_corridor',
     }
     for key, expected in required_metadata.items():
         actual = metadata.get(key)
@@ -275,6 +273,40 @@ def _validate_easy_scenario_payload(
             raise ValueError(
                 f'Scenario metadata field {key!r} must equal {expected!r}.'
             )
+    requested_blocker = metadata.get('requested_direct_path_blocker')
+    if type(requested_blocker) is not bool:
+        raise ValueError(
+            'Scenario metadata requested_direct_path_blocker must be bool.'
+        )
+    claimed_blocker_count = metadata.get('direct_path_blocker_count')
+    if type(claimed_blocker_count) is not int or claimed_blocker_count < 0:
+        raise ValueError(
+            'Scenario metadata direct_path_blocker_count must be a '
+            'non-negative integer.'
+        )
+    if requested_blocker and claimed_blocker_count < 1:
+        raise ValueError(
+            'requested_direct_path_blocker requires direct_path_blocker_count >= 1.'
+        )
+    if not requested_blocker and claimed_blocker_count != 0:
+        raise ValueError(
+            'Unblocked V2 easy scenarios require direct_path_blocker_count == 0.'
+        )
+    feasibility_check = metadata.get('feasibility_check')
+    if type(feasibility_check) is not str or not feasibility_check:
+        raise ValueError(
+            'Scenario metadata feasibility_check must be a non-empty string.'
+        )
+    if not requested_blocker and feasibility_check != 'direct_safe_corridor':
+        raise ValueError(
+            'Unblocked V2 easy scenarios must use the direct_safe_corridor '
+            'feasibility_check.'
+        )
+    if requested_blocker and feasibility_check == 'direct_safe_corridor':
+        raise ValueError(
+            'Blocked V2 easy scenarios must not use the direct_safe_corridor '
+            'feasibility_check.'
+        )
     requested_count = metadata.get('requested_zone_count')
     effective_count = metadata.get('effective_zone_count')
     if (
@@ -322,8 +354,6 @@ def _validate_easy_scenario_payload(
             f'{actual_blocker_count} does not match metadata '
             f'direct_path_blocker_count={metadata["direct_path_blocker_count"]}.'
         )
-    if actual_blocker_count != 0:
-        raise ValueError('actual direct path blocker count must be zero for V2 easy.')
     return _strict_json_copy(payload)
 
 

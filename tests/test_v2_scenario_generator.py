@@ -10,8 +10,10 @@ import numpy as np
 
 from brain_uav.config import ScenarioConfig
 from brain_uav.envs.v2_scenario_generator import (
+    DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES,
     DEFAULT_V2_SHAPE_PROBABILITIES,
     DEFAULT_V2_ZONE_COUNT_PROBABILITIES,
+    V2_SCENARIO_GENERATOR_VERSION,
     V2ScenarioGenerator,
     V2ScenarioGeneratorConfig,
     V2ScenarioGenerationError,
@@ -45,6 +47,12 @@ def _forced_counts(level: str, count: int):
     return result
 
 
+def _forced_blocker(level: str, value: float):
+    result = dict(DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES)
+    result[level] = value
+    return result
+
+
 def _forced_shape(shape_type: str):
     return {name: float(name == shape_type) for name in SHAPE_TYPES}
 
@@ -57,12 +65,22 @@ def _generator(
     seed: int = 7,
     ground_probability: float = 0.5,
     overlap_probability: float = 0.10,
+    blocker_probability: float | None = None,
 ):
+    if blocker_probability is None:
+        blocker = dict(DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES)
+        if count == 0 and level != 'hard':
+            # Easy/medium targets are overall rates; hard keeps its 1.0
+            # always-block sentinel even when this helper forces no zones.
+            blocker[level] = 0.0
+    else:
+        blocker = _forced_blocker(level, blocker_probability)
     config = V2ScenarioGeneratorConfig(
         zone_count_probabilities=_forced_counts(level, count),
         shape_probabilities=_forced_shape(shape_type),
         ground_contact_probability=ground_probability,
         medium_overlap_probability=overlap_probability,
+        direct_path_blocker_probability=blocker,
     )
     return V2ScenarioGenerator(
         ScenarioConfig(),
@@ -87,7 +105,29 @@ class TestV2ScenarioGeneratorConfiguration(unittest.TestCase):
             },
         )
         self.assertEqual(DEFAULT_V2_SHAPE_PROBABILITIES, {name: 0.2 for name in SHAPE_TYPES})
-        V2ScenarioGeneratorConfig()
+        self.assertEqual(
+            DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES,
+            {'easy': 0.50, 'medium': 0.80, 'hard': 1.00},
+        )
+        self.assertEqual(V2_SCENARIO_GENERATOR_VERSION, 2)
+        config = V2ScenarioGeneratorConfig()
+        self.assertAlmostEqual(
+            config.direct_path_blocker_probability_nonzero['easy'],
+            0.50 / 0.95,
+        )
+        self.assertAlmostEqual(
+            config.direct_path_blocker_probability_nonzero['easy'] * 0.95,
+            0.50,
+        )
+        self.assertAlmostEqual(
+            config.direct_path_blocker_probability_nonzero['medium'],
+            0.80 / 0.97,
+        )
+        self.assertAlmostEqual(
+            config.direct_path_blocker_probability_nonzero['medium'] * 0.97,
+            0.80,
+        )
+        self.assertEqual(config.direct_path_blocker_probability_nonzero['hard'], 1.0)
 
     def test_probability_and_scalar_validation_rejects_invalid_values(self):
         invalid_count_maps = (
@@ -123,8 +163,138 @@ class TestV2ScenarioGeneratorConfiguration(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 V2ScenarioGeneratorConfig(**values)
 
+        invalid_blockers = (
+            {'easy': 0.5, 'medium': 0.8},
+            {**DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES, 'easy': 1.1},
+            {**DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES, 'medium': -0.1},
+            {**DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES, 'easy': float('nan')},
+            {**DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES, 'hard': 0.9},
+        )
+        for probabilities in invalid_blockers:
+            with self.subTest(probabilities=probabilities), self.assertRaises(ValueError):
+                V2ScenarioGeneratorConfig(
+                    direct_path_blocker_probability=probabilities
+                )
+
+        default_counts = {
+            level: dict(values)
+            for level, values in DEFAULT_V2_ZONE_COUNT_PROBABILITIES.items()
+        }
+        unreachable_combinations = (
+            (
+                {**default_counts, 'easy': {0: 0.6, 1: 0.4}},
+                dict(DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES),
+            ),
+            (
+                {'easy': {0: 1.0}, 'medium': {0: 1.0}, 'hard': {0: 1.0}},
+                dict(DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES),
+            ),
+        )
+        for counts, blockers in unreachable_combinations:
+            with self.subTest(counts=counts), self.assertRaises(ValueError):
+                V2ScenarioGeneratorConfig(
+                    zone_count_probabilities=counts,
+                    direct_path_blocker_probability=blockers,
+                )
+
+        zero_forced = V2ScenarioGeneratorConfig(
+            zone_count_probabilities={
+                'easy': {0: 1.0},
+                'medium': {0: 1.0},
+                'hard': {0: 1.0},
+            },
+            direct_path_blocker_probability={
+                'easy': 0.0,
+                'medium': 0.0,
+                'hard': 1.0,
+            },
+        )
+        self.assertEqual(
+            zero_forced.direct_path_blocker_probability_nonzero,
+            {'easy': 0.0, 'medium': 0.0, 'hard': 1.0},
+        )
+
+    def test_blocker_targets_use_the_full_reachable_overall_interval(self):
+        counts = {
+            **DEFAULT_V2_ZONE_COUNT_PROBABILITIES,
+            'easy': {0: 0.6, 1: 0.4},
+        }
+        blockers = dict(DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES)
+        blockers['easy'] = 0.4
+        at_maximum = V2ScenarioGeneratorConfig(
+            zone_count_probabilities=counts,
+            direct_path_blocker_probability=blockers,
+        )
+        self.assertEqual(
+            at_maximum.direct_path_blocker_probability_nonzero['easy'], 1.0
+        )
+        self.assertAlmostEqual(
+            at_maximum.direct_path_blocker_probability_nonzero['easy'] * 0.4,
+            0.4,
+        )
+
+        blockers['easy'] = 0.5
+        with self.assertRaisesRegex(
+            ValueError, r'achievable overall interval is \[0\.0, 0\.4\]'
+        ):
+            V2ScenarioGeneratorConfig(
+                zone_count_probabilities=counts,
+                direct_path_blocker_probability=blockers,
+            )
+
+        zero_targets = V2ScenarioGeneratorConfig(
+            direct_path_blocker_probability={
+                'easy': 0.0,
+                'medium': 0.0,
+                'hard': 1.0,
+            },
+        )
+        self.assertEqual(
+            zero_targets.direct_path_blocker_probability_nonzero,
+            {'easy': 0.0, 'medium': 0.0, 'hard': 1.0},
+        )
+
 
 class TestV2ScenarioGenerator(unittest.TestCase):
+    def test_all_zero_zone_distributions_generate_unblocked_scenarios(self):
+        counts = {level: {0: 1.0} for level in ('easy', 'medium', 'hard')}
+        config = V2ScenarioGeneratorConfig(
+            zone_count_probabilities=counts,
+            direct_path_blocker_probability={
+                'easy': 0.0,
+                'medium': 0.0,
+                'hard': 1.0,
+            },
+        )
+        for level in ('easy', 'medium', 'hard'):
+            with self.subTest(level=level):
+                payload = V2ScenarioGenerator(
+                    ScenarioConfig(), level, seed=700, config=config
+                ).generate()
+                self.assertEqual(payload['zones'], [])
+                self.assertEqual(
+                    payload['metadata']['direct_path_blocker_count'], 0
+                )
+                self.assertIs(
+                    payload['metadata']['requested_direct_path_blocker'], False
+                )
+
+    def test_hard_nonzero_blocker_branch_does_not_consume_rng(self):
+        class RandomForbidden:
+            def random(self):
+                raise AssertionError('hard blocker selection must not draw RNG')
+
+        generator = _generator('hard', 2)
+        rng = RandomForbidden()
+        self.assertIs(
+            generator._sample_direct_path_blocker_branch(rng, zone_count=2),
+            True,
+        )
+        self.assertIs(
+            generator._sample_direct_path_blocker_branch(rng, zone_count=0),
+            False,
+        )
+
     def test_forced_counts_generate_zero_through_six_without_truncation(self):
         cases = ((0, 'easy'), (1, 'easy'), (2, 'easy'), (3, 'hard'), (4, 'hard'), (5, 'hard'), (6, 'hard'))
         for count, level in cases:
@@ -204,19 +374,26 @@ class TestV2ScenarioGenerator(unittest.TestCase):
                 self.assertGreater(zone.point_clearance(goal), 106.0)
 
     def test_curriculum_blocking_rules_and_zero_zone_exceptions(self):
-        easy = _generator('easy', 2, seed=601).generate()
-        medium = _generator('medium', 2, seed=602).generate()
-        hard = _generator('hard', 2, seed=603).generate()
+        easy_zero = _generator('easy', 0, seed=601).generate()
         medium_zero = _generator('medium', 0, seed=604).generate()
         hard_zero = _generator('hard', 0, seed=605).generate()
+        easy_clear = _generator('easy', 2, seed=607, blocker_probability=0.0).generate()
+        easy_blocked = _generator('easy', 2, seed=606, blocker_probability=1.0).generate()
+        medium_blocked = _generator('medium', 2, seed=608, blocker_probability=1.0).generate()
+        hard = _generator('hard', 2, seed=603).generate()
 
-        self.assertEqual(easy['metadata']['direct_path_blocker_count'], 0)
-        self.assertGreaterEqual(medium['metadata']['direct_path_blocker_count'], 1)
-        self.assertGreaterEqual(hard['metadata']['direct_path_blocker_count'], 1)
-        self.assertEqual(medium_zero['metadata']['direct_path_blocker_count'], 0)
-        self.assertEqual(hard_zero['metadata']['direct_path_blocker_count'], 0)
-        self.assertTrue(medium_zero['metadata']['feasibility_passed'])
-        self.assertTrue(hard_zero['metadata']['feasibility_passed'])
+        for payload in (easy_zero, medium_zero, hard_zero, easy_clear):
+            metadata = payload['metadata']
+            self.assertEqual(metadata['direct_path_blocker_count'], 0)
+            self.assertIs(metadata['requested_direct_path_blocker'], False)
+            self.assertEqual(metadata['feasibility_check'], 'direct_safe_corridor')
+        for payload in (easy_blocked, medium_blocked, hard):
+            metadata = payload['metadata']
+            self.assertGreaterEqual(metadata['direct_path_blocker_count'], 1)
+            self.assertIs(metadata['requested_direct_path_blocker'], True)
+            self.assertNotEqual(metadata['feasibility_check'], 'direct_safe_corridor')
+            self.assertTrue(metadata['feasibility_passed'])
+        self.assertFalse(easy_blocked['metadata']['overlap_allowed'])
 
     def test_start_goal_stage_ranges_preserve_confirmed_construction(self):
         expected = {
@@ -280,6 +457,7 @@ class TestV2ScenarioGenerator(unittest.TestCase):
                 requested_shape_types=('sphere', 'sphere'),
                 requested_ground_contact=(True, True),
                 overlap_allowed=True,
+                require_direct_path_blocker=False,
             )
         self.assertEqual([zone.zone_id for zone in allowed[0]], ['first', 'overlapping'])
 
@@ -296,6 +474,7 @@ class TestV2ScenarioGenerator(unittest.TestCase):
                 requested_shape_types=('sphere', 'sphere'),
                 requested_ground_contact=(True, True),
                 overlap_allowed=False,
+                require_direct_path_blocker=False,
             )
         self.assertEqual([zone.zone_id for zone in separated_result[0]], ['first', 'separated'])
 
@@ -332,6 +511,7 @@ class TestV2ScenarioGenerator(unittest.TestCase):
                 requested_shape_types=('sphere',),
                 requested_ground_contact=(False,),
                 overlap_allowed=False,
+                require_direct_path_blocker=False,
             )
 
         self.assertIsNotNone(result)
@@ -352,9 +532,11 @@ class TestV2ScenarioGenerator(unittest.TestCase):
             requested_shape_types,
             requested_ground_contact,
             overlap_allowed,
+            require_direct_path_blocker,
             rejection_counts,
         ):
-            del rng, state, goal, zone_count, overlap_allowed, rejection_counts
+            del rng, state, goal, zone_count, overlap_allowed
+            del require_direct_path_blocker, rejection_counts
             recorded_shapes.append(requested_shape_types)
             recorded_ground_contact.append(requested_ground_contact)
             if len(recorded_shapes) == 1:
@@ -405,6 +587,9 @@ class TestV2ScenarioGenerator(unittest.TestCase):
             ScenarioConfig(),
             'medium',
             seed=20260904,
+            config=V2ScenarioGeneratorConfig(
+                direct_path_blocker_probability=_forced_blocker('medium', 0.97),
+            ),
         )
 
         payloads = [generator.generate() for _ in range(3)]
@@ -437,6 +622,7 @@ class TestV2ScenarioGenerator(unittest.TestCase):
             zone_count_probabilities=_forced_counts('easy', 1),
             shape_probabilities=_forced_shape('sphere'),
             zone_candidate_attempts=2,
+            direct_path_blocker_probability=_forced_blocker('easy', 0.0),
         )
         generator = V2ScenarioGenerator(
             scenario,
@@ -474,6 +660,7 @@ class TestV2ScenarioGenerator(unittest.TestCase):
             'requested_reference_scales',
             'overlap_allowed',
             'aabb_overlap_pair_count',
+            'requested_direct_path_blocker',
             'direct_path_blocker_count',
             'feasibility_check',
             'feasibility_passed',
@@ -486,6 +673,47 @@ class TestV2ScenarioGenerator(unittest.TestCase):
         zone_metadata = payload['zones'][0]['metadata']
         self.assertEqual(zone_metadata['requested_reference_scale'], metadata['requested_reference_scales'][0])
         self.assertIn('actual_shape_parameters', zone_metadata)
+
+    def test_branch_draws_match_metadata_and_true_geometry(self):
+        scenario = ScenarioConfig()
+        margin = scenario.corridor_blocking_margin
+        for level, seed in (('easy', 900), ('medium', 910)):
+            with self.subTest(level=level):
+                generator = _generator(level, 2, seed=seed)
+                branches = set()
+                for _ in range(24):
+                    payload = generator.generate()
+                    metadata = payload['metadata']
+                    state = np.asarray(payload['state'], dtype=np.float64)
+                    goal = np.asarray(payload['goal'], dtype=np.float64)
+                    actual = sum(
+                        zone.violates_segment(state[:3], goal, uav_radius=margin)
+                        for zone in _zones(payload)
+                    )
+                    self.assertEqual(
+                        actual, metadata['direct_path_blocker_count']
+                    )
+                    requested = metadata['requested_direct_path_blocker']
+                    self.assertIs(requested, actual >= 1)
+                    if requested:
+                        self.assertNotEqual(
+                            metadata['feasibility_check'], 'direct_safe_corridor'
+                        )
+                        self.assertTrue(metadata['feasibility_passed'])
+                    else:
+                        self.assertEqual(
+                            metadata['feasibility_check'], 'direct_safe_corridor'
+                        )
+                    branches.add(requested)
+                self.assertEqual(len(branches), 2)
+
+    def test_hard_nonzero_scenarios_always_block_the_corridor(self):
+        generator = _generator('hard', 2, seed=950)
+        for _ in range(8):
+            metadata = generator.generate()['metadata']
+            self.assertTrue(metadata['requested_direct_path_blocker'])
+            self.assertGreaterEqual(metadata['direct_path_blocker_count'], 1)
+            self.assertNotEqual(metadata['feasibility_check'], 'direct_safe_corridor')
 
 
 if __name__ == '__main__':

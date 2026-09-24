@@ -34,7 +34,7 @@ from .v2_feasibility import (
 V2_ENV_SCENARIO_FORMAT = 'v2_static_no_fly_scenario'
 V2_ENV_SCENARIO_VERSION = 1
 V2_SCENARIO_GENERATOR_NAME = 'brain_uav_v2_random_training'
-V2_SCENARIO_GENERATOR_VERSION = 1
+V2_SCENARIO_GENERATOR_VERSION = 2
 V2_CURRICULUM_LEVELS = ('easy', 'medium', 'hard')
 V2_SHAPE_TYPES = (
     'sphere',
@@ -51,6 +51,16 @@ DEFAULT_V2_ZONE_COUNT_PROBABILITIES: dict[str, dict[int, float]] = {
 }
 DEFAULT_V2_SHAPE_PROBABILITIES: dict[str, float] = {
     shape_type: 0.20 for shape_type in V2_SHAPE_TYPES
+}
+# For easy and medium, the overall per-scenario probability that at least one
+# zone blocks the straight start-to-goal safety corridor with
+# corridor_blocking_margin, including zero-zone scenarios. The conditional
+# probability for non-empty scenarios is derived in the config. Hard's 1.0 is
+# a fixed sentinel for its original rule: every non-empty scenario must block.
+DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES: dict[str, float] = {
+    'easy': 0.50,
+    'medium': 0.80,
+    'hard': 1.00,
 }
 
 
@@ -150,6 +160,45 @@ def _validate_shape_probabilities(value: Any) -> dict[str, float]:
     return result
 
 
+def _validate_blocker_probabilities(value: Any) -> dict[str, float]:
+    if not isinstance(value, Mapping) or set(value) != set(V2_CURRICULUM_LEVELS):
+        raise ValueError(
+            'direct_path_blocker_probability must define easy, medium, and hard.'
+        )
+    return {
+        level: _probability(
+            value[level],
+            name=f'direct_path_blocker_probability[{level!r}]',
+        )
+        for level in V2_CURRICULUM_LEVELS
+    }
+
+
+def _nonzero_blocker_probability(
+    level: str,
+    target: float,
+    zero_zone_probability: float,
+) -> float:
+    """Derive the conditional blocker probability for non-empty scenarios.
+
+    Zero-zone scenarios can never block, so reaching the overall target
+    requires ``P(block | zones>=1) = target / (1 - P(0 zones))``. The
+    reachable overall interval is ``[0, 1 - P(0 zones)]``.
+    """
+
+    non_empty_probability = 1.0 - zero_zone_probability
+    if target > non_empty_probability:
+        raise ValueError(
+            f'direct_path_blocker_probability[{level!r}]={target!r} is '
+            f'unreachable with zone_count_probabilities[{level!r}] zero-zone '
+            f'probability {zero_zone_probability!r}; the achievable overall '
+            f'interval is [0.0, {non_empty_probability!r}].'
+        )
+    if non_empty_probability <= 0.0:
+        return 0.0
+    return target / non_empty_probability
+
+
 @dataclass(slots=True)
 class V2ScenarioGeneratorConfig:
     """Auditable sampling and validation settings for the V2 generator."""
@@ -165,6 +214,9 @@ class V2ScenarioGeneratorConfig:
     )
     ground_contact_probability: float = 0.5
     medium_overlap_probability: float = 0.10
+    direct_path_blocker_probability: Mapping[str, float] = field(
+        default_factory=lambda: dict(DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES)
+    )
     start_surface_clearance: float = 160.0
     goal_surface_clearance: float = 106.0
     start_goal_sampling_attempts: int = 40
@@ -174,11 +226,34 @@ class V2ScenarioGeneratorConfig:
     pyramid_base_ratio_range: tuple[float, float] = (1.50, 2.00)
     pyramid_height_ratio_range: tuple[float, float] = (0.75, 1.25)
     feasibility: V2FeasibilityConfig = field(default_factory=V2FeasibilityConfig)
+    # Derived in __post_init__: easy/medium use P(blocker | zones >= 1);
+    # hard is always 1.0 for its fixed non-empty-scenario rule.
+    direct_path_blocker_probability_nonzero: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         self.zone_count_probabilities = _validate_count_probabilities(
             self.zone_count_probabilities
         )
+        self.direct_path_blocker_probability = _validate_blocker_probabilities(
+            self.direct_path_blocker_probability
+        )
+        if self.direct_path_blocker_probability['hard'] != 1.0:
+            raise ValueError(
+                "direct_path_blocker_probability['hard'] must be 1.0; hard "
+                'requires a blocker whenever at least one zone is present.'
+            )
+        self.direct_path_blocker_probability_nonzero = {
+            level: (
+                1.0
+                if level == 'hard'
+                else _nonzero_blocker_probability(
+                    level,
+                    self.direct_path_blocker_probability[level],
+                    self.zone_count_probabilities[level].get(0, 0.0),
+                )
+            )
+            for level in V2_CURRICULUM_LEVELS
+        }
         self.shape_probabilities = _validate_shape_probabilities(
             self.shape_probabilities
         )
@@ -297,6 +372,10 @@ class V2ScenarioGenerator:
         )
         local_rng = np.random.default_rng(scenario_seed)
         requested_zone_count = self._sample_zone_count(local_rng)
+        require_direct_path_blocker = self._sample_direct_path_blocker_branch(
+            local_rng,
+            requested_zone_count,
+        )
         overlap_allowed = self._sample_overlap_mode(local_rng)
         requested_shape_types = self._sample_requested_shape_types(
             local_rng,
@@ -323,6 +402,7 @@ class V2ScenarioGenerator:
                 requested_shape_types=requested_shape_types,
                 requested_ground_contact=requested_ground_contact,
                 overlap_allowed=overlap_allowed,
+                require_direct_path_blocker=require_direct_path_blocker,
                 rejection_counts=rejection_counts,
             )
             if sampled is None:
@@ -330,18 +410,14 @@ class V2ScenarioGenerator:
                 continue
             zones, reference_scales = sampled
             blocker_count = self._count_direct_path_blockers(state, goal, zones)
-            if self.curriculum_level == 'easy' and blocker_count != 0:
-                rejection_counts['easy_direct_path_blocked'] += 1
-                continue
-            if (
-                self.curriculum_level in ('medium', 'hard')
-                and requested_zone_count > 0
-                and blocker_count < 1
-            ):
+            if require_direct_path_blocker and blocker_count < 1:
                 rejection_counts['required_direct_path_blocker_missing'] += 1
                 continue
+            if not require_direct_path_blocker and blocker_count != 0:
+                rejection_counts['direct_path_blocker_forbidden_present'] += 1
+                continue
 
-            if self.curriculum_level == 'easy' or requested_zone_count == 0:
+            if not require_direct_path_blocker:
                 feasibility_type = 'direct_safe_corridor'
                 feasibility_passed = True
                 feasibility_examined_nodes = 0
@@ -370,6 +446,7 @@ class V2ScenarioGenerator:
                 zones=zones,
                 reference_scales=reference_scales,
                 overlap_allowed=overlap_allowed,
+                requested_direct_path_blocker=require_direct_path_blocker,
                 direct_path_blocker_count=blocker_count,
                 feasibility_type=feasibility_type,
                 feasibility_passed=feasibility_passed,
@@ -401,6 +478,29 @@ class V2ScenarioGenerator:
         counts = np.asarray(tuple(distribution.keys()), dtype=np.int64)
         probabilities = np.asarray(tuple(distribution.values()), dtype=np.float64)
         return int(rng.choice(counts, p=probabilities))
+
+    def _sample_direct_path_blocker_branch(
+        self,
+        rng: np.random.Generator,
+        zone_count: int,
+    ) -> bool:
+        """Draw the corridor-blocker branch once per scenario (v2 semantics).
+
+        The branch is drawn before any sampling attempt and every retry of
+        this scenario keeps it, so a generation failure can never quietly
+        switch a scenario between the blocked and unblocked populations.
+        Zero-zone scenarios can never block. Hard non-empty scenarios always
+        require a blocker and skip the RNG draw to preserve their sample stream.
+        """
+
+        if zone_count <= 0:
+            return False
+        if self.curriculum_level == 'hard':
+            return True
+        conditional = self.config.direct_path_blocker_probability_nonzero[
+            self.curriculum_level
+        ]
+        return bool(rng.random() < conditional)
 
     def _sample_overlap_mode(self, rng: np.random.Generator) -> bool:
         if self.curriculum_level == 'easy':
@@ -517,6 +617,7 @@ class V2ScenarioGenerator:
         requested_shape_types: tuple[str, ...],
         requested_ground_contact: tuple[bool, ...],
         overlap_allowed: bool,
+        require_direct_path_blocker: bool,
         rejection_counts: Counter[str] | None = None,
     ) -> tuple[list[NoFlyZone], list[float]] | None:
         if len(requested_shape_types) != zone_count:
@@ -527,10 +628,12 @@ class V2ScenarioGenerator:
             raise ValueError('requested_shape_types contains an unsupported shape type.')
         if any(type(value) is not bool for value in requested_ground_contact):
             raise ValueError('requested_ground_contact must contain only bool values.')
+        if type(require_direct_path_blocker) is not bool:
+            raise ValueError('require_direct_path_blocker must be bool.')
         candidate_rejections = rejection_counts if rejection_counts is not None else Counter()
         zones: list[NoFlyZone] = []
         reference_scales: list[float] = []
-        must_place_blocker = self.curriculum_level in ('medium', 'hard') and zone_count > 0
+        must_place_blocker = require_direct_path_blocker and zone_count > 0
         reference_range = _STAGE_SPECS[self.curriculum_level].reference_scale_range
 
         for zone_index in range(zone_count):
@@ -803,6 +906,7 @@ class V2ScenarioGenerator:
         zones: list[NoFlyZone],
         reference_scales: list[float],
         overlap_allowed: bool,
+        requested_direct_path_blocker: bool,
         direct_path_blocker_count: int,
         feasibility_type: str,
         feasibility_passed: bool,
@@ -828,6 +932,7 @@ class V2ScenarioGenerator:
             'requested_reference_scales': [float(value) for value in reference_scales],
             'overlap_allowed': bool(overlap_allowed),
             'aabb_overlap_pair_count': int(self._aabb_overlap_pair_count(zones)),
+            'requested_direct_path_blocker': bool(requested_direct_path_blocker),
             'direct_path_blocker_count': int(direct_path_blocker_count),
             'feasibility_check': feasibility_type,
             'feasibility_passed': bool(feasibility_passed),

@@ -39,29 +39,38 @@ from brain_uav.trainers.v2_validation import (
 )
 
 
-def _metadata(stage: str, scenario_seed: int, zone_count: int = 0) -> dict:
+def _metadata(
+    stage: str,
+    scenario_seed: int,
+    zone_count: int = 0,
+    *,
+    requested_direct_path_blocker: bool = False,
+    feasibility_check: str = 'direct_safe_corridor',
+    generator_version: int = V2_SCENARIO_GENERATOR_VERSION,
+) -> dict:
     return {
         'generator': V2_SCENARIO_GENERATOR_NAME,
-        'generator_version': V2_SCENARIO_GENERATOR_VERSION,
+        'generator_version': generator_version,
         'scenario_seed': scenario_seed,
         'requested_curriculum_level': stage,
         'effective_curriculum_level': stage,
         'requested_zone_count': zone_count,
         'effective_zone_count': zone_count,
         'shape_counts': {
-            'sphere': 0,
+            'sphere': zone_count,
             'ellipsoid': 0,
             'box': 0,
             'triangular_pyramid': 0,
             'quadrangular_pyramid': 0,
         },
-        'requested_shape_types': [],
-        'requested_ground_contact': [],
-        'requested_reference_scales': [],
+        'requested_shape_types': ['sphere'] * zone_count,
+        'requested_ground_contact': [False] * zone_count,
+        'requested_reference_scales': [1.0] * zone_count,
         'overlap_allowed': stage == 'hard',
         'aabb_overlap_pair_count': 0,
-        'direct_path_blocker_count': 0,
-        'feasibility_check': 'direct_safe_corridor',
+        'requested_direct_path_blocker': requested_direct_path_blocker,
+        'direct_path_blocker_count': 1 if requested_direct_path_blocker else 0,
+        'feasibility_check': feasibility_check,
         'feasibility_passed': True,
         'feasibility_examined_nodes': 0,
         'feasibility_edge_checks': 0,
@@ -70,15 +79,38 @@ def _metadata(stage: str, scenario_seed: int, zone_count: int = 0) -> dict:
     }
 
 
-def _payload(stage: str, scenario_seed: int, *, goal_x: float = 1.0) -> dict:
+def _payload(
+    stage: str,
+    scenario_seed: int,
+    *,
+    goal_x: float = 1.0,
+    zones: tuple[tuple[float, float, float], ...] = (),
+    requested_direct_path_blocker: bool = False,
+    feasibility_check: str = 'direct_safe_corridor',
+    generator_version: int = V2_SCENARIO_GENERATOR_VERSION,
+) -> dict:
+    from brain_uav.geometry import NoFlyZone as _Zone
+    from brain_uav.geometry import Sphere as _Sphere
+
+    zone_objects = tuple(
+        _Zone(f'zone-{index:03d}', _Sphere(list(center), 5.0))
+        for index, center in enumerate(zones)
+    )
     return {
         'format': V2_ENV_SCENARIO_FORMAT,
         'format_version': V2_ENV_SCENARIO_VERSION,
         'state': [0.0, 0.0, 100.0, 0.0, 0.0],
         'goal': [goal_x, 0.0, 100.0],
-        'zones': [],
+        'zones': [zone.to_dict() for zone in zone_objects],
         'curriculum_level': stage,
-        'metadata': _metadata(stage, scenario_seed),
+        'metadata': _metadata(
+            stage,
+            scenario_seed,
+            len(zone_objects),
+            requested_direct_path_blocker=requested_direct_path_blocker,
+            feasibility_check=feasibility_check,
+            generator_version=generator_version,
+        ),
     }
 
 
@@ -222,6 +254,99 @@ class TestV2Validation(unittest.TestCase):
             path.write_text('{"format": NaN}', encoding='utf-8')
             with self.assertRaises(ValueError):
                 load_v2_validation_pool(path, expected_level='medium')
+
+    def test_easy_blocked_and_medium_unblocked_zone_scenarios_are_accepted(self):
+        blocked_easy = _payload(
+            'easy',
+            1000,
+            goal_x=100.0,
+            zones=((50.0, 0.0, 100.0),),
+            requested_direct_path_blocker=True,
+            feasibility_check='sparse_visibility_graph',
+        )
+        unblocked_medium = _payload(
+            'medium',
+            1001,
+            goal_x=100.0,
+            zones=((50.0, 200.0, 100.0),),
+            requested_direct_path_blocker=False,
+        )
+        for stage, payload in (('easy', blocked_easy), ('medium', unblocked_medium)):
+            with self.subTest(stage=stage):
+                pool = V2ValidationPool(
+                    curriculum_level=stage,
+                    master_seed=20260904,
+                    stage_seed=derive_validation_stage_seed(20260904, stage),
+                    scenario_config=asdict(self.scenario),
+                    uav_collision_radius=0.0,
+                    scenarios=(
+                        {
+                            'scenario_id': f'{stage}_0000',
+                            'sequence_index': 0,
+                            'scenario_seed': payload['metadata']['scenario_seed'],
+                            'payload': payload,
+                        },
+                    ),
+                )
+                self.assertEqual(
+                    pool.scenarios[0]['payload']['metadata'][
+                        'direct_path_blocker_count'
+                    ],
+                    1 if stage == 'easy' else 0,
+                )
+
+    def test_metadata_blocker_count_must_match_actual_geometry(self):
+        forged = _payload(
+            'easy',
+            1000,
+            goal_x=100.0,
+            zones=((50.0, 200.0, 100.0),),
+            requested_direct_path_blocker=True,
+            feasibility_check='sparse_visibility_graph',
+        )
+        with self.assertRaisesRegex(ValueError, 'actual direct path blocker'):
+            V2ValidationPool(
+                curriculum_level='easy',
+                master_seed=20260904,
+                stage_seed=derive_validation_stage_seed(20260904, 'easy'),
+                scenario_config=asdict(self.scenario),
+                uav_collision_radius=0.0,
+                scenarios=(
+                    {
+                        'scenario_id': 'easy_0000',
+                        'sequence_index': 0,
+                        'scenario_seed': forged['metadata']['scenario_seed'],
+                        'payload': forged,
+                    },
+                ),
+            )
+
+    def test_pre_v2_generator_version_payloads_are_rejected(self):
+        legacy = _payload(
+            'easy',
+            1000,
+            goal_x=100.0,
+            zones=((50.0, 0.0, 100.0),),
+            requested_direct_path_blocker=True,
+            feasibility_check='sparse_visibility_graph',
+            generator_version=1,
+        )
+        with self.assertRaisesRegex(ValueError, 'generator_version'):
+            V2ValidationPool(
+                curriculum_level='easy',
+                master_seed=20260904,
+                stage_seed=derive_validation_stage_seed(20260904, 'easy'),
+                scenario_config=asdict(self.scenario),
+                uav_collision_radius=0.0,
+                scenarios=(
+                    {
+                        'scenario_id': 'easy_0000',
+                        'sequence_index': 0,
+                        'scenario_seed': legacy['metadata']['scenario_seed'],
+                        'payload': legacy,
+                    },
+                ),
+            )
 
     def test_expert_easy_pool_format_cannot_impersonate_validation_pool(self):
         with tempfile.TemporaryDirectory() as directory:
