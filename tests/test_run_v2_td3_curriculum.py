@@ -110,6 +110,8 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertEqual(args.device, 'auto')
         self.assertEqual(args.model, 'ann')
         self.assertEqual(args.snn_time_window, 4)
+        self.assertEqual(args.medium_gamma, 0.99)
+        self.assertEqual(args.medium_failure_sample_bias, 1.0)
         self.assertFalse(args.pinned_batch_transfer)
         self.assertFalse(args.aggregate_relation_values_first)
         self.assertEqual(args.periodic_snapshot_interval_steps, 150_000)
@@ -437,6 +439,8 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                     validation_seed=20260904,
                     max_stage='hard',
                     device='cpu',
+                    medium_gamma=0.995,
+                    medium_failure_sample_bias=3.0,
                     stage_runner=fake_stage,
                 )
 
@@ -451,6 +455,10 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertIsNotNone(calls[0]['prepared_initialization'])
         self.assertIsNone(calls[1]['prepared_initialization'])
         self.assertEqual(calls[0]['device'], 'cpu')
+        self.assertEqual(calls[0]['gamma'], 0.99)
+        self.assertEqual(calls[0]['failure_sample_bias'], 1.0)
+        self.assertEqual(calls[1]['gamma'], 0.995)
+        self.assertEqual(calls[1]['failure_sample_bias'], 3.0)
         self.assertFalse(summary['passed'])
         self.assertEqual(summary['failed_stage'], 'medium')
         self.assertEqual(len(summary['stages']), 2)
@@ -461,6 +469,29 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertEqual(
             summary['validation_pools']['easy']['master_seed'],
             actual_validation_seed,
+        )
+
+    def test_main_forwards_medium_only_experiment_parameters(self):
+        with mock.patch(
+            'brain_uav.scripts.run_v2_td3_curriculum.resolve_training_device',
+            return_value='cpu',
+        ), mock.patch(
+            'brain_uav.scripts.run_v2_td3_curriculum.run_v2_curriculum',
+            return_value={'passed': True},
+        ) as curriculum_runner:
+            result = main([
+                '--bc-checkpoint', 'bc.pt',
+                '--output-root', 'run',
+                '--validation-pool-dir', 'validation',
+                '--device', 'cpu',
+                '--medium-gamma', '0.995',
+                '--medium-failure-sample-bias', '3.0',
+            ])
+        self.assertEqual(result, 0)
+        self.assertEqual(curriculum_runner.call_args.kwargs['medium_gamma'], 0.995)
+        self.assertEqual(
+            curriculum_runner.call_args.kwargs['medium_failure_sample_bias'],
+            3.0,
         )
 
     def test_existing_validation_pool_is_loaded_with_command_seed_contract(self):

@@ -262,6 +262,7 @@ class V2TD3UpdateMetrics:
     critic_td_error_mean: float = 0.0
     critic_failure_td_error_mean: float = 0.0
     actor_grad_norm: float = 0.0
+    sample_failure_fraction: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,7 +329,11 @@ class _ReusablePinnedReplayBatchTransfer:
 
     @staticmethod
     def _view(
-        batch: V2ReplayBatch, obs_zones: int, next_zones: int,
+        batch: V2ReplayBatch,
+        obs_zones: int,
+        next_zones: int,
+        *,
+        sample_failure_fraction: float | None = None,
     ) -> V2ReplayBatch:
         return V2ReplayBatch(
             obs=V2ObservationBatch(
@@ -349,6 +354,11 @@ class _ReusablePinnedReplayBatchTransfer:
             success=batch.success,
             near_goal=batch.near_goal,
             line_to_goal_safe=batch.line_to_goal_safe,
+            sample_failure_fraction=(
+                batch.sample_failure_fraction
+                if sample_failure_fraction is None
+                else sample_failure_fraction
+            ),
         )
 
     @staticmethod
@@ -389,7 +399,12 @@ class _ReusablePinnedReplayBatchTransfer:
         ):
             self._host_ready_event.synchronize()
         host = self._view(self._host, obs_zones, next_zones)
-        device = self._view(self._device, obs_zones, next_zones)
+        device = self._view(
+            self._device,
+            obs_zones,
+            next_zones,
+            sample_failure_fraction=batch.sample_failure_fraction,
+        )
         self._copy(batch, host, non_blocking=False)
         self._copy(host, device, non_blocking=self.device.type == 'cuda')
         if self.device.type == 'cuda':
@@ -3255,6 +3270,7 @@ class V2TD3UpdateEngine:
             metrics = V2TD3UpdateMetrics(
                 critic_loss=statistic_values[0],
                 sample_success_fraction=statistic_values[1],
+                sample_failure_fraction=batch.sample_failure_fraction,
                 sample_near_goal_fraction=statistic_values[2],
                 critic_updated=True,
                 critic_targets_updated=critic_targets_updated,
@@ -3301,6 +3317,7 @@ class V2TD3UpdateEngine:
                     else 0.0
                 ),
                 sample_success_fraction=statistic_values[7],
+                sample_failure_fraction=batch.sample_failure_fraction,
                 sample_near_goal_fraction=statistic_values[8],
                 critic_updated=True,
                 critic_targets_updated=critic_targets_updated,

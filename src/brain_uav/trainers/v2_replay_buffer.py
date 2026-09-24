@@ -140,6 +140,7 @@ class V2ReplayBatch:
     success: torch.Tensor
     near_goal: torch.Tensor
     line_to_goal_safe: torch.Tensor
+    sample_failure_fraction: float = 0.0
 
     def __post_init__(self) -> None:
         if not isinstance(self.obs, V2ObservationBatch):
@@ -180,6 +181,11 @@ class V2ReplayBatch:
                     f'All replay tensors must share one device; {name} is on '
                     f'{value.device}, expected {device}.'
                 )
+        failure_fraction = _finite_fraction(
+            self.sample_failure_fraction,
+            name='sample_failure_fraction',
+        )
+        object.__setattr__(self, 'sample_failure_fraction', failure_fraction)
 
     @property
     def batch_size(self) -> int:
@@ -198,6 +204,7 @@ class V2ReplayBatch:
             success=self.success.to(target),
             near_goal=self.near_goal.to(target),
             line_to_goal_safe=self.line_to_goal_safe.to(target),
+            sample_failure_fraction=self.sample_failure_fraction,
         )
 
 
@@ -218,6 +225,7 @@ class V2ReplayBuffer:
         success_replay_fraction: float = 0.25,
         success_batch_fraction: float = 0.25,
         *,
+        failure_sample_bias: float = 1.0,
         seed: int | None = None,
     ) -> None:
         self.capacity = _positive_int(capacity, name='capacity')
@@ -233,6 +241,10 @@ class V2ReplayBuffer:
         self.near_goal_sample_bias = _finite_at_least_one(
             near_goal_sample_bias,
             name='near_goal_sample_bias',
+        )
+        self.failure_sample_bias = _finite_at_least_one(
+            failure_sample_bias,
+            name='failure_sample_bias',
         )
         self.success_replay_fraction = _finite_fraction(
             success_replay_fraction,
@@ -266,6 +278,7 @@ class V2ReplayBuffer:
         self.reward = np.zeros((self.capacity, 1), dtype=np.float32)
         self.done = np.zeros((self.capacity, 1), dtype=np.float32)
         self.success = np.zeros(self.capacity, dtype=np.bool_)
+        self.failure = np.zeros(self.capacity, dtype=np.bool_)
         self.near_goal = np.zeros(self.capacity, dtype=np.bool_)
         self.line_to_goal_safe = np.zeros(self.capacity, dtype=np.bool_)
         self.sample_weight = np.zeros(self.capacity, dtype=np.float64)
@@ -430,6 +443,7 @@ class V2ReplayBuffer:
         self.reward[index, 0] = reward_value
         self.done[index, 0] = float(bool(done))
         self.success[index] = bool(success)
+        self.failure[index] = False
         self.near_goal[index] = bool(near_goal)
         self.line_to_goal_safe[index] = bool(line_to_goal_safe)
         self.write_id[index] = write_id
@@ -458,9 +472,43 @@ class V2ReplayBuffer:
             current = bool(self.success[index])
             desired = bool(success)
             if current == desired:
+                if desired and self.failure[index]:
+                    self.failure[index] = False
+                    self._set_primary_slot_weight(index, self._slot_weight(index))
+                    updated += 1
                 continue
             self.success[index] = desired
+            if desired:
+                self.failure[index] = False
             self.success_count += 1 if desired else -1
+            self._set_primary_slot_weight(index, self._slot_weight(index))
+            updated += 1
+        return updated
+
+    def mark_failure_slots(
+        self,
+        slot_refs: list[tuple[int, int]],
+        failure: bool = True,
+    ) -> int:
+        """Update confirmed-failure flags for live primary slots only."""
+
+        updated = 0
+        desired = bool(failure)
+        for index, write_id in slot_refs:
+            index = int(index)
+            if index < 0 or index >= self.capacity:
+                continue
+            if int(self.write_id[index]) != int(write_id):
+                continue
+            current_failure = bool(self.failure[index])
+            current_success = bool(self.success[index])
+            new_success = False if desired else current_success
+            if current_failure == desired and current_success == new_success:
+                continue
+            self.failure[index] = desired
+            if current_success != new_success:
+                self.success[index] = new_success
+                self.success_count += 1 if new_success else -1
             self._set_primary_slot_weight(index, self._slot_weight(index))
             updated += 1
         return updated
@@ -522,6 +570,8 @@ class V2ReplayBuffer:
             weight *= self.success_sample_bias
         if self.near_goal_sample_bias > 1.0 and self.near_goal[index]:
             weight *= self.near_goal_sample_bias
+        if self.failure_sample_bias > 1.0 and self.failure[index]:
+            weight *= self.failure_sample_bias
         return float(weight)
 
     def _set_primary_slot_weight(self, index: int, weight: float) -> None:
@@ -611,6 +661,7 @@ class V2ReplayBuffer:
             'next_count': self.next_zone_count[indices].copy(),
             'done': self.done[indices].copy(),
             'success': self.success[indices].astype(np.float32).reshape(-1, 1),
+            'failure': self.failure[indices].copy(),
             'near_goal': self.near_goal[indices].astype(np.float32).reshape(-1, 1),
             'line_to_goal_safe': self.line_to_goal_safe[indices]
             .astype(np.float32)
@@ -636,6 +687,7 @@ class V2ReplayBuffer:
             'next_count': self.success_next_zone_count[indices].copy(),
             'done': self.success_done[indices].copy(),
             'success': np.ones((batch_size, 1), dtype=np.float32),
+            'failure': np.zeros(batch_size, dtype=np.bool_),
             'near_goal': self.success_near_goal[indices]
             .astype(np.float32)
             .reshape(-1, 1),
@@ -722,4 +774,5 @@ class V2ReplayBuffer:
             success=torch.from_numpy(sample['success']),
             near_goal=torch.from_numpy(sample['near_goal']),
             line_to_goal_safe=torch.from_numpy(sample['line_to_goal_safe']),
+            sample_failure_fraction=float(np.mean(sample['failure'])),
         )

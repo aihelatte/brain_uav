@@ -54,6 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--consecutive-windows', type=int, default=4)
     parser.add_argument('--max-failures-per-window', type=int, default=1)
     parser.add_argument('--validation-max-failures', type=int, default=5)
+    parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--failure-sample-bias', type=float, default=1.0)
     # These default to the 2026-09-22-verified full compile + CUDA Graph
     # combination (see default_v2_cuda_graph_compilation below) unless
     # explicitly overridden with --no-<flag>. compile_critic_encoder,
@@ -385,6 +387,8 @@ def run_v2_td3_stage(
     metrics_out: str | Path,
     validation_pool: str | Path,
     seed: int = 7,
+    gamma: float = 0.99,
+    failure_sample_bias: float = 1.0,
     device: str = 'auto',
     max_stage_steps: int | None = None,
     early_stop_min_steps: int = 125_000,
@@ -442,6 +446,8 @@ def run_v2_td3_stage(
         consecutive_qualified_windows=consecutive_windows,
         max_failures_per_window=max_failures_per_window,
         validation_max_failures=validation_max_failures,
+        gamma=gamma,
+        failure_sample_bias=failure_sample_bias,
     )
     if prepared_initialization is None:
         prepared_initialization = prepare_v2_stage_initialization(
@@ -743,6 +749,8 @@ def main(argv: list[str] | None = None) -> int:
         consecutive_qualified_windows=args.consecutive_windows,
         max_failures_per_window=args.max_failures_per_window,
         validation_max_failures=args.validation_max_failures,
+        gamma=args.gamma,
+        failure_sample_bias=args.failure_sample_bias,
     )
     print(json.dumps({
         'requested_device': args.device,
@@ -767,6 +775,8 @@ def main(argv: list[str] | None = None) -> int:
         consecutive_windows=args.consecutive_windows,
         max_failures_per_window=args.max_failures_per_window,
         validation_max_failures=args.validation_max_failures,
+        gamma=args.gamma,
+        failure_sample_bias=args.failure_sample_bias,
         model=args.model,
         snn_time_window=args.snn_time_window,
         compile_critic_encoder=args.compile_critic_encoder,

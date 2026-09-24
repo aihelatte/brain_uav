@@ -24,7 +24,9 @@ from brain_uav.trainers.v2_formal_training import (
     V2BCFormalInitialization,
     V2PreparedStageInitialization,
     V2_FORMAL_CHECKPOINT_FORMAT,
+    V2_FORMAL_CHECKPOINT_VERSION,
     V2_PERIODIC_SNAPSHOT_FORMAT,
+    V2_PERIODIC_SNAPSHOT_VERSION,
     V2EarlyStopController,
     V2FormalStageTrainer,
     V2FormalTrainingConfig,
@@ -142,6 +144,7 @@ class TestV2FormalTraining(unittest.TestCase):
         scenario = make_scenario_config()
         config = V2FormalTrainingConfig(
             stage='easy', seed=83, max_steps=2, replay_capacity=8, batch_size=2,
+            gamma=0.995, failure_sample_bias=3.0,
         )
         source = {}
         actor = _engine(scenario).actor
@@ -174,6 +177,8 @@ class TestV2FormalTraining(unittest.TestCase):
         self.assertTrue(optimized.actor_optimizer.param_groups[0]['fused'])
         self.assertTrue(optimized.critic_optimizer.param_groups[0]['fused'])
         self.assertTrue(optimized.reduce_update_stat_syncs)
+        self.assertEqual(eager.replay.failure_sample_bias, 3.0)
+        self.assertEqual(eager.gamma, 0.995)
         self.assertTrue(all(
             layer.attention.aggregate_relation_values_first
             for layer in optimized.actor.zone_set_encoder.layers
@@ -332,18 +337,71 @@ class TestV2FormalTraining(unittest.TestCase):
         self.assertEqual(hard.max_steps, 1_000_000)
         self.assertEqual((hard.actor_lr, hard.critic_lr), (1.125e-4, 2.125e-4))
         self.assertEqual(easy.success_sample_bias, 1.0)
+        self.assertEqual(easy.failure_sample_bias, 1.0)
+        self.assertEqual(easy.gamma, 0.99)
+        self.assertEqual(easy.to_dict()['failure_sample_bias'], 1.0)
+        medium_trial = V2FormalTrainingConfig(
+            stage='medium', gamma=0.995, failure_sample_bias=3.0,
+        )
+        self.assertEqual(medium_trial.gamma, 0.995)
+        self.assertEqual(medium_trial.to_dict()['gamma'], 0.995)
+        self.assertEqual(medium_trial.to_dict()['failure_sample_bias'], 3.0)
         self.assertEqual(easy.near_goal_sample_bias, 2.0)
         self.assertEqual(easy.zone_storage_capacity, 6)
         self.assertEqual(easy.warmup_strategy, 'policy_with_noise')
         for kwargs in (
             {'stage': 'easy_two_zone'},
             {'stage': 'easy', 'success_sample_bias': 0.5},
+            {'stage': 'easy', 'failure_sample_bias': 0.5},
+            {'stage': 'easy', 'gamma': 1.01},
             {'stage': 'easy', 'success_batch_fraction': 1.1},
             {'stage': 'easy', 'window_episode_count': 0},
             {'stage': 'easy', 'max_failures_per_window': 15},
         ):
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 V2FormalTrainingConfig(**kwargs)
+
+    def test_terminal_non_goal_marks_complete_episode_but_stage_cutoff_stays_unconfirmed(self):
+        scenario = ScenarioConfig(max_steps=2)
+        engine = _engine(scenario)
+        trainer = V2FormalStageTrainer(
+            scenario,
+            RewardConfig(),
+            V2FormalTrainingConfig(
+                stage='easy', max_steps=2, replay_capacity=8, batch_size=2,
+            ),
+            engine,
+            scenario_sources={'easy': _Source(_scenario_payload(0))},
+            validation_runner=lambda actor: _validation_result(False),
+        )
+        result = trainer.run()
+        self.assertEqual(result.episodes[0]['outcome'], 'timeout')
+        np.testing.assert_array_equal(
+            engine.replay.failure[:len(engine.replay)], [True, True],
+        )
+        np.testing.assert_array_equal(
+            engine.replay.success[:len(engine.replay)], [False, False],
+        )
+
+        # The stage budget expires before the environment episode terminates.
+        longer_scenario = ScenarioConfig(max_steps=10)
+        unfinished_engine = _engine(longer_scenario)
+        unfinished_trainer = V2FormalStageTrainer(
+            longer_scenario,
+            RewardConfig(),
+            V2FormalTrainingConfig(
+                stage='easy', max_steps=1, replay_capacity=8, batch_size=2,
+            ),
+            unfinished_engine,
+            scenario_sources={'easy': _Source(_scenario_payload(0))},
+            validation_runner=lambda actor: _validation_result(False),
+        )
+        unfinished_trainer.run()
+        self.assertEqual(unfinished_trainer.result.episodes, [])
+        np.testing.assert_array_equal(
+            unfinished_engine.replay.failure[:len(unfinished_engine.replay)],
+            [False],
+        )
 
     def test_early_stop_uses_only_failures_and_validation_gate(self):
         controller = V2EarlyStopController(
@@ -473,6 +531,7 @@ class TestV2FormalTraining(unittest.TestCase):
         self.assertEqual(result.outcome_counts['goal'], 1)
         self.assertEqual(engine.replay.success_count, 1)
         self.assertEqual(engine.replay.success_size, 1)
+        np.testing.assert_array_equal(engine.replay.failure[:len(engine.replay)], [False])
 
     def test_episode_records_expose_critic_q_td_error_and_actor_grad_norm_diagnostics(self):
         # A1/A2/A4 in this diagnostic pass (H4/H5 in docs/无法早停排查文档.md):
@@ -512,8 +571,13 @@ class TestV2FormalTraining(unittest.TestCase):
                 'critic_q1_mean', 'critic_q1_std', 'critic_q1_max_abs',
                 'critic_target_q_mean', 'critic_td_error_mean',
                 'critic_failure_td_error_mean', 'actor_grad_norm',
+                'batch_failure_sample_fraction',
             ):
                 self.assertIn(key, episode)
+        self.assertEqual(
+            result.episodes[1]['batch_failure_sample_fraction'],
+            0.5,
+        )
         self.assertTrue(any(episode['actor_grad_norm'] > 0.0 for episode in result.episodes))
 
     def test_window_medium_only_stats_isolate_medium_curriculum_level_episodes(self):
@@ -904,7 +968,11 @@ class TestV2FormalTraining(unittest.TestCase):
     def test_formal_checkpoint_excludes_replay_and_rejects_failed_or_wrong_predecessor(self):
         scenario = ScenarioConfig(max_steps=1)
         engine = _engine(scenario)
-        config = V2FormalTrainingConfig(stage='easy', max_steps=1)
+        engine.gamma = 0.995
+        engine.replay.failure_sample_bias = 3.0
+        config = V2FormalTrainingConfig(
+            stage='easy', max_steps=1, gamma=0.995, failure_sample_bias=3.0,
+        )
         result = V2FormalTrainingResult.empty('easy', global_steps_start=10)
         result.status = 'passed'
         result.passed_validation = True
@@ -930,6 +998,9 @@ class TestV2FormalTraining(unittest.TestCase):
             initialization_source={'kind': 'v2_bc_best', 'path': 'bc.pt'},
         )
         self.assertEqual(payload['format'], V2_FORMAL_CHECKPOINT_FORMAT)
+        self.assertEqual(payload['format_version'], V2_FORMAL_CHECKPOINT_VERSION)
+        self.assertEqual(payload['formal_config']['failure_sample_bias'], 3.0)
+        self.assertEqual(payload['formal_config']['gamma'], 0.995)
         self.assertNotIn('replay', payload)
         self.assertFalse(any('zone_features' in key for key in payload))
         self.assertEqual(payload['scenario_config']['max_steps'], 1)
@@ -952,6 +1023,9 @@ class TestV2FormalTraining(unittest.TestCase):
             load_v2_formal_checkpoint(failed, expected_stage='easy', require_passed=True)
         with self.assertRaisesRegex(ValueError, 'predecessor'):
             load_v2_formal_checkpoint(payload, next_stage='hard', require_passed=True)
+        legacy = dict(payload, format_version=1)
+        with self.assertRaisesRegex(ValueError, 'predates failure_sample_bias'):
+            load_v2_formal_checkpoint(legacy)
 
     def test_periodic_snapshot_round_trips_and_is_rejected_by_formal_checkpoint_loader(self):
         # C1 in this diagnostic pass: a separate, non-terminal format from
@@ -972,7 +1046,10 @@ class TestV2FormalTraining(unittest.TestCase):
             initialization_source={'kind': 'v2_bc_best', 'path': 'bc.pt'},
         )
         self.assertEqual(payload['format'], V2_PERIODIC_SNAPSHOT_FORMAT)
+        self.assertEqual(payload['format_version'], V2_PERIODIC_SNAPSHOT_VERSION)
         self.assertEqual(payload['stage_steps'], 42)
+        self.assertEqual(payload['formal_config']['gamma'], 0.99)
+        self.assertEqual(payload['formal_config']['failure_sample_bias'], 1.0)
         self.assertNotIn('status', payload)
         self.assertNotIn('passed_validation', payload)
         self.assertNotIn('training_result', payload)
@@ -983,6 +1060,8 @@ class TestV2FormalTraining(unittest.TestCase):
         self.assertEqual(loaded['stage_steps'], 42)
         with self.assertRaisesRegex(ValueError, 'format is incompatible'):
             load_v2_formal_checkpoint(payload)
+        with self.assertRaisesRegex(ValueError, 'predates failure_sample_bias'):
+            load_v2_periodic_snapshot(dict(payload, format_version=1))
 
         formal_result = V2FormalTrainingResult.empty('easy', global_steps_start=0)
         formal_result.status = 'passed'

@@ -66,9 +66,9 @@ from .v2_validation import (
 
 
 V2_FORMAL_CHECKPOINT_FORMAT = 'v2_formal_ann_td3_stage'
-V2_FORMAL_CHECKPOINT_VERSION = 1
+V2_FORMAL_CHECKPOINT_VERSION = 2
 V2_SNN_FORMAL_CHECKPOINT_FORMAT = 'v2_formal_snn_td3_stage'
-V2_SNN_FORMAL_CHECKPOINT_VERSION = 1
+V2_SNN_FORMAL_CHECKPOINT_VERSION = 2
 _FORMAL_CHECKPOINT_FIELDS = {
     'format',
     'format_version',
@@ -93,7 +93,7 @@ _SNN_FORMAL_CHECKPOINT_FIELDS = _FORMAL_CHECKPOINT_FIELDS | {'model_type'}
 # passed_validation/training_result) and must never be accepted by
 # load_v2_formal_checkpoint as a stage predecessor.
 V2_PERIODIC_SNAPSHOT_FORMAT = 'v2_formal_periodic_snapshot'
-V2_PERIODIC_SNAPSHOT_VERSION = 1
+V2_PERIODIC_SNAPSHOT_VERSION = 2
 _PERIODIC_SNAPSHOT_FIELDS = {
     'format',
     'format_version',
@@ -187,6 +187,7 @@ class V2FormalTrainingConfig:
     zone_storage_capacity: int = 6
     batch_size: int = 64
     success_sample_bias: float = 1.0
+    failure_sample_bias: float = 1.0
     near_goal_sample_bias: float = 2.0
     success_replay_fraction: float = 0.25
     success_batch_fraction: float = 0.25
@@ -232,8 +233,9 @@ class V2FormalTrainingConfig:
         if batch_size > replay_capacity:
             raise ValueError('batch_size must not exceed replay_capacity.')
         success_bias = _finite(self.success_sample_bias, name='success_sample_bias')
+        failure_bias = _finite(self.failure_sample_bias, name='failure_sample_bias')
         near_goal_bias = _finite(self.near_goal_sample_bias, name='near_goal_sample_bias')
-        if success_bias < 1.0 or near_goal_bias < 1.0:
+        if success_bias < 1.0 or failure_bias < 1.0 or near_goal_bias < 1.0:
             raise ValueError('Replay sampling biases must be at least 1.')
         success_replay_fraction = _fraction(self.success_replay_fraction, name='success_replay_fraction')
         success_batch_fraction = _fraction(self.success_batch_fraction, name='success_batch_fraction')
@@ -271,6 +273,7 @@ class V2FormalTrainingConfig:
         object.__setattr__(self, 'zone_storage_capacity', zone_capacity)
         object.__setattr__(self, 'batch_size', batch_size)
         object.__setattr__(self, 'success_sample_bias', success_bias)
+        object.__setattr__(self, 'failure_sample_bias', failure_bias)
         object.__setattr__(self, 'near_goal_sample_bias', near_goal_bias)
         object.__setattr__(self, 'success_replay_fraction', success_replay_fraction)
         object.__setattr__(self, 'success_batch_fraction', success_batch_fraction)
@@ -1105,6 +1108,7 @@ def build_v2_stage_engine(
         2,
         config.zone_storage_capacity,
         success_sample_bias=config.success_sample_bias,
+        failure_sample_bias=config.failure_sample_bias,
         near_goal_sample_bias=config.near_goal_sample_bias,
         success_replay_fraction=config.success_replay_fraction,
         success_batch_fraction=config.success_batch_fraction,
@@ -1381,6 +1385,8 @@ class V2FormalStageTrainer:
                             line_to_goal_safe=transition.line_to_goal_safe,
                         )
                     self.engine.replay.mark_success_slots(slot_refs, success=True)
+                else:
+                    self.engine.replay.mark_failure_slots(slot_refs, failure=True)
                 actor_updates = [value for value in update_metrics if value.actor_updated]
                 episode_record = {
                     'episode': len(self.result.episodes) + 1,
@@ -1405,6 +1411,9 @@ class V2FormalStageTrainer:
                     'replay_success_fraction': self.engine.replay.success_fraction(),
                     'success_replay_size': self.engine.replay.success_size,
                     'batch_success_fraction': update_metrics[-1].sample_success_fraction if update_metrics else 0.0,
+                    'batch_failure_sample_fraction': mean(
+                        [value.sample_failure_fraction for value in update_metrics]
+                    ) if update_metrics else 0.0,
                     # Diagnostic-only additions (H4/H5 in docs/无法早停排查文档.md):
                     # critic Q/TD-error statistics and the actor gradient norm,
                     # aggregated at the same per-episode grain as critic_loss.
@@ -1477,6 +1486,10 @@ class V2FormalStageTrainer:
                         'average_length': mean(value['episode_length'] for value in window_episodes),
                         'average_actor_loss': mean(value['actor_loss'] for value in window_episodes),
                         'average_critic_loss': mean(value['critic_loss'] for value in window_episodes),
+                        'average_batch_failure_sample_fraction': mean(
+                            value['batch_failure_sample_fraction']
+                            for value in window_episodes
+                        ),
                         'bc_lambda': current_bc_lambda,
                         'average_bc_loss': mean(value['bc_loss'] for value in window_episodes),
                         'average_weighted_bc_contribution': mean(value['weighted_bc_contribution'] for value in window_episodes),
@@ -1712,6 +1725,12 @@ def load_v2_periodic_snapshot(
     if payload.get('format') != V2_PERIODIC_SNAPSHOT_FORMAT:
         raise ValueError('Periodic V2 snapshot format is incompatible.')
     if payload.get('format_version') != V2_PERIODIC_SNAPSHOT_VERSION:
+        if payload.get('format_version') == 1:
+            raise ValueError(
+                'Legacy periodic V2 snapshot version 1 predates '
+                'failure_sample_bias; it cannot be loaded with the current '
+                'sampling configuration.'
+            )
         raise ValueError('Periodic V2 snapshot format_version is incompatible.')
     model_type = 'snn' if 'model_type' in payload else 'ann'
     expected_fields = (
@@ -1807,6 +1826,12 @@ def load_v2_formal_checkpoint(
         if model_type != expected_model_type:
             raise ValueError('Formal V2 checkpoint model type is incompatible.')
     if payload.get('format_version') != expected_version:
+        if payload.get('format_version') == 1:
+            raise ValueError(
+                'Legacy formal V2 checkpoint version 1 predates '
+                'failure_sample_bias; it cannot be loaded with the current '
+                'sampling configuration.'
+            )
         raise ValueError('Formal V2 checkpoint format_version is incompatible.')
     if set(payload) != expected_fields:
         raise ValueError('Formal V2 checkpoint has missing or unknown fields.')

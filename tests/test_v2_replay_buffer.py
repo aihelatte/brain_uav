@@ -63,6 +63,8 @@ class TestV2ReplayBuffer(unittest.TestCase):
             {'success_sample_bias': float('nan')},
             {'near_goal_sample_bias': 0.5},
             {'near_goal_sample_bias': float('inf')},
+            {'failure_sample_bias': 0.99},
+            {'failure_sample_bias': float('nan')},
             {'success_replay_fraction': -0.01},
             {'success_replay_fraction': 1.01},
             {'success_batch_fraction': float('nan')},
@@ -288,6 +290,90 @@ class TestV2ReplayBuffer(unittest.TestCase):
         self.assertEqual(replay.total_sample_weight, 3.0)
         self.assertEqual(replay.sampling_weight_total, 3.0)
 
+    def test_failure_slots_are_episode_wide_mutually_exclusive_and_write_id_safe(self):
+        replay = V2ReplayBuffer(
+            2, 2, 1, success_sample_bias=2.0,
+            failure_sample_bias=3.0, success_replay_fraction=0.0,
+        )
+        obs = _observation(1)
+        first = replay.add(obs, np.zeros(2, np.float32), 0.0, obs, False)
+        second = replay.add(obs, np.zeros(2, np.float32), 0.0, obs, True)
+
+        self.assertEqual(replay.mark_failure_slots([first, second]), 2)
+        np.testing.assert_array_equal(replay.failure, [True, True])
+        np.testing.assert_array_equal(replay.sample_weight, [3.0, 3.0])
+        self.assertEqual(replay.sampling_weight_total, 6.0)
+
+        # Success settlement clears the failure label and uses success weight.
+        self.assertEqual(replay.mark_success_slots([first]), 1)
+        self.assertTrue(replay.success[0])
+        self.assertFalse(replay.failure[0])
+        self.assertEqual(replay.sample_weight[0], 2.0)
+        self.assertEqual(replay.mark_failure_slots([first]), 1)
+        self.assertFalse(replay.success[0])
+        self.assertTrue(replay.failure[0])
+
+        # Replacing the failed slot clears its old marker and restores unit weight.
+        replacement = replay.add(obs, np.ones(2, np.float32), 0.0, obs, False)
+        self.assertEqual(replacement, (0, 2))
+        self.assertFalse(replay.failure[0])
+        self.assertEqual(replay.sample_weight[0], 1.0)
+        self.assertEqual(replay.sampling_weight_total, 4.0)
+        self.assertEqual(replay.mark_failure_slots([first]), 0)
+
+    def test_failure_bias_updates_fenwick_and_reports_actual_sample_fraction(self):
+        replay = V2ReplayBuffer(
+            4, 2, 1, failure_sample_bias=3.0,
+            success_batch_fraction=0.25, success_replay_fraction=0.0,
+        )
+        obs = _observation(1)
+        refs = [
+            replay.add(
+                obs,
+                np.array([index, 0.0], dtype=np.float32),
+                0.0,
+                obs,
+                False,
+            )
+            for index in range(4)
+        ]
+        replay.mark_failure_slots([refs[0], refs[2]])
+        np.testing.assert_array_equal(replay.sample_weight, [3.0, 1.0, 3.0, 1.0])
+        self.assertEqual(replay.sampling_weight_total, 8.0)
+
+        replay.rng = _ScriptedRNG(draws=[0.0, 0.7])
+        batch = replay.sample(2)
+        torch.testing.assert_close(batch.action[:, 0], torch.tensor([0.0, 2.0]))
+        self.assertEqual(batch.sample_failure_fraction, 1.0)
+        self.assertEqual(batch.to('cpu').sample_failure_fraction, 1.0)
+
+    def test_default_failure_bias_preserves_rng_stream_and_sample_contents(self):
+        plain = V2ReplayBuffer(8, 2, 1, success_replay_fraction=0.0, seed=92)
+        labeled = V2ReplayBuffer(
+            8, 2, 1, failure_sample_bias=1.0,
+            success_replay_fraction=0.0, seed=92,
+        )
+        obs = _observation(1)
+        refs = []
+        for index in range(8):
+            args = (
+                obs,
+                np.array([index, -index], dtype=np.float32),
+                float(index),
+                obs,
+                False,
+            )
+            plain.add(*args)
+            refs.append(labeled.add(*args))
+        labeled.mark_failure_slots(refs[::2])
+
+        plain_batch = plain.sample(4)
+        labeled_batch = labeled.sample(4)
+        torch.testing.assert_close(plain_batch.action, labeled_batch.action)
+        torch.testing.assert_close(plain_batch.reward, labeled_batch.reward)
+        torch.testing.assert_close(plain_batch.obs.ego_features, labeled_batch.obs.ego_features)
+        self.assertEqual(plain.rng.bit_generator.state, labeled.rng.bit_generator.state)
+
     def test_weighted_primary_sampling_uses_exact_remaining_weight_intervals(self):
         replay = V2ReplayBuffer(
             4,
@@ -420,6 +506,7 @@ class TestV2ReplayBuffer(unittest.TestCase):
         )
         self.assertEqual(batch.obs.max_zone_count, 3)
         self.assertEqual(batch.next_obs.max_zone_count, 4)
+        self.assertEqual(batch.sample_failure_fraction, 0.0)
 
     def test_success_shortage_is_backfilled_from_primary(self):
         replay = V2ReplayBuffer(16, 2, 3)

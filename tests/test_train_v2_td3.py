@@ -19,6 +19,7 @@ from brain_uav.scripts.train_v2_td3 import (
     _resolve_v2_cuda_graph_compilation,
     build_parser,
     default_v2_cuda_graph_compilation,
+    main as train_main,
     run_v2_td3_stage,
 )
 from brain_uav.trainers.v2_formal_training import (
@@ -184,6 +185,8 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertEqual(args.consecutive_windows, 4)
         self.assertEqual(args.max_failures_per_window, 1)
         self.assertEqual(args.validation_max_failures, 5)
+        self.assertEqual(args.gamma, 0.99)
+        self.assertEqual(args.failure_sample_bias, 1.0)
         self.assertFalse(args.compile_critic_encoder)
         self.assertFalse(args.compile_target_encoders)
         self.assertFalse(args.pinned_batch_transfer)
@@ -255,6 +258,28 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             '--snn-time-window', '3',
         ])
         self.assertEqual((snn.model, snn.snn_time_window), ('snn', 3))
+
+    def test_main_forwards_independent_gamma_and_failure_bias(self):
+        with mock.patch(
+            'brain_uav.scripts.train_v2_td3.resolve_training_device',
+            return_value='cpu',
+        ), mock.patch(
+            'brain_uav.scripts.train_v2_td3.run_v2_td3_stage',
+            return_value={'passed': True},
+        ) as stage_runner:
+            result = train_main([
+                '--stage', 'medium',
+                '--init-checkpoint', 'easy.pt',
+                '--output', 'medium.pt',
+                '--metrics-out', 'medium.json',
+                '--validation-pool', 'medium_validation.json',
+                '--device', 'cpu',
+                '--gamma', '0.995',
+                '--failure-sample-bias', '3.0',
+            ])
+        self.assertEqual(result, 0)
+        self.assertEqual(stage_runner.call_args.kwargs['gamma'], 0.995)
+        self.assertEqual(stage_runner.call_args.kwargs['failure_sample_bias'], 3.0)
 
     def test_default_v2_cuda_graph_compilation_is_device_and_model_aware(self):
         cuda_combo = default_v2_cuda_graph_compilation(model='ann', resolved_device='cuda')
