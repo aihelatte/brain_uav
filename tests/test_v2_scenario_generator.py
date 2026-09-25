@@ -61,6 +61,7 @@ def _generator(
     level: str,
     count: int,
     *,
+    scenario: ScenarioConfig | None = None,
     shape_type: str = 'sphere',
     seed: int = 7,
     ground_probability: float = 0.5,
@@ -83,7 +84,7 @@ def _generator(
         direct_path_blocker_probability=blocker,
     )
     return V2ScenarioGenerator(
-        ScenarioConfig(),
+        scenario or ScenarioConfig(),
         curriculum_level=level,
         seed=seed,
         config=config,
@@ -417,6 +418,125 @@ class TestV2ScenarioGenerator(unittest.TestCase):
                 self.assertLessEqual(abs(goal[2] - state[2]), scenario.world_z_max * gap_ratio + 1e-6)
                 self.assertGreaterEqual(state[4], psi_range[0])
                 self.assertLessEqual(state[4], psi_range[1])
+
+    def test_higher_world_ceiling_preserves_absolute_start_goal_sampling(self):
+        default_scenario = ScenarioConfig()
+        raised_scenario = ScenarioConfig(world_z_max=600.0)
+        self.assertEqual(default_scenario.world_z_max, 437.5)
+        self.assertEqual(raised_scenario.world_z_max, 600.0)
+        expected = {
+            'easy': ((0.16, 0.28), (0.16, 0.33), 0.12),
+            'medium': ((0.18, 0.30), (0.18, 0.35), 0.14),
+            'hard': ((0.18, 0.30), (0.18, 0.36), 0.15),
+        }
+        reference_height = min(
+            float(raised_scenario.world_z_max),
+            float(raised_scenario.world_xy) / 3.0,
+        )
+        for level, (state_ratio, goal_ratio, gap_ratio) in expected.items():
+            with self.subTest(level=level):
+                default_generator = V2ScenarioGenerator(
+                    default_scenario, level, seed=17
+                )
+                raised_generator = V2ScenarioGenerator(
+                    raised_scenario, level, seed=17
+                )
+                default_pair = default_generator._sample_start_goal(
+                    np.random.default_rng(901)
+                )
+                raised_pair = raised_generator._sample_start_goal(
+                    np.random.default_rng(901)
+                )
+                self.assertIsNotNone(default_pair)
+                self.assertIsNotNone(raised_pair)
+                for actual, expected_point in zip(raised_pair, default_pair):
+                    np.testing.assert_array_equal(actual, expected_point)
+                state, goal = raised_pair
+                self.assertGreaterEqual(state[2], reference_height * state_ratio[0])
+                self.assertLessEqual(state[2], reference_height * state_ratio[1])
+                self.assertGreaterEqual(goal[2], reference_height * goal_ratio[0])
+                self.assertLessEqual(goal[2], reference_height * goal_ratio[1])
+                self.assertLessEqual(
+                    abs(float(goal[2] - state[2])),
+                    reference_height * gap_ratio + 1e-6,
+                )
+
+        for scenario, reference_height in (
+            (ScenarioConfig(world_z_max=150.0), 150.0),
+            (
+                ScenarioConfig(
+                    target_distance=200.0,
+                    world_xy=300.0,
+                    world_z_max=600.0,
+                ),
+                100.0,
+            ),
+        ):
+            with self.subTest(world_xy=scenario.world_xy, ceiling=scenario.world_z_max):
+                pair = V2ScenarioGenerator(
+                    scenario, 'easy', seed=18
+                )._sample_start_goal(np.random.default_rng(902))
+                self.assertIsNotNone(pair)
+                state, goal = pair
+                self.assertGreaterEqual(state[2], reference_height * 0.16)
+                self.assertLessEqual(state[2], reference_height * 0.28)
+                self.assertGreaterEqual(goal[2], reference_height * 0.16)
+                self.assertLessEqual(goal[2], reference_height * 0.33)
+                self.assertLessEqual(state[2], scenario.world_z_max)
+                self.assertLessEqual(goal[2], scenario.world_z_max)
+
+    def test_raised_world_generation_keeps_geometry_and_feasibility_consistent(self):
+        scenario = ScenarioConfig(world_z_max=600.0)
+        margin = scenario.corridor_blocking_margin
+        for level in ('easy', 'medium'):
+            for requested_blocker in (False, True):
+                with self.subTest(level=level, requested_blocker=requested_blocker):
+                    payload = _generator(
+                        level,
+                        2,
+                        scenario=scenario,
+                        seed=1200 + 10 * (level == 'medium') + requested_blocker,
+                        blocker_probability=float(requested_blocker),
+                    ).generate()
+                    state = np.asarray(payload['state'], dtype=np.float64)
+                    goal = np.asarray(payload['goal'], dtype=np.float64)
+                    zones = _zones(payload)
+                    metadata = payload['metadata']
+                    actual_count = sum(
+                        zone.violates_segment(state[:3], goal, uav_radius=margin)
+                        for zone in zones
+                    )
+                    self.assertEqual(actual_count, metadata['direct_path_blocker_count'])
+                    self.assertIs(metadata['requested_direct_path_blocker'], requested_blocker)
+                    self.assertLessEqual(state[2], scenario.world_z_max)
+                    self.assertLessEqual(goal[2], scenario.world_z_max)
+                    for zone in zones:
+                        bounds = zone.shape.bounding_box()
+                        self.assertGreaterEqual(bounds.min_corner[2], 0.0)
+                        self.assertLessEqual(bounds.max_corner[2], scenario.world_z_max)
+                    if requested_blocker:
+                        self.assertGreaterEqual(actual_count, 1)
+                        self.assertTrue(metadata['feasibility_passed'])
+                    else:
+                        self.assertEqual(actual_count, 0)
+                        self.assertEqual(metadata['feasibility_check'], 'direct_safe_corridor')
+
+    def test_suspended_non_blocker_sampling_uses_the_raised_world_ceiling(self):
+        legacy = _generator('easy', 0, scenario=ScenarioConfig())
+        raised = _generator(
+            'easy', 0, scenario=ScenarioConfig(world_z_max=600.0)
+        )
+        legacy_center = legacy._sample_primitive_center(
+            np.random.default_rng(2), 20.0, 20.0, 20.0, None, grounded=False
+        )
+        raised_center = raised._sample_primitive_center(
+            np.random.default_rng(2), 20.0, 20.0, 20.0, None, grounded=False
+        )
+        self.assertIsNotNone(legacy_center)
+        self.assertIsNotNone(raised_center)
+        self.assertLessEqual(legacy_center[2] + 20.0, legacy.scenario.world_z_max)
+        self.assertGreater(raised_center[2], legacy.scenario.world_z_max)
+        self.assertLessEqual(raised_center[2] + 20.0, raised.scenario.world_z_max)
 
     def test_overlap_modes_and_aabb_count_are_distinct_metadata(self):
         easy = _generator('easy', 2, seed=701).generate()

@@ -545,15 +545,20 @@ class V2ScenarioGenerator:
             scenario.target_distance * spec.distance_ratio[0],
             scenario.target_distance * spec.distance_ratio[1],
         )
+        # Keep the legacy altitude scale when only the vertical ceiling grows.
+        altitude_reference = min(
+            float(scenario.world_z_max),
+            float(scenario.world_xy) / 3.0,
+        )
         state_z_range = (
-            scenario.world_z_max * spec.state_z_ratio[0],
-            scenario.world_z_max * spec.state_z_ratio[1],
+            altitude_reference * spec.state_z_ratio[0],
+            altitude_reference * spec.state_z_ratio[1],
         )
         goal_z_range = (
-            scenario.world_z_max * spec.goal_z_ratio[0],
-            scenario.world_z_max * spec.goal_z_ratio[1],
+            altitude_reference * spec.goal_z_ratio[0],
+            altitude_reference * spec.goal_z_ratio[1],
         )
-        max_height_gap = scenario.world_z_max * spec.max_height_gap_ratio
+        max_height_gap = altitude_reference * spec.max_height_gap_ratio
         for _ in range(self.config.start_goal_sampling_attempts):
             distance = float(rng.uniform(*distance_range))
             mean_y = float(

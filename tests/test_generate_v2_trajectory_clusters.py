@@ -5,8 +5,10 @@ import tempfile
 import unittest
 from dataclasses import asdict, replace
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
+import torch
 
 from brain_uav.config import RewardConfig, ScenarioConfig
 from brain_uav.envs import V2_ENV_SCENARIO_FORMAT, V2_ENV_SCENARIO_VERSION
@@ -21,17 +23,36 @@ from brain_uav.scripts.generate_v2_trajectory_clusters import (
     V2_SCENARIO_POOL_VERSION,
     V2_TRAJECTORY_CLUSTER_VERSION,
     V2PlannerSpec,
+    V2PlannerRolloutResult,
+    _build_parser,
     collect_v2_planner_rollout,
     generate_easy_scenario_pool,
     generate_v2_trajectory_clusters,
     load_easy_scenario_pool,
+    main as generate_clusters_main,
     save_easy_scenario_pool,
 )
+from brain_uav.scripts.run_v2_td3_curriculum import prepare_v2_validation_pools
 from brain_uav.scripts.v2_trajectory_io import (
     V2_TRAJECTORY_SHARD_VERSION,
     V2TrajectoryShardBuffer,
     build_successful_v2_trajectory,
     load_v2_trajectory_shard,
+)
+from brain_uav.models import V2ANNPolicyActor
+from brain_uav.observations import V2ObservationScales
+from brain_uav.trainers.v2_bc import (
+    V2BCTrainingConfig,
+    V2BCTrainingResult,
+    build_v2_bc_checkpoint_payload,
+    load_v2_bc_actor_checkpoint,
+    load_v2_bc_trajectory_cluster,
+    split_v2_bc_scenarios,
+)
+from brain_uav.trainers.v2_validation import (
+    generate_v2_validation_pool,
+    load_v2_validation_pool,
+    save_v2_validation_pool,
 )
 
 
@@ -511,6 +532,187 @@ class TestV2PlannerRollout(unittest.TestCase):
 
 
 class TestClusterOrchestration(unittest.TestCase):
+    def test_world_z_max_cli_snapshot_and_downstream_config_validation(self) -> None:
+        required_args = ['--output-dir', 'unused', '--scenario-count', '1']
+        defaults = _build_parser().parse_args(required_args)
+        self.assertIsNone(defaults.world_z_max)
+        self.assertEqual(defaults.heuristic_repulsive_gain, 3.0)
+        self.assertEqual(defaults.heuristic_influence_margin, 4.0)
+        self.assertEqual(defaults.apf_repulsive_gain, 5000.0)
+        self.assertEqual(defaults.apf_influence_margin, 6.0)
+        self.assertEqual(
+            _build_parser().parse_args(required_args + ['--world-z-max', '600']).world_z_max,
+            600.0,
+        )
+
+        def fake_rollout(
+            payload,
+            *,
+            scenario_id,
+            trajectory_id,
+            planner_spec,
+            **_kwargs,
+        ):
+            trajectory = build_successful_v2_trajectory(
+                trajectory_id=trajectory_id,
+                scenario_id=scenario_id,
+                planner_name=planner_spec.name,
+                scenario_seed=payload['metadata']['scenario_seed'],
+                observations=[_observation(len(payload['zones']), 1.0)],
+                states_before_action=np.asarray(payload['state'], dtype=np.float32)[None, :],
+                actions=np.zeros((1, 2), dtype=np.float32),
+                terminal_state=np.asarray(payload['state'], dtype=np.float32),
+                outcome='goal',
+            )
+            return V2PlannerRolloutResult(
+                scenario_id=scenario_id,
+                planner_name=planner_spec.name,
+                outcome='goal',
+                step_count=1,
+                trajectory=trajectory,
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / 'clusters'
+            with mock.patch(
+                'brain_uav.scripts.generate_v2_trajectory_clusters.collect_v2_planner_rollout',
+                side_effect=fake_rollout,
+            ):
+                generate_clusters_main(
+                    [
+                        '--output-dir', str(output),
+                        '--scenario-count', '2',
+                        '--seed', '717',
+                        '--shard-size', '1',
+                        '--world-z-max', '600',
+                        '--apf-repulsive-gain', '1e7',
+                        '--apf-influence-margin', '6',
+                    ]
+                )
+
+            pool = json.loads((output / 'scenario_pool.json').read_text(encoding='utf-8'))
+            manifest = json.loads((output / 'manifest.json').read_text(encoding='utf-8'))
+            self.assertEqual(pool['scenario_config']['world_z_max'], 600.0)
+            self.assertEqual(manifest['scenario_config'], pool['scenario_config'])
+            self.assertEqual(
+                manifest['statistics']['planners']['v2_heuristic']['parameters'],
+                {'repulsive_gain': 3.0, 'influence_margin': 4.0},
+            )
+            self.assertEqual(
+                manifest['statistics']['planners']['v2_apf']['parameters'],
+                {
+                    'attractive_gain': 1.0,
+                    'repulsive_gain': 1e7,
+                    'influence_margin': 6.0,
+                },
+            )
+
+            cluster = load_v2_bc_trajectory_cluster(output)
+            self.assertEqual(cluster.scenario_config.world_z_max, 600.0)
+
+            scenario = cluster.scenario_config
+            actor = V2ANNPolicyActor(
+                V2ObservationScales(
+                    world_xy=float(scenario.world_xy),
+                    world_z_min=float(scenario.world_z_min),
+                    world_z_max=float(scenario.world_z_max),
+                    gamma_max=float(scenario.gamma_max),
+                ),
+                action_dim=2,
+                hidden_dim=8,
+                action_limit=torch.tensor(
+                    [scenario.delta_gamma_max, scenario.delta_psi_max],
+                    dtype=torch.float32,
+                ),
+            )
+            state_dict = actor.state_dict()
+            training_config = V2BCTrainingConfig(
+                epochs=1,
+                batch_size=1,
+                learning_rate=1e-3,
+                seed=717,
+                validation_fraction=0.5,
+            )
+            checkpoint_payload = build_v2_bc_checkpoint_payload(
+                checkpoint_kind='best',
+                actor=actor,
+                actor_state_dict=state_dict,
+                cluster=cluster,
+                split=split_v2_bc_scenarios(
+                    cluster, validation_fraction=0.5, seed=717
+                ),
+                config=training_config,
+                result=V2BCTrainingResult(
+                    train_loss_history=(0.2,),
+                    validation_loss_history=(0.1,),
+                    best_epoch=1,
+                    best_validation_loss=0.1,
+                    best_state_dict=state_dict,
+                    final_state_dict=state_dict,
+                ),
+                finished_at='2026-09-25T00:00:00Z',
+            )
+            self.assertEqual(
+                checkpoint_payload['dataset_provenance']['scenario_config'],
+                pool['scenario_config'],
+            )
+            checkpoint_path = root / 'bc_best.pt'
+            torch.save(checkpoint_payload, checkpoint_path)
+            loaded_actor = load_v2_bc_actor_checkpoint(checkpoint_path)
+            self.assertEqual(loaded_actor.scales.world_z_max, 600.0)
+
+            validation_dir = root / 'validation'
+            validation_paths = prepare_v2_validation_pools(
+                validation_dir,
+                cluster.scenario_config,
+                validation_seed=901,
+                scenario_count=1,
+            )
+            for stage, path in validation_paths.items():
+                loaded = load_v2_validation_pool(
+                    path,
+                    expected_level=stage,
+                    expected_scenario=cluster.scenario_config,
+                    expected_count=1,
+                    expected_master_seed=901,
+                )
+                self.assertEqual(loaded.scenario_config['world_z_max'], 600.0)
+
+            legacy_path = root / 'legacy_validation.json'
+            legacy_pool = generate_v2_validation_pool(
+                ScenarioConfig(),
+                'easy',
+                scenario_count=1,
+                master_seed=902,
+            )
+            save_v2_validation_pool(legacy_path, legacy_pool)
+            with self.assertRaisesRegex(ValueError, 'ScenarioConfig is incompatible'):
+                load_v2_validation_pool(
+                    legacy_path,
+                    expected_level='easy',
+                    expected_scenario=cluster.scenario_config,
+                    expected_count=1,
+                    expected_master_seed=902,
+                )
+
+            legacy_scenario_pool_path = root / 'legacy_scenario_pool.json'
+            save_easy_scenario_pool(
+                legacy_scenario_pool_path,
+                generate_easy_scenario_pool(ScenarioConfig(), 1, seed=903),
+            )
+            mismatched_output = root / 'mismatched_clusters'
+            with self.assertRaisesRegex(ValueError, 'ScenarioConfig does not match'):
+                generate_clusters_main(
+                    [
+                        '--output-dir', str(mismatched_output),
+                        '--scenario-count', '1',
+                        '--scenario-pool', str(legacy_scenario_pool_path),
+                        '--world-z-max', '600',
+                    ]
+                )
+            self.assertFalse(mismatched_output.exists())
+
     def test_loaded_pool_uses_its_saved_scenario_config_and_radius(self) -> None:
         scenario = _config(
             speed=2.0,
@@ -564,6 +766,7 @@ class TestClusterOrchestration(unittest.TestCase):
             replace(pool_scenario, speed=3.0),
             replace(pool_scenario, max_steps=4),
             replace(pool_scenario, goal_radius=0.75),
+            replace(pool_scenario, world_z_max=600.0),
         )
         for index, mismatch in enumerate(mismatches):
             with self.subTest(config=mismatch):

@@ -70,12 +70,24 @@ class _V2Planner(Protocol):
 class V2PlannerSpec:
     name: str
     factory: Callable[[V2StaticNoFlyTrajectoryEnv], _V2Planner]
+    parameters: Mapping[str, float] | None = None
 
     def __post_init__(self) -> None:
         if type(self.name) is not str or not self.name.strip():
             raise ValueError('Planner name must be a non-empty string.')
         if not callable(self.factory):
             raise TypeError('Planner factory must be callable.')
+        if self.parameters is not None:
+            if not isinstance(self.parameters, Mapping):
+                raise TypeError('Planner parameters must be a mapping or None.')
+            parameters: dict[str, float] = {}
+            for key, value in self.parameters.items():
+                if type(key) is not str or not key.strip():
+                    raise ValueError('Planner parameter names must be non-empty strings.')
+                if type(value) not in (int, float) or not isfinite(float(value)) or value < 0:
+                    raise ValueError(f'Planner parameter {key!r} must be finite and non-negative.')
+                parameters[key] = float(value)
+            object.__setattr__(self, 'parameters', parameters)
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,8 +108,16 @@ class V2PlannerRolloutResult:
 
 
 DEFAULT_V2_PLANNER_SPECS = (
-    V2PlannerSpec('v2_heuristic', V2HeuristicPlanner),
-    V2PlannerSpec('v2_apf', V2ArtificialPotentialFieldPlanner),
+    V2PlannerSpec(
+        'v2_heuristic',
+        V2HeuristicPlanner,
+        {'repulsive_gain': 3.0, 'influence_margin': 4.0},
+    ),
+    V2PlannerSpec(
+        'v2_apf',
+        V2ArtificialPotentialFieldPlanner,
+        {'attractive_gain': 1.0, 'repulsive_gain': 5000.0, 'influence_margin': 6.0},
+    ),
 )
 
 
@@ -573,6 +593,9 @@ def _new_statistics(
         'successful_trajectories': 0,
         'planners': {
             spec.name: {
+                'parameters': (
+                    None if spec.parameters is None else dict(spec.parameters)
+                ),
                 'attempts': 0,
                 'goal': 0,
                 'collision': 0,
@@ -838,17 +861,57 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--shard-size', type=int, default=25)
     parser.add_argument('--scenario-pool', type=Path, default=None)
+    parser.add_argument(
+        '--world-z-max',
+        type=float,
+        default=None,
+        help=(
+            'Set the V2 scenario world ceiling; when loading a pool, it must '
+            'match that pool\'s saved configuration.'
+        ),
+    )
+    parser.add_argument('--heuristic-repulsive-gain', type=float, default=3.0)
+    parser.add_argument('--heuristic-influence-margin', type=float, default=4.0)
+    parser.add_argument('--apf-repulsive-gain', type=float, default=5000.0)
+    parser.add_argument('--apf-influence-margin', type=float, default=6.0)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = _build_parser().parse_args(argv)
+    scenario = (
+        None
+        if args.world_z_max is None
+        else ScenarioConfig(world_z_max=args.world_z_max)
+    )
+    heuristic_parameters = {
+        'repulsive_gain': args.heuristic_repulsive_gain,
+        'influence_margin': args.heuristic_influence_margin,
+    }
+    apf_parameters = {
+        'attractive_gain': 1.0,
+        'repulsive_gain': args.apf_repulsive_gain,
+        'influence_margin': args.apf_influence_margin,
+    }
     manifest = generate_v2_trajectory_clusters(
         output_dir=args.output_dir,
         scenario_count=args.scenario_count,
         seed=args.seed,
         shard_size=args.shard_size,
         scenario_pool_path=args.scenario_pool,
+        scenario=scenario,
+        planner_specs=(
+            V2PlannerSpec(
+                'v2_heuristic',
+                lambda env: V2HeuristicPlanner(env, **heuristic_parameters),
+                heuristic_parameters,
+            ),
+            V2PlannerSpec(
+                'v2_apf',
+                lambda env: V2ArtificialPotentialFieldPlanner(env, **apf_parameters),
+                apf_parameters,
+            ),
+        ),
     )
     print(
         json.dumps(
