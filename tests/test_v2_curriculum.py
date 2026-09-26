@@ -83,6 +83,18 @@ class TestV2Curriculum(unittest.TestCase):
             with self.subTest(step=step):
                 self.assertEqual(v2_bc_lambda(step), value)
 
+    def test_bc_schedule_can_delay_only_the_final_drop_to_400k(self) -> None:
+        from brain_uav.v2_curriculum import v2_bc_lambda
+
+        self.assertEqual(v2_bc_lambda(299_999), 15.0)
+        self.assertEqual(v2_bc_lambda(300_000), 5.0)
+        self.assertEqual(v2_bc_lambda(299_999, final_drop_step=400_000), 15.0)
+        self.assertEqual(v2_bc_lambda(300_000, final_drop_step=400_000), 15.0)
+        self.assertEqual(v2_bc_lambda(399_999, final_drop_step=400_000), 15.0)
+        self.assertEqual(v2_bc_lambda(400_000, final_drop_step=400_000), 5.0)
+        with self.assertRaisesRegex(ValueError, 'final_drop_step'):
+            v2_bc_lambda(300_000, final_drop_step=350_000)
+
     def test_noise_schedule_decays_for_first_half_then_stays_final(self) -> None:
         from brain_uav.v2_curriculum import V2NoiseSchedule
 

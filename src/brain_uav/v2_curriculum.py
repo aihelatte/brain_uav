@@ -131,7 +131,11 @@ class V2CurriculumSelector:
         return str(self.rng.choice(self.levels, p=self.probabilities))
 
 
-def v2_bc_lambda(stage_local_step: int) -> float:
+def v2_bc_lambda(
+    stage_local_step: int,
+    *,
+    final_drop_step: int = 300_000,
+) -> float:
     """V2-only BC weight schedule; V1's td3.py `_bc_lambda` is unchanged.
 
     H10 in docs/P5早停判据离线回放结论_20260917.md: the original 30->5 step at
@@ -142,13 +146,16 @@ def v2_bc_lambda(stage_local_step: int) -> float:
     """
 
     step = _nonnegative_int(stage_local_step, name='stage_local_step')
+    final_step = _nonnegative_int(final_drop_step, name='final_drop_step')
+    if final_step not in (300_000, 400_000):
+        raise ValueError('final_drop_step must be 300000 or 400000.')
     if step < 75_000:
         return 500.0
     if step < 150_000:
         return 150.0
     if step < 250_000:
         return 30.0
-    if step < 300_000:
+    if step < final_step:
         return 15.0
     return 5.0
 

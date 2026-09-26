@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import asdict
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -24,8 +26,11 @@ from brain_uav.scripts.train_v2_td3 import (
 )
 from brain_uav.trainers.v2_formal_training import (
     V2BCFormalInitialization,
+    V2_FORMAL_CHECKPOINT_FORMAT,
+    V2_FORMAL_CHECKPOINT_VERSION,
     V2PreparedStageInitialization,
 )
+from brain_uav.trainers.v2_validation import scenario_config_snapshot
 from brain_uav.trainers.v2_reporting import V2ExperimentReporter
 from brain_uav.v2_curriculum import derive_v2_component_seed
 
@@ -187,6 +192,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertEqual(args.validation_max_failures, 5)
         self.assertEqual(args.gamma, 0.99)
         self.assertEqual(args.failure_sample_bias, 1.0)
+        self.assertEqual(args.bc_final_drop_step, 300_000)
         self.assertFalse(args.compile_critic_encoder)
         self.assertFalse(args.compile_target_encoders)
         self.assertFalse(args.pinned_batch_transfer)
@@ -276,10 +282,23 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 '--device', 'cpu',
                 '--gamma', '0.995',
                 '--failure-sample-bias', '3.0',
+                '--bc-final-drop-step', '400000',
             ])
         self.assertEqual(result, 0)
         self.assertEqual(stage_runner.call_args.kwargs['gamma'], 0.995)
         self.assertEqual(stage_runner.call_args.kwargs['failure_sample_bias'], 3.0)
+        self.assertEqual(stage_runner.call_args.kwargs['bc_final_drop_step'], 400_000)
+
+    def test_non_default_bc_final_drop_is_medium_only(self):
+        with self.assertRaisesRegex(ValueError, 'medium'):
+            run_v2_td3_stage(
+                stage='easy',
+                init_checkpoint=Path('easy.pt'),
+                output=Path('easy-out.pt'),
+                metrics_out=Path('easy-metrics.json'),
+                validation_pool=Path('easy-validation.json'),
+                bc_final_drop_step=400_000,
+            )
 
     def test_default_v2_cuda_graph_compilation_is_device_and_model_aware(self):
         cuda_combo = default_v2_cuda_graph_compilation(model='ann', resolved_device='cuda')
@@ -470,7 +489,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'CUDA'):
                 resolve_training_device('cuda')
 
-    def test_stage_resolves_auto_before_engine_and_records_both_devices(self):
+    def test_medium_stage_records_bc_schedule_and_resolves_auto_before_engine(self):
         scenario = ScenarioConfig(target_distance=1_701.0)
         rewards = RewardConfig(progress_weight=3.25)
         actor = V2ANNPolicyActor(
@@ -490,7 +509,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         )
         pool = SimpleNamespace(
             scenario_count=100,
-            curriculum_level='easy',
+            curriculum_level='medium',
             master_seed=20260904,
             stage_seed=123,
             content_digest='digest',
@@ -530,21 +549,25 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             root = Path(directory)
             checkpoint = root / 'bc.pt'
             prepared = V2PreparedStageInitialization(
-                stage='easy',
-                model_seed=derive_v2_component_seed(7, 'easy', 'model'),
+                stage='medium',
+                model_seed=derive_v2_component_seed(7, 'medium', 'model'),
                 verified_initialization_source=checkpoint.resolve(),
                 snn_time_window=None,
                 scenario_config=scenario,
                 reward_config=rewards,
                 uav_collision_radius=0.75,
                 model_type='ann',
-                bc_initialization=V2BCFormalInitialization(
-                    actor=actor,
-                    scenario_config=scenario,
-                    uav_collision_radius=0.75,
-                    model_type='ann',
-                ),
-                formal_checkpoint=None,
+                bc_initialization=None,
+                formal_checkpoint={
+                    'stage': 'easy',
+                    'status': 'passed',
+                    'passed_validation': True,
+                    'format': V2_FORMAL_CHECKPOINT_FORMAT,
+                    'format_version': V2_FORMAL_CHECKPOINT_VERSION,
+                    'scenario_config': scenario_config_snapshot(scenario),
+                    'reward_config': asdict(rewards),
+                    'uav_collision_radius': 0.75,
+                },
                 torch_rng_state=torch.get_rng_state().clone(),
             )
             with mock.patch(
@@ -568,15 +591,21 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 'brain_uav.scripts.train_v2_td3.save_v2_formal_checkpoint'
             ), mock.patch(
                 'brain_uav.scripts.train_v2_td3._write_strict_json'
-            ):
+            ) as metrics_writer:
                 trainer_type.return_value.run.return_value = result
                 summary = run_v2_td3_stage(
-                    stage='easy',
+                    stage='medium',
                     init_checkpoint=checkpoint,
                     output=root / 'easy.pt',
                     metrics_out=root / 'metrics.json',
                     validation_pool=root / 'validation.json',
                     device='auto',
+                    bc_final_drop_step=400_000,
+                )
+                stage_start = json.loads(
+                    (root / 'metrics_reports' / 'stage_start.json').read_text(
+                        encoding='utf-8'
+                    )
                 )
 
         resolver.assert_called_once_with('auto')
@@ -599,6 +628,19 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertEqual(
             summary['replay_sampling_implementation'],
             'fenwick_ppswor_v1',
+        )
+        expected_schedule = {
+            'kind': 'stage_local_piecewise_constant',
+            'boundaries': [0, 75_000, 150_000, 250_000, 400_000],
+            'values': [500.0, 150.0, 30.0, 15.0, 5.0],
+        }
+        self.assertEqual(
+            trainer_type.call_args.kwargs['bc_final_drop_step'], 400_000
+        )
+        self.assertEqual(stage_start['bc_schedule'], expected_schedule)
+        self.assertEqual(summary['bc_schedule'], expected_schedule)
+        self.assertEqual(
+            metrics_writer.call_args.args[1]['bc_schedule'], expected_schedule
         )
 
 

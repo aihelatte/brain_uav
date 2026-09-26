@@ -25,6 +25,7 @@ from brain_uav.trainers.v2_formal_training import (
     save_v2_formal_checkpoint,
     save_v2_periodic_snapshot,
     validate_v2_prepared_stage_initialization,
+    v2_bc_schedule_metadata,
 )
 from brain_uav.trainers.v2_validation import (
     V2_VALIDATION_POOL_VERSION,
@@ -56,6 +57,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--validation-max-failures', type=int, default=5)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--failure-sample-bias', type=float, default=1.0)
+    parser.add_argument(
+        '--bc-final-drop-step',
+        type=int,
+        choices=(300_000, 400_000),
+        default=300_000,
+        help='Stage-local 15-to-5 BC switch; 400000 is medium-only.',
+    )
     # These default to the 2026-09-22-verified full compile + CUDA Graph
     # combination (see default_v2_cuda_graph_compilation below) unless
     # explicitly overridden with --no-<flag>. compile_critic_encoder,
@@ -389,6 +397,7 @@ def run_v2_td3_stage(
     seed: int = 7,
     gamma: float = 0.99,
     failure_sample_bias: float = 1.0,
+    bc_final_drop_step: int = 300_000,
     device: str = 'auto',
     max_stage_steps: int | None = None,
     early_stop_min_steps: int = 125_000,
@@ -427,6 +436,10 @@ def run_v2_td3_stage(
     cuda_graph_updates: bool = False,
     periodic_snapshot_interval_steps: int | None = None,
 ) -> dict[str, Any]:
+    bc_schedule = v2_bc_schedule_metadata(
+        stage,
+        final_drop_step=bc_final_drop_step,
+    )
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
     if model not in ('ann', 'snn'):
@@ -568,6 +581,7 @@ def run_v2_td3_stage(
             'seed': seed,
             'max_steps': config.max_steps,
             'formal_config': config.to_dict(),
+            'bc_schedule': bc_schedule,
             'checkpoint_output': str(output_path),
             'failed_checkpoint_output': str(failed_output_path),
             'metrics_output': str(metrics_path),
@@ -604,6 +618,7 @@ def run_v2_td3_stage(
                 uav_collision_radius=effective_uav_collision_radius,
                 seed_manifest=components.seed_manifest,
                 initialization_source=components.initialization_source,
+                bc_final_drop_step=bc_final_drop_step,
             )
             snapshot_path = periodic_snapshot_dir / f'step_{stage_steps:09d}.pt'
             save_v2_periodic_snapshot(snapshot_path, payload)
@@ -640,6 +655,7 @@ def run_v2_td3_stage(
         global_steps_start=global_steps_start,
         uav_collision_radius=effective_uav_collision_radius,
         reporter=reporter,
+        bc_final_drop_step=bc_final_drop_step,
         periodic_snapshot_interval_steps=periodic_snapshot_interval_steps,
         periodic_snapshot_sink=periodic_snapshot_sink,
         periodic_validation_sink=periodic_validation_sink,
@@ -665,6 +681,7 @@ def run_v2_td3_stage(
             seed_manifest=components.seed_manifest,
             validation_pool_metadata=validation_metadata,
             initialization_source=components.initialization_source,
+            bc_final_drop_step=bc_final_drop_step,
         )
         checkpoint_path = output_path if result.passed_validation else failed_output_path
         if checkpoint_path.exists():
@@ -689,6 +706,7 @@ def run_v2_td3_stage(
             'scenario_config': scenario_config_snapshot(scenario_config),
             'reward_config': asdict(reward_config),
             'formal_config': config.to_dict(),
+            'bc_schedule': bc_schedule,
             'seed_manifest': dict(components.seed_manifest),
             'validation_pool': validation_metadata,
             'initialization_source': dict(components.initialization_source),
@@ -715,6 +733,7 @@ def run_v2_td3_stage(
         summary = {
             'stage': stage,
             'model_type': model,
+            'bc_schedule': bc_schedule,
             'passed': result.passed_validation,
             'checkpoint': str(checkpoint_path),
             'metrics': str(metrics_path),
@@ -756,6 +775,10 @@ def main(argv: list[str] | None = None) -> int:
         'requested_device': args.device,
         'resolved_device': resolved_device,
         'resolved_v2_formal_config': config_preview.to_dict(),
+        'bc_schedule': v2_bc_schedule_metadata(
+            args.stage,
+            final_drop_step=args.bc_final_drop_step,
+        ),
         'model_type': args.model,
         'snn_time_window': args.snn_time_window if args.model == 'snn' else None,
     }, indent=2))
@@ -777,6 +800,7 @@ def main(argv: list[str] | None = None) -> int:
         validation_max_failures=args.validation_max_failures,
         gamma=args.gamma,
         failure_sample_bias=args.failure_sample_bias,
+        bc_final_drop_step=args.bc_final_drop_step,
         model=args.model,
         snn_time_window=args.snn_time_window,
         compile_critic_encoder=args.compile_critic_encoder,

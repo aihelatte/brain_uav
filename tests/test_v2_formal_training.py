@@ -1014,7 +1014,11 @@ class TestV2FormalTraining(unittest.TestCase):
             path = Path(directory) / 'easy.pt'
             save_v2_formal_checkpoint(path, payload)
             loaded = load_v2_formal_checkpoint(path, expected_stage='easy', require_passed=True)
+            medium_predecessor = load_v2_formal_checkpoint(
+                path, next_stage='medium', require_passed=True,
+            )
         self.assertTrue(loaded['passed_validation'])
+        self.assertEqual(medium_predecessor['bc_schedule']['boundaries'][-1], 300_000)
 
         failed = dict(payload)
         failed['status'] = 'failed'
@@ -1026,6 +1030,76 @@ class TestV2FormalTraining(unittest.TestCase):
         legacy = dict(payload, format_version=1)
         with self.assertRaisesRegex(ValueError, 'predates failure_sample_bias'):
             load_v2_formal_checkpoint(legacy)
+
+    def test_medium_400k_bc_schedule_is_recorded_and_strictly_loaded(self):
+        scenario = ScenarioConfig(max_steps=1)
+        engine = _engine(scenario)
+        config = V2FormalTrainingConfig(stage='medium', max_steps=1)
+        result = V2FormalTrainingResult.empty('medium', global_steps_start=10)
+        result.status = 'passed'
+        result.passed_validation = True
+        result.stop_reason = 'fixed_validation_passed'
+        validation = _validation_result(True).to_dict()
+        validation['curriculum_level'] = 'medium'
+        result.validation_records.append(validation)
+        common = {
+            'scenario': scenario,
+            'rewards': RewardConfig(),
+            'uav_collision_radius': 0.0,
+            'seed_manifest': {'base_seed': 7},
+            'validation_pool_metadata': {
+                'path': 'medium.json',
+                'format_version': 1,
+                'curriculum_level': 'medium',
+                'master_seed': 20260904,
+                'stage_seed': 11,
+                'scenario_count': 100,
+                'content_digest': 'medium-digest',
+            },
+            'initialization_source': {
+                'kind': 'validated_v2_td3_stage',
+                'previous_stage': 'easy',
+                'path': 'easy.pt',
+            },
+            'bc_final_drop_step': 400_000,
+        }
+        payload = build_v2_formal_checkpoint(engine, result, config, **common)
+        expected_schedule = {
+            'kind': 'stage_local_piecewise_constant',
+            'boundaries': [0, 75_000, 150_000, 250_000, 400_000],
+            'values': [500.0, 150.0, 30.0, 15.0, 5.0],
+        }
+        self.assertEqual(payload['bc_schedule'], expected_schedule)
+        self.assertEqual(payload['format_version'], V2_FORMAL_CHECKPOINT_VERSION)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'medium-400k.pt'
+            save_v2_formal_checkpoint(path, payload)
+            loaded = load_v2_formal_checkpoint(
+                path, expected_stage='medium', require_passed=True,
+            )
+        self.assertEqual(loaded['bc_schedule'], expected_schedule)
+
+        invalid_schedule = deepcopy(payload)
+        invalid_schedule['bc_schedule']['boundaries'][-1] = 350_000
+        with self.assertRaisesRegex(ValueError, 'BC schedule is incompatible'):
+            load_v2_formal_checkpoint(invalid_schedule)
+
+        snapshot = build_v2_periodic_snapshot(
+            engine,
+            config,
+            stage_steps=300_000,
+            scenario=scenario,
+            rewards=RewardConfig(),
+            uav_collision_radius=0.0,
+            seed_manifest={'base_seed': 7},
+            initialization_source={'kind': 'validated_v2_td3_stage', 'path': 'easy.pt'},
+            bc_final_drop_step=400_000,
+        )
+        self.assertEqual(snapshot['bc_schedule'], expected_schedule)
+        self.assertEqual(
+            load_v2_periodic_snapshot(snapshot, expected_stage='medium')['bc_schedule'],
+            expected_schedule,
+        )
 
     def test_periodic_snapshot_round_trips_and_is_rejected_by_formal_checkpoint_loader(self):
         # C1 in this diagnostic pass: a separate, non-terminal format from

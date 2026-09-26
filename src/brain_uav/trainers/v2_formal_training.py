@@ -116,6 +116,37 @@ V2_BC_SCHEDULE_METADATA = {
     'boundaries': [0, 75_000, 150_000, 250_000, 300_000],
     'values': [500.0, 150.0, 30.0, 15.0, 5.0],
 }
+V2_BC_SCHEDULE_400K_METADATA = {
+    'kind': 'stage_local_piecewise_constant',
+    'boundaries': [0, 75_000, 150_000, 250_000, 400_000],
+    'values': [500.0, 150.0, 30.0, 15.0, 5.0],
+}
+
+
+def v2_bc_schedule_metadata(
+    stage: str,
+    *,
+    final_drop_step: int = 300_000,
+) -> dict[str, Any]:
+    """Return a supported stage-local BC schedule, keeping 400k medium-only."""
+
+    if stage not in ('easy', 'medium', 'hard'):
+        raise ValueError('stage must be easy, medium, or hard.')
+    if type(final_drop_step) is not int or final_drop_step not in (300_000, 400_000):
+        raise ValueError('final_drop_step must be 300000 or 400000.')
+    if final_drop_step == 400_000:
+        if stage != 'medium':
+            raise ValueError('The 400000-step BC schedule is supported only for medium.')
+        return _strict_json_copy(V2_BC_SCHEDULE_400K_METADATA)
+    return _strict_json_copy(V2_BC_SCHEDULE_METADATA)
+
+
+def _validate_bc_schedule_metadata(value: Any, *, stage: str) -> None:
+    accepted = [v2_bc_schedule_metadata(stage)]
+    if stage == 'medium':
+        accepted.append(v2_bc_schedule_metadata(stage, final_drop_step=400_000))
+    if not any(value == schedule for schedule in accepted):
+        raise ValueError('Formal V2 checkpoint BC schedule is incompatible.')
 
 
 def _nonnegative_int(value: Any, *, name: str) -> int:
@@ -1195,6 +1226,7 @@ class V2FormalStageTrainer:
         global_steps_start: int = 0,
         uav_collision_radius: float = 0.0,
         reporter: V2ExperimentReporter | None = None,
+        bc_final_drop_step: int = 300_000,
         periodic_snapshot_interval_steps: int | None = None,
         periodic_snapshot_sink: Callable[[int], None] | None = None,
         periodic_validation_sink: Callable[[int], None] | None = None,
@@ -1209,6 +1241,10 @@ class V2FormalStageTrainer:
             raise TypeError('validation_runner must be callable.')
         if reporter is not None and not isinstance(reporter, V2ExperimentReporter):
             raise TypeError('reporter must be a V2ExperimentReporter when provided.')
+        bc_schedule = v2_bc_schedule_metadata(
+            config.stage,
+            final_drop_step=bc_final_drop_step,
+        )
         if periodic_snapshot_interval_steps is not None:
             periodic_snapshot_interval_steps = _positive_int(
                 periodic_snapshot_interval_steps,
@@ -1239,6 +1275,8 @@ class V2FormalStageTrainer:
         self.scenario_sources = dict(scenario_sources)
         self.validation_runner = validation_runner
         self.reporter = reporter
+        self.bc_final_drop_step = bc_final_drop_step
+        self.bc_schedule = bc_schedule
         self.periodic_snapshot_interval_steps = periodic_snapshot_interval_steps
         self.periodic_snapshot_sink = periodic_snapshot_sink
         self.periodic_validation_sink = periodic_validation_sink
@@ -1343,7 +1381,10 @@ class V2FormalStageTrainer:
             episode_length += 1
             self.result.stage_steps += 1
             self.result.global_steps_end = self.result.global_steps_start + self.result.stage_steps
-            current_bc_lambda = v2_bc_lambda(local_step_index)
+            current_bc_lambda = v2_bc_lambda(
+                local_step_index,
+                final_drop_step=self.bc_final_drop_step,
+            )
             if len(self.engine.replay) >= self.engine.batch_size:
                 try:
                     metrics = self.engine.update_once(
@@ -1598,6 +1639,7 @@ def build_v2_formal_checkpoint(
     seed_manifest: Mapping[str, Any],
     validation_pool_metadata: Mapping[str, Any],
     initialization_source: Mapping[str, Any],
+    bc_final_drop_step: int = 300_000,
 ) -> dict[str, Any]:
     if not isinstance(engine, V2TD3UpdateEngine):
         raise TypeError('engine must be V2TD3UpdateEngine.')
@@ -1638,7 +1680,10 @@ def build_v2_formal_checkpoint(
         'reward_config': _strict_json_copy(asdict(rewards)),
         'uav_collision_radius': radius,
         'seed_manifest': _strict_json_copy(seed_manifest),
-        'bc_schedule': _strict_json_copy(V2_BC_SCHEDULE_METADATA),
+        'bc_schedule': v2_bc_schedule_metadata(
+            config.stage,
+            final_drop_step=bc_final_drop_step,
+        ),
         'training_result': result.to_dict(),
         'validation_pool': _strict_json_copy(validation_pool_metadata),
         'initialization_source': _strict_json_copy(initialization_source),
@@ -1658,6 +1703,7 @@ def build_v2_periodic_snapshot(
     uav_collision_radius: float,
     seed_manifest: Mapping[str, Any],
     initialization_source: Mapping[str, Any],
+    bc_final_drop_step: int = 300_000,
 ) -> dict[str, Any]:
     """Build one non-terminal, purely observational mid-stage snapshot (C1).
 
@@ -1690,7 +1736,10 @@ def build_v2_periodic_snapshot(
         'reward_config': _strict_json_copy(asdict(rewards)),
         'uav_collision_radius': radius,
         'seed_manifest': _strict_json_copy(seed_manifest),
-        'bc_schedule': _strict_json_copy(V2_BC_SCHEDULE_METADATA),
+        'bc_schedule': v2_bc_schedule_metadata(
+            config.stage,
+            final_drop_step=bc_final_drop_step,
+        ),
         'initialization_source': _strict_json_copy(initialization_source),
     }
     if model_type == 'snn':
@@ -1776,8 +1825,7 @@ def load_v2_periodic_snapshot(
     _nonnegative_float(payload['uav_collision_radius'], name='uav_collision_radius')
     if not isinstance(payload['seed_manifest'], dict) or not payload['seed_manifest']:
         raise ValueError('Periodic V2 snapshot seed_manifest is invalid.')
-    if payload['bc_schedule'] != V2_BC_SCHEDULE_METADATA:
-        raise ValueError('Periodic V2 snapshot BC schedule is incompatible.')
+    _validate_bc_schedule_metadata(payload['bc_schedule'], stage=stage)
     if not isinstance(payload['initialization_source'], dict):
         raise ValueError('Periodic V2 snapshot initialization source is invalid.')
     return payload
@@ -1897,8 +1945,7 @@ def load_v2_formal_checkpoint(
         if not isinstance(name, str):
             raise ValueError('Formal V2 checkpoint seed_manifest keys must be strings.')
         _nonnegative_int(value, name=f'seed_manifest[{name!r}]')
-    if payload['bc_schedule'] != V2_BC_SCHEDULE_METADATA:
-        raise ValueError('Formal V2 checkpoint BC schedule is incompatible.')
+    _validate_bc_schedule_metadata(payload['bc_schedule'], stage=stage)
     training_result = payload['training_result']
     if not isinstance(training_result, dict) or training_result.get('stage') != stage or training_result.get('passed_validation') != payload['passed_validation']:
         raise ValueError('Formal V2 checkpoint result is incompatible.')
@@ -1950,6 +1997,7 @@ def load_v2_formal_checkpoint(
 
 __all__ = [
     'V2_BC_SCHEDULE_METADATA',
+    'V2_BC_SCHEDULE_400K_METADATA',
     'V2_FORMAL_CHECKPOINT_FORMAT',
     'V2_FORMAL_CHECKPOINT_VERSION',
     'V2_PERIODIC_SNAPSHOT_FORMAT',
@@ -1973,4 +2021,5 @@ __all__ = [
     'save_v2_formal_checkpoint',
     'save_v2_periodic_snapshot',
     'validate_v2_prepared_stage_initialization',
+    'v2_bc_schedule_metadata',
 ]
