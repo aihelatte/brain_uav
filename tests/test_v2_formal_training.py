@@ -972,6 +972,7 @@ class TestV2FormalTraining(unittest.TestCase):
         engine.replay.failure_sample_bias = 3.0
         config = V2FormalTrainingConfig(
             stage='easy', max_steps=1, gamma=0.995, failure_sample_bias=3.0,
+            actor_lr=2e-4, critic_lr=3e-4,
         )
         result = V2FormalTrainingResult.empty('easy', global_steps_start=10)
         result.status = 'passed'
@@ -1001,6 +1002,8 @@ class TestV2FormalTraining(unittest.TestCase):
         self.assertEqual(payload['format_version'], V2_FORMAL_CHECKPOINT_VERSION)
         self.assertEqual(payload['formal_config']['failure_sample_bias'], 3.0)
         self.assertEqual(payload['formal_config']['gamma'], 0.995)
+        self.assertEqual(payload['formal_config']['actor_lr'], 2e-4)
+        self.assertEqual(payload['formal_config']['critic_lr'], 3e-4)
         self.assertNotIn('replay', payload)
         self.assertFalse(any('zone_features' in key for key in payload))
         self.assertEqual(payload['scenario_config']['max_steps'], 1)
@@ -1100,6 +1103,72 @@ class TestV2FormalTraining(unittest.TestCase):
             load_v2_periodic_snapshot(snapshot, expected_stage='medium')['bc_schedule'],
             expected_schedule,
         )
+
+        smooth_payload = build_v2_formal_checkpoint(
+            engine,
+            result,
+            config,
+            **dict(common, bc_final_drop_step=300_000, bc_schedule='smooth-final'),
+        )
+        smooth_schedule = {
+            'kind': 'stage_local_piecewise_constant',
+            'name': 'smooth-final',
+            'boundaries': [0, 75_000, 150_000, 250_000, 300_000, 335_000, 370_000],
+            'values': [500.0, 150.0, 30.0, 15.0, 10.0, 7.0, 5.0],
+        }
+        self.assertEqual(smooth_payload['bc_schedule'], smooth_schedule)
+        with tempfile.TemporaryDirectory() as directory:
+            smooth_path = Path(directory) / 'medium-smooth-final.pt'
+            save_v2_formal_checkpoint(smooth_path, smooth_payload)
+            loaded = load_v2_formal_checkpoint(
+                smooth_path, next_stage='hard', require_passed=True,
+            )
+        self.assertEqual(loaded['bc_schedule'], smooth_schedule)
+
+        tampered = deepcopy(smooth_payload)
+        tampered['bc_schedule']['values'][-1] = 6.0
+        with self.assertRaisesRegex(ValueError, 'BC schedule is incompatible'):
+            load_v2_formal_checkpoint(tampered)
+
+        smooth_snapshot = build_v2_periodic_snapshot(
+            engine,
+            config,
+            stage_steps=300_000,
+            scenario=scenario,
+            rewards=RewardConfig(),
+            uav_collision_radius=0.0,
+            seed_manifest={'base_seed': 7},
+            initialization_source={'kind': 'validated_v2_td3_stage', 'path': 'easy.pt'},
+            bc_schedule='smooth-final',
+        )
+        self.assertEqual(smooth_snapshot['bc_schedule'], smooth_schedule)
+        self.assertEqual(
+            load_v2_periodic_snapshot(
+                smooth_snapshot, expected_stage='medium'
+            )['bc_schedule'],
+            smooth_schedule,
+        )
+        tampered_snapshot = deepcopy(smooth_snapshot)
+        tampered_snapshot['bc_schedule']['boundaries'][-1] = 369_999
+        with self.assertRaisesRegex(ValueError, 'BC schedule is incompatible'):
+            load_v2_periodic_snapshot(tampered_snapshot)
+
+        from brain_uav.trainers.v2_formal_training import v2_bc_schedule_metadata
+
+        with self.assertRaisesRegex(ValueError, 'easy or medium'):
+            v2_bc_schedule_metadata('hard', schedule='smooth-final')
+        with self.assertRaisesRegex(ValueError, 'easy or medium'):
+            build_v2_periodic_snapshot(
+                engine,
+                V2FormalTrainingConfig(stage='hard', max_steps=1),
+                stage_steps=0,
+                scenario=scenario,
+                rewards=RewardConfig(),
+                uav_collision_radius=0.0,
+                seed_manifest={'base_seed': 7},
+                initialization_source={'kind': 'validated_v2_td3_stage', 'path': 'medium.pt'},
+                bc_schedule='smooth-final',
+            )
 
     def test_periodic_snapshot_round_trips_and_is_rejected_by_formal_checkpoint_loader(self):
         # C1 in this diagnostic pass: a separate, non-terminal format from

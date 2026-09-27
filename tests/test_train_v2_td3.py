@@ -193,6 +193,9 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertEqual(args.gamma, 0.99)
         self.assertEqual(args.failure_sample_bias, 1.0)
         self.assertEqual(args.bc_final_drop_step, 300_000)
+        self.assertEqual(args.bc_schedule, 'default')
+        self.assertIsNone(args.actor_lr)
+        self.assertIsNone(args.critic_lr)
         self.assertFalse(args.compile_critic_encoder)
         self.assertFalse(args.compile_target_encoders)
         self.assertFalse(args.pinned_batch_transfer)
@@ -288,6 +291,68 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertEqual(stage_runner.call_args.kwargs['gamma'], 0.995)
         self.assertEqual(stage_runner.call_args.kwargs['failure_sample_bias'], 3.0)
         self.assertEqual(stage_runner.call_args.kwargs['bc_final_drop_step'], 400_000)
+        self.assertIsNone(stage_runner.call_args.kwargs['actor_lr'])
+        self.assertIsNone(stage_runner.call_args.kwargs['critic_lr'])
+
+    def test_main_forwards_smooth_schedule_and_explicit_learning_rates(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        startup_output = StringIO()
+        with redirect_stdout(startup_output), mock.patch(
+            'brain_uav.scripts.train_v2_td3.resolve_training_device',
+            return_value='cpu',
+        ), mock.patch(
+            'brain_uav.scripts.train_v2_td3.run_v2_td3_stage',
+            return_value={'passed': True},
+        ) as stage_runner:
+            result = train_main([
+                '--stage', 'medium',
+                '--init-checkpoint', 'easy.pt',
+                '--output', 'medium.pt',
+                '--metrics-out', 'medium.json',
+                '--validation-pool', 'medium_validation.json',
+                '--device', 'cpu',
+                '--bc-schedule', 'smooth-final',
+                '--actor-lr', '0.0002',
+                '--critic-lr', '0.0003',
+            ])
+        self.assertEqual(result, 0)
+        self.assertEqual(stage_runner.call_args.kwargs['bc_schedule'], 'smooth-final')
+        self.assertEqual(stage_runner.call_args.kwargs['actor_lr'], 2e-4)
+        self.assertEqual(stage_runner.call_args.kwargs['critic_lr'], 3e-4)
+        startup, _ = json.JSONDecoder().raw_decode(startup_output.getvalue())
+        self.assertEqual(
+            startup['resolved_v2_formal_config']['actor_lr'], 2e-4
+        )
+        self.assertEqual(
+            startup['resolved_v2_formal_config']['critic_lr'], 3e-4
+        )
+        self.assertEqual(startup['bc_schedule']['name'], 'smooth-final')
+
+    def test_smooth_bc_schedule_rejects_400k_and_hard_stage(self):
+        base = [
+            '--stage', 'medium', '--init-checkpoint', 'easy.pt',
+            '--output', 'medium.pt', '--metrics-out', 'medium.json',
+            '--validation-pool', 'medium_validation.json', '--device', 'cpu',
+            '--bc-schedule', 'smooth-final',
+        ]
+        with mock.patch(
+            'brain_uav.scripts.train_v2_td3.resolve_training_device',
+            return_value='cpu',
+        ), mock.patch(
+            'brain_uav.scripts.train_v2_td3.run_v2_td3_stage'
+        ) as stage_runner:
+            with self.assertRaisesRegex(ValueError, 'conflict'):
+                train_main([*base, '--bc-final-drop-step', '400000'])
+            with self.assertRaisesRegex(ValueError, 'easy or medium'):
+                train_main([
+                    '--stage', 'hard', '--init-checkpoint', 'medium.pt',
+                    '--output', 'hard.pt', '--metrics-out', 'hard.json',
+                    '--validation-pool', 'hard_validation.json', '--device', 'cpu',
+                    '--bc-schedule', 'smooth-final',
+                ])
+        stage_runner.assert_not_called()
 
     def test_non_default_bc_final_drop_is_medium_only(self):
         with self.assertRaisesRegex(ValueError, 'medium'):
@@ -587,12 +652,21 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             ) as trainer_type, mock.patch(
                 'brain_uav.scripts.train_v2_td3.build_v2_formal_checkpoint',
                 return_value={'checkpoint': True},
+            ) as formal_checkpoint_builder, mock.patch(
+                'brain_uav.scripts.train_v2_td3.build_v2_periodic_snapshot',
+                return_value={'snapshot': True},
+            ) as periodic_snapshot_builder, mock.patch(
+                'brain_uav.scripts.train_v2_td3.save_v2_periodic_snapshot'
             ), mock.patch(
                 'brain_uav.scripts.train_v2_td3.save_v2_formal_checkpoint'
             ), mock.patch(
                 'brain_uav.scripts.train_v2_td3._write_strict_json'
             ) as metrics_writer:
-                trainer_type.return_value.run.return_value = result
+                def finish_training():
+                    trainer_type.call_args.kwargs['periodic_snapshot_sink'](10)
+                    return result
+
+                trainer_type.return_value.run.side_effect = finish_training
                 summary = run_v2_td3_stage(
                     stage='medium',
                     init_checkpoint=checkpoint,
@@ -600,7 +674,10 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                     metrics_out=root / 'metrics.json',
                     validation_pool=root / 'validation.json',
                     device='auto',
-                    bc_final_drop_step=400_000,
+                    actor_lr=2e-4,
+                    critic_lr=3e-4,
+                    bc_schedule='smooth-final',
+                    periodic_snapshot_interval_steps=100,
                 )
                 stage_start = json.loads(
                     (root / 'metrics_reports' / 'stage_start.json').read_text(
@@ -623,6 +700,8 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         )
         self.assertEqual(builder.call_args.kwargs['device'], 'cuda')
         self.assertNotEqual(builder.call_args.kwargs['device'], 'auto')
+        self.assertEqual(builder.call_args.args[1].actor_lr, 2e-4)
+        self.assertEqual(builder.call_args.args[1].critic_lr, 3e-4)
         self.assertEqual(summary['requested_device'], 'auto')
         self.assertEqual(summary['resolved_device'], 'cuda')
         self.assertEqual(
@@ -631,12 +710,23 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         )
         expected_schedule = {
             'kind': 'stage_local_piecewise_constant',
-            'boundaries': [0, 75_000, 150_000, 250_000, 400_000],
-            'values': [500.0, 150.0, 30.0, 15.0, 5.0],
+            'name': 'smooth-final',
+            'boundaries': [0, 75_000, 150_000, 250_000, 300_000, 335_000, 370_000],
+            'values': [500.0, 150.0, 30.0, 15.0, 10.0, 7.0, 5.0],
         }
+        self.assertEqual(trainer_type.call_args.kwargs['bc_schedule'], 'smooth-final')
         self.assertEqual(
-            trainer_type.call_args.kwargs['bc_final_drop_step'], 400_000
+            formal_checkpoint_builder.call_args.kwargs['bc_schedule'],
+            'smooth-final',
         )
+        self.assertEqual(
+            periodic_snapshot_builder.call_args.kwargs['bc_schedule'],
+            'smooth-final',
+        )
+        self.assertEqual(stage_start['formal_config']['actor_lr'], 2e-4)
+        self.assertEqual(stage_start['formal_config']['critic_lr'], 3e-4)
+        self.assertEqual(metrics_writer.call_args.args[1]['formal_config']['actor_lr'], 2e-4)
+        self.assertEqual(metrics_writer.call_args.args[1]['formal_config']['critic_lr'], 3e-4)
         self.assertEqual(stage_start['bc_schedule'], expected_schedule)
         self.assertEqual(summary['bc_schedule'], expected_schedule)
         self.assertEqual(

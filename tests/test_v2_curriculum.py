@@ -95,6 +95,34 @@ class TestV2Curriculum(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'final_drop_step'):
             v2_bc_lambda(300_000, final_drop_step=350_000)
 
+    def test_smooth_final_bc_schedule_has_exact_stage_local_boundaries(self) -> None:
+        from brain_uav.v2_curriculum import v2_bc_lambda
+
+        expected = {
+            0: 500.0,
+            74_999: 500.0,
+            75_000: 150.0,
+            149_999: 150.0,
+            150_000: 30.0,
+            249_999: 30.0,
+            250_000: 15.0,
+            299_999: 15.0,
+            300_000: 10.0,
+            334_999: 10.0,
+            335_000: 7.0,
+            369_999: 7.0,
+            370_000: 5.0,
+        }
+        for step, value in expected.items():
+            with self.subTest(step=step):
+                self.assertEqual(
+                    v2_bc_lambda(step, schedule='smooth-final'), value
+                )
+        with self.assertRaisesRegex(ValueError, 'conflict'):
+            v2_bc_lambda(
+                300_000, schedule='smooth-final', final_drop_step=400_000
+            )
+
     def test_noise_schedule_decays_for_first_half_then_stays_final(self) -> None:
         from brain_uav.v2_curriculum import V2NoiseSchedule
 

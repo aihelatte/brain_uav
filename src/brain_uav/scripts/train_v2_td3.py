@@ -57,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--validation-max-failures', type=int, default=5)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--failure-sample-bias', type=float, default=1.0)
+    parser.add_argument('--actor-lr', type=float, default=None)
+    parser.add_argument('--critic-lr', type=float, default=None)
+    parser.add_argument(
+        '--bc-schedule', choices=('default', 'smooth-final'), default='default',
+        help='Optional stage-local BC schedule; smooth-final supports easy/medium.',
+    )
     parser.add_argument(
         '--bc-final-drop-step',
         type=int,
@@ -397,7 +403,10 @@ def run_v2_td3_stage(
     seed: int = 7,
     gamma: float = 0.99,
     failure_sample_bias: float = 1.0,
+    actor_lr: float | None = None,
+    critic_lr: float | None = None,
     bc_final_drop_step: int = 300_000,
+    bc_schedule: str = 'default',
     device: str = 'auto',
     max_stage_steps: int | None = None,
     early_stop_min_steps: int = 125_000,
@@ -436,9 +445,10 @@ def run_v2_td3_stage(
     cuda_graph_updates: bool = False,
     periodic_snapshot_interval_steps: int | None = None,
 ) -> dict[str, Any]:
-    bc_schedule = v2_bc_schedule_metadata(
+    bc_schedule_metadata = v2_bc_schedule_metadata(
         stage,
         final_drop_step=bc_final_drop_step,
+        schedule=bc_schedule,
     )
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
@@ -461,6 +471,8 @@ def run_v2_td3_stage(
         validation_max_failures=validation_max_failures,
         gamma=gamma,
         failure_sample_bias=failure_sample_bias,
+        actor_lr=actor_lr,
+        critic_lr=critic_lr,
     )
     if prepared_initialization is None:
         prepared_initialization = prepare_v2_stage_initialization(
@@ -581,7 +593,7 @@ def run_v2_td3_stage(
             'seed': seed,
             'max_steps': config.max_steps,
             'formal_config': config.to_dict(),
-            'bc_schedule': bc_schedule,
+            'bc_schedule': bc_schedule_metadata,
             'checkpoint_output': str(output_path),
             'failed_checkpoint_output': str(failed_output_path),
             'metrics_output': str(metrics_path),
@@ -619,6 +631,7 @@ def run_v2_td3_stage(
                 seed_manifest=components.seed_manifest,
                 initialization_source=components.initialization_source,
                 bc_final_drop_step=bc_final_drop_step,
+                bc_schedule=bc_schedule,
             )
             snapshot_path = periodic_snapshot_dir / f'step_{stage_steps:09d}.pt'
             save_v2_periodic_snapshot(snapshot_path, payload)
@@ -656,6 +669,7 @@ def run_v2_td3_stage(
         uav_collision_radius=effective_uav_collision_radius,
         reporter=reporter,
         bc_final_drop_step=bc_final_drop_step,
+        bc_schedule=bc_schedule,
         periodic_snapshot_interval_steps=periodic_snapshot_interval_steps,
         periodic_snapshot_sink=periodic_snapshot_sink,
         periodic_validation_sink=periodic_validation_sink,
@@ -682,6 +696,7 @@ def run_v2_td3_stage(
             validation_pool_metadata=validation_metadata,
             initialization_source=components.initialization_source,
             bc_final_drop_step=bc_final_drop_step,
+            bc_schedule=bc_schedule,
         )
         checkpoint_path = output_path if result.passed_validation else failed_output_path
         if checkpoint_path.exists():
@@ -706,7 +721,7 @@ def run_v2_td3_stage(
             'scenario_config': scenario_config_snapshot(scenario_config),
             'reward_config': asdict(reward_config),
             'formal_config': config.to_dict(),
-            'bc_schedule': bc_schedule,
+            'bc_schedule': bc_schedule_metadata,
             'seed_manifest': dict(components.seed_manifest),
             'validation_pool': validation_metadata,
             'initialization_source': dict(components.initialization_source),
@@ -733,7 +748,7 @@ def run_v2_td3_stage(
         summary = {
             'stage': stage,
             'model_type': model,
-            'bc_schedule': bc_schedule,
+            'bc_schedule': bc_schedule_metadata,
             'passed': result.passed_validation,
             'checkpoint': str(checkpoint_path),
             'metrics': str(metrics_path),
@@ -770,6 +785,8 @@ def main(argv: list[str] | None = None) -> int:
         validation_max_failures=args.validation_max_failures,
         gamma=args.gamma,
         failure_sample_bias=args.failure_sample_bias,
+        actor_lr=args.actor_lr,
+        critic_lr=args.critic_lr,
     )
     print(json.dumps({
         'requested_device': args.device,
@@ -778,6 +795,7 @@ def main(argv: list[str] | None = None) -> int:
         'bc_schedule': v2_bc_schedule_metadata(
             args.stage,
             final_drop_step=args.bc_final_drop_step,
+            schedule=args.bc_schedule,
         ),
         'model_type': args.model,
         'snn_time_window': args.snn_time_window if args.model == 'snn' else None,
@@ -800,7 +818,10 @@ def main(argv: list[str] | None = None) -> int:
         validation_max_failures=args.validation_max_failures,
         gamma=args.gamma,
         failure_sample_bias=args.failure_sample_bias,
+        actor_lr=args.actor_lr,
+        critic_lr=args.critic_lr,
         bc_final_drop_step=args.bc_final_drop_step,
+        bc_schedule=args.bc_schedule,
         model=args.model,
         snn_time_window=args.snn_time_window,
         compile_critic_encoder=args.compile_critic_encoder,
