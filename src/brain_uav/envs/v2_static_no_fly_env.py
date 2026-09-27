@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 
 from brain_uav.config import RewardConfig, ScenarioConfig
-from brain_uav.geometry import NoFlyZone, no_fly_zone_from_dict
+from brain_uav.geometry import Ellipsoid, NoFlyZone, no_fly_zone_from_dict
 from brain_uav.observations import (
     V2Observation,
     V2ObservationScales,
@@ -113,6 +113,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         *,
         uav_collision_radius: float = 0.0,
         scenario_generator: V2ScenarioGenerator | None = None,
+        cache_ellipsoid_segment_clearance: bool = False,
     ) -> None:
         if not isinstance(scenario, ScenarioConfig):
             raise TypeError('scenario must be a ScenarioConfig.')
@@ -129,6 +130,8 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
             raise TypeError('scenario_generator must be a V2ScenarioGenerator.')
         if scenario_generator is not None and scenario_generator.scenario != scenario:
             raise ValueError('scenario_generator and environment ScenarioConfig must match.')
+        if type(cache_ellipsoid_segment_clearance) is not bool:
+            raise TypeError('cache_ellipsoid_segment_clearance must be a bool.')
 
         super().__init__(
             scenario=scenario,
@@ -144,6 +147,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         )
         self._fixed_idx = 0
         self.scenario_generator = scenario_generator
+        self.cache_ellipsoid_segment_clearance = cache_ellipsoid_segment_clearance
         self.uav_collision_radius = _nonnegative_finite(
             uav_collision_radius,
             name='uav_collision_radius',
@@ -392,6 +396,11 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         self.state = _finite_vector(payload['state'], shape=(5,), name='scenario state')
         self.goal = _finite_vector(payload['goal'], shape=(3,), name='scenario goal')
         self.zones = zones
+        for zone in self.zones:
+            if isinstance(zone.shape, Ellipsoid):
+                zone.shape.set_segment_clearance_cache_enabled(
+                    self.cache_ellipsoid_segment_clearance
+                )
         if self._performance_diagnostic is not None:
             self._performance_diagnostic.attach_zones(self.zones)
         self.last_curriculum_level = str(payload.get('curriculum_level', 'custom'))

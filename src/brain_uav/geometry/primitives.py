@@ -111,7 +111,11 @@ class Ellipsoid(GeometryShape):
         radius_x: float,
         radius_y: float,
         radius_z: float,
+        *,
+        cache_segment_clearance: bool = False,
     ) -> None:
+        if type(cache_segment_clearance) is not bool:
+            raise TypeError('cache_segment_clearance must be a bool.')
         self._center = as_point3(center, name='center')
         self._radii = np.array(
             [
@@ -123,6 +127,8 @@ class Ellipsoid(GeometryShape):
         )
         if self._center[2] - self._radii[2] < -GEOMETRY_TOLERANCE:
             raise ValueError('Ellipsoid must not extend below z=0.')
+        self._segment_clearance_cache_enabled = cache_segment_clearance
+        self._last_segment_clearance: tuple[np.ndarray, np.ndarray, float] | None = None
 
     @property
     def center(self) -> np.ndarray:
@@ -143,6 +149,19 @@ class Ellipsoid(GeometryShape):
     @property
     def radius_z(self) -> float:
         return float(self._radii[2])
+
+    @property
+    def segment_clearance_cache_enabled(self) -> bool:
+        return self._segment_clearance_cache_enabled
+
+    def set_segment_clearance_cache_enabled(self, enabled: bool) -> None:
+        if type(enabled) is not bool:
+            raise TypeError('enabled must be a bool.')
+        self._segment_clearance_cache_enabled = enabled
+        self._last_segment_clearance = None
+
+    def clear_segment_clearance_cache(self) -> None:
+        self._last_segment_clearance = None
 
     def _level(self, point: np.ndarray) -> float:
         return float(np.sum(((point - self._center) / self._radii) ** 2))
@@ -336,7 +355,24 @@ class Ellipsoid(GeometryShape):
         return None
 
     def segment_clearance(self, start: Any, end: Any) -> float:
-        return convex_segment_clearance(self, start, end)
+        if not self._segment_clearance_cache_enabled:
+            return convex_segment_clearance(self, start, end)
+
+        start_point = as_point3(start, name='start')
+        end_point = as_point3(end, name='end')
+        cached = self._last_segment_clearance
+        if (
+            cached is not None
+            and np.array_equal(cached[0], start_point)
+            and np.array_equal(cached[1], end_point)
+        ):
+            return cached[2]
+
+        clearance = convex_segment_clearance(self, start_point, end_point)
+        self._last_segment_clearance = (
+            start_point.copy(), end_point.copy(), clearance
+        )
+        return clearance
 
     def bounding_box(self) -> AABB:
         return AABB(self._center - self._radii, self._center + self._radii)

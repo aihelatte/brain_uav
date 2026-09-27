@@ -27,6 +27,7 @@ from brain_uav.observations import (
     ZONE_FEATURE_DIM,
     V2Observation,
     V2ObservationBatch,
+    collate_single_v2_observation,
     collate_v2_observations,
 )
 
@@ -3609,6 +3610,7 @@ class V2TD3UpdateEngine:
         *,
         exploration_noise: float = 0.0,
         exploration_rng: np.random.Generator | None = None,
+        single_observation_fast_path: bool = False,
     ) -> np.ndarray:
         if not isinstance(observation, V2Observation):
             raise TypeError('observation must be a V2Observation.')
@@ -3622,7 +3624,13 @@ class V2TD3UpdateEngine:
             np.random.Generator,
         ):
             raise TypeError('exploration_rng must be a numpy.random.Generator.')
-        batch = collate_v2_observations([observation]).to(self.device)
+        if type(single_observation_fast_path) is not bool:
+            raise TypeError('single_observation_fast_path must be a bool.')
+        batch = (
+            collate_single_v2_observation(observation, device=self.device)
+            if single_observation_fast_path
+            else collate_v2_observations([observation]).to(self.device)
+        )
         with torch.inference_mode():
             action = self._action_inference_tensor(batch).detach().cpu().numpy()[0]
         if noise_scale > 0.0:

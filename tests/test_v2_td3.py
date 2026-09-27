@@ -3117,6 +3117,76 @@ class TestV2TD3(unittest.TestCase):
                 self.assertTrue(np.all(action >= np.array([-0.2, -0.3], dtype=np.float32)))
                 self.assertTrue(np.all(action <= np.array([0.2, 0.3], dtype=np.float32)))
 
+    def test_single_observation_fast_batch_matches_generic_dynamic_collate(self):
+        from brain_uav.observations import collate_single_v2_observation
+
+        for count in (0, 1, 6, 10):
+            observation = _observation(count, offset=2.0, scales=self.scales)
+            expected = collate_v2_observations([observation])
+            actual = collate_single_v2_observation(observation)
+            with self.subTest(zone_count=count):
+                for name in (
+                    'ego_features', 'goal_features', 'zone_features', 'presence_mask'
+                ):
+                    actual_tensor = getattr(actual, name)
+                    expected_tensor = getattr(expected, name)
+                    torch.testing.assert_close(
+                        actual_tensor, expected_tensor, rtol=0, atol=0
+                    )
+                    self.assertEqual(actual_tensor.shape, expected_tensor.shape)
+                    self.assertEqual(actual_tensor.dtype, expected_tensor.dtype)
+                    self.assertEqual(actual_tensor.device, expected_tensor.device)
+                    self.assertEqual(actual_tensor.stride(), expected_tensor.stride())
+                self.assertEqual(actual.ego_features.shape, (1, 6))
+                self.assertEqual(actual.goal_features.shape, (1, 4))
+                self.assertEqual(actual.zone_features.shape, (1, count, 19))
+                self.assertEqual(actual.presence_mask.shape, (1, count))
+                self.assertEqual(actual.ego_features.dtype, torch.float32)
+                self.assertEqual(actual.goal_features.dtype, torch.float32)
+                self.assertEqual(actual.zone_features.dtype, torch.float32)
+                self.assertEqual(actual.presence_mask.dtype, torch.bool)
+
+                source_fields = (
+                    ('ego_features', observation.ego_features),
+                    ('goal_features', observation.goal_features),
+                    ('zone_features', observation.zone_features),
+                    ('presence_mask', observation.presence_mask),
+                )
+                for name, source in source_fields:
+                    if source.size == 0:
+                        continue
+                    before = source.copy()
+                    tensor = getattr(actual, name)
+                    if tensor.dtype == torch.bool:
+                        tensor.reshape(-1)[0] = ~tensor.reshape(-1)[0]
+                    else:
+                        tensor.reshape(-1)[0] += 1.0
+                    np.testing.assert_array_equal(source, before)
+
+    def test_select_action_single_observation_fast_path_preserves_noise_rng(self):
+        engine = self.make_engine()
+        observation = _observation(6, scales=self.scales)
+        regular = engine.select_action(observation, exploration_noise=0.0)
+        fast = engine.select_action(
+            observation,
+            exploration_noise=0.0,
+            single_observation_fast_path=True,
+        )
+        np.testing.assert_array_equal(fast, regular)
+
+        regular_noisy = engine.select_action(
+            observation,
+            exploration_noise=0.05,
+            exploration_rng=np.random.default_rng(821),
+        )
+        fast_noisy = engine.select_action(
+            observation,
+            exploration_noise=0.05,
+            exploration_rng=np.random.default_rng(821),
+            single_observation_fast_path=True,
+        )
+        np.testing.assert_array_equal(fast_noisy, regular_noisy)
+
     def test_ann_action_inference_compile_is_independent_and_uses_current_parameters(self):
         torch.manual_seed(1201)
         eager = self.make_engine()

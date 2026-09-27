@@ -82,6 +82,87 @@ class TestNoFlyZone(unittest.TestCase):
         self.assertAlmostEqual(self.zone.segment_clearance(crossing_start, crossing_end), -0.5)
         self.assertTrue(self.zone.violates_segment(crossing_start, crossing_end))
 
+    def test_ellipsoid_segment_cache_is_opt_in_exact_and_single_entry(self):
+        from brain_uav.geometry.base import convex_segment_clearance
+
+        start = np.array([3.0, 0.2, 5.0], dtype=np.float64)
+        end = np.array([4.0, 0.2, 5.0], dtype=np.float64)
+        expected = Ellipsoid([0.0, 0.0, 5.0], 2.0, 1.0, 1.0).segment_clearance(
+            start, end
+        )
+
+        with patch(
+            'brain_uav.geometry.primitives.convex_segment_clearance',
+            wraps=convex_segment_clearance,
+        ) as raw_clearance:
+            uncached = Ellipsoid([0.0, 0.0, 5.0], 2.0, 1.0, 1.0)
+            uncached.segment_clearance(start, end)
+            uncached.segment_clearance(start, end)
+            self.assertEqual(raw_clearance.call_count, 2)
+
+        with patch(
+            'brain_uav.geometry.primitives.convex_segment_clearance',
+            wraps=convex_segment_clearance,
+        ) as raw_clearance:
+            cached = Ellipsoid(
+                [0.0, 0.0, 5.0], 2.0, 1.0, 1.0,
+                cache_segment_clearance=True,
+            )
+            self.assertEqual(cached.segment_clearance(start, end), expected)
+            self.assertEqual(cached.segment_clearance(start, end), expected)
+            start[0] = -100.0
+            self.assertEqual(
+                cached.segment_clearance([3.0, 0.2, 5.0], [4.0, 0.2, 5.0]),
+                expected,
+            )
+            self.assertEqual(raw_clearance.call_count, 1)
+
+            cached.segment_clearance([3.0, 0.2, 5.000001], [4.0, 0.2, 5.0])
+            cached.segment_clearance([4.0, 0.2, 5.0], [3.0, 0.2, 5.0])
+            self.assertEqual(raw_clearance.call_count, 3)
+
+    def test_ellipsoid_cache_keeps_zone_margin_radius_and_exception_semantics(self):
+        from brain_uav.geometry.base import convex_segment_clearance
+
+        shape = Ellipsoid(
+            [0.0, 0.0, 5.0], 2.0, 1.0, 1.0,
+            cache_segment_clearance=True,
+        )
+        first = NoFlyZone('first', shape, 0.2)
+        second = NoFlyZone('second', shape, 0.4)
+        start, end = [3.0, 0.2, 5.0], [4.0, 0.2, 5.0]
+
+        with patch(
+            'brain_uav.geometry.primitives.convex_segment_clearance',
+            wraps=convex_segment_clearance,
+        ) as raw_clearance:
+            first_clearance = first.segment_clearance(start, end, uav_radius=0.1)
+            second_clearance = second.segment_clearance(start, end, uav_radius=0.25)
+            self.assertAlmostEqual(first_clearance - second_clearance, 0.35)
+            self.assertFalse(first.violates_segment(start, end, uav_radius=0.1))
+            self.assertTrue(second.violates_segment(start, end, uav_radius=0.75))
+            self.assertEqual(raw_clearance.call_count, 1)
+
+        with self.assertRaises(ValueError):
+            shape.segment_clearance([0.0, np.nan, 0.0], end)
+
+        shape.clear_segment_clearance_cache()
+        with patch(
+            'brain_uav.geometry.primitives.convex_segment_clearance',
+            side_effect=RuntimeError('solver failed'),
+        ) as failed_solver:
+            with self.assertRaisesRegex(RuntimeError, 'solver failed'):
+                shape.segment_clearance(start, end)
+            self.assertEqual(failed_solver.call_count, 1)
+
+        with patch(
+            'brain_uav.geometry.primitives.convex_segment_clearance',
+            wraps=convex_segment_clearance,
+        ) as raw_clearance:
+            shape.segment_clearance(start, end)
+            shape.segment_clearance(start, end)
+            self.assertEqual(raw_clearance.call_count, 1)
+
     def test_metadata_is_copied_and_does_not_change_geometry(self):
         metadata = {'nested': {'value': 1}}
         first = NoFlyZone('first', self.shape, 0.5, metadata)

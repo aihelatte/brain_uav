@@ -45,6 +45,7 @@ from brain_uav.scripts.profile_v2_td3 import (
     _zero_zone_sample_count,
     _run_diagnostic_level,
     build_parser,
+    main as profile_main,
     run_v2_td3_timing_diagnostic,
 )
 from brain_uav.scripts.train_v2_bc import build_v2_bc_actor
@@ -1257,6 +1258,8 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertFalse(args.cache_actor_loss_coefficients)
         self.assertFalse(args.compile_action_inference)
         self.assertFalse(args.cuda_graph_action_inference)
+        self.assertFalse(args.cache_ellipsoid_segment_clearance)
+        self.assertFalse(args.single_observation_fast_path)
         self.assertFalse(args.pinned_batch_transfer)
         self.assertFalse(args.aggregate_relation_values_first)
         self.assertFalse(args.reduce_update_stat_syncs)
@@ -1332,6 +1335,42 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertTrue(optimization_scopes.aggregate_relation_values_first)
         self.assertTrue(optimization_scopes.reduce_update_stat_syncs)
         self.assertTrue(optimization_scopes.cuda_graph_updates)
+        optimized_paths = build_parser().parse_args([
+            '--model', 'snn', '--bc-checkpoint', 'bc.pt',
+            '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
+            '--cache-ellipsoid-segment-clearance',
+            '--single-observation-fast-path',
+        ])
+        self.assertTrue(optimized_paths.cache_ellipsoid_segment_clearance)
+        self.assertTrue(optimized_paths.single_observation_fast_path)
+        cache_only = build_parser().parse_args([
+            '--model', 'snn', '--bc-checkpoint', 'bc.pt',
+            '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
+            '--cache-ellipsoid-segment-clearance',
+        ])
+        fast_path_only = build_parser().parse_args([
+            '--model', 'snn', '--bc-checkpoint', 'bc.pt',
+            '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
+            '--single-observation-fast-path',
+        ])
+        self.assertTrue(cache_only.cache_ellipsoid_segment_clearance)
+        self.assertFalse(cache_only.single_observation_fast_path)
+        self.assertFalse(fast_path_only.cache_ellipsoid_segment_clearance)
+        self.assertTrue(fast_path_only.single_observation_fast_path)
+
+    def test_speed_optimization_flags_are_forwarded_by_cli(self) -> None:
+        with mock.patch(
+            'brain_uav.scripts.profile_v2_td3.run_v2_td3_timing_diagnostic',
+            return_value={},
+        ) as run:
+            profile_main([
+                '--model', 'snn', '--bc-checkpoint', 'bc.pt',
+                '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
+                '--cache-ellipsoid-segment-clearance',
+                '--single-observation-fast-path',
+            ])
+        self.assertTrue(run.call_args.kwargs['cache_ellipsoid_segment_clearance'])
+        self.assertTrue(run.call_args.kwargs['single_observation_fast_path'])
 
     def test_grouped_compile_modes_have_only_declared_warmup_differences(self) -> None:
         expected = {
@@ -2857,6 +2896,8 @@ class TestProfileV2TD3(unittest.TestCase):
                     warmup_steps=2,
                     batch_size=2,
                     scenario_count=2,
+                    cache_ellipsoid_segment_clearance=True,
+                    single_observation_fast_path=True,
                 )
             persisted = json.loads(
                 (output / 'diagnostic_summary.json').read_text(encoding='utf-8')
@@ -2865,6 +2906,8 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertEqual(summary, persisted)
         self.assertEqual(summary['format'], DIAGNOSTIC_FORMAT)
         self.assertFalse(summary['formal_stage_passed'])
+        self.assertTrue(summary['diagnostic_config']['cache_ellipsoid_segment_clearance'])
+        self.assertTrue(summary['diagnostic_config']['single_observation_fast_path'])
         self.assertEqual(tuple(summary['levels']), ('easy', 'medium', 'hard'))
         self.assertEqual(
             summary['levels']['easy']['timing']['replay_sample_relation'],
@@ -2876,6 +2919,9 @@ class TestProfileV2TD3(unittest.TestCase):
         )
         self.assertEqual(pool_preparer.call_count, 1)
         self.assertEqual(level_runner.call_count, 3)
+        for call in level_runner.call_args_list:
+            self.assertTrue(call.kwargs['cache_ellipsoid_segment_clearance'])
+            self.assertTrue(call.kwargs['single_observation_fast_path'])
         self.assertFalse(any(output.glob('*.pt')))
 
     def test_existing_output_directory_is_rejected(self) -> None:

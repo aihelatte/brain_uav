@@ -1,6 +1,10 @@
 """Structured observation contracts for UAV policy inputs."""
 
-from .v2_batch import V2ObservationBatch, collate_v2_observations
+from .v2_batch import (
+    V2ObservationBatch,
+    collate_single_v2_observation,
+    collate_v2_observations,
+)
 from .v2_builder import build_v2_observation
 from .v2_contract import (
     EGO_FEATURE_DIM,
@@ -40,5 +44,6 @@ __all__ = [
     'V2ObservationBatch',
     'V2ObservationScales',
     'build_v2_observation',
+    'collate_single_v2_observation',
     'collate_v2_observations',
 ]

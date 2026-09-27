@@ -175,3 +175,37 @@ def collate_v2_observations(
     if device is None:
         return cpu_batch
     return cpu_batch.to(device)
+
+
+def collate_single_v2_observation(
+    observation: V2Observation,
+    *,
+    device: torch.device | str | None = None,
+) -> V2ObservationBatch:
+    """Pack one observation without stacking or allocating zone padding."""
+
+    if not isinstance(observation, V2Observation):
+        raise TypeError('observation must be a V2Observation.')
+    zone_count = int(observation.zone_features.shape[0])
+    if zone_count == 0:
+        zone_features = torch.zeros(
+            (1, 0, ZONE_FEATURE_DIM),
+            dtype=torch.float32,
+        )
+        presence_mask = torch.zeros((1, 0), dtype=torch.bool)
+    else:
+        zone_features = torch.from_numpy(
+            observation.zone_features.copy()
+        ).unsqueeze(0)
+        presence_mask = torch.from_numpy(
+            observation.presence_mask.copy()
+        ).unsqueeze(0)
+    cpu_batch = V2ObservationBatch(
+        ego_features=torch.from_numpy(observation.ego_features.copy()).unsqueeze(0),
+        goal_features=torch.from_numpy(observation.goal_features.copy()).unsqueeze(0),
+        zone_features=zone_features,
+        presence_mask=presence_mask,
+    )
+    if device is None:
+        return cpu_batch
+    return cpu_batch.to(device)

@@ -61,7 +61,14 @@ def _config(**overrides):
 
 
 class TestV2StaticNoFlyTrajectoryEnv(unittest.TestCase):
-    def make_env(self, scenario_payload, *, config=None, radius=0.0):
+    def make_env(
+        self,
+        scenario_payload,
+        *,
+        config=None,
+        radius=0.0,
+        cache_ellipsoid_segment_clearance=False,
+    ):
         env_type, _, _ = _v2_api()
         return env_type(
             scenario=config or _config(),
@@ -69,6 +76,7 @@ class TestV2StaticNoFlyTrajectoryEnv(unittest.TestCase):
             seed=17,
             fixed_scenarios=[scenario_payload],
             uav_collision_radius=radius,
+            cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
         )
 
     def test_reset_without_explicit_or_fixed_scenario_is_rejected(self):
@@ -127,6 +135,47 @@ class TestV2StaticNoFlyTrajectoryEnv(unittest.TestCase):
                         expected,
                         atol=1e-7,
                     )
+
+    def test_ellipsoid_cache_is_default_off_and_rebuilt_with_each_scenario(self):
+        first_payload = _scenario(
+            [0.0, 0.0, 10.0, 0.0, 0.0],
+            [30.0, 0.0, 10.0],
+            [NoFlyZone('ellipse', Ellipsoid([15.0, 0.0, 10.0], 2.0, 1.0, 1.0))],
+        )
+        second_payload = _scenario(
+            [0.0, 0.0, 10.0, 0.0, 0.0],
+            [30.0, 0.0, 10.0],
+            [NoFlyZone('ellipse', Ellipsoid([15.0, 5.0, 10.0], 2.0, 1.0, 1.0))],
+        )
+        default_env = self.make_env(first_payload)
+        default_observation, default_info = default_env.reset()
+        self.assertFalse(default_env.zones[0].shape.segment_clearance_cache_enabled)
+
+        env = self.make_env(
+            first_payload,
+            cache_ellipsoid_segment_clearance=True,
+        )
+        cached_observation, cached_info = env.reset()
+        np.testing.assert_array_equal(
+            cached_observation.zone_features, default_observation.zone_features
+        )
+        self.assertEqual(cached_info['line_to_goal_safe'], default_info['line_to_goal_safe'])
+        self.assertFalse(cached_info['line_to_goal_safe'])
+        first_shape = env.zones[0].shape
+        self.assertTrue(first_shape.segment_clearance_cache_enabled)
+        first_clearance = first_shape.segment_clearance(
+            [10.0, 0.0, 10.0], [20.0, 0.0, 10.0]
+        )
+
+        _, second_info = env.reset(options={'scenario': second_payload})
+        second_shape = env.zones[0].shape
+        self.assertIsNot(second_shape, first_shape)
+        self.assertTrue(second_shape.segment_clearance_cache_enabled)
+        second_clearance = second_shape.segment_clearance(
+            [10.0, 0.0, 10.0], [20.0, 0.0, 10.0]
+        )
+        self.assertGreater(second_clearance, first_clearance)
+        self.assertTrue(second_info['line_to_goal_safe'])
 
     def test_each_shape_detects_endpoint_entry_full_segment_crossing_and_miss(self):
         shapes = {

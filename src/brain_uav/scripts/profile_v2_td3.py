@@ -1310,6 +1310,7 @@ def _compile_warmup_batches(
     prepared,
     batch_size: int,
     device: torch.device,
+    cache_ellipsoid_segment_clearance: bool = False,
 ) -> tuple[Any, ...]:
     warmup_env = V2StaticNoFlyTrajectoryEnv(
         prepared.scenario_config,
@@ -1317,6 +1318,7 @@ def _compile_warmup_batches(
         seed=pool.stage_seed,
         fixed_scenarios=[record['payload'] for record in pool.scenarios],
         uav_collision_radius=prepared.uav_collision_radius,
+        cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
     )
     observations = tuple(
         warmup_env.reset(options={'scenario': record['payload']})[0]
@@ -1336,10 +1338,18 @@ def _compile_warmup_batches(
 
 
 def _action_inference_warmup_batches(
-    *, pool: V2ValidationPool, prepared, device: torch.device,
+    *,
+    pool: V2ValidationPool,
+    prepared,
+    device: torch.device,
+    cache_ellipsoid_segment_clearance: bool = False,
 ) -> tuple[V2ObservationBatch, ...]:
     batches = list(_compile_warmup_batches(
-        pool=pool, prepared=prepared, batch_size=1, device=device,
+        pool=pool,
+        prepared=prepared,
+        batch_size=1,
+        device=device,
+        cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
     ))
     if not batches:
         raise ValueError('At least one action inference warmup batch is required.')
@@ -2743,6 +2753,7 @@ def _run_compiled_numerics_check(
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
     cuda_graph_action_inference: bool = False,
+    cache_ellipsoid_segment_clearance: bool = False,
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
     pinned_batch_transfer: bool = False,
@@ -2828,6 +2839,7 @@ def _run_compiled_numerics_check(
             prepared=prepared,
             batch_size=reference.batch_size,
             device=device,
+            cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
         )
         if compile_actors:
             compiled.warmup_actor_compile(warmup_batches)
@@ -2848,7 +2860,10 @@ def _run_compiled_numerics_check(
                 compiled.verify_update_cuda_graph_capture(warmup_batches)
             )
         action_inference_batches = _action_inference_warmup_batches(
-            pool=pool, prepared=prepared, device=device,
+            pool=pool,
+            prepared=prepared,
+            device=device,
+            cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
         )
         if compile_action_inference:
             compiled.warmup_action_inference_compile(action_inference_batches)
@@ -3186,6 +3201,7 @@ def _run_grouped_compiled_numerics_diagnostic(
     bc_checkpoint: Path,
     device: torch.device,
     snn_time_window: int,
+    cache_ellipsoid_segment_clearance: bool = False,
 ) -> dict[str, Any]:
     """Run one isolated eager/compiled critic-only localization update."""
 
@@ -3231,6 +3247,7 @@ def _run_grouped_compiled_numerics_diagnostic(
             prepared=prepared,
             batch_size=eager.batch_size,
             device=device,
+            cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
         )
         mixed_observation, _ = _numeric_diagnostic_observation_batches(
             warmup_batches,
@@ -3338,6 +3355,8 @@ def _run_diagnostic_level(
     compiled_path_profiler_updates: int = 0,
     compiled_profiler_output_dir: Path | None = None,
     environment_performance_diagnostic: bool = False,
+    cache_ellipsoid_segment_clearance: bool = False,
+    single_observation_fast_path: bool = False,
 ) -> dict[str, Any]:
     scenario_count = len(pool.scenarios)
     if scenario_count == 0 or measured_steps < scenario_count:
@@ -3370,12 +3389,17 @@ def _run_diagnostic_level(
     )
     engine = components.engine
     engine.actor.train()
+    if type(single_observation_fast_path) is not bool:
+        raise TypeError('single_observation_fast_path must be a bool.')
+    if type(cache_ellipsoid_segment_clearance) is not bool:
+        raise TypeError('cache_ellipsoid_segment_clearance must be a bool.')
     env = V2StaticNoFlyTrajectoryEnv(
         prepared.scenario_config,
         prepared.reward_config,
         seed=pool.stage_seed,
         fixed_scenarios=[record['payload'] for record in pool.scenarios],
         uav_collision_radius=prepared.uav_collision_radius,
+        cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
     )
     performance_diagnostic_enabled = bool(
         environment_performance_diagnostic or compiled_path_profiler_updates > 0
@@ -3502,6 +3526,7 @@ def _run_diagnostic_level(
             prepared=prepared,
             batch_size=engine.batch_size,
             device=device,
+            cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
         )
         compile_metadata['warmup_batch_shapes'] = [
             [batch.batch_size, int(batch.zone_features.shape[1])]
@@ -3524,7 +3549,10 @@ def _run_diagnostic_level(
             engine.warmup_actor_loss_compile(warmup_batches)
         if compile_action_inference:
             action_batches = _action_inference_warmup_batches(
-                pool=pool, prepared=prepared, device=device,
+                pool=pool,
+                prepared=prepared,
+                device=device,
+                cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
             )
             engine.warmup_action_inference_compile(action_batches)
             compile_metadata['action_inference_warmup_shapes'] = [
@@ -3586,6 +3614,7 @@ def _run_diagnostic_level(
             prepared=prepared,
             batch_size=engine.batch_size,
             device=device,
+            cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
         )
         compile_metadata['warmup_batch_shapes'] = [
             [batch.batch_size, int(batch.zone_features.shape[1])]
@@ -3753,6 +3782,7 @@ def _run_diagnostic_level(
                             formal_config.noise_schedule.exploration_initial
                         ),
                         exploration_rng=components.exploration_rng,
+                        single_observation_fast_path=single_observation_fast_path,
                     ),
                     cuda_event=True,
                 )
@@ -4101,6 +4131,8 @@ def run_v2_td3_timing_diagnostic(
     compiled_numerics_only: bool = False,
     compiled_numerics_group: str | None = None,
     compiled_performance_diagnostic_updates: int = 0,
+    cache_ellipsoid_segment_clearance: bool = False,
+    single_observation_fast_path: bool = False,
 ) -> dict[str, Any]:
     if model not in ('ann', 'snn'):
         raise ValueError('model must be ann or snn.')
@@ -4142,6 +4174,8 @@ def run_v2_td3_timing_diagnostic(
         ('reduce_update_stat_syncs', reduce_update_stat_syncs),
         ('cuda_graph_updates', cuda_graph_updates),
         ('cuda_graph_actor_update', cuda_graph_actor_update),
+        ('cache_ellipsoid_segment_clearance', cache_ellipsoid_segment_clearance),
+        ('single_observation_fast_path', single_observation_fast_path),
     ):
         if type(value) is not bool:
             raise TypeError(f'{name} must be a bool.')
@@ -4352,6 +4386,7 @@ def run_v2_td3_timing_diagnostic(
             bc_checkpoint=checkpoint,
             device=target_device,
             snn_time_window=snn_time_window,
+            cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
         )
         output.mkdir(parents=True, exist_ok=False)
         summary = {
@@ -4368,6 +4403,12 @@ def run_v2_td3_timing_diagnostic(
             'scenario_pool_directory': str(Path(scenario_pool_dir).resolve()),
             'scenario_pool_prepare_wall_seconds': pool_prepare_seconds,
             'compiled_numeric_group_localization': localization,
+            'diagnostic_config': {
+                'cache_ellipsoid_segment_clearance': (
+                    cache_ellipsoid_segment_clearance
+                ),
+                'single_observation_fast_path': single_observation_fast_path,
+            },
             'timing_levels_executed': 0,
         }
         summary = json.loads(json.dumps(
@@ -4412,6 +4453,7 @@ def run_v2_td3_timing_diagnostic(
             cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
             cuda_graph_action_inference=cuda_graph_action_inference,
+            cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
             aggregate_relation_values_first=aggregate_relation_values_first,
             reduce_update_stat_syncs=reduce_update_stat_syncs,
             pinned_batch_transfer=pinned_batch_transfer,
@@ -4434,6 +4476,12 @@ def run_v2_td3_timing_diagnostic(
             'scenario_pool_directory': str(Path(scenario_pool_dir).resolve()),
             'scenario_pool_prepare_wall_seconds': pool_prepare_seconds,
             'compiled_numerics': compiled_numerics,
+            'diagnostic_config': {
+                'cache_ellipsoid_segment_clearance': (
+                    cache_ellipsoid_segment_clearance
+                ),
+                'single_observation_fast_path': single_observation_fast_path,
+            },
             'timing_levels_executed': 0,
         }
         summary = json.loads(json.dumps(
@@ -4491,6 +4539,8 @@ def run_v2_td3_timing_diagnostic(
                 else None
             ),
             environment_performance_diagnostic=bool(compiled_profiler_updates),
+            cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
+            single_observation_fast_path=single_observation_fast_path,
         )
         level_results[level] = result
         print(json.dumps({
@@ -4621,6 +4671,10 @@ def run_v2_td3_timing_diagnostic(
             'cuda_graph_action_inference_requested': (
                 cuda_graph_action_inference
             ),
+            'cache_ellipsoid_segment_clearance': (
+                cache_ellipsoid_segment_clearance
+            ),
+            'single_observation_fast_path': single_observation_fast_path,
             'pinned_batch_transfer_requested': pinned_batch_transfer,
             'aggregate_relation_values_first_requested': (
                 aggregate_relation_values_first
@@ -4747,6 +4801,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--cache-actor-loss-coefficients', action='store_true')
     parser.add_argument('--compile-action-inference', action='store_true')
     parser.add_argument('--cuda-graph-action-inference', action='store_true')
+    parser.add_argument('--cache-ellipsoid-segment-clearance', action='store_true')
+    parser.add_argument('--single-observation-fast-path', action='store_true')
     parser.add_argument('--pinned-batch-transfer', action='store_true')
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument('--reduce-update-stat-syncs', action='store_true')
@@ -4828,6 +4884,10 @@ def main(argv: Sequence[str] | None = None) -> None:
         compiled_performance_diagnostic_updates=(
             args.compiled_performance_diagnostic_updates
         ),
+        cache_ellipsoid_segment_clearance=(
+            args.cache_ellipsoid_segment_clearance
+        ),
+        single_observation_fast_path=args.single_observation_fast_path,
     )
 
 
