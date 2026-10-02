@@ -18,6 +18,7 @@ from brain_uav.scripts.train_v2_td3 import (
 from brain_uav.trainers.v2_formal_training import (
     V2FormalTrainingConfig,
     prepare_v2_stage_initialization,
+    v2_bc_schedule_metadata,
 )
 from brain_uav.trainers.v2_validation import (
     derive_validation_stage_seed,
@@ -40,8 +41,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--max-stage', choices=('easy', 'medium', 'hard'), default='hard')
     parser.add_argument('--easy-max-stage-steps', type=int, default=None)
     parser.add_argument('--medium-max-stage-steps', type=int, default=None)
+    parser.add_argument('--hard-max-stage-steps', type=int, default=None)
+    parser.add_argument('--easy-gamma', type=float, default=0.99)
     parser.add_argument('--medium-gamma', type=float, default=0.99)
+    parser.add_argument('--hard-gamma', type=float, default=0.99)
+    parser.add_argument('--easy-failure-sample-bias', type=float, default=1.0)
     parser.add_argument('--medium-failure-sample-bias', type=float, default=1.0)
+    parser.add_argument('--hard-failure-sample-bias', type=float, default=1.0)
+    parser.add_argument('--bc-schedule', choices=('default', 'smooth-final'), default='default',
+                        help='BC schedule for easy/medium; hard keeps its default schedule.')
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--model', choices=('ann', 'snn'), default='ann')
     parser.add_argument('--snn-time-window', type=int, default=4)
@@ -112,10 +120,19 @@ def _stage_training_parameters(
     medium_max_stage_steps: int | None,
     medium_gamma: float,
     medium_failure_sample_bias: float,
-) -> dict[str, dict[str, int | float]]:
+    hard_max_stage_steps: int | None = None,
+    easy_gamma: float = 0.99,
+    hard_gamma: float = 0.99,
+    easy_failure_sample_bias: float = 1.0,
+    hard_failure_sample_bias: float = 1.0,
+    bc_schedule: str = 'default',
+) -> dict[str, dict[str, int | float | str]]:
+    # Validate the requested schedule even when hard resolves to default.
+    v2_bc_schedule_metadata('easy', schedule=bc_schedule)
     configs = {
         'easy': V2FormalTrainingConfig(
             stage='easy', max_steps=easy_max_stage_steps,
+            gamma=easy_gamma, failure_sample_bias=easy_failure_sample_bias,
         ),
         'medium': V2FormalTrainingConfig(
             stage='medium',
@@ -123,13 +140,17 @@ def _stage_training_parameters(
             gamma=medium_gamma,
             failure_sample_bias=medium_failure_sample_bias,
         ),
-        'hard': V2FormalTrainingConfig(stage='hard'),
+        'hard': V2FormalTrainingConfig(
+            stage='hard', max_steps=hard_max_stage_steps,
+            gamma=hard_gamma, failure_sample_bias=hard_failure_sample_bias,
+        ),
     }
     return {
         stage: {
             'max_stage_steps': configs[stage].max_steps,
             'gamma': configs[stage].gamma,
             'failure_sample_bias': configs[stage].failure_sample_bias,
+            'bc_schedule': 'default' if stage == 'hard' else bc_schedule,
         }
         for stage in v2_stage_sequence(max_stage)
     }
@@ -197,6 +218,12 @@ def run_v2_curriculum(
     medium_max_stage_steps: int | None = None,
     medium_gamma: float = 0.99,
     medium_failure_sample_bias: float = 1.0,
+    hard_max_stage_steps: int | None = None,
+    easy_gamma: float = 0.99,
+    hard_gamma: float = 0.99,
+    easy_failure_sample_bias: float = 1.0,
+    hard_failure_sample_bias: float = 1.0,
+    bc_schedule: str = 'default',
     device: str = 'auto',
     stage_runner: Callable[..., dict[str, Any]] = run_v2_td3_stage,
     model: str = 'ann',
@@ -262,6 +289,12 @@ def run_v2_curriculum(
         medium_max_stage_steps=medium_max_stage_steps,
         medium_gamma=medium_gamma,
         medium_failure_sample_bias=medium_failure_sample_bias,
+        hard_max_stage_steps=hard_max_stage_steps,
+        easy_gamma=easy_gamma,
+        hard_gamma=hard_gamma,
+        easy_failure_sample_bias=easy_failure_sample_bias,
+        hard_failure_sample_bias=hard_failure_sample_bias,
+        bc_schedule=bc_schedule,
     )
     bc_path = Path(bc_checkpoint)
     if not bc_path.is_file():
@@ -350,12 +383,13 @@ def run_v2_curriculum(
             max_stage_steps=(
                 easy_max_stage_steps if stage == 'easy'
                 else medium_max_stage_steps if stage == 'medium'
-                else None
+                else hard_max_stage_steps
             ),
             gamma=stage_training_parameters[stage]['gamma'],
             failure_sample_bias=(
                 stage_training_parameters[stage]['failure_sample_bias']
             ),
+            bc_schedule=stage_training_parameters[stage]['bc_schedule'],
             prepared_initialization=(
                 prepared_initialization if stage == 'easy' else None
             ),
@@ -445,6 +479,12 @@ def main(argv: list[str] | None = None) -> int:
         medium_max_stage_steps=args.medium_max_stage_steps,
         medium_gamma=args.medium_gamma,
         medium_failure_sample_bias=args.medium_failure_sample_bias,
+        hard_max_stage_steps=args.hard_max_stage_steps,
+        easy_gamma=args.easy_gamma,
+        hard_gamma=args.hard_gamma,
+        easy_failure_sample_bias=args.easy_failure_sample_bias,
+        hard_failure_sample_bias=args.hard_failure_sample_bias,
+        bc_schedule=args.bc_schedule,
     )
     resolved_device = resolve_training_device(args.device)
     print(json.dumps({
@@ -471,6 +511,12 @@ def main(argv: list[str] | None = None) -> int:
         medium_max_stage_steps=args.medium_max_stage_steps,
         medium_gamma=args.medium_gamma,
         medium_failure_sample_bias=args.medium_failure_sample_bias,
+        hard_max_stage_steps=args.hard_max_stage_steps,
+        easy_gamma=args.easy_gamma,
+        hard_gamma=args.hard_gamma,
+        easy_failure_sample_bias=args.easy_failure_sample_bias,
+        hard_failure_sample_bias=args.hard_failure_sample_bias,
+        bc_schedule=args.bc_schedule,
         device=args.device,
         model=args.model,
         snn_time_window=args.snn_time_window,

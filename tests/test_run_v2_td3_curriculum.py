@@ -100,6 +100,88 @@ def _prepared_initialization(
 
 
 class TestRunV2TD3CurriculumCLI(unittest.TestCase):
+    def test_cli_trial_parameters_reach_full_chain_and_preserve_checkpoint_gates(self):
+        for model, trial, failed_stage in (
+            ('ann', 'baseline', None), ('snn', 'baseline', None),
+            ('ann', 'gamma', None), ('snn', 'gamma', None),
+            ('ann', 'bias', None), ('snn', 'bias', None),
+            ('ann', 'baseline', 'easy'), ('snn', 'baseline', 'medium'),
+        ):
+            with self.subTest(model=model, trial=trial, failed_stage=failed_stage), \
+                    tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                bc = root / 'new_bc_best.pt'
+                bc.write_bytes(b'test-double')
+                scenario = ScenarioConfig(world_z_max=600.0)
+                actor = (_make_snn_actor(scenario, time_window=4, tau=2.0)
+                         if model == 'snn' else None)
+                calls = []
+                gamma = 0.995 if trial == 'gamma' else 0.99
+                biases = [2.0] * 3 if trial == 'bias' else [1.0, 1.5 if model == 'snn' else 1.0, 1.0]
+
+                def stage_runner(**kwargs):
+                    calls.append(kwargs)
+                    passed = kwargs['stage'] != failed_stage
+                    output = kwargs['output']
+                    checkpoint = output if passed else output.with_name(output.stem + '_failed.pt')
+                    return {'stage': kwargs['stage'], 'passed': passed,
+                            'checkpoint': str(checkpoint), 'steps': 1,
+                            'global_steps_end': kwargs['global_steps_start'] + 1}
+
+                def load_pool(path, **kwargs):
+                    stage = Path(path).stem
+                    return SimpleNamespace(master_seed=20260904,
+                        stage_seed=derive_validation_stage_seed(20260904, stage),
+                        scenario_count=100, content_digest=stage)
+
+                def run_chain(**kwargs):
+                    return run_v2_curriculum(stage_runner=stage_runner, **kwargs)
+
+                argv = ['--bc-checkpoint', str(bc), '--output-root', str(root / 'run'),
+                        '--validation-pool-dir', str(root / 'pools'), '--model', model,
+                        '--device', 'cpu', '--bc-schedule', 'smooth-final',
+                        '--periodic-snapshot-interval-steps', '0']
+                for stage, bias in zip(('easy', 'medium', 'hard'), biases):
+                    argv += [f'--{stage}-gamma', str(gamma),
+                             f'--{stage}-failure-sample-bias', str(bias),
+                             f'--{stage}-max-stage-steps', '500000']
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout), mock.patch(
+                    'brain_uav.scripts.run_v2_td3_curriculum.prepare_v2_stage_initialization',
+                    return_value=_prepared_initialization(scenario, actor=actor, source=bc),
+                ), mock.patch(
+                    'brain_uav.scripts.run_v2_td3_curriculum.prepare_v2_validation_pools',
+                    return_value={stage: root / f'{stage}.json' for stage in ('easy', 'medium', 'hard')},
+                ), mock.patch(
+                    'brain_uav.scripts.run_v2_td3_curriculum.load_v2_validation_pool',
+                    side_effect=load_pool,
+                ), mock.patch(
+                    'brain_uav.scripts.run_v2_td3_curriculum.run_v2_curriculum',
+                    side_effect=run_chain,
+                ):
+                    exit_code = main(argv)
+                preview, _ = json.JSONDecoder().raw_decode(stdout.getvalue())
+                summary = json.loads((root / 'run' / 'summary.json').read_text(encoding='utf-8'))
+                self.assertEqual(exit_code, 0 if failed_stage is None else 1)
+                self.assertEqual(summary['failed_stage'], failed_stage)
+                self.assertEqual(len(calls), 3 if failed_stage is None else
+                                 ('easy', 'medium', 'hard').index(failed_stage) + 1)
+                self.assertEqual(calls[0]['init_checkpoint'], bc)
+                for index, call in enumerate(calls):
+                    stage = call['stage']
+                    actual = {name: call[name] for name in
+                              ('gamma', 'failure_sample_bias', 'max_stage_steps', 'bc_schedule')}
+                    self.assertEqual(actual, {'gamma': gamma, 'failure_sample_bias': biases[index],
+                        'max_stage_steps': 500000,
+                        'bc_schedule': 'default' if stage == 'hard' else 'smooth-final'})
+                    self.assertEqual(preview['stage_training_parameters'][stage], actual)
+                    self.assertEqual(summary['stage_training_parameters'][stage], actual)
+                    self.assertIsNone(call['periodic_snapshot_interval_steps'])
+                    self.assertEqual(call['expected_validation_master_seed'], 20260904)
+                    if index:
+                        self.assertEqual(call['init_checkpoint'], calls[index - 1]['output'])
+                        self.assertNotIn('_failed', str(call['init_checkpoint']))
+
     def test_parser_defaults_to_one_easy_medium_hard_chain(self):
         args = build_parser().parse_args([
             '--bc-checkpoint', 'bc.pt',
@@ -114,6 +196,12 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertEqual(args.snn_time_window, 4)
         self.assertEqual(args.medium_gamma, 0.99)
         self.assertEqual(args.medium_failure_sample_bias, 1.0)
+        self.assertEqual(args.easy_gamma, 0.99)
+        self.assertEqual(args.hard_gamma, 0.99)
+        self.assertEqual(args.easy_failure_sample_bias, 1.0)
+        self.assertEqual(args.hard_failure_sample_bias, 1.0)
+        self.assertEqual(args.bc_schedule, 'default')
+        self.assertIsNone(args.hard_max_stage_steps)
         self.assertIsNone(args.easy_max_stage_steps)
         self.assertIsNone(args.medium_max_stage_steps)
         self.assertFalse(args.pinned_batch_transfer)
@@ -530,6 +618,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                 'max_stage_steps': 500_000,
                 'gamma': 0.99,
                 'failure_sample_bias': 1.0,
+                'bc_schedule': 'default',
             },
         )
         self.assertEqual(
@@ -538,6 +627,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                 'max_stage_steps': 500_000,
                 'gamma': 0.99,
                 'failure_sample_bias': 1.5,
+                'bc_schedule': 'default',
             },
         )
 
@@ -661,6 +751,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         for overrides in (
             {'easy_max_stage_steps': 0},
             {'medium_max_stage_steps': 1.5},
+            {'hard_max_stage_steps': 0},
         ):
             with self.subTest(overrides=overrides), self.assertRaisesRegex(
                 ValueError,

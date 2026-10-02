@@ -110,7 +110,7 @@ class TestV2ScenarioGeneratorConfiguration(unittest.TestCase):
             DEFAULT_V2_DIRECT_PATH_BLOCKER_PROBABILITIES,
             {'easy': 0.50, 'medium': 0.80, 'hard': 1.00},
         )
-        self.assertEqual(V2_SCENARIO_GENERATOR_VERSION, 2)
+        self.assertEqual(V2_SCENARIO_GENERATOR_VERSION, 3)
         config = V2ScenarioGeneratorConfig()
         self.assertAlmostEqual(
             config.direct_path_blocker_probability_nonzero['easy'],
@@ -257,6 +257,64 @@ class TestV2ScenarioGeneratorConfiguration(unittest.TestCase):
 
 
 class TestV2ScenarioGenerator(unittest.TestCase):
+    def test_box_sizes_and_placement_use_actual_half_sizes_in_every_stage(self):
+        scenario = ScenarioConfig(world_z_max=600.0)
+        for stage, scales in (('easy', (120.0, 190.0)),
+                              ('medium', (180.0, 220.0)),
+                              ('hard', (200.0, 250.0))):
+            generator = _generator(stage, 1, scenario=scenario, shape_type='box')
+            for scale in scales:
+                for grounded in (True, False):
+                    with self.subTest(stage=stage, scale=scale, grounded=grounded):
+                        half = 0.85 * scale
+                        zone = generator._sample_zone_candidate(
+                            np.random.default_rng(7), zone_id='box', shape_type='box',
+                            reference_scale=scale,
+                            target_point=np.array([scenario.world_xy - half,
+                                                   -scenario.world_xy + half, 600.0]),
+                            ground_contact=grounded,
+                        )
+                        self.assertIsNotNone(zone)
+                        np.testing.assert_allclose(zone.shape.half_sizes, [half] * 3)
+                        for name in ('size_x', 'size_y', 'size_z'):
+                            self.assertEqual(getattr(zone.shape, name), 1.7 * scale)
+                            self.assertEqual(zone.metadata['actual_shape_parameters'][name],
+                                             1.7 * scale)
+                        bounds = zone.shape.bounding_box()
+                        self.assertAlmostEqual(bounds.max_corner[0], scenario.world_xy)
+                        self.assertAlmostEqual(bounds.min_corner[1], -scenario.world_xy)
+                        self.assertAlmostEqual(bounds.min_corner[2] if grounded
+                                               else bounds.max_corner[2],
+                                               0.0 if grounded else 600.0)
+
+    def test_new_generator_metadata_and_old_box_pool_version_are_distinct(self):
+        import tempfile
+        from pathlib import Path
+        from brain_uav.trainers.v2_validation import (
+            V2ValidationPool, derive_validation_stage_seed, load_v2_validation_pool,
+            save_v2_validation_pool, scenario_config_snapshot,
+        )
+        self.assertEqual(V2_SCENARIO_GENERATOR_VERSION, 3)
+        scenario = ScenarioConfig(world_z_max=600.0)
+        payload = _generator('easy', 0, scenario=scenario).generate()
+        self.assertEqual(payload['metadata']['generator_version'], 3)
+        pool = V2ValidationPool(
+            'easy', 20260904, derive_validation_stage_seed(20260904, 'easy'),
+            scenario_config_snapshot(scenario), 0.0,
+            [{'scenario_id': 'easy_00000', 'sequence_index': 0,
+              'scenario_seed': payload['metadata']['scenario_seed'], 'payload': payload}],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'fixture_pool.json'
+            save_v2_validation_pool(path, pool)
+            self.assertEqual(load_v2_validation_pool(path, expected_level='easy').content_digest,
+                             pool.content_digest)
+            old = json.loads(path.read_text(encoding='utf-8'))
+            old['scenarios'][0]['payload']['metadata']['generator_version'] = 2
+            path.write_text(json.dumps(old), encoding='utf-8')
+            with self.assertRaisesRegex(ValueError, 'generator_version'):
+                load_v2_validation_pool(path, expected_level='easy')
+
     def test_all_zero_zone_distributions_generate_unblocked_scenarios(self):
         counts = {level: {0: 1.0} for level in ('easy', 'medium', 'hard')}
         config = V2ScenarioGeneratorConfig(
@@ -338,7 +396,7 @@ class TestV2ScenarioGenerator(unittest.TestCase):
                     self.assertGreaterEqual(zone.shape.radius_z / reference, 0.50)
                     self.assertLessEqual(zone.shape.radius_z / reference, 0.80)
                 elif isinstance(zone.shape, Box):
-                    self.assertEqual(zone.shape.size_x, 2.0 * reference)
+                    self.assertEqual(zone.shape.size_x, 1.7 * reference)
                 else:
                     self.assertGreaterEqual(zone.shape.base_size_x / reference, 1.50)
                     self.assertLessEqual(zone.shape.base_size_x / reference, 2.00)

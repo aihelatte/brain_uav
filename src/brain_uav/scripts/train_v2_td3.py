@@ -36,6 +36,12 @@ from brain_uav.trainers.v2_validation import (
 from brain_uav.trainers.v2_reporting import V2ExperimentReporter
 
 
+def _resolve_v2_actor_lr(stage: str, model: str, actor_lr: float | None) -> float | None:
+    if actor_lr is None and stage in ('easy', 'medium'):
+        return 1.55e-4 if model == 'ann' else 9.5e-4
+    return actor_lr
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='Train one formal structured-observation V2 ANN/SNN TD3 stage.'
@@ -57,7 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--validation-max-failures', type=int, default=5)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--failure-sample-bias', type=float, default=1.0)
-    parser.add_argument('--actor-lr', type=float, default=None)
+    parser.add_argument(
+        '--actor-lr', type=float, default=None,
+        help='Actor LR override; easy/medium defaults: ANN 1.55e-4, SNN 9.5e-4.',
+    )
     parser.add_argument('--critic-lr', type=float, default=None)
     parser.add_argument(
         '--bc-schedule', choices=('default', 'smooth-final'), default='default',
@@ -471,7 +480,7 @@ def run_v2_td3_stage(
         validation_max_failures=validation_max_failures,
         gamma=gamma,
         failure_sample_bias=failure_sample_bias,
-        actor_lr=actor_lr,
+        actor_lr=_resolve_v2_actor_lr(stage, model, actor_lr),
         critic_lr=critic_lr,
     )
     if prepared_initialization is None:
@@ -773,6 +782,7 @@ def run_v2_td3_stage(
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.actor_lr = _resolve_v2_actor_lr(args.stage, args.model, args.actor_lr)
     resolved_device = resolve_training_device(args.device)
     config_preview = V2FormalTrainingConfig(
         stage=args.stage,

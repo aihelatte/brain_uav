@@ -342,6 +342,44 @@ class TestV2ReportingPersistence(unittest.TestCase):
 
 
 class TestV2TrajectoryPlotting(unittest.TestCase):
+    def test_pyramid_side_edges_use_real_vertices_only_in_xy_for_both_sources(self):
+        import numpy as np
+        from matplotlib.figure import Figure
+        pyramids = [TriangularPyramid([-6.0, 3.0, 0.0], 6.0, 9.0, 8.0),
+                    QuadrangularPyramid([6.0, 3.0, 0.0], 8.0, 6.0, 10.0)]
+        original_save = Figure.savefig
+
+        def check_and_save(figure, *args, **kwargs):
+            for index, axis in enumerate(figure.axes):
+                red = [line for line in axis.lines if line.get_color() == 'tab:red']
+                self.assertEqual(len(red), 9 if index == 0 else 2)
+                self.assertEqual(sum(line.get_label() == 'solid boundary' for line in red), 1)
+                if index == 0:
+                    edges = [line for line in red if len(line.get_xdata()) == 2]
+                    expected = [np.array([shape.vertices[-1, :2], vertex[:2]])
+                                for shape in pyramids for vertex in shape.vertices[:-1]]
+                    for line, vertices in zip(edges, expected):
+                        np.testing.assert_array_equal(line.get_xydata(), vertices)
+                        self.assertEqual(line.get_linestyle(), '-')
+                        self.assertEqual(line.get_linewidth(), 1.5)
+            return original_save(figure, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            for source in ('training', 'fixed_validation'):
+                with mock.patch.object(Figure, 'savefig', new=check_and_save):
+                    export_v2_trajectory_views(directory, source, {
+                        'scenario_payload': _scenario_payload([
+                            NoFlyZone(str(index), shape, safety_margin=0.5)
+                            for index, shape in enumerate(pyramids)]),
+                        'scenario_config': asdict(ScenarioConfig(world_xy=20.0, world_z_max=40.0)),
+                        'reward_config': asdict(RewardConfig()), 'uav_collision_radius': 0.75,
+                        'trajectory': [[-10.0, -10.0, 20.0], [10.0, 10.0, 30.0]],
+                        'actions': [[0.0, 0.0]], 'terminal_state': [10, 10, 30, 0, 0],
+                        'outcome': 'goal', 'episode_return': 1.0, 'episode_length': 1,
+                        'stage': 'easy', 'global_steps': 1, 'model_type': 'ann',
+                        'source': source, 'selection_reasons': ['fixture'],
+                    })
+
     def test_five_shapes_and_zero_zone_render_as_redrawable_three_view_png(self) -> None:
         zones = [
             NoFlyZone('sphere', Sphere([-6.0, -4.0, 4.0], 2.0), safety_margin=0.5),

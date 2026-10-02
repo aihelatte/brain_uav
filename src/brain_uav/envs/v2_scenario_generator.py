@@ -34,7 +34,7 @@ from .v2_feasibility import (
 V2_ENV_SCENARIO_FORMAT = 'v2_static_no_fly_scenario'
 V2_ENV_SCENARIO_VERSION = 1
 V2_SCENARIO_GENERATOR_NAME = 'brain_uav_v2_random_training'
-V2_SCENARIO_GENERATOR_VERSION = 2
+V2_SCENARIO_GENERATOR_VERSION = 3
 V2_CURRICULUM_LEVELS = ('easy', 'medium', 'hard')
 V2_SHAPE_TYPES = (
     'sphere',
@@ -740,12 +740,13 @@ class V2ScenarioGenerator:
                 'radius_z': radius_z,
             }
         elif shape_type == 'box':
-            size = 2.0 * reference_scale
+            size = 1.7 * reference_scale
+            half_size = 0.85 * reference_scale
             placement = self._sample_primitive_center(
                 rng,
-                reference_scale,
-                reference_scale,
-                reference_scale,
+                half_size,
+                half_size,
+                half_size,
                 target_point,
                 ground_contact,
             )

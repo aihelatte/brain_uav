@@ -291,8 +291,41 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertEqual(stage_runner.call_args.kwargs['gamma'], 0.995)
         self.assertEqual(stage_runner.call_args.kwargs['failure_sample_bias'], 3.0)
         self.assertEqual(stage_runner.call_args.kwargs['bc_final_drop_step'], 400_000)
-        self.assertIsNone(stage_runner.call_args.kwargs['actor_lr'])
+        self.assertEqual(stage_runner.call_args.kwargs['actor_lr'], 1.55e-4)
         self.assertIsNone(stage_runner.call_args.kwargs['critic_lr'])
+
+    def test_main_resolves_model_learning_rates_and_preserves_hard_defaults(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+
+        for model, stage, expected_lr in (
+            ('ann', 'easy', 1.55e-4),
+            ('ann', 'medium', 1.55e-4),
+            ('snn', 'easy', 9.5e-4),
+            ('snn', 'medium', 9.5e-4),
+            ('ann', 'hard', 1.125e-4),
+            ('snn', 'hard', 1.125e-4),
+        ):
+            with self.subTest(model=model, stage=stage):
+                startup_output = StringIO()
+                with redirect_stdout(startup_output), mock.patch(
+                    'brain_uav.scripts.train_v2_td3.run_v2_td3_stage',
+                    return_value={'passed': True},
+                ) as stage_runner:
+                    result = train_main([
+                        '--model', model, '--stage', stage,
+                        '--init-checkpoint', 'init.pt', '--output', 'output.pt',
+                        '--metrics-out', 'metrics.json',
+                        '--validation-pool', 'validation.json', '--device', 'cpu',
+                    ])
+                self.assertEqual(result, 0)
+                startup, _ = json.JSONDecoder().raw_decode(startup_output.getvalue())
+                self.assertEqual(
+                    startup['resolved_v2_formal_config']['actor_lr'], expected_lr,
+                )
+                if stage != 'hard':
+                    self.assertEqual(stage_runner.call_args.kwargs['actor_lr'], expected_lr)
+                self.assertIsNone(stage_runner.call_args.kwargs['critic_lr'])
 
     def test_main_forwards_smooth_schedule_and_explicit_learning_rates(self):
         from contextlib import redirect_stdout

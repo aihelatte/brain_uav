@@ -395,6 +395,14 @@ def export_v2_trajectory_views(target_dir: str | Path, stem: str,
                 closed_entity = np.vstack((entity, entity[0]))
                 axis.plot(closed_entity[:, 0], closed_entity[:, 1], color='tab:red',
                           linewidth=1.5, label='solid boundary' if zone_index == 0 else None)
+                if projection == (0, 1) and isinstance(
+                    zone.shape, (TriangularPyramid, QuadrangularPyramid)
+                ):
+                    vertices = zone.shape.vertices
+                    for base_vertex in vertices[:-1]:
+                        axis.plot([vertices[-1, 0], base_vertex[0]],
+                                  [vertices[-1, 1], base_vertex[1]],
+                                  color='tab:red', linewidth=1.5)
                 if effective_margin > 0.0:
                     closed_safe = np.vstack((safe, safe[0]))
                     axis.plot(closed_safe[:, 0], closed_safe[:, 1], color='tab:orange',
