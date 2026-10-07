@@ -81,6 +81,11 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.best_goal_distance_so_far = 0.0
         self.last_segment_goal_distance = float('inf')
         self.last_goal_reached_by_segment = False
+        self.reward_diagnostics_enabled = False
+        self.last_reward_components = None
+        self.last_reward_component_error = 0.0
+        self.last_terminal_los_active = False
+        self.last_terminal_radial_tangential_active = False
 
     def seed(self, seed: int | None = None) -> None:
         self.rng = np.random.default_rng(seed)
@@ -177,6 +182,19 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.last_segment_goal_distance = self.best_goal_distance_so_far
         self.last_goal_reached_by_segment = False
         return self._get_obs(), self._info(progress=0.0)
+
+    def enable_reward_diagnostics(self, enabled: bool = True) -> None:
+        """Opt in to observing actual reward terms, without changing rewards."""
+        if type(enabled) is not bool:
+            raise TypeError('enabled must be a bool.')
+        self.reward_diagnostics_enabled = enabled
+        self._reset_reward_diagnostics()
+
+    def _reset_reward_diagnostics(self) -> None:
+        self.last_reward_components = None
+        self.last_reward_component_error = 0.0
+        self.last_terminal_los_active = False
+        self.last_terminal_radial_tangential_active = False
 
     def _sample_scenario(self) -> None:
         if self.curriculum_mix:
@@ -571,6 +589,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         goal_dir = self._goal_direction(pos)
         if goal_dir is None:
             return 0.0
+        if self.reward_diagnostics_enabled:
+            self.last_terminal_los_active = True
         alignment = float(np.dot(self._flight_direction(gamma, psi), goal_dir))
         if alignment >= 0.0:
             reward = self.rewards.terminal_los_weight * alignment
@@ -585,6 +605,8 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         goal_dir = self._goal_direction(pos)
         if goal_dir is None:
             return 0.0
+        if self.reward_diagnostics_enabled:
+            self.last_terminal_radial_tangential_active = True
         radial_component = float(np.dot(self._flight_direction(gamma, psi), goal_dir))
         tangential_component = math.sqrt(max(1.0 - radial_component**2, 0.0))
         reward = self.rewards.terminal_radial_weight * max(radial_component, 0.0)
@@ -808,33 +830,71 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         outcome: str,
         prev_best_goal_distance: float,
     ) -> float:
-        rew = self.rewards.progress_weight * (
+        if self.reward_diagnostics_enabled:
+            self._reset_reward_diagnostics()
+        progress = self.rewards.progress_weight * (
             (prev_distance - new_distance) * self._distance_reward_scale_compensation
         )
-        rew += self._breakthrough_reward(new_distance, prev_best_goal_distance, outcome)
-        rew += self._terminal_los_reward(self.state[:3], float(self.state[3]), float(self.state[4]), outcome)
-        rew += self._terminal_radial_tangential_reward(
+        rew = progress
+        breakthrough = self._breakthrough_reward(new_distance, prev_best_goal_distance, outcome)
+        rew += breakthrough
+        terminal_direction = self._terminal_los_reward(self.state[:3], float(self.state[3]), float(self.state[4]), outcome)
+        rew += terminal_direction
+        terminal_radial_tangential = self._terminal_radial_tangential_reward(
             self.state[:3],
             float(self.state[3]),
             float(self.state[4]),
             outcome,
         )
+        rew += terminal_radial_tangential
         rew -= self.rewards.step_penalty
-        rew -= self.rewards.smoothness_weight * float(np.square(action).sum())
-        rew -= self._action_change_penalty(prev_action, action)
-        rew -= self._zone_warning_penalty(self.state[:3])
-        rew -= self._boundary_warning_penalty(self.state[:3])
-        rew -= self._ground_warning_penalty(self.state[:3])
-        rew -= self._descent_trend_penalty(prev_state, self.state)
-        rew -= self._inefficiency_penalty()
+        action_magnitude = self.rewards.smoothness_weight * float(np.square(action).sum())
+        rew -= action_magnitude
+        action_change = self._action_change_penalty(prev_action, action)
+        rew -= action_change
+        zone_warning = self._zone_warning_penalty(self.state[:3])
+        rew -= zone_warning
+        boundary_warning = self._boundary_warning_penalty(self.state[:3])
+        rew -= boundary_warning
+        ground_warning = self._ground_warning_penalty(self.state[:3])
+        rew -= ground_warning
+        descent_trend = self._descent_trend_penalty(prev_state, self.state)
+        rew -= descent_trend
+        inefficiency = self._inefficiency_penalty()
+        rew -= inefficiency
+        termination = 0.0
         if outcome == 'goal':
             rew += self.rewards.goal_reward
+            termination = self.rewards.goal_reward
         elif outcome in {'collision', 'ground'}:
             rew -= self.rewards.collision_penalty
+            termination = -self.rewards.collision_penalty
         elif outcome == 'boundary':
             rew -= self.rewards.boundary_penalty
+            termination = -self.rewards.boundary_penalty
         elif outcome == 'timeout':
             rew -= self.rewards.timeout_penalty
+            termination = -self.rewards.timeout_penalty
+        if self.reward_diagnostics_enabled:
+            self.last_reward_components = {
+                'distance_progress': float(progress),
+                'breakthrough': float(breakthrough),
+                'terminal_direction': float(terminal_direction),
+                'terminal_radial_tangential': float(terminal_radial_tangential),
+                'step': -float(self.rewards.step_penalty),
+                'action_magnitude': -float(action_magnitude),
+                'action_change': -float(action_change),
+                'zone_warning': -float(zone_warning),
+                'boundary_warning': -float(boundary_warning),
+                'ground_warning': -float(ground_warning),
+                'descent_trend': -float(descent_trend),
+                'inefficiency': -float(inefficiency),
+                'termination': float(termination),
+            }
+            component_sum = math.fsum(self.last_reward_components.values())
+            self.last_reward_component_error = abs(component_sum - float(rew))
+            if not math.isclose(component_sum, float(rew), rel_tol=1e-10, abs_tol=1e-8):
+                raise RuntimeError('Reward diagnostic components do not sum to step reward.')
         return rew
 
     def _record_progress(self, step_progress: float) -> None:
@@ -996,7 +1056,10 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         return ((value + math.pi) % (2 * math.pi)) - math.pi
 
     def _info(self, *, progress: float, outcome: str = 'running') -> dict[str, Any]:
-        return {
+        # Both legacy and V2 reset call this shared helper after setting steps=0.
+        if self.steps == 0 and self.reward_diagnostics_enabled:
+            self._reset_reward_diagnostics()
+        info = {
             'goal_distance': self._goal_distance(self.state[:3]),
             'segment_goal_distance': float(self.last_segment_goal_distance),
             'goal_reached_by_segment': bool(self.last_goal_reached_by_segment),
@@ -1006,3 +1069,11 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             'curriculum_level': self.last_curriculum_level,
             'active_goal_radius': self._active_goal_radius(),
         }
+        if self.reward_diagnostics_enabled and self.last_reward_components is not None:
+            info.update(
+                reward_components=self.last_reward_components.copy(),
+                reward_component_error=self.last_reward_component_error,
+                terminal_los_active=self.last_terminal_los_active,
+                terminal_radial_tangential_active=self.last_terminal_radial_tangential_active,
+            )
+        return info
