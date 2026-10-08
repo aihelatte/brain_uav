@@ -46,6 +46,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         super().__init__()
         self.scenario = scenario or ScenarioConfig()
         self.rewards = rewards or RewardConfig()
+        self.rewards.validate_scenario(self.scenario)
         self.fixed_scenarios = fixed_scenarios or []
         self.curriculum_mix = normalize_curriculum_mix(curriculum_mix, fallback_level='hard') if curriculum_mix else None
         self._fixed_idx = 0
@@ -1012,7 +1013,19 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             )
         )
         descent_ratio = float(np.clip(abs(delta_z) / max_vertical_step, 0.0, 1.0))
-        if float(new_state[2]) >= self.scenario.descent_penalty_height:
+        if self.rewards.descent_three_band_enabled:
+            low, high = self.rewards.descent_low_height, self.rewards.descent_high_height
+            transition = self.rewards.descent_transition_factor
+            height = float(new_state[2])
+            if height >= high:
+                height_factor = 0.0
+            elif height >= low:
+                height_factor = transition * (high - height) / (high - low)
+            else:
+                height_factor = transition + (1.0 - transition) * float(np.clip(
+                    (low - height) / (low - self.scenario.world_z_min), 0.0, 1.0,
+                ))
+        elif float(new_state[2]) >= self.scenario.descent_penalty_height:
             height_factor = 0.35
         else:
             height_factor = 0.35 + 0.65 * float(

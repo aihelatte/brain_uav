@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
 import json
 from pathlib import Path
 from typing import Any, Callable
 
-from brain_uav.config import ScenarioConfig
+from brain_uav.config import RewardConfig, ScenarioConfig
 from brain_uav.models import V2SNNPolicyActor, require_v2_spikingjelly
 from brain_uav.scripts.common import DEVICE_CHOICES, resolve_training_device
 from brain_uav.scripts.train_v2_td3 import (
@@ -224,6 +225,7 @@ def run_v2_curriculum(
     easy_failure_sample_bias: float = 1.0,
     hard_failure_sample_bias: float = 1.0,
     bc_schedule: str = 'default',
+    rewards: RewardConfig | None = None,
     device: str = 'auto',
     stage_runner: Callable[..., dict[str, Any]] = run_v2_td3_stage,
     model: str = 'ann',
@@ -305,6 +307,7 @@ def run_v2_curriculum(
         device='cpu',
         model_type=model,
         snn_time_window=snn_time_window,
+        rewards=rewards,
     )
     bc_initialization = prepared_initialization.bc_initialization
     if bc_initialization is None:
@@ -374,6 +377,7 @@ def run_v2_curriculum(
             seed=seed,
             device=resolved_device,
             scenario=scenario,
+            rewards=prepared_initialization.reward_config if stage == 'easy' else None,
             uav_collision_radius=uav_collision_radius,
             expected_validation_master_seed=validated_pools[stage].master_seed,
             expected_validation_stage_seed=validated_pools[stage].stage_seed,
@@ -441,6 +445,7 @@ def run_v2_curriculum(
         'max_stage': max_stage,
         'stage_order': list(stages),
         'stage_training_parameters': stage_training_parameters,
+        'reward_config': asdict(prepared_initialization.reward_config),
         'passed': failed_stage is None and len(summaries) == len(stages),
         'failed_stage': failed_stage,
         'stages': summaries,

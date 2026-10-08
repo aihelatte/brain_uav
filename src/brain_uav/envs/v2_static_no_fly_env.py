@@ -237,6 +237,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         self.last_segment_goal_distance = self.best_goal_distance_so_far
         self.last_goal_reached_by_segment = False
         point_clearances, surface_normals = self._point_geometry(self.state[:3])
+        self._remember_reward_clearances(point_clearances)
         return self._get_obs(
             zone_point_clearances=point_clearances,
             zone_surface_normals=surface_normals,
@@ -316,6 +317,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
                 outcome=outcome,
                 zone_point_clearances=point_clearances,
             )
+        self._remember_reward_clearances(point_clearances)
         return observation, float(reward), terminated, truncated, info
 
     def render(self):
@@ -350,6 +352,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         self.last_segment_goal_distance = self.best_goal_distance_so_far
         self.last_goal_reached_by_segment = False
         point_clearances, surface_normals = self._point_geometry(self.state[:3])
+        self._remember_reward_clearances(point_clearances)
         return self._get_obs(
             zone_point_clearances=point_clearances,
             zone_surface_normals=surface_normals,
@@ -485,6 +488,28 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
             for zone in self.zones
         )
 
+    def _remember_reward_clearances(self, clearances: Sequence[float]) -> None:
+        if self.rewards.breakthrough_clearance_gate_enabled:
+            self._previous_reward_clearances = (
+                self.state[:3].copy(), self._zone_query_identity(),
+                float(self.uav_collision_radius), tuple(clearances),
+            )
+
+    def _breakthrough_reward(
+        self, new_distance: float, prev_best_goal_distance: float, outcome: str,
+    ) -> float:
+        reward = super()._breakthrough_reward(new_distance, prev_best_goal_distance, outcome)
+        if not self.rewards.breakthrough_clearance_gate_enabled or reward == 0.0:
+            return reward
+        previous_position, previous_geometry = self._breakthrough_context
+        previous = self._clearances_from_context(
+            previous_geometry, previous_position,
+        )
+        if previous is None:
+            previous = self._point_clearances(previous_position)
+        current = self._nearest_zone_surface_clearance(self.state[:3])
+        return reward if current > self._minimum_zone_clearance(previous) + 1e-6 else 0.0
+
     def _compute_reward(
         self,
         prev_state: np.ndarray,
@@ -497,6 +522,10 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         *,
         zone_point_clearances: Sequence[float] | None = None,
     ) -> float:
+        reuse_previous_geometry = zone_point_clearances is not None
+        if self.rewards.breakthrough_clearance_gate_enabled:
+            if zone_point_clearances is None:
+                zone_point_clearances = self._point_clearances(self.state[:3])
         if zone_point_clearances is None:
             return super()._compute_reward(
                 prev_state,
@@ -516,7 +545,13 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         )
         sentinel = object()
         previous = getattr(self, '_active_zone_point_clearances', sentinel)
+        previous_breakthrough = getattr(self, '_breakthrough_context', sentinel)
         self._active_zone_point_clearances = context
+        if self.rewards.breakthrough_clearance_gate_enabled:
+            self._breakthrough_context = (
+                prev_state[:3].copy(),
+                getattr(self, '_previous_reward_clearances', None) if reuse_previous_geometry else None,
+            )
         try:
             return super()._compute_reward(
                 prev_state,
@@ -532,12 +567,21 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
                 del self._active_zone_point_clearances
             else:
                 self._active_zone_point_clearances = previous
+            if self.rewards.breakthrough_clearance_gate_enabled:
+                if previous_breakthrough is sentinel:
+                    del self._breakthrough_context
+                else:
+                    self._breakthrough_context = previous_breakthrough
 
     def _active_clearances_for(
         self,
         position: Any,
     ) -> tuple[float, ...] | None:
-        context = getattr(self, '_active_zone_point_clearances', None)
+        return self._clearances_from_context(
+            getattr(self, '_active_zone_point_clearances', None), position,
+        )
+
+    def _clearances_from_context(self, context, position) -> tuple[float, ...] | None:
         if context is None:
             return None
         point, zone_identity, radius, clearances = context
@@ -600,6 +644,10 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         return min(clearances) if clearances else float('inf')
 
     def _nearest_zone_surface_clearance(self, pos: np.ndarray) -> float:
+        if self.rewards.breakthrough_clearance_gate_enabled:
+            clearances = self._active_clearances_for(pos)
+            if clearances is not None:
+                return self._minimum_zone_clearance(clearances)
         return self.min_zone_clearance(pos)
 
     def line_to_goal_is_safe(

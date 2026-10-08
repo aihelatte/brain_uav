@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from brain_uav.config import RewardConfig, ScenarioConfig
+from brain_uav.config import RewardConfig, ScenarioConfig, reward_config_from_snapshot
 from brain_uav.envs import V2ScenarioGenerator, V2StaticNoFlyTrajectoryEnv
 from brain_uav.models import V2ANNCritic, V2ANNPolicyActor, V2SNNPolicyActor
 from brain_uav.models.zone_set_encoder import ZoneSetEncoderConfig
@@ -706,6 +706,7 @@ def prepare_v2_stage_initialization(
             prepared_snn_time_window = None
         bc_initialization = None
 
+    effective_rewards.validate_scenario(effective_scenario)
     return V2PreparedStageInitialization(
         stage=config.stage,
         model_seed=model_seed,
@@ -1841,14 +1842,16 @@ def load_v2_periodic_snapshot(
     formal_config = payload['formal_config']
     if not isinstance(formal_config, dict) or formal_config.get('stage') != stage:
         raise ValueError('Periodic V2 snapshot config is incompatible.')
-    scenario_config_from_snapshot(payload['scenario_config'])
+    scenario = scenario_config_from_snapshot(payload['scenario_config'])
     reward_config = payload['reward_config']
     if not isinstance(reward_config, dict):
         raise ValueError('Periodic V2 snapshot RewardConfig is invalid.')
     try:
-        RewardConfig(**reward_config)
+        restored_rewards = reward_config_from_snapshot(reward_config)
+        restored_rewards.validate_scenario(scenario)
     except (TypeError, ValueError) as exc:
         raise ValueError('Periodic V2 snapshot RewardConfig is invalid.') from exc
+    payload['reward_config'] = _strict_json_copy(asdict(restored_rewards))
     _nonnegative_float(payload['uav_collision_radius'], name='uav_collision_radius')
     if not isinstance(payload['seed_manifest'], dict) or not payload['seed_manifest']:
         raise ValueError('Periodic V2 snapshot seed_manifest is invalid.')
@@ -1955,16 +1958,16 @@ def load_v2_formal_checkpoint(
         raise ValueError('Formal V2 checkpoint config is incompatible.') from exc
     if restored_config.to_dict() != formal_config:
         raise ValueError('Formal V2 checkpoint config does not round-trip.')
-    scenario_config_from_snapshot(payload['scenario_config'])
+    scenario = scenario_config_from_snapshot(payload['scenario_config'])
     reward_config = payload['reward_config']
     if not isinstance(reward_config, dict):
         raise ValueError('Formal V2 checkpoint RewardConfig is invalid.')
     try:
-        restored_rewards = RewardConfig(**reward_config)
+        restored_rewards = reward_config_from_snapshot(reward_config)
+        restored_rewards.validate_scenario(scenario)
     except (TypeError, ValueError) as exc:
         raise ValueError('Formal V2 checkpoint RewardConfig is invalid.') from exc
-    if _strict_json_copy(asdict(restored_rewards)) != reward_config:
-        raise ValueError('Formal V2 checkpoint RewardConfig does not round-trip.')
+    payload['reward_config'] = _strict_json_copy(asdict(restored_rewards))
     _nonnegative_float(payload['uav_collision_radius'], name='uav_collision_radius')
     if not isinstance(payload['seed_manifest'], dict) or not payload['seed_manifest']:
         raise ValueError('Formal V2 checkpoint seed_manifest is invalid.')

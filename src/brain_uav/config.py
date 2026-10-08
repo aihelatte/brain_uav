@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from math import isfinite
 from pathlib import Path
 
@@ -133,8 +133,31 @@ class RewardConfig:
     terminal_radial_weight: float = 45.0
     terminal_tangential_penalty_weight: float = 60.0
     terminal_tangential_penalty_cap: float = 80.0
+    breakthrough_clearance_gate_enabled: bool = False
+    descent_three_band_enabled: bool = False
+    descent_low_height: float = 20.0
+    descent_high_height: float = 60.0
+    descent_transition_factor: float = 0.35
 
     def __post_init__(self) -> None:
+        for name in ('breakthrough_clearance_gate_enabled', 'descent_three_band_enabled'):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f'{name} must be a bool.')
+        for name in ('descent_low_height', 'descent_high_height', 'descent_transition_factor'):
+            value = getattr(self, name)
+            if type(value) not in (int, float):
+                raise ValueError(f'{name} must be a finite number.')
+            try:
+                value = float(value)
+            except OverflowError as exc:
+                raise ValueError(f'{name} must be a finite number.') from exc
+            if not isfinite(value):
+                raise ValueError(f'{name} must be a finite number.')
+            setattr(self, name, value)
+        if not 0 <= self.descent_low_height < self.descent_high_height:
+            raise ValueError('descent heights must satisfy 0 <= low < high.')
+        if not 0 <= self.descent_transition_factor <= 1:
+            raise ValueError('descent_transition_factor must be in [0, 1].')
         try:
             ratio = float(self.zone_secondary_penalty_ratio)
         except (TypeError, ValueError, OverflowError) as exc:
@@ -146,6 +169,30 @@ class RewardConfig:
                 'zone_secondary_penalty_ratio must be finite and in [0, 1].'
             )
         self.zone_secondary_penalty_ratio = ratio
+
+    def validate_scenario(self, scenario: ScenarioConfig) -> None:
+        if self.descent_three_band_enabled and not (
+            isfinite(scenario.world_z_min)
+            and scenario.world_z_min < self.descent_low_height < self.descent_high_height
+        ):
+            raise ValueError('Three-band descent requires world_z_min < low < high.')
+
+
+def reward_config_from_snapshot(snapshot: dict) -> RewardConfig:
+    """Only the five newly introduced reward fields may be absent in old artifacts."""
+    added = ('breakthrough_clearance_gate_enabled', 'descent_three_band_enabled',
+             'descent_low_height', 'descent_high_height', 'descent_transition_factor')
+    names = {item.name for item in fields(RewardConfig)}
+    if not isinstance(snapshot, dict) or set(snapshot) - names or (names - set(snapshot)) - set(added):
+        raise ValueError('RewardConfig snapshot has missing or unknown fields.')
+    effective = dict(snapshot)
+    defaults = RewardConfig()
+    for name in added:
+        effective.setdefault(name, getattr(defaults, name))
+    restored = RewardConfig(**effective)
+    if asdict(restored) != effective:
+        raise ValueError('RewardConfig snapshot does not round-trip.')
+    return restored
 
 
 @dataclass(slots=True)
