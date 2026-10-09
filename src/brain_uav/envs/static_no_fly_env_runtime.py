@@ -21,6 +21,19 @@ from ..curriculum import normalize_curriculum_mix
 from ..utils.gym_compat import gym, spaces
 
 
+def boundary_violations(state, scenario: ScenarioConfig) -> list[dict[str, Any]]:
+    """Report all actual coordinate violations, including ground, without classifying outcomes."""
+    result = []
+    for index, axis in enumerate(('x', 'y', 'z')):
+        value = float(state[index])
+        low = -scenario.world_xy if index < 2 else scenario.world_z_min
+        high = scenario.world_xy if index < 2 else scenario.world_z_max
+        if value < low or value > high:
+            result.append({'axis': axis, 'direction': 'negative' if value < low else 'positive',
+                           'value': value, 'limit': float(low if value < low else high)})
+    return result
+
+
 @dataclass(slots=True)
 class Zone:
     """One static hemisphere no-fly zone."""
@@ -877,6 +890,10 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             rew -= self.rewards.timeout_penalty
             termination = -self.rewards.timeout_penalty
         if self.reward_diagnostics_enabled:
+            legacy_boundary_warning = (
+                self._legacy_boundary_warning_penalty(self.state[:3])
+                if self.rewards.boundary_directional_warning_enabled else boundary_warning
+            )
             self.last_reward_components = {
                 'distance_progress': float(progress),
                 'breakthrough': float(breakthrough),
@@ -886,12 +903,16 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
                 'action_magnitude': -float(action_magnitude),
                 'action_change': -float(action_change),
                 'zone_warning': -float(zone_warning),
-                'boundary_warning': -float(boundary_warning),
+                'boundary_warning': -float(legacy_boundary_warning),
                 'ground_warning': -float(ground_warning),
                 'descent_trend': -float(descent_trend),
                 'inefficiency': -float(inefficiency),
                 'termination': float(termination),
             }
+            if self.rewards.boundary_directional_warning_enabled:
+                self.last_reward_components['boundary_directional'] = -float(
+                    boundary_warning - legacy_boundary_warning
+                )
             component_sum = math.fsum(self.last_reward_components.values())
             self.last_reward_component_error = abs(component_sum - float(rew))
             if not math.isclose(component_sum, float(rew), rel_tol=1e-10, abs_tol=1e-8):
@@ -975,6 +996,32 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         return min(total_penalty, self.rewards.zone_penalty_cap)
 
     def _boundary_warning_penalty(self, pos: np.ndarray) -> float:
+        if not self.rewards.boundary_directional_warning_enabled:
+            return self._legacy_boundary_warning_penalty(pos)
+        x, y, z = map(float, pos)
+        gamma, psi = map(float, self.state[3:5])
+        speed = self.scenario.speed
+        vx = speed * math.cos(gamma) * math.cos(psi)
+        vy = speed * math.cos(gamma) * math.sin(psi)
+        vz = speed * math.sin(gamma)
+        faces = (
+            (self.scenario.world_xy - x, vx, speed),
+            (self.scenario.world_xy + x, -vx, speed),
+            (self.scenario.world_xy - y, vy, speed),
+            (self.scenario.world_xy + y, -vy, speed),
+            (self.scenario.world_z_max - z, vz, speed * math.sin(self.scenario.gamma_max)),
+        )
+        warning_distance = max(self.scenario.boundary_warning_distance, 1e-6)
+        penalties = []
+        for distance, outward_speed, denominator in faces:
+            old_ratio = min(1.0, max(0.0, (warning_distance - distance) / warning_distance))
+            h = min(1.0, max(0.0, 1.0 - distance / self.rewards.boundary_directional_warning_distance))
+            u = min(1.0, max(0.0, outward_speed / denominator))
+            penalties.append(self.rewards.boundary_soft_penalty_weight * old_ratio**2
+                             + self.rewards.boundary_directional_penalty_weight * h**2 * u)
+        return min(self.rewards.boundary_soft_penalty_cap, max(penalties))
+
+    def _legacy_boundary_warning_penalty(self, pos: np.ndarray) -> float:
         warning_distance = max(self.scenario.boundary_warning_distance, 1e-6)
         distances = [
             self.scenario.world_xy - abs(float(pos[0])),
@@ -1082,6 +1129,9 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
             'curriculum_level': self.last_curriculum_level,
             'active_goal_radius': self._active_goal_radius(),
         }
+        if outcome != 'running':
+            info['terminal_position'] = self.state[:3].copy().tolist()
+            info['boundary_violations'] = boundary_violations(self.state, self.scenario)
         if self.reward_diagnostics_enabled and self.last_reward_components is not None:
             info.update(
                 reward_components=self.last_reward_components.copy(),

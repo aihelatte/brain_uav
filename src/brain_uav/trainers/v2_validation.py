@@ -630,6 +630,8 @@ def evaluate_v2_fixed_validation(
             detail = {
                 'scenario_id': record['scenario_id'],
                 'outcome': outcome,
+                'terminal_position': info['terminal_position'],
+                'boundary_violations': info['boundary_violations'],
                 'episode_length': episode_length,
                 'episode_return': episode_return,
             }

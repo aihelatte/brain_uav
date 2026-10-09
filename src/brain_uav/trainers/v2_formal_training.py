@@ -1460,6 +1460,8 @@ class V2FormalStageTrainer:
                     'stage_steps': self.result.stage_steps,
                     'global_steps': self.result.global_steps_end,
                     'outcome': outcome,
+                    'terminal_position': info['terminal_position'],
+                    'boundary_violations': info['boundary_violations'],
                     'episode_return': episode_return,
                     'episode_length': episode_length,
                     'policy_warmup_steps': episode_warmup_steps,

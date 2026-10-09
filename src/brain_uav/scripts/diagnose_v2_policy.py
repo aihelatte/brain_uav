@@ -22,6 +22,7 @@ import torch
 
 from brain_uav.config import RewardConfig, ScenarioConfig
 from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
+from brain_uav.envs.static_no_fly_env_runtime import boundary_violations
 from brain_uav.models import V2ANNPolicyActor, V2SNNPolicyActor
 from brain_uav.observations import V2ObservationScales, collate_v2_observations
 from brain_uav.trainers.v2_formal_training import (
@@ -133,18 +134,6 @@ def load_diagnostic_inputs(*, model: str, checkpoint: str | Path,
         'checkpoint_path': checkpoint_path, 'pool_path': pool_path,
         'checkpoint_hash': checkpoint_hash, 'pool_hash': pool_hash,
     }
-
-
-def boundary_violations(state, scenario: ScenarioConfig) -> list[dict[str, Any]]:
-    result = []
-    for index, axis in enumerate(('x', 'y', 'z')):
-        value = float(state[index])
-        low = -scenario.world_xy if index < 2 else scenario.world_z_min
-        high = scenario.world_xy if index < 2 else scenario.world_z_max
-        if value < low or value > high:
-            result.append({'axis': axis, 'direction': 'negative' if value < low else 'positive',
-                           'value': value, 'limit': float(low if value < low else high)})
-    return result
 
 
 def _statistics(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -320,7 +309,8 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
                 'entered_250_range': min(min_point_distance, min_segment_distance) <= 250.0,
                 'terminal_guidance_steps': guidance_steps, 'terminal_los_steps': los_steps,
                 'terminal_radial_tangential_steps': radial_steps,
-                'boundary_violations': boundary_violations(env.state, scenario) if outcome == 'boundary' else [],
+                'terminal_position': info['terminal_position'],
+                'boundary_violations': info['boundary_violations'],
                 'max_reward_component_error': max_error, 'steps_path': steps_path, 'tail_50_path': tail_path,
                 'trajectory_views': None,
             }
