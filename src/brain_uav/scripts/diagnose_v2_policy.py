@@ -33,6 +33,9 @@ from brain_uav.trainers.v2_td3 import V2TD3UpdateEngine
 from brain_uav.trainers.v2_validation import (
     V2_VALIDATION_POOL_VERSION, load_v2_validation_pool, scenario_config_from_snapshot,
 )
+from brain_uav.utils.v2_operation_counts import (
+    OPERATION_COUNT_METHOD, count_v2_actor_operations, summarize_operation_counts,
+)
 
 
 OUTCOMES = ('goal', 'ground', 'boundary', 'collision', 'timeout')
@@ -168,7 +171,8 @@ def _software_versions() -> dict[str, Any]:
 
 def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool: str | Path,
                           output_dir: str | Path, device: str = 'cpu',
-                          max_scenes: int | None = None) -> dict[str, Any]:
+                          max_scenes: int | None = None,
+                          count_operations: bool = False) -> dict[str, Any]:
     """Evaluate full episodes; max_scenes selects only the original pool prefix."""
     output = Path(output_dir).resolve()
     if output.exists() and (not output.is_dir() or any(output.iterdir())):
@@ -216,6 +220,7 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
             'cache_ellipsoid_segment_clearance': env.cache_ellipsoid_segment_clearance,
             'single_observation_fast_path': False,
             'max_scenes': max_scenes, 'evaluated_scene_count': len(records),
+            'count_operations': count_operations,
             'full_pool': len(records) == pool.scenario_count,
             'reward_sum_tolerance': {'rtol': 1e-10, 'atol': 1e-8},
             'discount_convention': 'sum(gamma**t * reward[t]), t starts at 0',
@@ -246,7 +251,11 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
             while outcome == 'running':
                 batch = collate_v2_observations([observation], device=inputs['device'])
                 with torch.inference_mode():
-                    action = actor(batch)[0].detach().cpu().numpy().astype(np.float32)
+                    if count_operations:
+                        action_tensor, operations = count_v2_actor_operations(actor, batch)
+                    else:
+                        action_tensor = actor(batch)
+                    action = action_tensor[0].detach().cpu().numpy().astype(np.float32)
                 if action.shape != (2,) or not np.all(np.isfinite(action)):
                     raise RuntimeError('Actor returned a non-finite or invalid action.')
                 previous_state = env.state.copy()
@@ -283,6 +292,8 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
                     'line_to_goal_safe': info['line_to_goal_safe'], 'active_goal_radius': info['active_goal_radius'],
                     'terminated': bool(terminated), 'truncated': bool(truncated), 'outcome': info['outcome'],
                 })
+                if count_operations:
+                    step_rows[-1]['operation_counts'] = operations
                 previous_clearance = info['min_zone_clearance']
                 states.append(env.state.copy().tolist())
                 actions.append(env.prev_action.copy().tolist())
@@ -314,6 +325,10 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
                 'max_reward_component_error': max_error, 'steps_path': steps_path, 'tail_50_path': tail_path,
                 'trajectory_views': None,
             }
+            if count_operations:
+                row['operation_counts'] = summarize_operation_counts(
+                    step['operation_counts'] for step in step_rows)
+                row['initial_operation_counts'] = step_rows[0]['operation_counts']
             if outcome != 'goal' or not env.zones:
                 exported = export_v2_trajectory_views(output / 'trajectories', stem, {
                     'scenario_payload': record['payload'], 'scenario_config': payload['scenario_config'],
@@ -351,6 +366,33 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
                           for count in sorted({row['zone_count'] for row in rows})},
         'max_reward_component_error': max(row['max_reward_component_error'] for row in rows),
     }
+    if count_operations:
+        operation_report = {
+            'diagnostic_only': True, 'method': OPERATION_COUNT_METHOD,
+            'model': model, 'actor_parameter_count': sum(p.numel() for p in actor.parameters()),
+            'time_window': getattr(actor, 'time_window', None),
+            'checkpoint': manifest['checkpoint'], 'pool': manifest['pool'],
+            'evaluated_scene_count': len(rows), 'full_pool': manifest['runtime']['full_pool'],
+            'rollout': summarize_operation_counts(row['operation_counts']['totals'] for row in rows),
+            'by_zone_count': {
+                str(count): summarize_operation_counts(row['operation_counts']['totals']
+                    for row in rows if row['zone_count'] == count)
+                for count in sorted({row['zone_count'] for row in rows})},
+            'initial_observations': summarize_operation_counts(row['initial_operation_counts'] for row in rows),
+            'initial_observations_by_zone_count': {
+                str(count): summarize_operation_counts(row['initial_operation_counts']
+                    for row in rows if row['zone_count'] == count)
+                for count in sorted({row['zone_count'] for row in rows})},
+            'scene_equal_weight_mean_per_decision': {
+                key: math.fsum(row['operation_counts']['mean_per_decision'][key] for row in rows) / len(rows)
+                for key in rows[0]['operation_counts']['mean_per_decision']},
+            'comparison_note': 'Initial observations share fixed-pool inputs across models; rollout observations depend on each policy.',
+        }
+        _write_json(output / 'operation_counts.json', operation_report)
+        summary['operation_counts'] = {
+            'path': 'operation_counts.json', 'rollout': operation_report['rollout'],
+            'initial_observations': operation_report['initial_observations'],
+        }
     _write_json(output / 'summary.json', summary)
     env.close()
     return summary
@@ -364,13 +406,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--output-dir', required=True, type=Path)
     parser.add_argument('--device', choices=('cpu', 'cuda'), default='cpu')
     parser.add_argument('--max-scenes', type=int, default=None, help='Original pool prefix for smoke checks; default: entire pool.')
+    parser.add_argument('--count-operations', action='store_true',
+                        help='Count dense MACs and actual spike-input ACs on every eager actor decision; not a timing benchmark.')
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     summary = run_policy_diagnostic(**vars(args))
-    print(_json({'output_dir': str(args.output_dir.resolve()), 'overall': summary['overall']}))
+    print(_json({'output_dir': str(args.output_dir.resolve()), 'overall': summary['overall'],
+                 **({'operation_counts': summary['operation_counts']} if args.count_operations else {})}))
     return 0
 
 

@@ -135,6 +135,42 @@ class TestRewardDiagnostics(unittest.TestCase):
 
 
 class TestPolicyDiagnostic(unittest.TestCase):
+    def test_operation_counting_preserves_rollout_and_exports_every_decision(self):
+        from brain_uav.scripts import diagnose_v2_policy as diagnostic
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            checkpoint, pool, _ = write_inputs(directory)
+            summaries, all_steps = [], []
+            for enabled in (False, True):
+                output = directory / str(enabled)
+                summary = diagnostic.run_policy_diagnostic(
+                    model='ann', checkpoint=checkpoint, validation_pool=pool,
+                    output_dir=output, device='cpu', count_operations=enabled,
+                )
+                summaries.append(summary)
+                rows = [json.loads(line) for line in (output / 'episodes.jsonl').read_text().splitlines()]
+                steps = [json.loads(line) for row in rows
+                         for line in (output / row['steps_path']).read_text().splitlines()]
+                if enabled:
+                    report = json.loads((output / 'operation_counts.json').read_text())
+                    self.assertEqual(report['rollout']['decision_count'], len(steps))
+                    self.assertEqual(report['initial_observations']['decision_count'], 3)
+                    self.assertEqual(report['rollout']['totals']['macs'],
+                                     sum(step['operation_counts']['macs'] for step in steps))
+                    self.assertEqual(report['rollout']['totals']['acs'], 0)
+                    self.assertEqual(report['by_zone_count']['0']['decision_count'], 3)
+                    for row in rows:
+                        self.assertEqual(row['operation_counts']['decision_count'], row['episode_length'])
+                    for step in steps:
+                        step.pop('operation_counts')
+                else:
+                    self.assertNotIn('operation_counts', summary)
+                    self.assertFalse((output / 'operation_counts.json').exists())
+                all_steps.append(steps)
+            self.assertEqual(summaries[0]['overall'], summaries[1]['overall'])
+            self.assertEqual(all_steps[0], all_steps[1])
+            self.assertEqual(torch.load(checkpoint, weights_only=False)['status'], 'failed')
+
     def test_cache_is_explicitly_enabled_and_manifest_records_actual_state(self):
         from brain_uav.scripts import diagnose_v2_policy as diagnostic
         with tempfile.TemporaryDirectory() as root:
