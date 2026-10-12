@@ -3357,6 +3357,10 @@ def _run_diagnostic_level(
     environment_performance_diagnostic: bool = False,
     cache_ellipsoid_segment_clearance: bool = False,
     single_observation_fast_path: bool = False,
+    window_update_statistics: bool = False,
+    reuse_update_buffers: bool = False,
+    controlled_stage_step_offset: int = 0,
+    bc_schedule: str = 'default',
 ) -> dict[str, Any]:
     scenario_count = len(pool.scenarios)
     if scenario_count == 0 or measured_steps < scenario_count:
@@ -3385,6 +3389,8 @@ def _run_diagnostic_level(
         fused_adam=fused_adam,
         aggregate_relation_values_first=aggregate_relation_values_first,
         reduce_update_stat_syncs=reduce_update_stat_syncs,
+        window_update_statistics=window_update_statistics,
+        reuse_update_buffers=reuse_update_buffers,
         pinned_batch_transfer=pinned_batch_transfer,
     )
     engine = components.engine
@@ -3690,6 +3696,9 @@ def _run_diagnostic_level(
     critic_updates_before = 0
     original_sample = engine.replay.sample
     measured_phase = False
+    measured_update_metrics = []
+    loop_warmup_started = perf_counter()
+    loop_warmup_wall_seconds = 0.0
     step_number = 0
     measured_count = 0
     actual_warmup_steps = 0
@@ -3724,9 +3733,12 @@ def _run_diagnostic_level(
                 observation = None
                 episode_transitions = []
                 slot_refs = []
+                if window_update_statistics:
+                    engine.flush_update_statistics()
                 actual_warmup_steps = step_number
                 if device.type == 'cuda':
                     torch.cuda.synchronize(device)
+                loop_warmup_wall_seconds = perf_counter() - loop_warmup_started
                 measured_started = perf_counter()
                 actor_updates_before = engine.actor_update_count
                 critic_updates_before = engine.critic_update_count
@@ -3740,6 +3752,12 @@ def _run_diagnostic_level(
             if not measured_phase and step_number >= warmup_limit:
                 raise RuntimeError('Diagnostic warmup did not reach critic/actor update minima.')
             call = timing.call if measured_phase else lambda _n, op, **_k: op()
+            effective_noise = (formal_config.noise_schedule.values(
+                controlled_stage_step_offset + step_number, max_steps=formal_config.max_steps)
+                if controlled_stage_step_offset else (
+                    formal_config.noise_schedule.exploration_initial,
+                    formal_config.noise_schedule.policy_initial,
+                    formal_config.noise_schedule.clip_initial))
             if observation is None:
                 observation, _ = call(
                     'scenario_reset_wall_seconds',
@@ -3779,7 +3797,7 @@ def _run_diagnostic_level(
                     lambda: engine.select_action(
                         observation,
                         exploration_noise=(
-                            formal_config.noise_schedule.exploration_initial
+                            effective_noise[0]
                         ),
                         exploration_rng=components.exploration_rng,
                         single_observation_fast_path=single_observation_fast_path,
@@ -3819,8 +3837,8 @@ def _run_diagnostic_level(
             step_number += 1
             if len(engine.replay) >= engine.batch_size:
                 engine.set_target_noise(
-                    policy_noise=formal_config.noise_schedule.policy_initial,
-                    noise_clip=formal_config.noise_schedule.clip_initial,
+                    policy_noise=effective_noise[1],
+                    noise_clip=effective_noise[2],
                 )
                 update_sections: dict[str, float] = {}
                 update_details: dict[str, Any] = {}
@@ -3832,6 +3850,8 @@ def _run_diagnostic_level(
                     update_details.update(details)
 
                 def record_update(result: Any, elapsed: float) -> None:
+                    if controlled_stage_step_offset:
+                        measured_update_metrics.append(result)
                     update_timing.record(
                         actor_updated=bool(result.actor_updated),
                         total_wall_seconds=elapsed,
@@ -3855,8 +3875,9 @@ def _run_diagnostic_level(
                                 else 'td3_update_wall_seconds'
                             ),
                             lambda: engine.update_once(
-                                total_steps=step_number,
-                                bc_lambda=v2_bc_lambda(step_number - 1),
+                                total_steps=controlled_stage_step_offset + step_number,
+                                bc_lambda=v2_bc_lambda(controlled_stage_step_offset + step_number - 1, schedule=bc_schedule),
+                                **({'defer_statistics': True} if window_update_statistics else {}),
                                 timing_recorder=(
                                     capture_update_sections
                                     if measured_phase and not profile_sections
@@ -3889,6 +3910,8 @@ def _run_diagnostic_level(
                     perform_update(False)
             observation = next_observation
             if done:
+                if window_update_statistics:
+                    engine.flush_update_statistics()
                 outcome = str(info.get('outcome', ''))
                 if outcome == 'goal':
                     def record_success() -> None:
@@ -3900,6 +3923,8 @@ def _run_diagnostic_level(
                             )
                         engine.replay.mark_success_slots(slot_refs, success=True)
                     call('replay_write_wall_seconds', record_success)
+                else:
+                    call('replay_write_wall_seconds', lambda: engine.replay.mark_failure_slots(slot_refs, failure=True))
                 episodes_completed += int(measured_phase)
                 if measured_phase:
                     coverage[scenario_index]['episodes_completed'] += 1
@@ -3913,6 +3938,8 @@ def _run_diagnostic_level(
                     observation = None
                     episode_transitions = []
                     slot_refs = []
+        if window_update_statistics:
+            engine.flush_update_statistics()
         stream_seconds = timing.cuda_stream_interval_seconds()
         measured_total = perf_counter() - measured_started
         ordinary_actor_updates = engine.actor_update_count - actor_updates_before
@@ -3964,6 +3991,8 @@ def _run_diagnostic_level(
                 )
             compiled_path_profiler_metadata = compiled_path_profiler.finish()
     finally:
+        if window_update_statistics:
+            engine.flush_update_statistics()
         engine.replay.sample = original_sample
         env.set_performance_diagnostic(None)
         if environment_diagnostic is not None:
@@ -4018,6 +4047,12 @@ def _run_diagnostic_level(
         'warmup_critic_updates': critic_updates_before,
         'warmup_actor_updates': actor_updates_before,
         'measured_steps': measured_steps,
+        'local_optimizations': (engine.local_optimization_metadata() if window_update_statistics or reuse_update_buffers
+                                else {name: {'requested': False, 'effective': False} for name in ('window_update_statistics', 'reuse_update_buffers')}),
+        'controlled_stage_step_offset': controlled_stage_step_offset,
+        'bc_schedule': bc_schedule,
+        'loop_warmup_wall_seconds': loop_warmup_wall_seconds,
+        'measured_actor_spike_beta_eff': [metric.spike_beta_eff for metric in measured_update_metrics if metric.actor_updated],
         'scenario_coverage': coverage,
         'episodes_completed': episodes_completed,
         'actor_updates': actor_updates,
@@ -4124,6 +4159,8 @@ def run_v2_td3_timing_diagnostic(
     cuda_graph_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
+    window_update_statistics: bool = False,
+    reuse_update_buffers: bool = False,
     pinned_batch_transfer: bool = False,
     cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
@@ -4136,6 +4173,13 @@ def run_v2_td3_timing_diagnostic(
 ) -> dict[str, Any]:
     if model not in ('ann', 'snn'):
         raise ValueError('model must be ann or snn.')
+    for name, value in (('window_update_statistics', window_update_statistics), ('reuse_update_buffers', reuse_update_buffers)):
+        if type(value) is not bool:
+            raise TypeError(f'{name} must be a bool.')
+    if (window_update_statistics or reuse_update_buffers) and (
+        check_compiled_numerics or compiled_numerics_only or compiled_numerics_group
+    ):
+        raise ValueError('Original compiled-numeric checker does not support local optimization flags; use the controlled comparison checks separately.')
     steps = _positive_int(steps_per_level, name='steps_per_level')
     warmup = _nonnegative_int(warmup_steps, name='warmup_steps')
     batch = _positive_int(batch_size, name='batch_size')
@@ -4527,6 +4571,8 @@ def run_v2_td3_timing_diagnostic(
             cuda_graph_action_inference=cuda_graph_action_inference,
             aggregate_relation_values_first=aggregate_relation_values_first,
             reduce_update_stat_syncs=reduce_update_stat_syncs,
+            window_update_statistics=window_update_statistics,
+            reuse_update_buffers=reuse_update_buffers,
             pinned_batch_transfer=pinned_batch_transfer,
             cuda_graph_updates=cuda_graph_updates,
             cuda_graph_actor_update=cuda_graph_actor_update,
@@ -4679,6 +4725,8 @@ def run_v2_td3_timing_diagnostic(
             'aggregate_relation_values_first_requested': (
                 aggregate_relation_values_first
             ),
+            'window_update_statistics_requested': window_update_statistics,
+            'reuse_update_buffers_requested': reuse_update_buffers,
             'reduce_update_stat_syncs_requested': reduce_update_stat_syncs,
             'cuda_graph_updates_requested': cuda_graph_updates,
             'cuda_graph_actor_update_requested': cuda_graph_actor_update,
@@ -4731,12 +4779,291 @@ def run_v2_td3_timing_diagnostic(
     return summary
 
 
+def _run_local_optimization_correctness(args, *, prepared, config, pool, device, output):
+    """Fixed-input CUDA updates, separate from the end-to-end timing loop."""
+    from copy import deepcopy
+    from brain_uav.scripts.train_v2_td3 import (
+        _configure_stage_compilation, default_v2_cuda_graph_compilation,
+    )
+    count = _positive_int(args.correctness_updates, name='correctness_updates')
+    if count < 2 * config.policy_delay:
+        raise ValueError('Correctness updates must cover consecutive actor and critic-only updates.')
+    compilation = default_v2_cuda_graph_compilation(model=args.model, resolved_device='cuda')
+    fused = compilation.pop('fused_adam')
+    reduced = compilation.pop('reduce_update_stat_syncs')
+    offset = args.controlled_stage_step_offset
+    if offset + count > config.max_steps:
+        raise ValueError('Correctness counter would exceed stage horizon.')
+    report = {'diagnostic_only': True, 'purpose': 'CUDA correctness only; no speed measurement',
+        'passed': False, 'device': str(device), 'torch': torch.__version__, 'cuda': torch.version.cuda,
+        'rtol': COMPILED_NUMERIC_RTOL, 'atol': COMPILED_NUMERIC_ATOL,
+        'tolerance_note': 'Same arithmetic paths: 1e-5 absolute plus 1e-4 relative; any excess fails.',
+        'config': config.to_dict(), 'reward_config': asdict(prepared.reward_config),
+        'checkpoint': str(Path(args.bc_checkpoint).resolve()), 'pool_digest': pool.content_digest,
+        'controlled_stage_step_offset': offset, 'bc_schedule': args.comparison_bc_schedule,
+        'noise_control': 'identical CPU/CUDA RNG seed per update before target noise sampling',
+        'updates': count, 'groups': {}}
+
+    def flatten(value, name, result):
+        if isinstance(value, Mapping):
+            for key, item in value.items():
+                flatten(item, f'{name}.{key}', result)
+        elif isinstance(value, (tuple, list)):
+            for index, item in enumerate(value):
+                flatten(item, f'{name}.{index}', result)
+        elif value is None:
+            result[name + '.none'] = torch.tensor(True)
+        elif isinstance(value, (torch.Tensor, int, float, bool)):
+            result[name] = torch.as_tensor(value).detach().cpu().clone()
+        else:
+            raise TypeError(f'Unsupported correctness snapshot field {name}: {type(value)}')
+
+    initial = None
+    reference = None
+    try:
+        for group, window, buffers in (('A', False, False), ('B', True, False), ('C', False, True)):
+            engine = build_v2_stage_engine(None, config, init_checkpoint=args.bc_checkpoint,
+                rewards=prepared.reward_config, prepared_initialization=prepared, device=device,
+                model_type=args.model, snn_time_window=args.snn_time_window, fused_adam=fused,
+                reduce_update_stat_syncs=reduced, window_update_statistics=window,
+                reuse_update_buffers=buffers).engine
+            if initial is None:
+                initial = deepcopy(engine.checkpoint_state_dict())
+            engine.load_checkpoint_state_dict(initial)
+            configured = _configure_stage_compilation(engine, pool, prepared,
+                compile_critic_encoder=False, compile_target_encoders=False, **compilation)
+            # Existing pure-compute warmup restores state; do not replace captured BC modules afterwards.
+            batches = _compile_warmup_batches(pool=pool, prepared=prepared,
+                batch_size=engine.batch_size, device=device, cache_ellipsoid_segment_clearance=True)
+            mixed, nonempty = _numeric_diagnostic_observation_batches(batches, device=device)
+            fixed = [_fixed_numeric_replay_batch(obs, action_dim=engine.action_dim, device=device)
+                     for obs in (mixed, nonempty)]
+            # Repeated independent inference must reset both SNN layers, without an extra training forward.
+            with torch.inference_mode():
+                first = engine.actor(mixed).clone()
+                second = engine.actor(mixed).clone()
+            torch.testing.assert_close(first, second, rtol=COMPILED_NUMERIC_RTOL, atol=COMPILED_NUMERIC_ATOL)
+            snapshots, metrics, executions = [], [], []
+            report['groups'][group] = {'compilation': configured,
+                'local_optimizations': engine.local_optimization_metadata(), 'state_reset_check': True}
+            for index in range(count):
+                batch = fixed[index % len(fixed)]
+                engine.replay.sample = lambda batch_size, batch=batch: batch
+                torch.manual_seed(args.seed + index)
+                torch.cuda.manual_seed_all(args.seed + index)
+                total = offset + index + 1
+                _, policy_noise, noise_clip = config.noise_schedule.values(total, max_steps=config.max_steps)
+                engine.set_target_noise(policy_noise=policy_noise, noise_clip=noise_clip)
+                entries = []
+                metric = engine.update_once(total_steps=total,
+                    bc_lambda=v2_bc_lambda(total, schedule=args.comparison_bc_schedule),
+                    defer_statistics=window, compiled_execution_recorder=entries.append)
+                metrics.append(metric)
+                executions.append(entries)
+                snapshot = {}
+                # Do not call checkpoint_state_dict here: it flushes the window being tested.
+                for name in ('actor', 'critic1', 'critic2', 'actor_target', 'critic1_target', 'critic2_target'):
+                    flatten(getattr(engine, name).state_dict(), name, snapshot)
+                flatten(engine.actor_optimizer.state_dict(), 'optimizer.actor', snapshot)
+                flatten(engine.critic_optimizer.state_dict(), 'optimizer.critic', snapshot)
+                snapshots.append(snapshot)
+            engine.flush_update_statistics()
+            torch.cuda.synchronize(device)
+            for snapshot, metric in zip(snapshots, metrics):
+                flatten(asdict(metric), 'metrics', snapshot)
+            if not any(m.actor_updated for m in metrics) or all(m.actor_updated for m in metrics):
+                raise AssertionError('Correctness sequence must include actor and critic-only updates.')
+            if args.model == 'snn' and not all(m.spike_beta_eff > 0 for m in metrics if m.actor_updated):
+                raise AssertionError('SNN activity regularization did not take effect.')
+            if not all('critic_block' in entries for entries in executions):
+                raise AssertionError('Formal compiled critic path was not executed.')
+            if not configured.get('cuda_graph') or not configured.get('cuda_graph_actor_update'):
+                raise AssertionError('Formal update CUDA Graph configuration is missing.')
+            if not configured.get('cuda_graph_evidence', {}).get('verified'):
+                raise AssertionError('CUDA Graph replay evidence was not verified.')
+            report['groups'][group].update(executions=executions,
+                actor_updates=sum(m.actor_updated for m in metrics),
+                statistics=[asdict(m) for m in metrics])
+            if reference is None:
+                reference = snapshots
+            else:
+                report['groups'][group]['differences'] = [
+                    _compare_compiled_numeric_tensors(expected, actual,
+                        rtol=COMPILED_NUMERIC_RTOL, atol=COMPILED_NUMERIC_ATOL)
+                    for expected, actual in zip(reference, snapshots)]
+            del engine
+            gc.collect()
+            torch.cuda.empty_cache()
+        report['passed'] = True
+    except Exception as exc:
+        report['failure'] = {'type': type(exc).__name__, 'detail': str(exc)}
+        _strict_json_write(output / 'local_optimization_correctness.json', report)
+        raise
+    _strict_json_write(output / 'local_optimization_correctness.json', report)
+    return report
+
+
+def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingConfig | None = None, rewards=None) -> dict[str, Any]:
+    """A/B/C sequential short runs using the existing real timing loop.
+
+    A controlled stage counter bypasses the 25k freeze/ramp wait, not training
+    history: weights/optimizers/replay start fresh from the same BC every run.
+    Existing pool only; this mode never creates a scenario or validation pool.
+    """
+    from hashlib import sha256
+    import platform
+    import subprocess
+    import os
+    from importlib.metadata import version
+    from statistics import mean, stdev
+    from brain_uav.models.v2_policy_config import V2SpikeRegularizationConfig
+    from brain_uav.scripts.train_v2_td3 import default_v2_cuda_graph_compilation
+
+    if args.validation_pool is None:
+        raise ValueError('--validation-pool is required for A/B/C comparison.')
+    if args.detailed_profiler_updates or args.compiled_performance_diagnostic_updates:
+        raise ValueError('Profiler is not allowed in A/B/C throughput measurement.')
+    unsupported = ('window_update_statistics', 'reuse_update_buffers', 'compile_critic_encoder', 'compile_target_encoders', 'compile_actors',
+        'compile_critic_block', 'compile_target_block', 'compile_shared_relations',
+        'compile_snn_target_encoder', 'fused_adam', 'compile_actor_loss',
+        'cache_actor_loss_coefficients', 'compile_action_inference', 'cuda_graph_action_inference',
+        'pinned_batch_transfer', 'aggregate_relation_values_first', 'reduce_update_stat_syncs',
+        'cuda_graph_updates', 'cuda_graph_actor_update', 'single_observation_fast_path',
+        'check_compiled_numerics', 'compiled_numerics_only')
+    if any(getattr(args, name) for name in unsupported) or args.frozen_critic_strategy != 'eager' or args.compiled_numerics_group:
+        raise ValueError('Comparison uses formal compilation defaults; original diagnostic overrides are unsupported here.')
+    repeats = _positive_int(args.repeats, name='repeats')
+    steps = _positive_int(args.steps_per_level, name='steps_per_level')
+    offset = _nonnegative_int(args.controlled_stage_step_offset, name='controlled_stage_step_offset')
+    if offset < 75000:
+        raise ValueError('Comparison offset must reach actor unfreeze and spike ramp completion (75000).')
+    output = Path(args.output_dir)
+    if output.exists() and any(output.iterdir()):
+        raise FileExistsError('Refusing to overwrite nonempty output directory.')
+    target = torch.device(resolve_training_device(args.device))
+    if args.local_optimization_correctness and (target.type != 'cuda' or args.comparison_eager_cpu):
+        raise ValueError('Local optimization correctness requires real CUDA and formal compilation; CPU/mock is unsupported.')
+    regularization = V2SpikeRegularizationConfig(beta_max=1.0 if args.model == 'snn' else 0.0)
+    config = formal_config or V2FormalTrainingConfig(stage='easy', max_steps=500000, seed=args.seed, batch_size=args.batch_size,
+        replay_capacity=args.replay_capacity, actor_lr=1.55e-4 if args.model == 'ann' else 9.5e-4,
+        critic_lr=2.5e-4, failure_sample_bias=2.0, spike_regularization=regularization)
+    if rewards is None:
+        from brain_uav.config import RewardConfig
+        rewards = RewardConfig(breakthrough_clearance_gate_enabled=False,
+            descent_three_band_enabled=True, boundary_directional_warning_enabled=True)
+    if offset + args.warmup_steps + steps + config.batch_size + 4 > config.max_steps:
+        raise ValueError('Controlled counter would exceed configured stage horizon.')
+    if config.stage != 'easy' or config.seed != args.seed:
+        raise ValueError('Comparison requires easy BC initialization and matching seed.')
+    if offset <= config.actor_freeze_steps or offset < (config.spike_regularization or V2SpikeRegularizationConfig()).ramp_end_steps:
+        raise ValueError('Controlled counter must pass freeze and regularization ramp.')
+    if args.model == 'snn' and (config.spike_regularization or V2SpikeRegularizationConfig()).beta_max <= 0:
+        raise ValueError('SNN comparison must exercise enabled spike regularization.')
+    prepared = prepare_v2_stage_initialization(config, init_checkpoint=args.bc_checkpoint,
+        rewards=rewards, device=target, model_type=args.model, snn_time_window=args.snn_time_window)
+    original_pool = load_v2_validation_pool(args.validation_pool, expected_level='easy',
+        expected_scenario=prepared.scenario_config,
+        expected_uav_collision_radius=prepared.uav_collision_radius,
+        expected_master_seed=args.validation_seed)
+    count = min(_positive_int(args.scenario_count, name='scenario_count'), original_pool.scenario_count)
+    pool = V2ValidationPool(curriculum_level='easy', master_seed=original_pool.master_seed,
+        stage_seed=original_pool.stage_seed, scenario_config=original_pool.scenario_config,
+        uav_collision_radius=original_pool.uav_collision_radius, scenarios=original_pool.scenarios[:count])
+    if steps < count:
+        raise ValueError('Measurement must cover selected scenes.')
+    compilation = default_v2_cuda_graph_compilation(model=args.model, resolved_device=target.type)
+    if args.comparison_eager_cpu:
+        if target.type != 'cpu':
+            raise ValueError('--comparison-eager-cpu is only for explicit local CPU smoke.')
+        compilation = {}
+    compilation.pop('reduce_update_stat_syncs', None)
+    # All comparison groups preserve the formally adopted configuration on CUDA.
+    output.mkdir(parents=True, exist_ok=True)
+    if args.local_optimization_correctness:
+        return _run_local_optimization_correctness(args, prepared=prepared,
+            config=config, pool=pool, device=target, output=output)
+    def query(command):
+        result = subprocess.run(command, cwd=Path(__file__).resolve().parents[3],
+                                capture_output=True, text=True, check=False)
+        return {'returncode': result.returncode, 'stdout': result.stdout, 'stderr': result.stderr}
+    def load_snapshot():
+        if target.type != 'cuda':
+            return {'note': 'CPU diagnostic; no CUDA server-load evidence'}
+        try:
+            return {'gpu': query(['nvidia-smi', '--query-gpu=timestamp,index,utilization.gpu,memory.used', '--format=csv']),
+                    'compute_processes': query(['nvidia-smi', '--query-compute-apps=pid,process_name,used_gpu_memory', '--format=csv']),
+                    'host_load_average': list(os.getloadavg()) if hasattr(os, 'getloadavg') else None}
+        except OSError as exc:
+            return {'unavailable': str(exc)}
+    runs = {}
+    for group, window, buffers in (('A', False, False), ('B', True, False), ('C', False, True)):
+        runs[group] = []
+        for repeat in range(repeats):
+            random.seed(args.seed)
+            np.random.seed(args.seed)
+            torch.manual_seed(args.seed)
+            before = load_snapshot()
+            result = _run_diagnostic_level(level='easy', pool=pool, prepared=prepared,
+                formal_config=config, bc_checkpoint=args.bc_checkpoint, model=args.model,
+                snn_time_window=args.snn_time_window, device=target,
+                warmup_steps=args.warmup_steps, measured_steps=steps,
+                reduce_update_stat_syncs=True, cache_ellipsoid_segment_clearance=True,
+                window_update_statistics=window, reuse_update_buffers=buffers,
+                controlled_stage_step_offset=offset, bc_schedule=args.comparison_bc_schedule, **compilation)
+            result['server_load_before'] = before
+            result['server_load_after'] = load_snapshot()
+            result['repeat'] = repeat
+            runs[group].append(result)
+            _strict_json_write(output / f'{group}_{repeat}.json', result)
+            gc.collect()
+            if target.type == 'cuda':
+                torch.cuda.empty_cache()
+    averages = {group: mean(run['timing']['total_wall_seconds'] for run in values)
+                for group, values in runs.items()}
+    stable = all(run['critic_encoder_compile']['valid_for_speed_comparison'] is not False
+                 for values in runs.values() for run in values)
+    summary = {'valid_for_speed_comparison': stable, 'diagnostic_only': True, 'formal_training': False,
+        'method': 'fresh BC initialization per group/repeat; stage counter offset only; no prior training history',
+        'controlled_stage_step_offset': offset, 'requested_device': args.device, 'actual_device': str(target),
+        'software': {'python': platform.python_version(), 'torch': torch.__version__, 'cuda': torch.version.cuda, 'spikingjelly': version('spikingjelly')},
+        'code_version': query(['git', 'rev-parse', 'HEAD']), 'code_status': query(['git', 'status', '--short']),
+        'code_diff_sha256': sha256(query(['git', 'diff']).get('stdout', '').encode('utf-8')).hexdigest(),
+        'checkpoint': str(Path(args.bc_checkpoint).resolve()),
+        'checkpoint_sha256': sha256(Path(args.bc_checkpoint).read_bytes()).hexdigest(),
+        'validation_pool': str(Path(args.validation_pool).resolve()),
+        'pool_sha256': sha256(Path(args.validation_pool).read_bytes()).hexdigest(),
+        'original_pool_digest': original_pool.content_digest, 'selected_pool_digest': pool.content_digest,
+        'scenario_ids': [record['scenario_id'] for record in pool.scenarios],
+        'config': config.to_dict(), 'reward_config': asdict(prepared.reward_config),
+        'compilation_requested': compilation,
+        'explicit_cpu_smoke_override': args.comparison_eager_cpu,
+        'bc_schedule': args.comparison_bc_schedule,
+        'steps': steps, 'repeats': repeats, 'runs': runs,
+        'comparison': {group: {'mean_wall_seconds': averages[group],
+            'stdev_wall_seconds': stdev([run['timing']['total_wall_seconds'] for run in values]) if repeats > 1 else 0.0,
+            'seconds_per_step': averages[group] / steps,
+            'time_saved_percent': 100 * (1 - averages[group] / averages['A']) if stable else None,
+            'speedup': averages['A'] / averages[group] if stable else None} for group, values in runs.items()},
+        'limitations': 'Section wall times are submission intervals, not synchronized GPU execution; no profiler. Inspect graph growth and server load before accepting any speed conclusion.'}
+    _strict_json_write(output / 'local_optimization_summary.json', summary)
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', choices=('ann', 'snn'), required=True)
     parser.add_argument('--bc-checkpoint', type=Path, required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
-    parser.add_argument('--scenario-pool-dir', type=Path, required=True)
+    parser.add_argument('--scenario-pool-dir', type=Path)
+    parser.add_argument('--local-optimization-comparison', action='store_true')
+    parser.add_argument('--local-optimization-correctness', action='store_true',
+        help='Separate short CUDA A/B/C correctness check; never a throughput measurement.')
+    parser.add_argument('--correctness-updates', type=int, default=6)
+    parser.add_argument('--validation-pool', type=Path)
+    parser.add_argument('--repeats', type=int, default=2)
+    parser.add_argument('--comparison-eager-cpu', action='store_true')
+    parser.add_argument('--comparison-bc-schedule', choices=('default', 'smooth-final'), default='smooth-final')
+    parser.add_argument('--controlled-stage-step-offset', type=int, default=75000)
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--validation-seed', type=int, default=20260904)
@@ -4805,6 +5132,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--single-observation-fast-path', action='store_true')
     parser.add_argument('--pinned-batch-transfer', action='store_true')
     parser.add_argument('--aggregate-relation-values-first', action='store_true')
+    parser.add_argument('--window-update-statistics', action='store_true')
+    parser.add_argument('--reuse-update-buffers', action='store_true')
     parser.add_argument('--reduce-update-stat-syncs', action='store_true')
     parser.add_argument('--cuda-graph-updates', action='store_true')
     parser.add_argument('--cuda-graph-actor-update', action='store_true')
@@ -4845,6 +5174,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.local_optimization_comparison or args.local_optimization_correctness:
+        run_local_optimization_comparison(args)
+        return
+    if args.scenario_pool_dir is None:
+        raise ValueError('--scenario-pool-dir is required for the original diagnostic.')
     run_v2_td3_timing_diagnostic(
         model=args.model,
         bc_checkpoint=args.bc_checkpoint,
@@ -4875,6 +5209,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         cuda_graph_action_inference=args.cuda_graph_action_inference,
         aggregate_relation_values_first=args.aggregate_relation_values_first,
         reduce_update_stat_syncs=args.reduce_update_stat_syncs,
+        window_update_statistics=args.window_update_statistics,
+        reuse_update_buffers=args.reuse_update_buffers,
         pinned_batch_transfer=args.pinned_batch_transfer,
         cuda_graph_updates=args.cuda_graph_updates,
         cuda_graph_actor_update=args.cuda_graph_actor_update,

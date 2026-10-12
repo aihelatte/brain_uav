@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from math import isfinite, pi
 import random
 from time import perf_counter
@@ -244,7 +244,12 @@ def _nonnegative_int(value: Any, *, name: str) -> int:
 
 @dataclass(frozen=True, slots=True)
 class V2TD3UpdateMetrics:
-    """Scalar results from one independent V2 TD3 update."""
+    """Update scalars; explicit defer_statistics calls require flush before reading.
+
+    Only that opt-in API temporarily holds detached tensors in log fields.
+    flush_update_statistics finalizes those same objects in-place. Control
+    fields (actor_updated, counters, schedules) always remain immediate.
+    """
 
     critic_loss: float = 0.0
     actor_loss: float = 0.0
@@ -539,6 +544,8 @@ class V2TD3UpdateEngine:
         fused_adam: bool = False,
         aggregate_relation_values_first: bool = False,
         reduce_update_stat_syncs: bool = False,
+        window_update_statistics: bool = False,
+        reuse_update_buffers: bool = False,
         pinned_batch_transfer: bool = False,
         spike_regularization: V2SpikeRegularizationConfig | None = None,
     ) -> None:
@@ -585,6 +592,15 @@ class V2TD3UpdateEngine:
         self.fused_adam = fused_adam
         self.aggregate_relation_values_first = aggregate_relation_values_first
         self.reduce_update_stat_syncs = reduce_update_stat_syncs
+        for name, value in (('window_update_statistics', window_update_statistics),
+                            ('reuse_update_buffers', reuse_update_buffers)):
+            if type(value) is not bool:
+                raise TypeError(f'{name} must be a bool.')
+        self.window_update_statistics = window_update_statistics
+        self.reuse_update_buffers = reuse_update_buffers
+        self._pending_update_metrics: list[V2TD3UpdateMetrics] = []
+        self._defer_statistics = False
+        self._statistic_buffers: dict[tuple, torch.Tensor] = {}
         self.pinned_batch_transfer = pinned_batch_transfer
         self.cuda_graph_actor_update = False
         self.cuda_graph_updates = False
@@ -687,6 +703,8 @@ class V2TD3UpdateEngine:
             lr=critic_lr_value,
             fused=True if fused_adam else None,
         )
+        self._cached_actor_parameters = tuple(self.actor.parameters())
+        self._cached_critic_parameters = tuple(self.critic1.parameters()) + tuple(self.critic2.parameters())
         self.bc_reference_actor: V2PolicyActor | None = None
         if bc_reference_actor is not None:
             reference_model_type = _actor_model_type(
@@ -1349,6 +1367,7 @@ class V2TD3UpdateEngine:
             ),
             'cuda_graph_backend_options': graph_options or {},
             'cuda_graph_compile_mode': None if cuda_graph_updates else mode,
+            'local_optimizations': self.local_optimization_metadata(),
             'update_statistics_execution': (
                 'batched_device_readback'
                 if self.reduce_update_stat_syncs else 'per_scalar'
@@ -2944,6 +2963,7 @@ class V2TD3UpdateEngine:
         *,
         total_steps: int,
         bc_lambda: float = 0.0,
+        defer_statistics: bool = False,
         timing_recorder: Callable[[dict[str, float]], None] | None = None,
         reuse_shared_relations: bool = True,
         profile_sections: bool = False,
@@ -2953,6 +2973,11 @@ class V2TD3UpdateEngine:
         diagnostic_profile_sections: bool = False,
         compiled_execution_recorder: Callable[[str], None] | None = None,
     ) -> V2TD3UpdateMetrics:
+        if type(defer_statistics) is not bool:
+            raise TypeError('defer_statistics must be a bool.')
+        if defer_statistics and not self.window_update_statistics:
+            raise ValueError('defer_statistics requires window_update_statistics.')
+        self._defer_statistics = defer_statistics
         update_timing = _OptionalUpdateWallTimer(timing_recorder)
         detail_timing = _OptionalUpdateDetailTimer(
             diagnostic_timing_recorder,
@@ -3183,9 +3208,8 @@ class V2TD3UpdateEngine:
                     else:
                         critic_loss.backward()
         with update_timing.section('critic_gradient_check_and_clip'):
-            critic_parameters = list(self.critic1.parameters()) + list(
-                self.critic2.parameters()
-            )
+            critic_parameters = (self._cached_critic_parameters if self.reuse_update_buffers
+                                 else list(self.critic1.parameters()) + list(self.critic2.parameters()))
             if profile_sections or diagnostic_profile_sections:
                 with record_function('v2_td3.critic_gradient_check_and_clip'):
                     self._validate_and_clip_gradients(
@@ -3263,7 +3287,8 @@ class V2TD3UpdateEngine:
                 with detail_timing.section('actor_backward'):
                     actor_terms.actor_loss.backward()
                 with detail_timing.section('actor_gradient_check_and_clip'):
-                    actor_parameters = list(self.actor.parameters())
+                    actor_parameters = (self._cached_actor_parameters if self.reuse_update_buffers
+                                        else list(self.actor.parameters()))
                     clipped_norm = self._validate_and_clip_gradients(
                         actor_parameters,
                         max_norm=self.actor_grad_clip_norm,
@@ -3363,17 +3388,70 @@ class V2TD3UpdateEngine:
                 critic_failure_td_error_mean=statistic_values[14],
                 actor_grad_norm=statistic_values[15],
             )
+        if defer_statistics:
+            self._pending_update_metrics.append(metrics)
+            if len(self._pending_update_metrics) >= 32:
+                self.flush_update_statistics()
+        self._defer_statistics = False
         detail_timing.finish()
         update_timing.finish()
         return metrics
 
+    def local_optimization_metadata(self) -> dict[str, Any]:
+        return {name: {'requested': getattr(self, name), 'effective': getattr(self, name),
+                       'reason': 'explicit opt-in; device-independent path'}
+                for name in ('window_update_statistics', 'reuse_update_buffers')}
+
+    def flush_update_statistics(self) -> None:
+        """Finalize log-only scalars before consuming metrics, reporting or saving.
+
+        Only detached scalar snapshots are retained, bounded to 32 updates.
+        No decision or training tensor is delayed. Each sample keeps its own
+        value and weight; this does not average averages or drop tail windows.
+        """
+        if not self._pending_update_metrics:
+            return
+        entries = [(metric, field.name, value)
+                   for metric in self._pending_update_metrics
+                   for field in fields(metric)
+                   if isinstance((value := getattr(metric, field.name)), torch.Tensor)]
+        if entries:
+            values = torch.stack([value for _, _, value in entries]).cpu().tolist()
+            for (metric, name, _), value in zip(entries, values):
+                object.__setattr__(metric, name, float(value))
+        self._pending_update_metrics.clear()
+
     def _read_update_statistics(
         self,
         values: Sequence[torch.Tensor],
-    ) -> tuple[float, ...]:
-        if not self.reduce_update_stat_syncs:
+    ) -> tuple[float | torch.Tensor, ...]:
+        if not self._defer_statistics and not self.reduce_update_stat_syncs:
             return tuple(float(value.item()) for value in values)
-        packed = torch.stack(tuple(value.detach().reshape(()) for value in values))
+        detached = tuple(value.detach().reshape(()) for value in values)
+        if self.reuse_update_buffers:
+            # Scratch only: never an input to autograd or a captured graph.
+            # Shape/device/dtype key; deferred rows clone before next overwrite.
+            dtype = detached[0].dtype
+            for value in detached[1:]:
+                if value.dtype != dtype:
+                    dtype = torch.promote_types(dtype, value.dtype)
+            key = (len(detached), detached[0].device, dtype)
+            packed = self._statistic_buffers.get(key)
+            if packed is None:
+                # Three production widths (critic-only/ANN/SNN actor). Keep
+                # their addresses stable; device/dtype changes invalidate all.
+                if self._statistic_buffers and (
+                    next(iter(self._statistic_buffers))[1:] != key[1:]
+                    or len(self._statistic_buffers) >= 3
+                ):
+                    self._statistic_buffers.clear()
+                packed = torch.empty(len(detached), device=key[1], dtype=key[2])
+                self._statistic_buffers[key] = packed
+            torch.stack(detached, out=packed)
+        else:
+            packed = torch.stack(detached)
+        if self._defer_statistics:
+            return tuple(packed.clone().unbind())
         return tuple(float(value) for value in packed.cpu().tolist())
 
     def _actor_loss_coefficient_tensor(
@@ -3753,6 +3831,7 @@ class V2TD3UpdateEngine:
 
     def checkpoint_state_dict(self) -> dict[str, Any]:
         """Return the strict in-memory V2 checkpoint payload."""
+        self.flush_update_statistics()
 
         bc_reference_present = self.bc_reference_actor is not None
         checkpoint_format, checkpoint_version = self._checkpoint_format()
@@ -3874,6 +3953,8 @@ class V2TD3UpdateEngine:
         and the destination stage's BC reference are deliberately preserved.
         """
 
+        self.flush_update_statistics()
+        self._statistic_buffers.clear()
         state_targets = self._validated_network_state_targets(payload)
         for key, model in state_targets:
             model.load_state_dict(payload[key], strict=True)
@@ -3891,6 +3972,8 @@ class V2TD3UpdateEngine:
     def load_checkpoint_state_dict(self, payload: dict[str, Any]) -> None:
         """Strictly restore a V2 dynamic-set TD3 checkpoint payload."""
 
+        self.flush_update_statistics()
+        self._statistic_buffers.clear()
         state_targets = self._validated_network_state_targets(payload)
         if 'algorithm_config' not in payload:
             raise ValueError('checkpoint is missing algorithm_config.')

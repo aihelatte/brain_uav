@@ -91,6 +91,8 @@ def build_parser() -> argparse.ArgumentParser:
     # compile_target_encoders, pinned_batch_transfer, and
     # aggregate_relation_values_first are not part of that verified
     # combination and keep their plain False default.
+    parser.add_argument('--window-update-statistics', action='store_true')
+    parser.add_argument('--reuse-update-buffers', action='store_true')
     parser.add_argument('--compile-critic-encoder', action='store_true')
     parser.add_argument('--compile-target-encoders', action='store_true')
     parser.add_argument(
@@ -262,6 +264,7 @@ def _configure_stage_compilation(
             )
         return {
             'requested': False,
+            'local_optimizations': {name: {'requested': bool(getattr(engine, name, False)), 'effective': bool(getattr(engine, name, False))} for name in ('window_update_statistics', 'reuse_update_buffers')},
             'enabled_objects': [],
             'frozen_critic_strategy': 'eager',
             'select_action_execution': 'eager',
@@ -321,6 +324,7 @@ def _configure_stage_compilation(
         backend='inductor', mode='default', fullgraph=True, dynamic=True,
     )
     metadata['requested'] = True
+    metadata['local_optimizations'] = {name: {'requested': bool(getattr(engine, name, False)), 'effective': bool(getattr(engine, name, False))} for name in ('window_update_statistics', 'reuse_update_buffers')}
     metadata['reduce_update_stat_syncs_requested'] = bool(
         getattr(engine, 'reduce_update_stat_syncs', False)
     )
@@ -459,6 +463,8 @@ def run_v2_td3_stage(
     cuda_graph_action_inference: bool = False,
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
+    window_update_statistics: bool = False,
+    reuse_update_buffers: bool = False,
     pinned_batch_transfer: bool = False,
     cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
@@ -576,6 +582,8 @@ def run_v2_td3_stage(
         fused_adam=fused_adam,
         aggregate_relation_values_first=aggregate_relation_values_first,
         reduce_update_stat_syncs=reduce_update_stat_syncs,
+        window_update_statistics=window_update_statistics,
+        reuse_update_buffers=reuse_update_buffers,
         pinned_batch_transfer=pinned_batch_transfer,
     )
     compilation_metadata = _configure_stage_compilation(
@@ -804,8 +812,12 @@ def run_v2_td3_stage(
         }
         return summary
     finally:
-        if reporter is not None:
-            reporter.close()
+        try:
+            if getattr(components.engine, 'window_update_statistics', False):
+                components.engine.flush_update_statistics()
+        finally:
+            if reporter is not None:
+                reporter.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -830,6 +842,8 @@ def main(argv: list[str] | None = None) -> int:
         spike_regularization=spike_config,
     )
     print(json.dumps({
+        'local_optimizations_requested': {'window_update_statistics': args.window_update_statistics,
+                                          'reuse_update_buffers': args.reuse_update_buffers},
         'requested_device': args.device,
         'resolved_device': resolved_device,
         'resolved_v2_formal_config': config_preview.to_dict(),
@@ -884,6 +898,8 @@ def main(argv: list[str] | None = None) -> int:
         cuda_graph_action_inference=compilation['cuda_graph_action_inference'],
         aggregate_relation_values_first=args.aggregate_relation_values_first,
         reduce_update_stat_syncs=compilation['reduce_update_stat_syncs'],
+        window_update_statistics=args.window_update_statistics,
+        reuse_update_buffers=args.reuse_update_buffers,
         pinned_batch_transfer=args.pinned_batch_transfer,
         cuda_graph_updates=compilation['cuda_graph_updates'],
         cuda_graph_actor_update=compilation['cuda_graph_actor_update'],

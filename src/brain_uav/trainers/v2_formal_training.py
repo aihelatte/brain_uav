@@ -998,6 +998,8 @@ def build_v2_stage_engine(
     fused_adam: bool = False,
     aggregate_relation_values_first: bool = False,
     reduce_update_stat_syncs: bool = False,
+    window_update_statistics: bool = False,
+    reuse_update_buffers: bool = False,
     pinned_batch_transfer: bool = False,
 ) -> V2StageComponents:
     if scenario is not None and not isinstance(scenario, ScenarioConfig):
@@ -1227,6 +1229,8 @@ def build_v2_stage_engine(
         fused_adam=fused_adam,
         aggregate_relation_values_first=aggregate_relation_values_first,
         reduce_update_stat_syncs=reduce_update_stat_syncs,
+        window_update_statistics=window_update_statistics,
+        reuse_update_buffers=reuse_update_buffers,
         pinned_batch_transfer=pinned_batch_transfer,
     )
     if previous_engine_payload is not None:
@@ -1378,6 +1382,12 @@ class V2FormalStageTrainer:
         return bool(info.get('goal_reached_by_segment', False)) or min(values) <= self.config.near_goal_radius
 
     def run(self) -> V2FormalTrainingResult:
+        try:
+            return self._run()
+        finally:
+            self.engine.flush_update_statistics()
+
+    def _run(self) -> V2FormalTrainingResult:
         if self.reporter is not None:
             self.reporter.begin_episode()
         observation, episode_level = self._new_episode()
@@ -1447,6 +1457,7 @@ class V2FormalStageTrainer:
                     metrics = self.engine.update_once(
                         total_steps=self.result.stage_steps,
                         bc_lambda=current_bc_lambda,
+                        **({'defer_statistics': True} if self.engine.window_update_statistics else {}),
                     )
                 except FloatingPointError as exc:
                     raise FloatingPointError(
@@ -1467,6 +1478,7 @@ class V2FormalStageTrainer:
                 )
 
             if done:
+                self.engine.flush_update_statistics()
                 outcome = str(info.get('outcome', ''))
                 if outcome not in _OUTCOMES:
                     raise RuntimeError('Training environment returned an invalid terminal outcome.')
@@ -1686,6 +1698,7 @@ class V2FormalStageTrainer:
                 slot_refs = []
                 update_metrics = []
 
+        self.engine.flush_update_statistics()
         if not self.result.passed_validation:
             self.result.status = 'failed'
             self.result.stop_reason = 'max_steps_without_validation'
