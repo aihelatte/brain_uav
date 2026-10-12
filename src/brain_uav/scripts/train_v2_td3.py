@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 from time import perf_counter
@@ -12,6 +12,11 @@ from typing import Any
 from brain_uav.config import RewardConfig, ScenarioConfig
 from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
 from brain_uav.models import V2SNNPolicyActor, require_v2_spikingjelly
+from brain_uav.models.v2_policy_config import (
+    V2SpikeRegularizationConfig, add_policy_training_arguments,
+    spike_config_from_arguments, validate_policy_request, validate_policy_dimensions,
+    projection_from_architecture,
+)
 from brain_uav.observations import V2ObservationBatch, collate_v2_observations
 from brain_uav.scripts.common import DEVICE_CHOICES, resolve_training_device
 from brain_uav.trainers.v2_formal_training import (
@@ -55,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--model', choices=('ann', 'snn'), default='ann')
     parser.add_argument('--snn-time-window', type=int, default=4)
+    add_policy_training_arguments(parser)
     parser.add_argument('--max-stage-steps', type=int, default=None)
     parser.add_argument('--early-stop-min-steps', type=int, default=125_000)
     parser.add_argument('--window-episodes', type=int, default=15)
@@ -432,6 +438,10 @@ def run_v2_td3_stage(
     expected_validation_stage_seed: int | None = None,
     model: str = 'ann',
     snn_time_window: int = 4,
+    actor_projection_dim: int | None = None,
+    actor_hidden_dim: int | None = None,
+    actor_rl_scale_alpha: float = 2.5,
+    spike_regularization: V2SpikeRegularizationConfig | None = None,
     prepared_initialization: V2PreparedStageInitialization | None = None,
     reporting: bool = True,
     compile_critic_encoder: bool = False,
@@ -463,6 +473,7 @@ def run_v2_td3_stage(
     resolved_device = resolve_training_device(requested_device)
     if model not in ('ann', 'snn'):
         raise ValueError('model must be "ann" or "snn".')
+    validate_policy_dimensions(actor_projection_dim, actor_hidden_dim)
     if type(snn_time_window) is not int or snn_time_window <= 0:
         raise ValueError('snn_time_window must be a positive integer.')
     if type(reporting) is not bool:
@@ -482,6 +493,8 @@ def run_v2_td3_stage(
         failure_sample_bias=failure_sample_bias,
         actor_lr=_resolve_v2_actor_lr(stage, model, actor_lr),
         critic_lr=critic_lr,
+        actor_rl_scale_alpha=actor_rl_scale_alpha,
+        spike_regularization=V2SpikeRegularizationConfig() if spike_regularization is None else spike_regularization,
     )
     if prepared_initialization is None:
         prepared_initialization = prepare_v2_stage_initialization(
@@ -505,6 +518,21 @@ def run_v2_td3_stage(
         snn_time_window=snn_time_window,
     )
     scenario_config = prepared_initialization.scenario_config
+    if stage == 'easy':
+        validate_policy_request(prepared_initialization.bc_initialization.actor, actor_projection_dim, actor_hidden_dim)
+        effective_spike = config.spike_regularization
+    else:
+        previous = prepared_initialization.formal_checkpoint['engine_checkpoint']
+        if actor_projection_dim is not None and actor_projection_dim != projection_from_architecture(previous['architecture']):
+            raise ValueError('Requested actor projection differs from predecessor.')
+        if actor_hidden_dim is not None and actor_hidden_dim != previous['architecture']['actor_hidden_dim']:
+            raise ValueError('Requested actor width differs from predecessor.')
+        inherited = V2SpikeRegularizationConfig.from_snapshot(previous['algorithm_config'].get('spike_regularization', V2SpikeRegularizationConfig().to_dict()))
+        if spike_regularization is not None and spike_regularization != inherited:
+            raise ValueError('Requested spike regularization differs from predecessor.')
+        effective_spike = inherited
+    effective_spike.validate_model(model)
+    config = replace(config, spike_regularization=effective_spike)
     reward_config = prepared_initialization.reward_config
     effective_uav_collision_radius = (
         prepared_initialization.uav_collision_radius
@@ -783,6 +811,7 @@ def run_v2_td3_stage(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     args.actor_lr = _resolve_v2_actor_lr(args.stage, args.model, args.actor_lr)
+    spike_config = spike_config_from_arguments(args)
     resolved_device = resolve_training_device(args.device)
     config_preview = V2FormalTrainingConfig(
         stage=args.stage,
@@ -797,6 +826,8 @@ def main(argv: list[str] | None = None) -> int:
         failure_sample_bias=args.failure_sample_bias,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,
+        actor_rl_scale_alpha=args.actor_rl_scale_alpha,
+        spike_regularization=spike_config,
     )
     print(json.dumps({
         'requested_device': args.device,
@@ -834,6 +865,10 @@ def main(argv: list[str] | None = None) -> int:
         bc_schedule=args.bc_schedule,
         model=args.model,
         snn_time_window=args.snn_time_window,
+        actor_projection_dim=args.actor_projection_dim,
+        actor_hidden_dim=args.actor_hidden_dim,
+        actor_rl_scale_alpha=args.actor_rl_scale_alpha,
+        spike_regularization=spike_config,
         compile_critic_encoder=args.compile_critic_encoder,
         compile_target_encoders=args.compile_target_encoders,
         compile_actors=compilation['compile_actors'],

@@ -2926,6 +2926,10 @@ class TestV2TD3(unittest.TestCase):
                 'terminal_geo_regularization_enabled': False,
                 'terminal_geo_radius': 250.0,
                 'terminal_geo_lambda': 3000.0,
+                'spike_regularization': {
+                    'beta_max': 0.0, 'target_rate': 0.17,
+                    'ramp_start_steps': 25_000, 'ramp_end_steps': 75_000,
+                },
             },
         )
 

@@ -24,6 +24,7 @@ from brain_uav.config import RewardConfig, ScenarioConfig
 from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
 from brain_uav.envs.static_no_fly_env_runtime import boundary_violations
 from brain_uav.models import V2ANNPolicyActor, V2SNNPolicyActor
+from brain_uav.models.v2_policy_config import projection_from_architecture
 from brain_uav.observations import V2ObservationScales, collate_v2_observations
 from brain_uav.trainers.v2_formal_training import (
     _architecture_from_engine_payload, load_v2_formal_checkpoint,
@@ -35,6 +36,7 @@ from brain_uav.trainers.v2_validation import (
 )
 from brain_uav.utils.v2_operation_counts import (
     OPERATION_COUNT_METHOD, count_v2_actor_operations, summarize_operation_counts,
+    summarize_spike_activity,
 )
 
 
@@ -114,7 +116,8 @@ def load_diagnostic_inputs(*, model: str, checkpoint: str | Path,
     actor_type = V2ANNPolicyActor if model == 'ann' else V2SNNPolicyActor
     snn_arguments = {'time_window': snn['time_window'], 'tau': snn['tau']} if snn else {}
     actor = actor_type(scales, 2, hidden, action_high, uav_radius=radius,
-                       encoder_config=encoder, **snn_arguments)
+                       encoder_config=encoder,
+                       projection_dim=projection_from_architecture(engine_payload['architecture']), **snn_arguments)
     actor_state = engine_payload['actor_state_dict']
     V2TD3UpdateEngine._validate_state_dict(actor, actor_state, name='actor_state_dict')
     # strict=True checks keys/shapes, but can overwrite fixed geometry buffers.
@@ -204,6 +207,7 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
             'seed_manifest': payload['seed_manifest'],
             'initialization_source': payload['initialization_source'],
             'architecture': payload['engine_checkpoint']['architecture'],
+            'spike_regularization': payload['formal_config']['spike_regularization'],
         },
         'pool': {'path': str(inputs['pool_path']), 'sha256': inputs['pool_hash'],
                  'content_digest': pool.content_digest, 'scenario_count': pool.scenario_count,
@@ -253,6 +257,9 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
                 with torch.inference_mode():
                     if count_operations:
                         action_tensor, operations = count_v2_actor_operations(actor, batch)
+                        activity = operations
+                    elif model == 'snn':
+                        action_tensor, activity = actor.forward_with_diagnostics(batch, include_activity_counts=True)
                     else:
                         action_tensor = actor(batch)
                     action = action_tensor[0].detach().cpu().numpy().astype(np.float32)
@@ -294,6 +301,8 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
                 })
                 if count_operations:
                     step_rows[-1]['operation_counts'] = operations
+                if model == 'snn':
+                    step_rows[-1]['validation_forward_spike_activity'] = activity
                 previous_clearance = info['min_zone_clearance']
                 states.append(env.state.copy().tolist())
                 actions.append(env.prev_action.copy().tolist())
@@ -329,6 +338,10 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
                 row['operation_counts'] = summarize_operation_counts(
                     step['operation_counts'] for step in step_rows)
                 row['initial_operation_counts'] = step_rows[0]['operation_counts']
+            if model == 'snn':
+                row['validation_trajectory_spike_activity'] = summarize_spike_activity(
+                    step['validation_forward_spike_activity'] for step in step_rows)
+                row['initial_spike_activity'] = step_rows[0]['validation_forward_spike_activity']
             if outcome != 'goal' or not env.zones:
                 exported = export_v2_trajectory_views(output / 'trajectories', stem, {
                     'scenario_payload': record['payload'], 'scenario_config': payload['scenario_config'],
@@ -366,6 +379,13 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
                           for count in sorted({row['zone_count'] for row in rows})},
         'max_reward_component_error': max(row['max_reward_component_error'] for row in rows),
     }
+    if model == 'snn':
+        summary['spike_activity'] = {
+            'source': 'noise_free_diagnostic_forward',
+            'full_trajectories': summarize_spike_activity(row['validation_trajectory_spike_activity']['totals'] for row in rows),
+            'common_initial_observations': summarize_spike_activity(row['initial_spike_activity'] for row in rows),
+            'note': 'Unobserved in this finite evaluation set; this is not evidence of permanent neuron death.',
+        }
     if count_operations:
         operation_report = {
             'diagnostic_only': True, 'method': OPERATION_COUNT_METHOD,

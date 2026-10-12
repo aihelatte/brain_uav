@@ -18,6 +18,7 @@ from torch.profiler import record_function
 
 from brain_uav.models.v2_ann import V2ANNCritic, V2ANNPolicyActor
 from brain_uav.models.v2_snn import V2SNNPolicyActor
+from brain_uav.models.v2_policy_config import V2SpikeRegularizationConfig, policy_head_metadata
 from brain_uav.models.zone_set_encoder import ZoneSetSharedRelations
 from brain_uav.observations import (
     EGO_FEATURE_DIM,
@@ -108,6 +109,9 @@ def _actor_loss_tensor_block(
     gamma_max: float,
     terminal_radius: float,
     terminal_enabled: bool,
+    spike_rate: torch.Tensor | None = None,
+    spike_beta: torch.Tensor | None = None,
+    spike_target: float = 0.17,
 ) -> tuple[torch.Tensor, ...]:
     rl_actor_loss = -q_values.mean()
     q_scale = q_values.detach().abs().mean().clamp(min=1.0)
@@ -154,6 +158,8 @@ def _actor_loss_tensor_block(
         scaled_rl_actor_loss + bc_lambda * bc_loss
         + terminal_lambda * terminal_geo_loss
     )
+    if spike_rate is not None:
+        actor_loss = actor_loss + spike_beta * F.relu(spike_rate - spike_target).square()
     return (
         actor_loss, rl_actor_loss, scaled_rl_actor_loss,
         actor_rl_scale, bc_loss, terminal_geo_loss,
@@ -263,6 +269,10 @@ class V2TD3UpdateMetrics:
     critic_td_error_mean: float = 0.0
     critic_failure_td_error_mean: float = 0.0
     actor_grad_norm: float = 0.0
+    actor_batch_spike_rate_l1: float | None = None
+    spike_regularization_loss: float | None = None
+    spike_beta_eff: float | None = None
+    weighted_spike_regularization: float | None = None
     sample_failure_fraction: float = 0.0
 
 
@@ -274,6 +284,9 @@ class _ActorLossTerms:
     actor_rl_scale: torch.Tensor
     bc_loss: torch.Tensor
     terminal_geo_loss: torch.Tensor
+    spike_rate: torch.Tensor
+    spike_loss: torch.Tensor
+    spike_beta: float
 
 
 class _ReusablePinnedReplayBatchTransfer:
@@ -527,8 +540,13 @@ class V2TD3UpdateEngine:
         aggregate_relation_values_first: bool = False,
         reduce_update_stat_syncs: bool = False,
         pinned_batch_transfer: bool = False,
+        spike_regularization: V2SpikeRegularizationConfig | None = None,
     ) -> None:
         actor_model_type = _actor_model_type(actor)
+        self.spike_regularization = V2SpikeRegularizationConfig() if spike_regularization is None else spike_regularization
+        if not isinstance(self.spike_regularization, V2SpikeRegularizationConfig):
+            raise TypeError('spike_regularization must be V2SpikeRegularizationConfig.')
+        self.spike_regularization.validate_model(actor_model_type)
         if not isinstance(critic1, V2ANNCritic) or not isinstance(critic2, V2ANNCritic):
             raise TypeError('critic1 and critic2 must be V2ANNCritic instances.')
         if not isinstance(replay, V2ReplayBuffer):
@@ -790,6 +808,9 @@ class V2TD3UpdateEngine:
                         self.actor.scales.gamma_max,
                         self.terminal_geo_radius,
                         self.terminal_geo_regularization_enabled,
+                        spike_rate=torch.full((), .3, device=self.device, requires_grad=True) if self.model_type == 'snn' else None,
+                        spike_beta=torch.as_tensor(self.spike_regularization.beta_max, device=self.device) if self.model_type == 'snn' else None,
+                        spike_target=self.spike_regularization.target_rate,
                     )
                     total.backward()
                     if actions.grad is None or q_values.grad is None:
@@ -929,6 +950,7 @@ class V2TD3UpdateEngine:
         if (
             candidate.action_dim != expected.action_dim
             or candidate.hidden_dim != expected.hidden_dim
+            or candidate.projection_dim != expected.projection_dim
             or candidate.encoder_config != expected.encoder_config
             or candidate.scales != expected.scales
             or candidate.uav_radius != expected.uav_radius
@@ -2435,6 +2457,9 @@ class V2TD3UpdateEngine:
                     self.actor.scales.gamma_max,
                     self.terminal_geo_radius,
                     self.terminal_geo_regularization_enabled,
+                    spike_rate=torch.full((), .3, device=self.device, requires_grad=True) if self.model_type == 'snn' else None,
+                    spike_beta=torch.as_tensor(self.spike_regularization.beta_max, device=self.device) if self.model_type == 'snn' else None,
+                    spike_target=self.spike_regularization.target_rate,
                 )
                 total.backward()
 
@@ -3214,6 +3239,7 @@ class V2TD3UpdateEngine:
                         batch.obs,
                         batch.line_to_goal_safe,
                         bc_lambda=bc_lambda_value,
+                        stage_steps=total_steps_value,
                         shared_relations=current_shared_relations,
                         profile_sections=profile_sections,
                         critic_context=critic_context,
@@ -3302,6 +3328,8 @@ class V2TD3UpdateEngine:
                 diagnostic_td_error_mean,
                 diagnostic_failure_td_error_mean,
                 actor_grad_norm_tensor,
+                *((actor_terms.spike_rate, actor_terms.spike_loss,
+                   actor_terms.spike_loss * actor_terms.spike_beta) if self.model_type == 'snn' else ()),
             ))
             metrics = V2TD3UpdateMetrics(
                 critic_loss=statistic_values[0],
@@ -3323,6 +3351,10 @@ class V2TD3UpdateEngine:
                 critic_updated=True,
                 critic_targets_updated=critic_targets_updated,
                 actor_updated=True,
+                actor_batch_spike_rate_l1=statistic_values[16] if self.model_type == 'snn' else None,
+                spike_regularization_loss=statistic_values[17] if self.model_type == 'snn' else None,
+                spike_beta_eff=actor_terms.spike_beta if self.model_type == 'snn' else None,
+                weighted_spike_regularization=statistic_values[18] if self.model_type == 'snn' else None,
                 critic_q1_mean=statistic_values[9],
                 critic_q1_std=statistic_values[10],
                 critic_q1_max_abs=statistic_values[11],
@@ -3361,6 +3393,7 @@ class V2TD3UpdateEngine:
         line_to_goal_safe: torch.Tensor,
         *,
         bc_lambda: float,
+        stage_steps: int = 0,
         shared_relations: ZoneSetSharedRelations | None = None,
         profile_sections: bool = False,
         critic_context: torch.Tensor | None = None,
@@ -3384,11 +3417,19 @@ class V2TD3UpdateEngine:
             )
             if actor_uses_compiled and compiled_execution_recorder is not None:
                 compiled_execution_recorder('actor')
-            actor_actions = self.actor(
-                observation,
-                shared_relations=shared_relations,
-                profile_sections=profile_sections,
-            )
+            if isinstance(self.actor, V2SNNPolicyActor):
+                actor_actions, spike_rate = self.actor.forward_with_activity(
+                    observation, shared_relations=shared_relations,
+                    profile_sections=profile_sections,
+                )
+            else:
+                actor_actions = self.actor(
+                    observation, shared_relations=shared_relations,
+                    profile_sections=profile_sections,
+                )
+                spike_rate = actor_actions.new_zeros(())
+            spike_loss = F.relu(spike_rate - self.spike_regularization.target_rate).square()
+            spike_beta = self.spike_regularization.beta(stage_steps)
         with detail.section('actor_q_rl_loss_and_scale'):
             q_values = (
                 self.critic1(
@@ -3468,6 +3509,8 @@ class V2TD3UpdateEngine:
                     + bc_lambda * bc_loss
                     + terminal_lambda * terminal_geo_loss
                 )
+                if spike_beta != 0:
+                    actor_loss = actor_loss + spike_beta * spike_loss
             else:
                 if compiled_execution_recorder is not None:
                     compiled_execution_recorder('actor_loss')
@@ -3508,6 +3551,9 @@ class V2TD3UpdateEngine:
                     self.actor.scales.gamma_max,
                     self.terminal_geo_radius,
                     self.terminal_geo_regularization_enabled,
+                    spike_rate if isinstance(self.actor, V2SNNPolicyActor) else None,
+                    self._actor_loss_coefficient_tensor('spike_beta', spike_beta, q_values) if self.model_type == 'snn' else None,
+                    self.spike_regularization.target_rate,
                 )
         return _ActorLossTerms(
             actor_loss=actor_loss,
@@ -3516,6 +3562,9 @@ class V2TD3UpdateEngine:
             actor_rl_scale=actor_rl_scale,
             bc_loss=bc_loss,
             terminal_geo_loss=terminal_geo_loss,
+            spike_rate=spike_rate,
+            spike_loss=spike_loss,
+            spike_beta=spike_beta,
         )
 
     def _build_shared_relations(
@@ -3652,6 +3701,7 @@ class V2TD3UpdateEngine:
             'encoder_config': asdict(self.actor.encoder_config),
             'uav_radius': self.actor.uav_radius,
             'actor_hidden_dim': self.actor.hidden_dim,
+            **policy_head_metadata(self.actor),
             'critic1_hidden_dim': self.critic1.hidden_dim,
             'critic2_hidden_dim': self.critic2.hidden_dim,
         }
@@ -3666,9 +3716,10 @@ class V2TD3UpdateEngine:
         return metadata
 
     def _checkpoint_format(self) -> tuple[str, int]:
+        extension = int(self.actor.projection_dim is not None)
         if self.model_type == 'snn':
-            return V2_SNN_TD3_CHECKPOINT_FORMAT, V2_SNN_TD3_CHECKPOINT_VERSION
-        return V2_TD3_CHECKPOINT_FORMAT, V2_TD3_CHECKPOINT_VERSION
+            return V2_SNN_TD3_CHECKPOINT_FORMAT, V2_SNN_TD3_CHECKPOINT_VERSION + extension
+        return V2_TD3_CHECKPOINT_FORMAT, V2_TD3_CHECKPOINT_VERSION + extension
 
     def _algorithm_config(self) -> dict[str, Any]:
         return {
@@ -3687,6 +3738,7 @@ class V2TD3UpdateEngine:
             ),
             'terminal_geo_radius': self.terminal_geo_radius,
             'terminal_geo_lambda': self.terminal_geo_lambda,
+            'spike_regularization': self.spike_regularization.to_dict(),
         }
 
     @staticmethod
@@ -3842,7 +3894,10 @@ class V2TD3UpdateEngine:
         state_targets = self._validated_network_state_targets(payload)
         if 'algorithm_config' not in payload:
             raise ValueError('checkpoint is missing algorithm_config.')
-        if payload['algorithm_config'] != self._algorithm_config():
+        algorithm = dict(payload['algorithm_config'])
+        if 'spike_regularization' not in algorithm and 'policy_head' not in payload['architecture']:
+            algorithm['spike_regularization'] = V2SpikeRegularizationConfig().to_dict()
+        if algorithm != self._algorithm_config():
             raise ValueError('checkpoint algorithm_config is incompatible.')
 
         if 'bc_reference_present' not in payload:

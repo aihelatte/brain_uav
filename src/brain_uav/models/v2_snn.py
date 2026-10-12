@@ -148,8 +148,8 @@ class V2SNNPolicyHead(nn.Module):
         return action
 
     def forward_with_diagnostics(
-        self, context: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, float]]:
+        self, context: torch.Tensor, *, include_activity_counts: bool = False,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         """Forward pass plus per-layer firing-rate statistics (H9 in docs).
 
         Reuses the exact same computation as :meth:`forward` (via
@@ -163,6 +163,12 @@ class V2SNNPolicyHead(nn.Module):
             'spike_rate_l1': float(first_spikes.mean().detach().cpu()),
             'spike_rate_l2': float(second_spikes.mean().detach().cpu()),
         }
+        if include_activity_counts:
+            diagnostics['decision_count'] = 1
+            for layer, spikes in ((1, first_spikes), (2, second_spikes)):
+                diagnostics[f'spike_count_l{layer}'] = int(torch.count_nonzero(spikes).item())
+                diagnostics[f'spike_slots_l{layer}'] = spikes.numel()
+                diagnostics[f'active_neurons_l{layer}'] = spikes.detach().bool().any(dim=0).any(dim=0).cpu().tolist()
         return action, diagnostics
 
 
@@ -184,6 +190,7 @@ class V2SNNPolicyActor(nn.Module):
         tau: float = 2.0,
         uav_radius: float = 0.0,
         encoder_config: ZoneSetEncoderConfig | None = None,
+        projection_dim: int | None = None,
     ) -> None:
         super().__init__()
         require_v2_spikingjelly()
@@ -216,8 +223,13 @@ class V2SNNPolicyActor(nn.Module):
             uav_radius=uav_radius,
             config=encoder_config,
         )
+        if projection_dim is not None and type(projection_dim) is not int:
+            raise ValueError('projection_dim must be a positive integer.')
+        self.projection_dim = None if projection_dim is None else _positive_int(projection_dim, name='projection_dim')
+        self.projection = nn.Identity() if self.projection_dim is None else nn.Linear(self.zone_set_encoder.output_dim, self.projection_dim)
+        _reset_linear_layers(self.projection)
         self.snn_head = V2SNNPolicyHead(
-            self.zone_set_encoder.output_dim,
+            self.projection_dim or self.zone_set_encoder.output_dim,
             self.hidden_dim,
             self.action_dim,
             time_window=self.time_window,
@@ -234,12 +246,12 @@ class V2SNNPolicyActor(nn.Module):
             functional.reset_net(self.snn_head)
 
     def action_from_context(self, context: torch.Tensor) -> torch.Tensor:
-        return torch.tanh(self.snn_head(context)) * self.action_limit
+        return torch.tanh(self.snn_head(self.projection(context))) * self.action_limit
 
     def action_from_context_with_diagnostics(
-        self, context: torch.Tensor,
+        self, context: torch.Tensor, *, include_activity_counts: bool = False,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        raw_action, diagnostics = self.snn_head.forward_with_diagnostics(context)
+        raw_action, diagnostics = self.snn_head.forward_with_diagnostics(self.projection(context), include_activity_counts=include_activity_counts)
         return torch.tanh(raw_action) * self.action_limit, diagnostics
 
     def forward(
@@ -268,6 +280,7 @@ class V2SNNPolicyActor(nn.Module):
         *,
         shared_relations: ZoneSetSharedRelations | None = None,
         profile_sections: bool = False,
+        include_activity_counts: bool = False,
     ) -> tuple[torch.Tensor, dict[str, float]]:
         """Forward pass plus LIF firing-rate diagnostics (H9 in docs).
 
@@ -287,7 +300,27 @@ class V2SNNPolicyActor(nn.Module):
                 shared_relations=shared_relations,
                 profile_sections=profile_sections,
             )
-            return self.action_from_context_with_diagnostics(context)
+            return self.action_from_context_with_diagnostics(context, include_activity_counts=include_activity_counts)
+
+    def forward_with_activity(
+        self, observation: V2ObservationBatch, *,
+        shared_relations: ZoneSetSharedRelations | None = None,
+        profile_sections: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Same online forward, with a graph-bearing scalar LIF1 activity rate.
+
+        Spike tensors are local to this call and never retained on the actor.
+        """
+        if not isinstance(observation, V2ObservationBatch):
+            raise TypeError('observation must be a V2ObservationBatch.')
+        with self.reset_state_context():
+            context = self.zone_set_encoder(
+                observation.ego_features, observation.goal_features,
+                observation.zone_features, observation.presence_mask,
+                shared_relations=shared_relations, profile_sections=profile_sections,
+            )
+            raw, first, _ = self.snn_head._forward_impl(self.projection(context))
+            return torch.tanh(raw) * self.action_limit, first.mean()
 
 
 __all__ = [

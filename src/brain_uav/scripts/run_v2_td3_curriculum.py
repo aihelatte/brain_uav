@@ -10,6 +10,10 @@ from typing import Any, Callable
 
 from brain_uav.config import RewardConfig, ScenarioConfig
 from brain_uav.models import V2SNNPolicyActor, require_v2_spikingjelly
+from brain_uav.models.v2_policy_config import (
+    V2SpikeRegularizationConfig, add_policy_training_arguments,
+    spike_config_from_arguments, validate_policy_request, policy_head_metadata,
+)
 from brain_uav.scripts.common import DEVICE_CHOICES, resolve_training_device
 from brain_uav.scripts.train_v2_td3 import (
     _resolve_v2_cuda_graph_compilation,
@@ -54,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--model', choices=('ann', 'snn'), default='ann')
     parser.add_argument('--snn-time-window', type=int, default=4)
+    add_policy_training_arguments(parser)
     # See default_v2_cuda_graph_compilation in train_v2_td3.py: these default
     # to the 2026-09-22-verified full compile + CUDA Graph combination
     # unless explicitly overridden with --no-<flag>.
@@ -230,6 +235,10 @@ def run_v2_curriculum(
     stage_runner: Callable[..., dict[str, Any]] = run_v2_td3_stage,
     model: str = 'ann',
     snn_time_window: int = 4,
+    actor_projection_dim: int | None = None,
+    actor_hidden_dim: int | None = None,
+    actor_rl_scale_alpha: float = 2.5,
+    spike_regularization: V2SpikeRegularizationConfig | None = None,
     compile_critic_encoder: bool = False,
     compile_target_encoders: bool = False,
     compile_actors: bool = False,
@@ -302,7 +311,8 @@ def run_v2_curriculum(
     if not bc_path.is_file():
         raise FileNotFoundError(f'V2 BC checkpoint does not exist: {bc_path}')
     prepared_initialization = prepare_v2_stage_initialization(
-        V2FormalTrainingConfig(stage='easy', seed=seed),
+        V2FormalTrainingConfig(stage='easy', seed=seed, spike_regularization=spike_regularization,
+                              actor_rl_scale_alpha=actor_rl_scale_alpha),
         init_checkpoint=bc_path,
         device='cpu',
         model_type=model,
@@ -312,6 +322,9 @@ def run_v2_curriculum(
     bc_initialization = prepared_initialization.bc_initialization
     if bc_initialization is None:
         raise RuntimeError('Prepared easy initialization is missing the BC actor.')
+    validate_policy_request(bc_initialization.actor, actor_projection_dim, actor_hidden_dim)
+    spike_regularization = spike_regularization or V2SpikeRegularizationConfig()
+    spike_regularization.validate_model(model)
     if model == 'snn':
         actor = bc_initialization.actor
         if type(actor) is not V2SNNPolicyActor:
@@ -384,6 +397,10 @@ def run_v2_curriculum(
             global_steps_start=global_steps,
             model=model,
             snn_time_window=effective_snn_time_window,
+            actor_projection_dim=actor_projection_dim,
+            actor_hidden_dim=actor_hidden_dim,
+            actor_rl_scale_alpha=actor_rl_scale_alpha,
+            spike_regularization=spike_regularization,
             max_stage_steps=(
                 easy_max_stage_steps if stage == 'easy'
                 else medium_max_stage_steps if stage == 'medium'
@@ -446,6 +463,9 @@ def run_v2_curriculum(
         'stage_order': list(stages),
         'stage_training_parameters': stage_training_parameters,
         'reward_config': asdict(prepared_initialization.reward_config),
+        'policy_structure': {'actor_hidden_dim': bc_initialization.actor.hidden_dim, **policy_head_metadata(bc_initialization.actor)},
+        'spike_regularization': spike_regularization.to_dict(),
+        'actor_rl_scale_alpha': actor_rl_scale_alpha,
         'passed': failed_stage is None and len(summaries) == len(stages),
         'failed_stage': failed_stage,
         'stages': summaries,
@@ -502,6 +522,9 @@ def main(argv: list[str] | None = None) -> int:
             'failure_sample_bias': args.medium_failure_sample_bias,
         },
         'stage_training_parameters': stage_training_parameters,
+        'policy_structure_request': {'projection_dim': args.actor_projection_dim, 'hidden_dim': args.actor_hidden_dim},
+        'spike_regularization': (spike_config_from_arguments(args) or V2SpikeRegularizationConfig()).to_dict(),
+        'actor_rl_scale_alpha': args.actor_rl_scale_alpha,
     }, indent=2))
     compilation = _resolve_v2_cuda_graph_compilation(args, resolved_device=resolved_device)
     print(json.dumps({'resolved_compilation_defaults': compilation}, indent=2))
@@ -525,6 +548,10 @@ def main(argv: list[str] | None = None) -> int:
         device=args.device,
         model=args.model,
         snn_time_window=args.snn_time_window,
+        actor_projection_dim=args.actor_projection_dim,
+        actor_hidden_dim=args.actor_hidden_dim,
+        actor_rl_scale_alpha=args.actor_rl_scale_alpha,
+        spike_regularization=spike_config_from_arguments(args),
         compile_critic_encoder=args.compile_critic_encoder,
         compile_target_encoders=args.compile_target_encoders,
         compile_actors=compilation['compile_actors'],

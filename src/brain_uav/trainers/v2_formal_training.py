@@ -22,6 +22,7 @@ import torch
 from brain_uav.config import RewardConfig, ScenarioConfig, reward_config_from_snapshot
 from brain_uav.envs import V2ScenarioGenerator, V2StaticNoFlyTrajectoryEnv
 from brain_uav.models import V2ANNCritic, V2ANNPolicyActor, V2SNNPolicyActor
+from brain_uav.models.v2_policy_config import V2SpikeRegularizationConfig, projection_from_architecture
 from brain_uav.models.zone_set_encoder import ZoneSetEncoderConfig
 from brain_uav.observations import (
     V2Observation,
@@ -252,6 +253,7 @@ class V2FormalTrainingConfig:
     actor_grad_clip_norm: float | None = 1.0
     critic_grad_clip_norm: float | None = 1.0
     actor_rl_scale_alpha: float = 2.5
+    spike_regularization: V2SpikeRegularizationConfig | None = None
     terminal_geo_regularization_enabled: bool = True
     terminal_geo_radius: float = 250.0
     terminal_geo_lambda: float = 3000.0
@@ -265,6 +267,8 @@ class V2FormalTrainingConfig:
     validation_max_failures: int = 5
 
     def __post_init__(self) -> None:
+        if self.spike_regularization is not None and not isinstance(self.spike_regularization, V2SpikeRegularizationConfig):
+            raise TypeError('spike_regularization must be V2SpikeRegularizationConfig.')
         if self.stage not in V2_TD3_STAGES:
             raise ValueError('stage must be easy, medium, or hard.')
         seed = _nonnegative_int(self.seed, name='seed')
@@ -348,7 +352,9 @@ class V2FormalTrainingConfig:
         object.__setattr__(self, 'validation_max_failures', validation_failures)
 
     def to_dict(self) -> dict[str, Any]:
-        return _strict_json_copy(asdict(self))
+        values = asdict(self)
+        values['spike_regularization'] = (self.spike_regularization or V2SpikeRegularizationConfig()).to_dict()
+        return _strict_json_copy(values)
 
 
 class V2EarlyStopController:
@@ -554,7 +560,7 @@ def load_v2_bc_formal_initialization(
     if (
         not isinstance(raw, dict)
         or raw.get('format') != expected_format
-        or raw.get('format_version') != expected_version
+        or raw.get('format_version') not in (expected_version, expected_version + 1)
         or raw.get('checkpoint_kind') != 'best'
     ):
         raise ValueError(
@@ -625,6 +631,8 @@ def prepare_v2_stage_initialization(
         raise TypeError('config must be a V2FormalTrainingConfig.')
     if model_type not in ('ann', 'snn'):
         raise ValueError('model_type must be "ann" or "snn".')
+    if config.spike_regularization is not None:
+        config.spike_regularization.validate_model(model_type)
     if type(snn_time_window) is not int or snn_time_window <= 0:
         raise ValueError('snn_time_window must be a positive integer.')
     if scenario is not None and not isinstance(scenario, ScenarioConfig):
@@ -756,11 +764,27 @@ def _architecture_from_engine_payload(
         if model_type == 'ann'
         else V2_SNN_TD3_CHECKPOINT_VERSION
     )
-    if engine_payload.get('format') != expected_format or engine_payload.get('format_version') != expected_version:
+    if engine_payload.get('format') != expected_format or engine_payload.get('format_version') not in (expected_version, expected_version + 1):
         raise ValueError('Previous stage does not contain a strict V2 TD3 engine checkpoint.')
     architecture = engine_payload.get('architecture')
     if not isinstance(architecture, Mapping):
         raise ValueError('Previous stage engine architecture is missing.')
+    expected_fields = {'scales', 'encoder_config', 'uav_radius', 'actor_hidden_dim',
+                       'critic1_hidden_dim', 'critic2_hidden_dim'}
+    if model_type == 'snn':
+        expected_fields |= {'model_type', 'time_window', 'tau', 'surrogate', 'backend'}
+    if 'policy_head' in architecture:
+        expected_fields.add('policy_head')
+    if set(architecture) != expected_fields:
+        raise ValueError('Engine architecture has missing or unknown fields.')
+    projection_from_architecture(architecture)
+    if ('policy_head' in architecture) != (engine_payload['format_version'] == expected_version + 1):
+        raise ValueError('Engine format version and policy_head schema disagree.')
+    algorithm = engine_payload.get('algorithm_config', {})
+    if 'spike_regularization' in algorithm:
+        V2SpikeRegularizationConfig.from_snapshot(algorithm['spike_regularization']).validate_model(model_type)
+    elif 'policy_head' in architecture:
+        raise ValueError('Projected policy checkpoint is missing spike_regularization configuration.')
     try:
         scales = V2ObservationScales(**architecture['scales'])
         encoder = ZoneSetEncoderConfig(**architecture['encoder_config'])
@@ -1043,8 +1067,9 @@ def build_v2_stage_engine(
             or actor.time_window != snn_time_window
         ):
             raise ValueError('V2 SNN BC time_window is incompatible with training.')
-        critic1_hidden = actor_hidden
-        critic2_hidden = actor_hidden
+        # A new actor head does not change the established ANN critic width.
+        critic1_hidden = 128 if actor.projection_dim is not None else actor_hidden
+        critic2_hidden = critic1_hidden
         initialization_source = {
             'kind': 'v2_bc_best',
             'path': _verified_initialization_source_path(prepared),
@@ -1057,7 +1082,7 @@ def build_v2_stage_engine(
                 V2_BC_CHECKPOINT_VERSION
                 if model_type == 'ann'
                 else V2_SNN_BC_CHECKPOINT_VERSION
-            ),
+            ) + int(actor.projection_dim is not None),
             'checkpoint_kind': 'best',
         }
         if model_type == 'snn':
@@ -1098,6 +1123,7 @@ def build_v2_stage_engine(
                 action_limit,
                 uav_radius=radius,
                 encoder_config=encoder_config,
+                projection_dim=projection_from_architecture(previous_engine_payload['architecture']),
             )
         else:
             if snn_metadata['time_window'] != snn_time_window:
@@ -1113,6 +1139,7 @@ def build_v2_stage_engine(
                 tau=snn_metadata['tau'],
                 uav_radius=radius,
                 encoder_config=encoder_config,
+                projection_dim=projection_from_architecture(previous_engine_payload['architecture']),
             )
         V2TD3UpdateEngine._validate_state_dict(
             actor,
@@ -1167,6 +1194,11 @@ def build_v2_stage_engine(
     )
     initial_policy_noise = config.noise_schedule.policy_initial
     initial_noise_clip = config.noise_schedule.clip_initial
+    inherited_spike = V2SpikeRegularizationConfig() if previous_engine_payload is None else V2SpikeRegularizationConfig.from_snapshot(
+        previous_engine_payload['algorithm_config'].get('spike_regularization', V2SpikeRegularizationConfig().to_dict()))
+    if previous_engine_payload is not None and config.spike_regularization is not None and config.spike_regularization != inherited_spike:
+        raise ValueError('Spike regularization differs from the formal predecessor.')
+    effective_spike = config.spike_regularization or inherited_spike
     engine = V2TD3UpdateEngine(
         actor,
         critic1,
@@ -1186,6 +1218,7 @@ def build_v2_stage_engine(
         actor_grad_clip_norm=config.actor_grad_clip_norm,
         critic_grad_clip_norm=config.critic_grad_clip_norm,
         actor_rl_scale_alpha=config.actor_rl_scale_alpha,
+        spike_regularization=effective_spike,
         terminal_geo_regularization_enabled=config.terminal_geo_regularization_enabled,
         terminal_geo_radius=config.terminal_geo_radius,
         terminal_geo_lambda=config.terminal_geo_lambda,
@@ -1453,6 +1486,7 @@ class V2FormalStageTrainer:
                 else:
                     self.engine.replay.mark_failure_slots(slot_refs, failure=True)
                 actor_updates = [value for value in update_metrics if value.actor_updated]
+                activity_updates = [value for value in actor_updates if value.actor_batch_spike_rate_l1 is not None]
                 episode_record = {
                     'episode': len(self.result.episodes) + 1,
                     'stage': self.config.stage,
@@ -1467,6 +1501,12 @@ class V2FormalStageTrainer:
                     'policy_warmup_steps': episode_warmup_steps,
                     'critic_loss': mean([value.critic_loss for value in update_metrics]) if update_metrics else 0.0,
                     'actor_loss': mean([value.actor_loss for value in actor_updates]) if actor_updates else 0.0,
+                    'rl_actor_loss': mean(value.rl_actor_loss for value in actor_updates) if actor_updates else None,
+                    'scaled_rl_actor_loss': mean(value.scaled_rl_actor_loss for value in actor_updates) if actor_updates else None,
+                    'actor_batch_spike_rate_l1': mean(value.actor_batch_spike_rate_l1 for value in activity_updates) if activity_updates else None,
+                    'spike_regularization_loss': mean(value.spike_regularization_loss for value in activity_updates) if activity_updates else None,
+                    'spike_beta_eff': mean(value.spike_beta_eff for value in activity_updates) if activity_updates else None,
+                    'weighted_spike_regularization': mean(value.weighted_spike_regularization for value in activity_updates) if activity_updates else None,
                     'bc_loss': mean([value.bc_loss for value in actor_updates]) if actor_updates else 0.0,
                     'weighted_bc_contribution': mean([value.bc_loss * value.bc_lambda for value in actor_updates]) if actor_updates else 0.0,
                     'terminal_geo_loss': mean([value.terminal_geo_loss for value in actor_updates]) if actor_updates else 0.0,
@@ -1515,6 +1555,8 @@ class V2FormalStageTrainer:
                         self.engine.actor.train(was_training)
                     episode_record['snn_spike_rate_l1'] = snn_spike_diagnostics['spike_rate_l1']
                     episode_record['snn_spike_rate_l2'] = snn_spike_diagnostics['spike_rate_l2']
+                    episode_record['episode_terminal_spike_rate_l1'] = snn_spike_diagnostics['spike_rate_l1']
+                    episode_record['episode_terminal_spike_rate_l2'] = snn_spike_diagnostics['spike_rate_l2']
                 self.result.episodes.append(episode_record)
                 if self.reporter is not None:
                     reporting_record = dict(episode_record)
@@ -1702,7 +1744,7 @@ def build_v2_formal_checkpoint(
         'stage': result.stage,
         'passed_validation': result.passed_validation,
         'engine_checkpoint': engine.checkpoint_state_dict(),
-        'formal_config': config.to_dict(),
+        'formal_config': {**config.to_dict(), 'spike_regularization': engine.spike_regularization.to_dict()},
         'scenario_config': scenario_config_snapshot(scenario),
         'reward_config': _strict_json_copy(asdict(rewards)),
         'uav_collision_radius': radius,
@@ -1760,7 +1802,7 @@ def build_v2_periodic_snapshot(
         'stage': config.stage,
         'stage_steps': steps,
         'engine_checkpoint': engine.checkpoint_state_dict(),
-        'formal_config': config.to_dict(),
+        'formal_config': {**config.to_dict(), 'spike_regularization': engine.spike_regularization.to_dict()},
         'scenario_config': scenario_config_snapshot(scenario),
         'reward_config': _strict_json_copy(asdict(rewards)),
         'uav_collision_radius': radius,
@@ -1838,12 +1880,14 @@ def load_v2_periodic_snapshot(
     if (
         not isinstance(engine_payload, dict)
         or engine_payload.get('format') != expected_engine_format
-        or engine_payload.get('format_version') != expected_engine_version
+        or engine_payload.get('format_version') not in (expected_engine_version, expected_engine_version + 1)
     ):
         raise ValueError('Periodic V2 snapshot engine payload is incompatible.')
     formal_config = payload['formal_config']
     if not isinstance(formal_config, dict) or formal_config.get('stage') != stage:
         raise ValueError('Periodic V2 snapshot config is incompatible.')
+    _architecture_from_engine_payload(engine_payload, model_type=model_type)
+    _validate_policy_training_snapshot_config(payload, model_type)
     scenario = scenario_config_from_snapshot(payload['scenario_config'])
     reward_config = payload['reward_config']
     if not isinstance(reward_config, dict):
@@ -1861,6 +1905,33 @@ def load_v2_periodic_snapshot(
     if not isinstance(payload['initialization_source'], dict):
         raise ValueError('Periodic V2 snapshot initialization source is invalid.')
     return payload
+
+
+def _validate_policy_training_snapshot_config(payload, model_type):
+    engine = payload['engine_checkpoint']
+    algorithm = engine['algorithm_config']
+    if not isinstance(payload['formal_config'], dict):
+        raise ValueError('V2 snapshot formal training configuration must be a dict.')
+    formal = dict(payload['formal_config'])
+    payload['formal_config'] = formal
+    if 'spike_regularization' not in formal:
+        if 'spike_regularization' in algorithm or 'policy_head' in engine['architecture']:
+            raise ValueError('New policy snapshot is missing formal spike_regularization.')
+        formal['spike_regularization'] = V2SpikeRegularizationConfig().to_dict()
+    effective = V2SpikeRegularizationConfig.from_snapshot(formal['spike_regularization'])
+    effective.validate_model(model_type)
+    algorithm_config = V2SpikeRegularizationConfig.from_snapshot(algorithm.get('spike_regularization', V2SpikeRegularizationConfig().to_dict()))
+    if effective != algorithm_config:
+        raise ValueError('Formal and engine spike_regularization configurations disagree.')
+    values = dict(formal)
+    try:
+        noise = V2NoiseSchedule(**values.pop('noise_schedule'))
+        values['spike_regularization'] = effective
+        restored = V2FormalTrainingConfig(noise_schedule=noise, **values)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise ValueError('V2 snapshot formal training configuration is incompatible.') from exc
+    if restored.to_dict() != formal:
+        raise ValueError('V2 snapshot formal training configuration does not round-trip.')
 
 
 def save_v2_formal_checkpoint(path: str | Path, payload: Mapping[str, Any]) -> None:
@@ -1942,24 +2013,15 @@ def load_v2_formal_checkpoint(
         if model_type == 'ann'
         else V2_SNN_TD3_CHECKPOINT_VERSION
     )
-    if not isinstance(engine_payload, dict) or engine_payload.get('format') != expected_engine_format or engine_payload.get('format_version') != expected_engine_version:
+    if not isinstance(engine_payload, dict) or engine_payload.get('format') != expected_engine_format or engine_payload.get('format_version') not in (expected_engine_version, expected_engine_version + 1):
         raise ValueError('Formal V2 checkpoint engine payload is incompatible.')
     if model_type == 'snn' and engine_payload.get('model_type') != 'snn':
         raise ValueError('Formal V2 SNN engine model_type is incompatible.')
+    _architecture_from_engine_payload(engine_payload, model_type=model_type)
+    _validate_policy_training_snapshot_config(payload, model_type)
     formal_config = payload['formal_config']
     if not isinstance(formal_config, dict) or formal_config.get('stage') != stage:
         raise ValueError('Formal V2 checkpoint config is incompatible.')
-    config_values = dict(formal_config)
-    try:
-        noise_values = config_values.pop('noise_schedule')
-        restored_config = V2FormalTrainingConfig(
-            noise_schedule=V2NoiseSchedule(**noise_values),
-            **config_values,
-        )
-    except (TypeError, ValueError) as exc:
-        raise ValueError('Formal V2 checkpoint config is incompatible.') from exc
-    if restored_config.to_dict() != formal_config:
-        raise ValueError('Formal V2 checkpoint config does not round-trip.')
     scenario = scenario_config_from_snapshot(payload['scenario_config'])
     reward_config = payload['reward_config']
     if not isinstance(reward_config, dict):

@@ -665,6 +665,10 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                     'scenario_config': scenario_config_snapshot(scenario),
                     'reward_config': asdict(rewards),
                     'uav_collision_radius': 0.75,
+                    'engine_checkpoint': {
+                        'architecture': {'actor_hidden_dim': actor.hidden_dim},
+                        'algorithm_config': {},
+                    },
                 },
                 torch_rng_state=torch.get_rng_state().clone(),
             )

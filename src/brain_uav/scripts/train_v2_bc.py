@@ -17,6 +17,7 @@ from brain_uav.models import (
     require_v2_spikingjelly,
 )
 from brain_uav.models.zone_set_encoder import ZoneSetEncoderConfig
+from brain_uav.models.v2_policy_config import policy_head_metadata, V2SpikeRegularizationConfig
 from brain_uav.observations import V2ObservationScales
 from brain_uav.scripts.common import DEVICE_CHOICES, resolve_training_device
 from brain_uav.trainers.v2_bc import (
@@ -96,6 +97,7 @@ def build_v2_bc_actor(
     model: str = 'ann',
     snn_time_window: int = 4,
     snn_tau: float = 2.0,
+    actor_projection_dim: int | None = None,
 ) -> V2ANNPolicyActor | V2SNNPolicyActor:
     """Construct one strict V2 actor from bound trajectory provenance."""
 
@@ -127,6 +129,7 @@ def build_v2_bc_actor(
         action_limit=action_limit,
         uav_radius=cluster.uav_collision_radius,
         encoder_config=encoder_config,
+        projection_dim=actor_projection_dim,
     )
     if model == 'ann':
         return V2ANNPolicyActor(**common)
@@ -150,6 +153,8 @@ def train_v2_behavior_cloning(
     training_config: TrainingConfig | None = None,
     model: str = 'ann',
     snn_time_window: int = 4,
+    actor_projection_dim: int | None = None,
+    actor_hidden_dim: int | None = None,
     shard_cache_mb: float = 256.0,
     deduplicate_identical_trajectories: bool = False,
 ) -> dict[str, Any]:
@@ -207,7 +212,8 @@ def train_v2_behavior_cloning(
     set_global_seed(run_config.seed)
     actor = build_v2_bc_actor(
         cluster,
-        actor_hidden_dim=defaults.hidden_dim,
+        actor_hidden_dim=defaults.hidden_dim if actor_hidden_dim is None else actor_hidden_dim,
+        actor_projection_dim=actor_projection_dim,
         encoder_config=ZoneSetEncoderConfig(),
         model=model,
         snn_time_window=snn_time_window,
@@ -267,6 +273,8 @@ def train_v2_behavior_cloning(
             'epochs': run_config.epochs,
             'batch_size': run_config.batch_size,
             'learning_rate': run_config.learning_rate,
+            'policy_structure': {'actor_hidden_dim': actor.hidden_dim, **policy_head_metadata(actor)},
+            'spike_regularization': V2SpikeRegularizationConfig().to_dict(),
             'validation_fraction': run_config.validation_fraction,
             'requested_device': requested_device,
             'resolved_device': resolved_device,
@@ -326,6 +334,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--model', choices=('ann', 'snn'), default='ann')
     parser.add_argument('--snn-time-window', type=int, default=4)
+    parser.add_argument('--actor-projection-dim', type=int, default=None)
+    parser.add_argument('--actor-hidden-dim', type=int, default=None)
     parser.add_argument('--shard-cache-mb', type=float, default=256.0)
     parser.add_argument(
         '--deduplicate-identical-trajectories',
@@ -347,6 +357,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         device=args.device,
         model=args.model,
         snn_time_window=args.snn_time_window,
+        actor_projection_dim=args.actor_projection_dim,
+        actor_hidden_dim=args.actor_hidden_dim,
         shard_cache_mb=args.shard_cache_mb,
         deduplicate_identical_trajectories=(
             args.deduplicate_identical_trajectories

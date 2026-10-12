@@ -48,6 +48,7 @@ class V2ANNPolicyActor(nn.Module):
         *,
         uav_radius: float = 0.0,
         encoder_config: ZoneSetEncoderConfig | None = None,
+        projection_dim: int | None = None,
     ) -> None:
         super().__init__()
         if not isinstance(scales, V2ObservationScales):
@@ -77,8 +78,13 @@ class V2ANNPolicyActor(nn.Module):
             uav_radius=uav_radius,
             config=encoder_config,
         )
+        if projection_dim is not None and type(projection_dim) is not int:
+            raise ValueError('projection_dim must be a positive integer.')
+        self.projection_dim = None if projection_dim is None else _positive_int(projection_dim, name='projection_dim')
+        self.projection = nn.Identity() if self.projection_dim is None else nn.Linear(self.zone_set_encoder.output_dim, self.projection_dim)
+        _reset_linear_layers(self.projection)
         self.head = nn.Sequential(
-            nn.Linear(self.zone_set_encoder.output_dim, self.hidden_dim),
+            nn.Linear(self.projection_dim or self.zone_set_encoder.output_dim, self.hidden_dim),
             nn.LeakyReLU(0.01),
             nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.LeakyReLU(0.01),
@@ -123,7 +129,7 @@ class V2ANNPolicyActor(nn.Module):
             token_pair_relations,
             relation_pair_mask,
         )
-        return self.head(context) * self.action_limit
+        return self.head(self.projection(context)) * self.action_limit
 
     def enable_compiled_full_forward(
         self,
@@ -199,7 +205,7 @@ class V2ANNPolicyActor(nn.Module):
             shared_relations=shared_relations,
             profile_sections=profile_sections,
         )
-        return self.head(context) * self.action_limit
+        return self.head(self.projection(context)) * self.action_limit
 
 
 class V2ANNCritic(nn.Module):

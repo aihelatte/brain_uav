@@ -38,6 +38,7 @@ import torch
 from brain_uav.config import RewardConfig
 from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
 from brain_uav.models import V2ANNCritic, V2ANNPolicyActor, V2SNNPolicyActor
+from brain_uav.models.v2_policy_config import projection_from_architecture
 from brain_uav.observations import collate_v2_observations
 from brain_uav.scripts.common import DEVICE_CHOICES, resolve_training_device
 from brain_uav.trainers.v2_formal_training import (
@@ -91,11 +92,13 @@ def load_actor_and_critics(
             return V2ANNPolicyActor(
                 scales, int(action_high.shape[0]), actor_hidden, action_high,
                 uav_radius=radius, encoder_config=encoder_config,
+                projection_dim=projection_from_architecture(engine_payload['architecture']),
             )
         return V2SNNPolicyActor(
             scales, int(action_high.shape[0]), actor_hidden, action_high,
             time_window=snn_metadata['time_window'], tau=snn_metadata['tau'],
             uav_radius=radius, encoder_config=encoder_config,
+            projection_dim=projection_from_architecture(engine_payload['architecture']),
         )
 
     actor = build_actor()

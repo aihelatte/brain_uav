@@ -23,6 +23,7 @@ from torch.nn import functional as F
 
 from brain_uav.config import ScenarioConfig
 from brain_uav.models import V2ANNPolicyActor, V2SNNPolicyActor
+from brain_uav.models.v2_policy_config import V2SpikeRegularizationConfig, policy_head_metadata, projection_from_architecture
 from brain_uav.models.zone_set_encoder import ZoneSetEncoderConfig
 from brain_uav.observations import (
     EGO_FEATURE_DIM,
@@ -1059,6 +1060,7 @@ def _actor_architecture(actor: V2ANNPolicyActor | V2SNNPolicyActor) -> dict[str,
         'encoder_config': asdict(actor.encoder_config),
         'uav_radius': actor.uav_radius,
         'actor_hidden_dim': actor.hidden_dim,
+        **policy_head_metadata(actor),
     }
 
 
@@ -1113,7 +1115,8 @@ def _build_v2_bc_checkpoint_common(
     action_low, action_high = _cluster_action_bounds(cluster)
     return {
         'format': V2_BC_CHECKPOINT_FORMAT,
-        'format_version': V2_BC_CHECKPOINT_VERSION,
+        'format_version': V2_BC_CHECKPOINT_VERSION + int(actor.projection_dim is not None),
+        **({'spike_regularization': V2SpikeRegularizationConfig().to_dict()} if actor.projection_dim is not None else {}),
         'checkpoint_kind': checkpoint_kind,
         'observation_contract': v2_bc_observation_contract(),
         'architecture': _actor_architecture(actor),
@@ -1199,7 +1202,7 @@ def build_v2_snn_bc_checkpoint_payload(
         finished_at=finished_at,
     )
     common['format'] = V2_SNN_BC_CHECKPOINT_FORMAT
-    common['format_version'] = V2_SNN_BC_CHECKPOINT_VERSION
+    common['format_version'] = V2_SNN_BC_CHECKPOINT_VERSION + int(actor.projection_dim is not None)
     common['model_type'] = 'snn'
     common['architecture'] = _snn_actor_architecture(actor)
     return common
@@ -1293,20 +1296,28 @@ def _validate_checkpoint_payload(
             f'checkpoint format must be {V2_BC_CHECKPOINT_FORMAT!r}; '
             'legacy flat BC checkpoints are not supported.'
         )
-    if payload.get('format_version') != V2_BC_CHECKPOINT_VERSION:
+    if payload.get('format_version') not in (V2_BC_CHECKPOINT_VERSION, V2_BC_CHECKPOINT_VERSION + 1):
         raise ValueError('Unsupported V2 BC checkpoint format_version.')
-    if set(payload) != _CHECKPOINT_FIELDS:
+    if set(payload) != _CHECKPOINT_FIELDS | ({'spike_regularization'} if payload['format_version'] == 2 else set()):
         raise ValueError('V2 BC checkpoint has missing or unknown fields.')
+    if payload['format_version'] == 2:
+        if V2SpikeRegularizationConfig.from_snapshot(payload['spike_regularization']).beta_max != 0:
+            raise ValueError('BC spike regularization must be disabled.')
     if payload['checkpoint_kind'] not in ('best', 'final'):
         raise ValueError('V2 BC checkpoint_kind is invalid.')
     if payload['observation_contract'] != v2_bc_observation_contract():
         raise ValueError('V2 BC observation contract is incompatible.')
 
     architecture = payload['architecture']
+    if type(architecture) is not dict:
+        raise ValueError('V2 BC checkpoint architecture is invalid.')
+    if ('policy_head' in architecture) != (payload['format_version'] == V2_BC_CHECKPOINT_VERSION + 1):
+        raise ValueError('BC format version and policy_head schema disagree.')
     if type(architecture) is not dict or set(architecture) != {
         'scales', 'encoder_config', 'uav_radius', 'actor_hidden_dim'
-    }:
+    } | ({'policy_head'} if 'policy_head' in architecture else set()):
         raise ValueError('V2 BC checkpoint architecture is invalid.')
+    projection_from_architecture(architecture)
     try:
         scales = V2ObservationScales(**architecture['scales'])
         encoder_config = ZoneSetEncoderConfig(**architecture['encoder_config'])
@@ -1488,9 +1499,9 @@ def _validate_snn_checkpoint_payload(
             f'checkpoint format must be {V2_SNN_BC_CHECKPOINT_FORMAT!r}; '
             'ANN and legacy flat BC checkpoints are not supported.'
         )
-    if payload.get('format_version') != V2_SNN_BC_CHECKPOINT_VERSION:
+    if payload.get('format_version') not in (V2_SNN_BC_CHECKPOINT_VERSION, V2_SNN_BC_CHECKPOINT_VERSION + 1):
         raise ValueError('Unsupported V2 SNN BC checkpoint format_version.')
-    if set(payload) != _SNN_CHECKPOINT_FIELDS or payload.get('model_type') != 'snn':
+    if set(payload) != _SNN_CHECKPOINT_FIELDS | ({'spike_regularization'} if payload['format_version'] == 2 else set()) or payload.get('model_type') != 'snn':
         raise ValueError('V2 SNN BC checkpoint has missing, unknown, or invalid fields.')
     architecture = payload.get('architecture')
     expected_fields = {
@@ -1503,6 +1514,8 @@ def _validate_snn_checkpoint_payload(
         'surrogate',
         'backend',
     }
+    if isinstance(architecture, dict) and 'policy_head' in architecture:
+        expected_fields.add('policy_head')
     if type(architecture) is not dict or set(architecture) != expected_fields:
         raise ValueError('V2 SNN BC checkpoint architecture is invalid.')
     time_window = _positive_int(architecture['time_window'], name='time_window')
@@ -1515,11 +1528,13 @@ def _validate_snn_checkpoint_payload(
     common = deepcopy(payload)
     common.pop('model_type')
     common['format'] = V2_BC_CHECKPOINT_FORMAT
-    common['format_version'] = V2_BC_CHECKPOINT_VERSION
+    common['format_version'] = payload['format_version']
     common['architecture'] = {
         name: deepcopy(architecture[name])
         for name in ('scales', 'encoder_config', 'uav_radius', 'actor_hidden_dim')
     }
+    if 'policy_head' in architecture:
+        common['architecture']['policy_head'] = deepcopy(architecture['policy_head'])
     scales, encoder, radius, hidden, low, high = _validate_checkpoint_payload(common)
     return scales, encoder, radius, hidden, low, high, time_window, tau
 
@@ -1572,6 +1587,9 @@ def load_v2_bc_actor_checkpoint(
     scales, encoder_config, uav_radius, hidden_dim, _, action_high = (
         _validate_checkpoint_payload(payload)
     )
+    projection_dim = projection_from_architecture(payload['architecture'])
+    if expected_actor is not None and expected_actor.projection_dim != projection_dim:
+        raise ValueError('expected_actor projection does not match BC checkpoint.')
     if expected_actor is None:
         actor = V2ANNPolicyActor(
             scales=scales,
@@ -1580,6 +1598,7 @@ def load_v2_bc_actor_checkpoint(
             action_limit=torch.from_numpy(action_high.copy()),
             uav_radius=uav_radius,
             encoder_config=encoder_config,
+            projection_dim=projection_dim,
         )
     else:
         _validate_expected_actor(
@@ -1621,6 +1640,9 @@ def load_v2_snn_bc_actor_checkpoint(
         time_window,
         tau,
     ) = _validate_snn_checkpoint_payload(payload)
+    projection_dim = projection_from_architecture(payload['architecture'])
+    if expected_actor is not None and expected_actor.projection_dim != projection_dim:
+        raise ValueError('expected_actor projection does not match BC checkpoint.')
     if payload['checkpoint_kind'] != 'best':
         raise ValueError('V2 SNN TD3 initialization requires a best BC checkpoint.')
     if expected_actor is None:
@@ -1633,6 +1655,7 @@ def load_v2_snn_bc_actor_checkpoint(
             tau=tau,
             uav_radius=uav_radius,
             encoder_config=encoder_config,
+            projection_dim=projection_dim,
         )
     else:
         _validate_expected_snn_actor(
