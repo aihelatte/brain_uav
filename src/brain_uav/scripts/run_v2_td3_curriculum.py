@@ -64,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     # unless explicitly overridden with --no-<flag>.
     parser.add_argument('--window-update-statistics', action='store_true')
     parser.add_argument('--reuse-update-buffers', action='store_true')
+    parser.add_argument('--cuda-graph-critic-tail', action='store_true', help='Capture checked fused critic Adam and optional critic target updates; requires CUDA.')
     parser.add_argument('--compile-critic-encoder', action='store_true')
     parser.add_argument('--compile-target-encoders', action='store_true')
     parser.add_argument(
@@ -258,6 +259,7 @@ def run_v2_curriculum(
     reduce_update_stat_syncs: bool = False,
     window_update_statistics: bool = False,
     reuse_update_buffers: bool = False,
+    cuda_graph_critic_tail: bool = False,
     pinned_batch_transfer: bool = False,
     cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
@@ -269,7 +271,7 @@ def run_v2_curriculum(
         raise ValueError('model must be "ann" or "snn".')
     if cache_actor_loss_coefficients and not compile_actor_loss:
         raise ValueError('cache_actor_loss_coefficients requires compile_actor_loss.')
-    for name, value in (('window_update_statistics', window_update_statistics), ('reuse_update_buffers', reuse_update_buffers)):
+    for name, value in (('window_update_statistics', window_update_statistics), ('reuse_update_buffers', reuse_update_buffers), ('cuda_graph_critic_tail', cuda_graph_critic_tail)):
         if type(value) is not bool:
             raise TypeError(f'{name} must be a bool.')
     if type(reduce_update_stat_syncs) is not bool:
@@ -438,6 +440,7 @@ def run_v2_curriculum(
             reduce_update_stat_syncs=reduce_update_stat_syncs,
             window_update_statistics=window_update_statistics,
             reuse_update_buffers=reuse_update_buffers,
+            cuda_graph_critic_tail=cuda_graph_critic_tail,
             pinned_batch_transfer=pinned_batch_transfer,
             cuda_graph_updates=cuda_graph_updates,
             cuda_graph_actor_update=cuda_graph_actor_update,
@@ -496,6 +499,7 @@ def run_v2_curriculum(
             'aggregate_relation_values_first': aggregate_relation_values_first,
             'window_update_statistics': window_update_statistics,
             'reuse_update_buffers': reuse_update_buffers,
+            'cuda_graph_critic_tail': cuda_graph_critic_tail,
             'reduce_update_stat_syncs': reduce_update_stat_syncs,
             'pinned_batch_transfer': pinned_batch_transfer,
             'cuda_graph_updates': cuda_graph_updates,
@@ -525,7 +529,7 @@ def main(argv: list[str] | None = None) -> int:
     resolved_device = resolve_training_device(args.device)
     print(json.dumps({
         'local_optimizations_requested': {'window_update_statistics': args.window_update_statistics,
-                                          'reuse_update_buffers': args.reuse_update_buffers},
+                                          'reuse_update_buffers': args.reuse_update_buffers, 'cuda_graph_critic_tail': args.cuda_graph_critic_tail},
         'requested_device': args.device,
         'resolved_device': resolved_device,
         'model_type': args.model,
@@ -582,6 +586,7 @@ def main(argv: list[str] | None = None) -> int:
         reduce_update_stat_syncs=compilation['reduce_update_stat_syncs'],
         window_update_statistics=args.window_update_statistics,
         reuse_update_buffers=args.reuse_update_buffers,
+        cuda_graph_critic_tail=args.cuda_graph_critic_tail,
         pinned_batch_transfer=args.pinned_batch_transfer,
         cuda_graph_updates=compilation['cuda_graph_updates'],
         cuda_graph_actor_update=compilation['cuda_graph_actor_update'],

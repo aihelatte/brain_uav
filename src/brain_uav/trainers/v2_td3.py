@@ -546,6 +546,7 @@ class V2TD3UpdateEngine:
         reduce_update_stat_syncs: bool = False,
         window_update_statistics: bool = False,
         reuse_update_buffers: bool = False,
+        cuda_graph_critic_tail: bool = False,
         pinned_batch_transfer: bool = False,
         spike_regularization: V2SpikeRegularizationConfig | None = None,
     ) -> None:
@@ -598,6 +599,12 @@ class V2TD3UpdateEngine:
                 raise TypeError(f'{name} must be a bool.')
         self.window_update_statistics = window_update_statistics
         self.reuse_update_buffers = reuse_update_buffers
+        if type(cuda_graph_critic_tail) is not bool:
+            raise TypeError('cuda_graph_critic_tail must be a bool.')
+        if cuda_graph_critic_tail and (self.device.type != 'cuda' or not fused_adam):
+            raise ValueError('cuda_graph_critic_tail requires CUDA and fused Adam.')
+        self.cuda_graph_critic_tail = cuda_graph_critic_tail
+        self._critic_tail = None
         self._pending_update_metrics: list[V2TD3UpdateMetrics] = []
         self._defer_statistics = False
         self._statistic_buffers: dict[tuple, torch.Tensor] = {}
@@ -702,6 +709,7 @@ class V2TD3UpdateEngine:
             list(self.critic1.parameters()) + list(self.critic2.parameters()),
             lr=critic_lr_value,
             fused=True if fused_adam else None,
+            capturable=cuda_graph_critic_tail,
         )
         self._cached_actor_parameters = tuple(self.actor.parameters())
         self._cached_critic_parameters = tuple(self.critic1.parameters()) + tuple(self.critic2.parameters())
@@ -3225,23 +3233,25 @@ class V2TD3UpdateEngine:
                     component='critic',
                     total_steps=total_steps_value,
                 )
+        critic_targets_updated = total_steps_value % self.policy_delay == 0
+        actor_updated = critic_targets_updated and total_steps_value > self.actor_freeze_steps
         with update_timing.section('critic_optimizer_step'):
-            if profile_sections or diagnostic_profile_sections:
+            if self.cuda_graph_critic_tail:
+                if self._critic_tail is None:
+                    from .v2_critic_tail import CriticUpdateTail
+                    self._critic_tail = CriticUpdateTail(self)
+                self._critic_tail.step(critic_targets_updated)
+            elif profile_sections or diagnostic_profile_sections:
                 with record_function('v2_td3.critic_optimizer_step'):
                     self.critic_optimizer.step()
             else:
                 self.critic_optimizer.step()
-
-        critic_targets_updated = total_steps_value % self.policy_delay == 0
-        actor_updated = (
-            critic_targets_updated
-            and total_steps_value > self.actor_freeze_steps
-        )
         if critic_targets_updated:
-            with update_timing.section('target_soft_update'):
-                self._soft_update(self.critic1, self.critic1_target)
-                self._soft_update(self.critic2, self.critic2_target)
-                self.critic_target_update_count += 1
+            if not self.cuda_graph_critic_tail:
+                with update_timing.section('target_soft_update'):
+                    self._soft_update(self.critic1, self.critic1_target)
+                    self._soft_update(self.critic2, self.critic2_target)
+            self.critic_target_update_count += 1
 
         actor_terms: _ActorLossTerms | None = None
         actor_grad_norm_tensor = torch.zeros((), device=current_q1_detached.device)
@@ -3398,9 +3408,17 @@ class V2TD3UpdateEngine:
         return metrics
 
     def local_optimization_metadata(self) -> dict[str, Any]:
-        return {name: {'requested': getattr(self, name), 'effective': getattr(self, name),
+        metadata = {name: {'requested': getattr(self, name), 'effective': getattr(self, name),
                        'reason': 'explicit opt-in; device-independent path'}
                 for name in ('window_update_statistics', 'reuse_update_buffers')}
+        metadata['cuda_graph_critic_tail'] = {
+            'requested': self.cuda_graph_critic_tail,
+            'effective': self._critic_tail is not None and bool(self._critic_tail.graphs),
+            'reason': ('captured checked critic tail' if self._critic_tail and self._critic_tail.graphs else 'disabled or capture pending until checked gradients'),
+            'capture_seconds': self._critic_tail.capture_seconds if self._critic_tail else 0.0,
+            'replays': self._critic_tail.replays if self._critic_tail else 0,
+        }
+        return metadata
 
     def flush_update_statistics(self) -> None:
         """Finalize log-only scalars before consuming metrics, reporting or saving.
@@ -3955,6 +3973,7 @@ class V2TD3UpdateEngine:
 
         self.flush_update_statistics()
         self._statistic_buffers.clear()
+        self._critic_tail = None  # Checkpoint loading invalidates captured optimizer addresses.
         state_targets = self._validated_network_state_targets(payload)
         for key, model in state_targets:
             model.load_state_dict(payload[key], strict=True)
@@ -3974,6 +3993,7 @@ class V2TD3UpdateEngine:
 
         self.flush_update_statistics()
         self._statistic_buffers.clear()
+        self._critic_tail = None  # Checkpoint loading invalidates captured optimizer addresses.
         state_targets = self._validated_network_state_targets(payload)
         if 'algorithm_config' not in payload:
             raise ValueError('checkpoint is missing algorithm_config.')
