@@ -3360,9 +3360,14 @@ def _run_diagnostic_level(
     window_update_statistics: bool = False,
     reuse_update_buffers: bool = False,
     cuda_graph_critic_tail: bool = False,
+    critic_tail_internal_timing: bool = False,
     controlled_stage_step_offset: int = 0,
     bc_schedule: str = 'default',
 ) -> dict[str, Any]:
+    if type(critic_tail_internal_timing) is not bool:
+        raise TypeError('critic_tail_internal_timing must be a bool.')
+    if critic_tail_internal_timing and not cuda_graph_critic_tail:
+        raise ValueError('Internal timing requires the critic tail path.')
     scenario_count = len(pool.scenarios)
     if scenario_count == 0 or measured_steps < scenario_count:
         raise ValueError('measured_steps must cover every fixed-pool scenario.')
@@ -3741,6 +3746,10 @@ def _run_diagnostic_level(
                 if device.type == 'cuda':
                     torch.cuda.synchronize(device)
                 loop_warmup_wall_seconds = perf_counter() - loop_warmup_started
+                if critic_tail_internal_timing:
+                    if engine._critic_tail is None or not engine._critic_tail.graphs:
+                        raise RuntimeError('Critic tail must be captured during warmup before internal timing.')
+                    engine._critic_tail.reset_internal_timing(enabled=True)
                 measured_started = perf_counter()
                 actor_updates_before = engine.actor_update_count
                 critic_updates_before = engine.critic_update_count
@@ -4050,6 +4059,8 @@ def _run_diagnostic_level(
         'warmup_actor_updates': actor_updates_before,
         'measured_steps': measured_steps,
         'local_optimizations': engine.local_optimization_metadata(),
+        'critic_tail_internal_timing': (engine._critic_tail.internal_timing_report()
+            if engine._critic_tail is not None else {'enabled': False, 'calls': 0}),
         'critic_tail_timing_note': 'Critic optimizer section includes stable gradient copies and optional critic targets; target_soft_update still includes actor targets.',
         'controlled_stage_step_offset': controlled_stage_step_offset,
         'bc_schedule': bc_schedule,
@@ -4965,6 +4976,8 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
 
     if sum(bool(getattr(args, name)) for name in ('local_optimization_comparison', 'local_optimization_correctness', 'critic_tail_comparison', 'critic_tail_correctness')) > 1:
         raise ValueError('Select exactly one comparison/correctness mode.')
+    if args.critic_tail_internal_timing and not args.critic_tail_comparison:
+        raise ValueError('--critic-tail-internal-timing requires --critic-tail-comparison (timing only).')
     if args.validation_pool is None:
         raise ValueError('--validation-pool is required for A/B/C comparison.')
     if args.detailed_profiler_updates or args.compiled_performance_diagnostic_updates:
@@ -5057,6 +5070,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 reduce_update_stat_syncs=True, cache_ellipsoid_segment_clearance=True,
                 window_update_statistics=window, reuse_update_buffers=buffers,
                 cuda_graph_critic_tail=args.critic_tail_comparison and group == 'B',
+                critic_tail_internal_timing=args.critic_tail_internal_timing and group == 'B',
                 controlled_stage_step_offset=offset, bc_schedule=args.comparison_bc_schedule, **compilation)
             result['server_load_before'] = before
             result['server_load_after'] = load_snapshot()
@@ -5086,6 +5100,8 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
         'compilation_requested': compilation,
         'explicit_cpu_smoke_override': args.comparison_eager_cpu,
         'bc_schedule': args.comparison_bc_schedule,
+        'critic_tail_internal_timing_requested': args.critic_tail_internal_timing,
+        'final_speed_acceptance': False if args.critic_tail_internal_timing else None,
         'comparison_kind': 'checked_critic_tail' if args.critic_tail_comparison else 'local_optimizations',
         'steps': steps, 'repeats': repeats, 'runs': runs,
         'comparison': {group: {'mean_wall_seconds': averages[group],
@@ -5106,6 +5122,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--scenario-pool-dir', type=Path)
     parser.add_argument('--local-optimization-comparison', action='store_true')
     parser.add_argument('--critic-tail-correctness', action='store_true', help='CUDA old path vs checked critic-tail correctness, separate from timing.')
+    parser.add_argument('--critic-tail-internal-timing', action='store_true', help='Diagnostic CPU wall aggregation during critic-tail A/B measurement; adds instrumentation overhead.')
     parser.add_argument('--critic-tail-comparison', action='store_true', help='CUDA A/B short timing with both local optimizations disabled.')
     parser.add_argument('--local-optimization-correctness', action='store_true',
         help='Separate short CUDA A/B/C correctness check; never a throughput measurement.')
@@ -5226,6 +5243,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.critic_tail_internal_timing and not args.critic_tail_comparison:
+        raise ValueError('--critic-tail-internal-timing requires --critic-tail-comparison (timing only).')
     if args.local_optimization_comparison or args.local_optimization_correctness or args.critic_tail_correctness or args.critic_tail_comparison:
         run_local_optimization_comparison(args)
         return

@@ -11,6 +11,32 @@ class CriticUpdateTail:
         self.signature = None
         self.capture_seconds = 0.0
         self.replays = 0
+        self.reset_internal_timing()
+
+    def reset_internal_timing(self, *, enabled=False):
+        """Diagnostic-only measurement window; capture/warmup remain separate."""
+        if type(enabled) is not bool:
+            raise TypeError('enabled must be a bool.')
+        self.internal_timing_enabled = enabled
+        self._timing_calls = 0
+        self._timing_seconds = dict.fromkeys(
+            ('checks', 'gradient_copy_submission', 'replay_submission', 'total'), 0.0)
+
+    def internal_timing_report(self):
+        values = dict(self._timing_seconds)
+        values['uncovered'] = values['total'] - sum(
+            values[key] for key in ('checks', 'gradient_copy_submission', 'replay_submission'))
+        return {
+            'enabled': self.internal_timing_enabled,
+            'calls': self._timing_calls,
+            'total_seconds': values,
+            'average_seconds': {key: value / self._timing_calls if self._timing_calls else None
+                                for key, value in values.items()},
+            'capture_and_warmup_seconds': self.capture_seconds,
+            'note': 'CPU wall intervals may include submission and waits, not pure GPU compute. '
+                    'Internal instrumentation has overhead; not a final speed acceptance run. '
+                    'Capture calls are excluded; counters reset at measurement start.',
+        }
 
     def _signature(self):
         e = self.engine
@@ -106,6 +132,9 @@ class CriticUpdateTail:
             self.capture_seconds += perf_counter() - start
 
     def step(self, targets):
+        # A first-call capture is not a steady-state sample. No new clocks when disabled.
+        timed = self.internal_timing_enabled and bool(self.graphs)
+        started = perf_counter() if timed else None
         e = self.engine
         parameters = tuple(p for g in e.critic_optimizer.param_groups for p in g['params'])
         if not self.graphs:
@@ -119,9 +148,22 @@ class CriticUpdateTail:
                 if g is not None:
                     if p.grad.shape != g.shape or p.grad.device != g.device or p.grad.dtype != g.dtype:
                         raise RuntimeError('Critic tail gradient layout changed before parameter update.')
+            if timed:
+                checked = perf_counter()
             for p, g in zip(parameters, self.buffers):
                 if g is not None:
                     g.copy_(p.grad)
+            if timed:
+                copied = perf_counter()
         # Copies and replay use the current stream, with FIFO dependency.
+        if timed:
+            replay_started = perf_counter()
         self.graphs[targets].replay()
         self.replays += 1
+        if timed:
+            finished = perf_counter()
+            self._timing_calls += 1
+            self._timing_seconds['checks'] += checked - started
+            self._timing_seconds['gradient_copy_submission'] += copied - checked
+            self._timing_seconds['replay_submission'] += finished - replay_started
+            self._timing_seconds['total'] += finished - started
