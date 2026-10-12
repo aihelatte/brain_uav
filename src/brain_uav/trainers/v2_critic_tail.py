@@ -9,6 +9,9 @@ class CriticUpdateTail:
         self.graphs = {}
         self.buffers = ()
         self.signature = None
+        self._parameters = ()
+        self._copy_buffers = ()
+        self._gradient_layouts = ()
         self.capture_seconds = 0.0
         self.replays = 0
         self.reset_internal_timing()
@@ -38,19 +41,46 @@ class CriticUpdateTail:
                     'Capture calls are excluded; counters reset at measurement start.',
         }
 
+    @staticmethod
+    def _tensor_signature(value):
+        # Metadata only: preserve address/layout detection without device readback.
+        return (id(value), value.data_ptr(), value.device, value.dtype,
+                value.layout, value.shape, value.stride(), value.storage_offset())
+
+    @staticmethod
+    def _configuration_value(value):
+        # Formal Adam uses scalar settings. Never repr a device tensor (which can sync).
+        if type(value) is tuple:
+            return (tuple, tuple(CriticUpdateTail._configuration_value(v) for v in value))
+        if type(value) not in (bool, int, float, str, type(None)):
+            raise RuntimeError('Critic tail requires scalar optimizer configuration before parameter update.')
+        return (type(value), value)
+
+    def _bind_replay_inputs(self, parameters):
+        self._parameters = tuple(parameters)
+        self._copy_buffers = tuple(g for g in self.buffers if g is not None)
+        self._gradient_layouts = tuple(
+            None if p.grad is None else (p.grad.shape, p.grad.device, p.grad.dtype,
+                                        p.grad.layout, p.grad.stride())
+            for p in parameters)
+
     def _signature(self):
         e = self.engine
         optimizer = e.critic_optimizer
         models = (e.critic1, e.critic2, e.critic1_target, e.critic2_target)
         parameters = tuple(p for model in models for p in model.parameters())
-        group_signature = tuple(tuple((k, repr(v)) for k, v in g.items() if k != 'params')
+        group_signature = tuple(tuple((k, self._configuration_value(v))
+                                      for k, v in g.items() if k != 'params')
                                 for g in optimizer.param_groups)
-        state = tuple((id(p), tuple((k, id(v), v.data_ptr(), v.device, v.dtype, tuple(v.shape))
-                     for k, v in optimizer.state.get(p, {}).items()))
-                     for g in optimizer.param_groups for p in g['params'])
-        return (id(optimizer), tuple((id(p), p.data_ptr(), p.device, p.dtype, tuple(p.shape))
-                for p in parameters), tuple(tuple(id(p) for p in g['params'])
-                for g in optimizer.param_groups), group_signature, state, e.tau)
+        state = tuple((id(p), id(optimizer.state.get(p)),
+                       tuple((k, self._tensor_signature(v))
+                             for k, v in optimizer.state.get(p, {}).items()))
+                      for g in optimizer.param_groups for p in g['params'])
+        return (id(optimizer), id(optimizer.state), tuple(id(model) for model in models),
+                tuple(self._tensor_signature(p) for p in parameters),
+                tuple(tuple(id(p) for p in g['params']) for g in optimizer.param_groups),
+                group_signature, state, self._configuration_value(e.tau),
+                tuple(None if g is None else self._tensor_signature(g) for g in self.buffers))
 
     def _operations(self, targets):
         e = self.engine
@@ -64,6 +94,8 @@ class CriticUpdateTail:
         optimizer = e.critic_optimizer
         if e.device.type != 'cuda' or not all(g.get('fused') and g.get('capturable') for g in optimizer.param_groups):
             raise ValueError('Critic tail capture requires CUDA fused Adam with capturable=True.')
+        if not hasattr(torch, '_foreach_copy_'):
+            raise RuntimeError('Critic tail requires torch._foreach_copy_; no fallback.')
         original_grads = tuple(p.grad for p in parameters)
         self.buffers = tuple(None if g is None else g.detach().clone() for g in original_grads)
         tensors = tuple(p for model in (e.critic1, e.critic2, e.critic1_target, e.critic2_target)
@@ -130,29 +162,34 @@ class CriticUpdateTail:
             for p, g in zip(parameters, original_grads):
                 p.grad = g
             self.capture_seconds += perf_counter() - start
+        self._bind_replay_inputs(parameters)
 
     def step(self, targets):
         # A first-call capture is not a steady-state sample. No new clocks when disabled.
         timed = self.internal_timing_enabled and bool(self.graphs)
         started = perf_counter() if timed else None
         e = self.engine
-        parameters = tuple(p for g in e.critic_optimizer.param_groups for p in g['params'])
         if not self.graphs:
+            parameters = tuple(p for g in e.critic_optimizer.param_groups for p in g['params'])
             self._capture(parameters)
         if self.signature != self._signature():
             raise RuntimeError('Critic tail addresses/configuration changed; invalidate before recapture.')
-        if any((p.grad is None) != (g is None) for p, g in zip(parameters, self.buffers)):
-            raise RuntimeError('Critic tail gradient presence changed before parameter update.')
+        gradients = []
         with torch.no_grad():
-            for p, g in zip(parameters, self.buffers):
-                if g is not None:
-                    if p.grad.shape != g.shape or p.grad.device != g.device or p.grad.dtype != g.dtype:
+            for p, expected in zip(self._parameters, self._gradient_layouts):
+                gradient = p.grad
+                if (gradient is None) != (expected is None):
+                    raise RuntimeError('Critic tail gradient presence changed before parameter update.')
+                if gradient is not None:
+                    layout = (gradient.shape, gradient.device, gradient.dtype, gradient.layout,
+                              gradient.stride())
+                    if layout != expected:
                         raise RuntimeError('Critic tail gradient layout changed before parameter update.')
+                    gradients.append(gradient)
             if timed:
                 checked = perf_counter()
-            for p, g in zip(parameters, self.buffers):
-                if g is not None:
-                    g.copy_(p.grad)
+            if gradients:
+                torch._foreach_copy_(self._copy_buffers, gradients)
             if timed:
                 copied = perf_counter()
         # Copies and replay use the current stream, with FIFO dependency.

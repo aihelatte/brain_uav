@@ -18,6 +18,7 @@ class TestCriticTailTiming(TestCase):
         tail.buffers = tuple(torch.zeros_like(p) for p in parameters)
         tail.graphs = {False: mock.Mock(), True: mock.Mock()}
         tail.signature = tail._signature()
+        tail._bind_replay_inputs(parameters)
         return tail
 
     def test_disabled_does_not_read_clock_or_accumulate(self):
