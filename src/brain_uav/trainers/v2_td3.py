@@ -1472,10 +1472,20 @@ class V2TD3UpdateEngine:
         # No manual graph input/gradient buffers and no nested compiled calls.
         self._compiled_critic_front = None
         self._compiled_actor_objective = None
+        self._merged_bindings = None
         if self._merged_compile_options is not None:
-            models = (self.actor, self.critic1, self.critic2, self.actor_target,
-                      self.critic1_target, self.critic2_target)
-            self._merged_bindings = (models, tuple(tuple(m.parameters()) for m in models))
+            names = ('actor', 'critic1', 'critic2', 'actor_target',
+                     'critic1_target', 'critic2_target')
+            roots = tuple((name, getattr(self, name)) for name in names)
+            # Cache the registration topology, not a promise that it never changes.
+            # Direct dictionary checks retain detection of uncontrolled replacements
+            # without recursive parameters() walks/temporary tuples each update.
+            modules = {}
+            for _, model in roots:
+                for module in model.modules():
+                    modules.setdefault(id(module), (module, module._parameters, module._modules,
+                        tuple(module._parameters.items()), tuple(module._modules.items())))
+            self._merged_bindings = (roots, tuple(modules.values()))
             if self.compile_critic_update_front:
                 self._compiled_critic_front = torch.compile(
                     self._compute_critic_front_tensors, **self._merged_compile_options)
@@ -1484,19 +1494,26 @@ class V2TD3UpdateEngine:
                     _actor_objective_tensor_block, **self._merged_compile_options)
 
     def _validate_merged_bindings(self):
-        # Identity/layout guard only, no data_ptr/repr/state scans or GPU reads.
-        # Optimizers are outside these graphs, so their state is never captured.
-        models = (self.actor, self.critic1, self.critic2, self.actor_target,
-                  self.critic1_target, self.critic2_target)
-        bound, parameters = self._merged_bindings
-        if any(a is not b for a, b in zip(models, bound)):
-            raise RuntimeError('Merged block model replacement requires a new stage engine.')
-        for model, expected in zip(models, parameters):
-            actual = tuple(model.parameters())
-            if len(actual) != len(expected) or any(a is not b for a, b in zip(actual, expected)):
+        # Keep checks before any parameter update, even on A-only critic steps:
+        # replacement can also invalidate optimizers outside the merged block.
+        roots, modules = self._merged_bindings
+        for name, expected in roots:
+            if getattr(self, name) is not expected:
+                raise RuntimeError('Merged block model replacement requires a new stage engine.')
+        for module, parameters, children, expected_parameters, expected_children in modules:
+            if module._modules is not children or len(children) != len(expected_children):
+                raise RuntimeError('Merged block module replacement requires a new stage engine.')
+            for actual_name, (name, child) in zip(children, expected_children):
+                if actual_name != name or children[actual_name] is not child:
+                    raise RuntimeError('Merged block module replacement requires a new stage engine.')
+            if module._parameters is not parameters or len(parameters) != len(expected_parameters):
                 raise RuntimeError('Merged block parameter replacement requires a new stage engine.')
-            if any(p.device != self._merged_device or p.dtype != torch.float32 for p in actual):
-                raise RuntimeError('Merged blocks only support the configured CUDA float32 parameters.')
+            for actual_name, (name, expected) in zip(parameters, expected_parameters):
+                actual = parameters[actual_name]
+                if actual_name != name or actual is not expected:
+                    raise RuntimeError('Merged block parameter replacement requires a new stage engine.')
+                if actual is not None and (actual.device != self._merged_device or actual.dtype != torch.float32):
+                    raise RuntimeError('Merged blocks only support the configured CUDA float32 parameters.')
 
     def merged_update_metadata(self):
         return {name: {'requested': getattr(self, name),

@@ -4803,7 +4803,7 @@ def run_v2_td3_timing_diagnostic(
     return summary
 
 
-TD3_BLOCK_CORRECTNESS_VERSION = 2
+TD3_BLOCK_CORRECTNESS_VERSION = 3
 
 
 def _td3_block_correctness_steps(config, count):
@@ -4846,12 +4846,35 @@ def _td3_gradient_snapshot(engine, *, actor_backward):
 
 
 def _compare_td3_block_snapshot(expected, actual, *, context, report, output=None):
+    retained = set()
     try:
         if expected.keys() != actual.keys():
             key = sorted(expected.keys() ^ actual.keys())[0]
             raise AssertionError('Snapshot fields differ: ' + key)
         for key in expected:
-            exact = not expected[key].is_floating_point() or key.endswith('.step')
+            if (key.startswith('grad.actor.') and not key.endswith('.none')
+                    and not context['actor_backward']):
+                # These are not consumed: the next actor backward first sets all
+                # actor grads to None. Keep presence/shape/type checks and evidence,
+                # but do not treat unused graph-pool storage as a current gradient.
+                if expected[key].shape != actual[key].shape or expected[key].dtype != actual[key].dtype:
+                    raise AssertionError('Retained gradient shape/dtype changed: ' + key)
+                retained.add(key)
+                if not torch.equal(expected[key], actual[key]):
+                    delta = (actual[key].to(torch.float64) - expected[key].to(torch.float64)).abs()
+                    maximum = float(delta.max()) if delta.numel() else 0.0
+                    observation = {k: v for k, v in context.items() if k != 'gradients'}
+                    observation.update(context['gradients'][key], field=key, consumed_by_update=False,
+                        maximum_absolute_error=maximum if isfinite(maximum) else None,
+                        non_finite_difference=not isfinite(maximum))
+                    report.setdefault('retained_gradient_observations', []).append(observation)
+                    if output is not None and 'retained_gradient_evidence_path' not in report:
+                        path = output / 'retained_gradient_change.pt'
+                        torch.save({'context': observation, 'expected': expected[key], 'actual': actual[key]}, path)
+                        report['retained_gradient_evidence_path'] = str(path)
+                continue
+            exact = (not expected[key].is_floating_point() or key.endswith('.step')
+                     or context.get('comparison') == 'adjacent_steps')
             _compare_compiled_numeric_tensors({key: expected[key]}, {key: actual[key]},
                 rtol=0 if exact else COMPILED_NUMERIC_RTOL,
                 atol=0 if exact else COMPILED_NUMERIC_ATOL)
@@ -4871,8 +4894,12 @@ def _compare_td3_block_snapshot(expected, actual, *, context, report, output=Non
                         'actual': actual.get(key)}, evidence_path)
             failure['evidence_path'] = str(evidence_path)
         raise
-    return _compare_compiled_numeric_tensors(expected, actual,
+    result = _compare_compiled_numeric_tensors(
+        {k: v for k, v in expected.items() if k not in retained},
+        {k: v for k, v in actual.items() if k not in retained},
         rtol=COMPILED_NUMERIC_RTOL, atol=COMPILED_NUMERIC_ATOL)
+    result['unused_retained_gradient_fields'] = len(retained)
+    return result
 
 
 @contextmanager
@@ -4972,6 +4999,10 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
         'pool_digest': pool.content_digest, 'bc_schedule': args.comparison_bc_schedule}
     if block_check:
         report['reference_contract'] = contract
+        report['gradient_comparison_contract'] = (
+            'Current backward gradients remain strict at rtol=1e-4/atol=1e-5. '
+            'Unused retained actor gradient values are observations; presence/shape/dtype stay strict. '
+            'Actor parameters, target, optimizer and actor count must be exactly unchanged on critic-only steps.')
     report['comparison_kind'] = 'merged_update_blocks' if block_check else ('checked_critic_tail' if tail_comparison else 'local_optimizations')
     if tail_comparison:
         report['optimizer_execution_difference'] = 'Only critic capturable differs (A=false, B=true); excluded from numeric comparison. step, moments and other optimizer settings remain compared.'
@@ -5041,15 +5072,17 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
                     snapshot.update(gradients)
                     snapshot_contexts.append({'snapshot_index': index, 'stage_steps': total,
                         'actor_backward': metric.actor_updated, 'gradients': gradient_evidence})
+                    flatten({name: getattr(engine, name) for name in ('update_count', 'critic_update_count', 'critic_target_update_count', 'actor_update_count')}, 'counts', snapshot)
                     if block_check:
                         report['groups'][group]['snapshot_evidence'] = snapshot_contexts
                         if snapshots and not metric.actor_updated:
-                            previous = {k: v for k, v in snapshots[-1].items() if k.startswith('grad.actor.')}
-                            current = {k: v for k, v in gradients.items() if k.startswith('grad.actor.')}
-                            # Do not repair live .grad: retain evidence if graph storage was overwritten.
+                            prefixes = ('grad.actor.', 'actor.', 'actor_target.', 'optimizer.actor.', 'counts.actor_update_count')
+                            previous = {k: v for k, v in snapshots[-1].items() if k.startswith(prefixes)}
+                            current = {k: v for k, v in snapshot.items() if k.startswith(prefixes)}
+                            # Observe unused residuals; require exact unchanged actor state.
                             _compare_td3_block_snapshot(previous, current,
-                                context=snapshot_contexts[-1], report=report, output=output)
-                    flatten({name: getattr(engine, name) for name in ('update_count', 'critic_update_count', 'critic_target_update_count', 'actor_update_count')}, 'counts', snapshot)
+                                context={**snapshot_contexts[-1], 'comparison': 'adjacent_steps'},
+                                report=report, output=output)
                 snapshots.append(snapshot)
             engine.flush_update_statistics()
             torch.cuda.synchronize(device)

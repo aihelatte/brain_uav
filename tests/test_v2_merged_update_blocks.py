@@ -115,6 +115,8 @@ class TestMergedUpdateBlocks(unittest.TestCase):
         engine=self.engine()
         self.assertFalse(engine.compile_critic_update_front)
         self.assertFalse(engine.compile_actor_objective)
+        with mock.patch.object(engine, '_validate_merged_bindings', side_effect=AssertionError('disabled guard')):
+            engine.update_once(total_steps=1)
         for name in ('compile_critic_update_front','compile_actor_objective'):
             kw=dict(actor=engine.actor,critic1=engine.critic1,critic2=engine.critic2,replay=engine.replay,
                 actor_lr=.001,critic_lr=.001,gamma=.99,tau=.005,policy_noise=.1,noise_clip=.05,
@@ -144,8 +146,8 @@ class TestMergedUpdateBlocks(unittest.TestCase):
         engine.load_checkpoint_state_dict(payload)
         self.assertIsNone(engine._compiled_critic_front)
         self.assertIsNone(engine._compiled_actor_objective)
-        models=(engine.actor,engine.critic1,engine.critic2,engine.actor_target,engine.critic1_target,engine.critic2_target)
-        engine._merged_bindings=(models,tuple(tuple(m.parameters()) for m in models))
+        engine._merged_compile_options={}
+        engine._rebuild_merged_blocks()
         engine._merged_device=engine.device
         original=engine.critic1
         engine.critic1=deepcopy(original)
@@ -153,6 +155,48 @@ class TestMergedUpdateBlocks(unittest.TestCase):
         engine.critic1=original
         original.head[0].weight=torch.nn.Parameter(original.head[0].weight.clone())
         with self.assertRaisesRegex(RuntimeError,'parameter replacement'): engine._validate_merged_bindings()
+
+    def test_cached_registration_guards_without_parameter_walks(self):
+        from contextlib import ExitStack
+        engine = self.engine()
+        engine._merged_compile_options = {}
+        engine._merged_device = engine.device
+        engine._rebuild_merged_blocks()
+        models = (engine.actor, engine.critic1, engine.critic2, engine.actor_target,
+                  engine.critic1_target, engine.critic2_target)
+        with ExitStack() as stack:
+            for model in models:
+                stack.enter_context(mock.patch.object(model, 'parameters', side_effect=AssertionError('recursive parameter walk')))
+                stack.enter_context(mock.patch.object(model, 'modules', side_effect=AssertionError('recursive module walk')))
+            engine._validate_merged_bindings()
+        original_head = engine.critic1.head
+        engine.critic1.head = deepcopy(original_head)
+        with self.assertRaisesRegex(RuntimeError, 'module replacement'): engine._validate_merged_bindings()
+        engine.critic1.head = original_head
+        parameters = original_head[0]._parameters
+        original_head[0]._parameters = dict(parameters)
+        with self.assertRaisesRegex(RuntimeError, 'parameter replacement'): engine._validate_merged_bindings()
+        original_head[0]._parameters = parameters
+        items = tuple(parameters.items())
+        value = parameters.pop('weight'); parameters['weight'] = value
+        with self.assertRaisesRegex(RuntimeError, 'parameter replacement'): engine._validate_merged_bindings()
+        parameters.clear(); parameters.update(items)
+        original_data = original_head[0].weight.data
+        original_head[0].weight.data = original_data.to(torch.float64)
+        with self.assertRaisesRegex(RuntimeError, 'float32'): engine._validate_merged_bindings()
+        original_head[0].weight.data = original_data
+        engine._merged_device = torch.device('meta')
+        with self.assertRaisesRegex(RuntimeError, 'configured CUDA'): engine._validate_merged_bindings()
+        engine._merged_device = engine.device
+        original_head[0].register_parameter('unexpected', None)
+        with self.assertRaisesRegex(RuntimeError, 'parameter replacement'): engine._validate_merged_bindings()
+        del original_head[0]._parameters['unexpected']
+        engine._validate_merged_bindings()
+        # Loading rebinds the registration cache without changing the checkpoint schema.
+        previous = engine._merged_bindings
+        engine.load_checkpoint_state_dict(deepcopy(engine.checkpoint_state_dict()))
+        self.assertIsNot(engine._merged_bindings, previous)
+        engine._validate_merged_bindings()
 
     def test_serial_suite_order_failure_isolation_and_baseline_reuse(self):
         with tempfile.TemporaryDirectory() as tmp:

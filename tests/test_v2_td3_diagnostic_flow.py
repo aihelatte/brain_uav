@@ -30,6 +30,8 @@ class TestTD3DiagnosticFlow(unittest.TestCase):
         payload = dict(contract=contract, snapshots=[{}] * 8)
         profile._validate_td3_block_reference(payload, contract, 8)
         with self.assertRaises(ValueError): profile._validate_td3_block_reference(payload, contract, 9)
+        with self.assertRaisesRegex(ValueError, 'Obsolete'):
+            profile._validate_td3_block_reference({**payload, 'contract': {**contract, 'version': 2}}, contract, 8)
 
     def test_gradient_storage_none_and_failure_context(self):
         engine = self.engine()
@@ -44,13 +46,35 @@ class TestTD3DiagnosticFlow(unittest.TestCase):
         self.assertEqual(evidence['grad.actor.0']['source'], 'retained_no_backward')
         report = {}
         context = dict(snapshot_index=4, stage_steps=25003, actor_backward=False, gradients=evidence)
-        with self.assertRaises(AssertionError):
-            profile._compare_td3_block_snapshot(expected, actual, context=context, report=report)
-        failure = report['first_snapshot_failure']
-        self.assertEqual(failure['parameter_name'], 'actor.weight')
-        self.assertEqual(failure['maximum_absolute_error'], 3.)
-        self.assertFalse(failure['actor_backward'])
+        result = profile._compare_td3_block_snapshot(expected, actual, context=context, report=report)
+        self.assertEqual(result['unused_retained_gradient_fields'], 1)
+        observation = report['retained_gradient_observations'][0]
+        self.assertEqual(observation['parameter_name'], 'actor.weight')
+        self.assertEqual(observation['maximum_absolute_error'], 3.)
+        self.assertFalse(observation['consumed_by_update'])
         self.assertIs(engine.actor.weight.grad, identity)
+        # Identical numerical difference is still fatal for a current backward.
+        current_context = {**context, 'actor_backward': True, 'gradients': metadata}
+        with self.assertRaises(AssertionError):
+            profile._compare_td3_block_snapshot(expected, actual, context=current_context, report=report)
+        self.assertTrue(report['first_snapshot_failure']['actor_backward'])
+        # None/presence remains strict even for retained storage.
+        missing = dict(actual); missing.pop('grad.actor.1.none'); missing['grad.actor.1'] = torch.ones(1)
+        with self.assertRaises(AssertionError):
+            profile._compare_td3_block_snapshot(expected, missing, context=context, report={})
+        # Do not hide weight, optimizer, target, count or statistic changes.
+        for key in ('actor.weight', 'optimizer.actor.moment', 'actor_target.weight',
+                    'counts.actor_update_count', 'metrics.critic_loss', 'grad.critic1.0'):
+            before = {**expected, key: torch.tensor(1.)}
+            after = {**actual, key: torch.tensor(2.)}
+            with self.assertRaises(AssertionError):
+                profile._compare_td3_block_snapshot(before, after, context=context, report={})
+        # Across adjacent critic-only steps, actor state must be exactly unchanged.
+        before = {**expected, 'actor.weight': torch.tensor(1.)}
+        after = {**actual, 'actor.weight': torch.tensor(1.000001)}
+        with self.assertRaises(AssertionError):
+            profile._compare_td3_block_snapshot(before, after,
+                context={**context, 'comparison': 'adjacent_steps'}, report={})
 
     def test_inf_injection_calls_original_and_restores_for_actor_and_critic(self):
         for component in ('actor', 'critic'):
