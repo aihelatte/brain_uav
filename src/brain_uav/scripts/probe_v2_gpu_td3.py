@@ -206,6 +206,11 @@ def compare(a, b):
     return float((a.double() - b.double()).abs().max()) if a.numel() else 0.
 
 
+def numeric_snapshot(tensor):
+    """Independent diagnostic values, never part of the autograd graph."""
+    return tensor.detach().clone()
+
+
 def _location(progress, stage, *, model=None, mode=None, replay_index=None, injection=None):
     if progress is not None:
         progress.update(stage=stage, model=model, mode=mode,
@@ -217,7 +222,7 @@ def probe_snn_reset(probe, stream, *, progress=None, evidence=None):
     evidence = {} if evidence is None else evidence
     evidence.update(passed=False, completed_samples=[])
     _location(progress, 'snn_reset_prepare', model='snn')
-    initial_ego = probe.args[0].clone()
+    initial_ego = numeric_snapshot(probe.args[0])
     def forward():
         with torch.no_grad():
             return probe.actor_forward(probe.actor, probe.args)
@@ -239,7 +244,7 @@ def probe_snn_reset(probe, stream, *, progress=None, evidence=None):
         torch.cuda.synchronize()
         for actual, reference in zip(output, expected):
             compare(actual, reference)
-        samples.append(tuple(x.clone() for x in output))
+        samples.append(tuple(numeric_snapshot(x) for x in output))
         evidence['completed_samples'].append(index)
     _location(progress, 'snn_reset_repeat_compare', model='snn')
     for index in (1, 3):
@@ -269,7 +274,7 @@ def probe_adam_gate(*, progress=None, evidence=None):
     # Nonzero preexisting moments/step: skipping must preserve all three.
     for value in adam.state_tensors():
         value.fill_(7.)
-    initial = [x.clone() for x in [p, missing, *adam.state_tensors()]]
+    initial = [numeric_snapshot(x) for x in [p, missing, *adam.state_tensors()]]
     graph = torch.cuda.CUDAGraph()
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -293,7 +298,7 @@ def probe_adam_gate(*, progress=None, evidence=None):
     _location(progress, 'adam_gate_native_parity')
     reference = nn.Parameter(p.detach().clone())
     optimizer = torch.optim.Adam([reference], lr=.001, fused=True)
-    optimizer.state[reference] = dict(step=adam.steps[0].clone(), exp_avg=adam.m[0].clone(), exp_avg_sq=adam.v[0].clone())
+    optimizer.state[reference] = dict(step=numeric_snapshot(adam.steps[0]), exp_avg=numeric_snapshot(adam.m[0]), exp_avg_sq=numeric_snapshot(adam.v[0]))
     reference.grad = torch.ones_like(reference)
     p.grad.fill_(1.)
     flag.zero_()
@@ -321,7 +326,7 @@ def probe_update(model, *, progress=None, evidence=None):
     _location(progress, 'update_prepare', model=model)
     torch.manual_seed(7)
     probe = UpdateProbe(model)
-    saved = [x.clone() for x in probe.persistent()]
+    saved = [numeric_snapshot(x) for x in probe.persistent()]
     def restore():
         with torch.no_grad():
             for x, value in zip(probe.persistent(), saved):
@@ -368,9 +373,9 @@ def probe_update(model, *, progress=None, evidence=None):
     for index, mode in enumerate(sequence):
         _location(progress, 'update_reference', model=model, mode=mode, replay_index=index)
         probe.operation(mode)
-        gradients = [None if p.grad is None else p.grad.detach().clone()
+        gradients = [None if p.grad is None else numeric_snapshot(p.grad)
                      for p in probe.critic_params + probe.actor_params]
-        expected.append(([x.detach().clone() for x in probe.persistent()], probe.outputs.clone(), gradients))
+        expected.append(([numeric_snapshot(x) for x in probe.persistent()], numeric_snapshot(probe.outputs), gradients))
         evidence['completed_reference_steps'].append(index)
     restore()
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]) as profiler:

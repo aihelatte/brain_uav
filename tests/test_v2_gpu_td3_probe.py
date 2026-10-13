@@ -13,6 +13,19 @@ from brain_uav.trainers.v2_replay_buffer import V2ReplayBuffer
 
 
 class TestGPUTD3CapabilityProbe(unittest.TestCase):
+    def test_numeric_snapshot_is_detached_and_independent(self):
+        parameter = torch.nn.Parameter(torch.tensor([1., 2.]))
+        for source in (parameter, parameter * 3.):
+            with self.subTest(leaf=source.is_leaf):
+                saved = probe.numeric_snapshot(source)
+                self.assertFalse(saved.requires_grad)
+                self.assertIsNone(saved.grad_fn)
+                torch.testing.assert_close(saved, source, rtol=0, atol=0)
+                self.assertNotEqual(saved.data_ptr(), source.data_ptr())
+                original = source.detach().clone()
+                saved.add_(10.)
+                torch.testing.assert_close(source, original, rtol=0, atol=0)
+
     def test_update_warmup_wait_follows_reset_current_stream_work(self):
         events = []
         stream = SimpleNamespace(wait_stream=lambda current: events.append('wait'))
