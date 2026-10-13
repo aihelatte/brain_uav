@@ -493,6 +493,7 @@ class _OptionalUpdateDetailTimer:
         self,
         recorder: Callable[[dict[str, Any]], None] | None,
         profile_sections: bool,
+        names: tuple[str, ...] = V2_TD3_UPDATE_DETAIL_SECTIONS,
     ) -> None:
         if recorder is not None and not callable(recorder):
             raise TypeError(
@@ -503,9 +504,9 @@ class _OptionalUpdateDetailTimer:
         self.recorder = recorder
         self.profile_sections = profile_sections
         self.wall_seconds = {
-            name: 0.0 for name in V2_TD3_UPDATE_DETAIL_SECTIONS
+            name: 0.0 for name in names
         }
-        self.calls = {name: 0 for name in V2_TD3_UPDATE_DETAIL_SECTIONS}
+        self.calls = {name: 0 for name in names}
 
     @contextmanager
     def section(self, name: str) -> Iterator[None]:
@@ -3237,6 +3238,7 @@ class V2TD3UpdateEngine:
         ) = None,
         diagnostic_profile_sections: bool = False,
         compiled_execution_recorder: Callable[[str], None] | None = None,
+        block_attribution_recorder: Callable[[dict[str, Any]], None] | None = None,
     ) -> V2TD3UpdateMetrics:
         if type(defer_statistics) is not bool:
             raise TypeError('defer_statistics must be a bool.')
@@ -3257,6 +3259,9 @@ class V2TD3UpdateEngine:
         def record_compiled_execution(name: str) -> None:
             if compiled_execution_recorder is not None:
                 compiled_execution_recorder(name)
+        attribution = _OptionalUpdateDetailTimer(block_attribution_recorder,
+            diagnostic_profile_sections, names=('merged_bindings', 'critic_input_preparation',
+                'critic_equivalent_compute', 'actor_q_head_objective', 'critic_equivalent_backward'))
         total_steps_value = _nonnegative_int(total_steps, name='total_steps')
         bc_lambda_value = _finite_float(bc_lambda, name='bc_lambda')
         if bc_lambda_value < 0.0:
@@ -3268,7 +3273,8 @@ class V2TD3UpdateEngine:
                 or (self.compile_actor_objective and self._compiled_actor_objective is None)):
             raise RuntimeError('Merged update blocks must be configured before updating.')
         if self.compile_critic_update_front or self.compile_actor_objective:
-            self._validate_merged_bindings()
+            with attribution.section('merged_bindings'):
+                self._validate_merged_bindings()
         self._mark_cuda_graph_step_begin()
 
         with update_timing.section('replay_sample'):
@@ -3284,12 +3290,16 @@ class V2TD3UpdateEngine:
                 raise ValueError('Merged critic front requires shared relations.')
             with update_timing.section('target_forward_and_td_target'):
                 with torch.no_grad():
+                    if self.actor.zone_set_encoder.compiled_shared_relations_enabled:
+                        record_compiled_execution('shared_relations')
                     next_shared_relations = self._build_shared_relations(batch.next_obs,
                         profile_sections=profile_sections)
                     noise = (torch.randn_like(batch.action) * self.policy_noise).clamp(
                         -self.noise_clip, self.noise_clip)
                     target_input = noise
                     if self.model_type == 'snn':
+                        if self.actor_target.zone_set_encoder.compiled_tensor_forward_enabled:
+                            record_compiled_execution('snn_target_encoder')
                         target_input = self.actor_target(batch.next_obs,
                             shared_relations=next_shared_relations, profile_sections=profile_sections) + noise
                         target_input = torch.maximum(torch.minimum(target_input, self.action_high), self.action_low)
@@ -3300,10 +3310,13 @@ class V2TD3UpdateEngine:
                     return self.critic1.zone_set_encoder.prepare_tensor_forward_arguments(
                         obs.ego_features, obs.goal_features, obs.zone_features,
                         obs.presence_mask, shared_relations=relations)
-                current_q1, current_q2, critic_loss, target_q, diagnostics = self._compiled_critic_front(
-                    arguments(batch.obs, current_shared_relations),
-                    arguments(batch.next_obs, next_shared_relations), batch.action,
-                    target_input, batch.reward, batch.done, batch.success)
+                with attribution.section('critic_input_preparation'):
+                    front_current = arguments(batch.obs, current_shared_relations)
+                    front_next = arguments(batch.next_obs, next_shared_relations)
+                with attribution.section('critic_equivalent_compute'):
+                    current_q1, current_q2, critic_loss, target_q, diagnostics = self._compiled_critic_front(
+                        front_current, front_next, batch.action,
+                        target_input, batch.reward, batch.done, batch.success)
                 record_compiled_execution('critic_update_front')
                 self._merged_executions['compile_critic_update_front'] += 1
                 self._require_finite_loss(critic_loss, component='critic', total_steps=total_steps_value)
@@ -3335,16 +3348,17 @@ class V2TD3UpdateEngine:
                         self._compiled_target_block is not None
                         or self._compiled_target_critic_td is not None
                     ):
-                        target_arguments = (
-                            self.actor_target.zone_set_encoder.
-                            prepare_tensor_forward_arguments(
-                                batch.next_obs.ego_features,
-                                batch.next_obs.goal_features,
-                                batch.next_obs.zone_features,
-                                batch.next_obs.presence_mask,
-                                shared_relations=next_shared_relations,
+                        with attribution.section('critic_input_preparation'):
+                            target_arguments = (
+                                self.actor_target.zone_set_encoder.
+                                prepare_tensor_forward_arguments(
+                                    batch.next_obs.ego_features,
+                                    batch.next_obs.goal_features,
+                                    batch.next_obs.zone_features,
+                                    batch.next_obs.presence_mask,
+                                    shared_relations=next_shared_relations,
+                                )
                             )
-                        )
                         if self._compiled_target_block is not None:
                             record_compiled_execution('target_block')
                             with (
@@ -3352,14 +3366,15 @@ class V2TD3UpdateEngine:
                                 if diagnostic_profile_sections
                                 else nullcontext()
                             ):
-                                next_action, target_q1, target_q2, target_q = (
-                                    self._compiled_target_block(
-                                        *target_arguments,
-                                        noise,
-                                        batch.reward,
-                                        batch.done,
+                                with attribution.section('critic_equivalent_compute'):
+                                    next_action, target_q1, target_q2, target_q = (
+                                        self._compiled_target_block(
+                                            *target_arguments,
+                                            noise,
+                                            batch.reward,
+                                            batch.done,
+                                        )
                                     )
-                                )
                         else:
                             if self.actor_target.zone_set_encoder.compiled_tensor_forward_enabled:
                                 record_compiled_execution('snn_target_encoder')
@@ -3380,14 +3395,15 @@ class V2TD3UpdateEngine:
                                 if diagnostic_profile_sections
                                 else nullcontext()
                             ):
-                                next_action, target_q1, target_q2, target_q = (
-                                    self._compiled_target_critic_td(
-                                        *target_arguments,
-                                        next_action,
-                                        batch.reward,
-                                        batch.done,
+                                with attribution.section('critic_equivalent_compute'):
+                                    next_action, target_q1, target_q2, target_q = (
+                                        self._compiled_target_critic_td(
+                                            *target_arguments,
+                                            next_action,
+                                            batch.reward,
+                                            batch.done,
+                                        )
                                     )
-                                )
                     else:
                         if (
                             isinstance(self.actor_target, V2SNNPolicyActor)
@@ -3436,28 +3452,30 @@ class V2TD3UpdateEngine:
                     else None
                 )
                 if self._compiled_critic_loss is not None:
-                    critic_arguments = (
-                        self.critic1.zone_set_encoder.prepare_tensor_forward_arguments(
-                            batch.obs.ego_features,
-                            batch.obs.goal_features,
-                            batch.obs.zone_features,
-                            batch.obs.presence_mask,
-                            shared_relations=current_shared_relations,
+                    with attribution.section('critic_input_preparation'):
+                        critic_arguments = (
+                            self.critic1.zone_set_encoder.prepare_tensor_forward_arguments(
+                                batch.obs.ego_features,
+                                batch.obs.goal_features,
+                                batch.obs.zone_features,
+                                batch.obs.presence_mask,
+                                shared_relations=current_shared_relations,
+                            )
                         )
-                    )
                     record_compiled_execution('critic_block')
                     with (
                         record_function('v2_td3.compiled.critic_block')
                         if diagnostic_profile_sections
                         else nullcontext()
                     ):
-                        current_q1, current_q2, critic_loss = (
-                            self._compiled_critic_loss(
-                                *critic_arguments,
-                                batch.action,
-                                target_q,
+                        with attribution.section('critic_equivalent_compute'):
+                            current_q1, current_q2, critic_loss = (
+                                self._compiled_critic_loss(
+                                    *critic_arguments,
+                                    batch.action,
+                                    target_q,
+                                )
                             )
-                        )
                 else:
                     current_q1 = self.critic1(
                         batch.obs,
@@ -3479,19 +3497,20 @@ class V2TD3UpdateEngine:
                     component='critic',
                     total_steps=total_steps_value,
                 )
-                with torch.no_grad():
-                    current_q1_detached = current_q1.detach()
-                    td_error = (current_q1_detached - target_q.detach()).abs()
-                    failure_mask = (batch.success < 0.5).to(td_error.dtype)
-                    diagnostic_q1_mean = current_q1_detached.mean()
-                    diagnostic_q1_std = current_q1_detached.std(unbiased=False)
-                    diagnostic_q1_max_abs = current_q1_detached.abs().max()
-                    diagnostic_target_q_mean = target_q.detach().mean()
-                    diagnostic_td_error_mean = td_error.mean()
-                    diagnostic_failure_td_error_mean = (
-                        (td_error * failure_mask).sum()
-                        / failure_mask.sum().clamp_min(1.0)
-                    )
+                with attribution.section('critic_equivalent_compute'):
+                    with torch.no_grad():
+                        current_q1_detached = current_q1.detach()
+                        td_error = (current_q1_detached - target_q.detach()).abs()
+                        failure_mask = (batch.success < 0.5).to(td_error.dtype)
+                        diagnostic_q1_mean = current_q1_detached.mean()
+                        diagnostic_q1_std = current_q1_detached.std(unbiased=False)
+                        diagnostic_q1_max_abs = current_q1_detached.abs().max()
+                        diagnostic_target_q_mean = target_q.detach().mean()
+                        diagnostic_td_error_mean = td_error.mean()
+                        diagnostic_failure_td_error_mean = (
+                            (td_error * failure_mask).sum()
+                            / failure_mask.sum().clamp_min(1.0)
+                        )
         with update_timing.section('critic_backward'):
             with (
                 record_function('v2_td3.critic_backward')
@@ -3507,9 +3526,11 @@ class V2TD3UpdateEngine:
                 with detail_timing.section('critic_loss_backward'):
                     if profile_sections:
                         with record_function('v2_td3.critic_loss_backward'):
-                            critic_loss.backward()
+                            with attribution.section('critic_equivalent_backward'):
+                                critic_loss.backward()
                     else:
-                        critic_loss.backward()
+                        with attribution.section('critic_equivalent_backward'):
+                            critic_loss.backward()
         with update_timing.section('critic_gradient_check_and_clip'):
             critic_parameters = (self._cached_critic_parameters if self.reuse_update_buffers
                                  else list(self.critic1.parameters()) + list(self.critic2.parameters()))
@@ -3573,6 +3594,7 @@ class V2TD3UpdateEngine:
                         profile_sections=profile_sections,
                         critic_context=critic_context,
                         diagnostic_timing=detail_timing,
+                        attribution_timing=attribution,
                         compiled_execution_recorder=compiled_execution_recorder,
                     )
                 finally:
@@ -3700,6 +3722,7 @@ class V2TD3UpdateEngine:
                 self.flush_update_statistics()
         self._defer_statistics = False
         detail_timing.finish()
+        attribution.finish()
         update_timing.finish()
         return metrics
 
@@ -3791,9 +3814,12 @@ class V2TD3UpdateEngine:
         profile_sections: bool = False,
         critic_context: torch.Tensor | None = None,
         diagnostic_timing: _OptionalUpdateDetailTimer | None = None,
+        attribution_timing: _OptionalUpdateDetailTimer | None = None,
         compiled_execution_recorder: Callable[[str], None] | None = None,
     ) -> _ActorLossTerms:
         detail = diagnostic_timing or _OptionalUpdateDetailTimer(None, False)
+        attribution = attribution_timing or _OptionalUpdateDetailTimer(None, False,
+            names=('actor_q_head_objective',))
         weighted_spike = None
         with detail.section('actor_forward'):
             actor_uses_compiled = (
@@ -3822,8 +3848,11 @@ class V2TD3UpdateEngine:
                     profile_sections=profile_sections,
                 )
                 spike_rate = actor_actions.new_zeros(())
-            spike_loss = (None if self._compiled_actor_objective is not None else
-                          F.relu(spike_rate - self.spike_regularization.target_rate).square())
+            if self._compiled_actor_objective is None:
+                with attribution.section('actor_q_head_objective'):
+                    spike_loss = F.relu(spike_rate - self.spike_regularization.target_rate).square()
+            else:
+                spike_loss = None
             spike_beta = self.spike_regularization.beta(stage_steps)
         with detail.section('actor_q_rl_loss_and_scale'):
             if self._compiled_actor_objective is not None:
@@ -3832,19 +3861,20 @@ class V2TD3UpdateEngine:
                 # Only a dtype/device anchor; Q is computed once inside the merged block.
                 q_values = actor_actions
             else:
-                q_values = (
-                    self.critic1(
-                        observation,
-                        actor_actions,
-                        shared_relations=shared_relations,
-                        profile_sections=profile_sections,
+                with attribution.section('actor_q_head_objective'):
+                    q_values = (
+                        self.critic1(
+                            observation,
+                            actor_actions,
+                            shared_relations=shared_relations,
+                            profile_sections=profile_sections,
+                        )
+                        if critic_context is None
+                        else self.critic1.forward_from_context(
+                            critic_context,
+                            actor_actions,
+                        )
                     )
-                    if critic_context is None
-                    else self.critic1.forward_from_context(
-                        critic_context,
-                        actor_actions,
-                    )
-                )
                 if self._compiled_actor_loss is None:
                     rl_actor_loss = -q_values.mean()
                     q_scale = q_values.detach().abs().mean().clamp(min=1.0)
@@ -3943,20 +3973,21 @@ class V2TD3UpdateEngine:
                 prefix = ((self.critic1, critic_context, actor_actions, reference_actions)
                           if self._compiled_actor_objective is not None else
                           (actor_actions, q_values, reference_actions))
-                outputs = objective(
-                    *prefix,
-                    observation.ego_features, observation.goal_features,
-                    line_to_goal_safe, self.action_low, self.action_high,
-                    *coefficients,
-                    self.actor.scales.horizontal_span,
-                    self.actor.scales.vertical_span,
-                    self.actor.scales.gamma_max,
-                    self.terminal_geo_radius,
-                    self.terminal_geo_regularization_enabled,
-                    spike_rate if isinstance(self.actor, V2SNNPolicyActor) else None,
-                    self._actor_loss_coefficient_tensor('spike_beta', spike_beta, q_values) if self.model_type == 'snn' else None,
-                    self.spike_regularization.target_rate,
-                )
+                with attribution.section('actor_q_head_objective'):
+                    outputs = objective(
+                        *prefix,
+                        observation.ego_features, observation.goal_features,
+                        line_to_goal_safe, self.action_low, self.action_high,
+                        *coefficients,
+                        self.actor.scales.horizontal_span,
+                        self.actor.scales.vertical_span,
+                        self.actor.scales.gamma_max,
+                        self.terminal_geo_radius,
+                        self.terminal_geo_regularization_enabled,
+                        spike_rate if isinstance(self.actor, V2SNNPolicyActor) else None,
+                        self._actor_loss_coefficient_tensor('spike_beta', spike_beta, q_values) if self.model_type == 'snn' else None,
+                        self.spike_regularization.target_rate,
+                    )
                 actor_loss, rl_actor_loss, scaled_rl_actor_loss, actor_rl_scale, bc_loss, terminal_geo_loss = outputs[:6]
                 if self._compiled_actor_objective is not None:
                     spike_loss, weighted_spike = outputs[6:8]

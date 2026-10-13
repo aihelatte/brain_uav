@@ -190,6 +190,31 @@ class _UpdateTimingSummary:
         }
 
 
+class _BlockAttributionSummary:
+    """Measurement-window-only CPU intervals, never synchronized device timing."""
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.updates = 0
+        self.wall_seconds = {}
+        self.calls = {}
+
+    def record(self, detail):
+        self.updates += 1
+        for name, value in detail['wall_seconds'].items():
+            self.wall_seconds[name] = self.wall_seconds.get(name, 0.0) + value
+            self.calls[name] = self.calls.get(name, 0) + detail['calls'][name]
+
+    def report(self, enabled):
+        return {'enabled': enabled, 'updates': self.updates,
+            'regions': {name: {'cpu_wall_seconds': seconds, 'calls': self.calls[name],
+                'mean_cpu_wall_seconds_per_call': seconds / self.calls[name] if self.calls[name] else None}
+                for name, seconds in self.wall_seconds.items()},
+            'note': 'CPU submission/wait intervals, not GPU compute. Multiple baseline calls form the equivalent region; calls are not graph/kernel counts. No CUDA synchronization is added. Warmup and profiler updates excluded. Instrumentation has overhead.',
+            'scope': 'C: target critic/TD + online twin critics/loss + diagnostic reductions; ANN also includes target actor in both paths, SNN excludes it. Shared relations/noise and input packing outside compute. A: Q head + objective only, actor/reference/context outside; backward separately in existing actor_backward region. Baseline spike scalar is included via a separate same-name interval inside actor_forward; do not sum this region with its parent.'}
+
+
 class _NestedUpdateTimingSummary:
     """Aggregate diagnostic child intervals without treating parents as additive."""
 
@@ -3320,6 +3345,17 @@ def _run_grouped_compiled_numerics_diagnostic(
         torch.cuda.set_rng_state_all(cuda_rng_state)
 
 
+def _post_measurement_target_noise(config: V2FormalTrainingConfig,
+                                   profile_total_steps: int,
+                                   controlled_stage_step_offset: int) -> tuple[float, float]:
+    """Match timing diagnostics: offset uses stage schedule, ordinary mode initial noise."""
+    if controlled_stage_step_offset:
+        _, policy_noise, noise_clip = config.noise_schedule.values(
+            profile_total_steps, max_steps=config.max_steps)
+        return policy_noise, noise_clip
+    return config.noise_schedule.policy_initial, config.noise_schedule.clip_initial
+
+
 def _run_diagnostic_level(
     *,
     level: str,
@@ -3363,6 +3399,7 @@ def _run_diagnostic_level(
     compile_critic_update_front: bool = False,
     compile_actor_objective: bool = False,
     critic_tail_internal_timing: bool = False,
+    block_attribution_wall: bool = False,
     controlled_stage_step_offset: int = 0,
     bc_schedule: str = 'default',
 ) -> dict[str, Any]:
@@ -3658,6 +3695,7 @@ def _run_diagnostic_level(
             'comparison only if no new Dynamo graphs appear after the warmup boundary.'
         )
     timing = _TimingBook(device)
+    block_attribution = _BlockAttributionSummary()
     update_timing = _UpdateTimingSummary()
     detailed_profiler = _DetailedUpdateProfiler(
         device,
@@ -3692,6 +3730,12 @@ def _run_diagnostic_level(
             expected_compiled_entries[expected_compiled_entries.index(
                 'target_block'
             )] = 'target_critic_td_block'
+        if compile_critic_update_front:
+            expected_compiled_entries = [name for name in expected_compiled_entries
+                if name not in ('critic_block', 'target_block', 'target_critic_td_block')]
+            expected_compiled_entries.append('critic_update_front')
+        if compile_actor_objective:
+            expected_compiled_entries.append('actor_objective')
         compiled_path_profiler = _CompiledPathProfiler(
             device,
             requested_updates=compiled_path_profiler_updates,
@@ -3746,6 +3790,7 @@ def _run_diagnostic_level(
                 slot_refs = []
                 if window_update_statistics:
                     engine.flush_update_statistics()
+                block_attribution.reset()
                 actual_warmup_steps = step_number
                 if device.type == 'cuda':
                     torch.cuda.synchronize(device)
@@ -3893,6 +3938,7 @@ def _run_diagnostic_level(
                                 total_steps=controlled_stage_step_offset + step_number,
                                 bc_lambda=v2_bc_lambda(controlled_stage_step_offset + step_number - 1, schedule=bc_schedule),
                                 **({'defer_statistics': True} if window_update_statistics else {}),
+                                block_attribution_recorder=(block_attribution.record if block_attribution_wall and measured_phase and not profile_sections else None),
                                 timing_recorder=(
                                     capture_update_sections
                                     if measured_phase and not profile_sections
@@ -3976,15 +4022,17 @@ def _run_diagnostic_level(
                     return batch
 
                 engine.replay.sample = capture_profile_sample
-                profile_total_steps = step_number + offset + 1
+                profile_total_steps = controlled_stage_step_offset + step_number + offset + 1
+                profile_policy_noise, profile_noise_clip = _post_measurement_target_noise(
+                    formal_config, profile_total_steps, controlled_stage_step_offset)
                 engine.set_target_noise(
-                    policy_noise=formal_config.noise_schedule.policy_initial,
-                    noise_clip=formal_config.noise_schedule.clip_initial,
+                    policy_noise=profile_policy_noise,
+                    noise_clip=profile_noise_clip,
                 )
                 metrics = compiled_path_profiler.run(
                     lambda total_steps=profile_total_steps: engine.update_once(
                         total_steps=total_steps,
-                        bc_lambda=v2_bc_lambda(total_steps - 1),
+                        bc_lambda=v2_bc_lambda(total_steps - 1, schedule=bc_schedule),
                         profile_sections=False,
                         diagnostic_profile_sections=True,
                         compiled_execution_recorder=(
@@ -4062,6 +4110,7 @@ def _run_diagnostic_level(
         'warmup_critic_updates': critic_updates_before,
         'warmup_actor_updates': actor_updates_before,
         'measured_steps': measured_steps,
+        'block_attribution': block_attribution.report(block_attribution_wall),
         'local_optimizations': engine.local_optimization_metadata(),
         'critic_tail_internal_timing': (engine._critic_tail.internal_timing_report()
             if engine._critic_tail is not None else {'enabled': False, 'calls': 0}),
@@ -5230,8 +5279,15 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
         raise ValueError('--critic-tail-internal-timing requires --critic-tail-comparison (timing only).')
     if args.validation_pool is None:
         raise ValueError('--validation-pool is required for A/B/C comparison.')
-    if args.detailed_profiler_updates or args.compiled_performance_diagnostic_updates:
-        raise ValueError('Profiler is not allowed in A/B/C throughput measurement.')
+    if args.detailed_profiler_updates or (args.compiled_performance_diagnostic_updates and args.td3_block_attribution != 'profiler'):
+        raise ValueError('Profiler is not allowed in throughput measurement unless block attribution profiler mode is selected.')
+    if args.td3_block_attribution:
+        if not args.td3_block_comparison or args.td3_block_choice == 'CA':
+            raise ValueError('Attribution requires a baseline/C/A block comparison worker; no suite or CA.')
+        if args.critic_tail_internal_timing:
+            raise ValueError('Attribution cannot combine tail timing.')
+        if args.td3_block_attribution == 'profiler' and args.compiled_performance_diagnostic_updates not in (0, 2, 3, 4, 5, 6, 7, 8):
+            raise ValueError('Attribution profiler requires 2..8 updates.')
     unsupported = ('compile_critic_update_front', 'compile_actor_objective', 'cuda_graph_critic_tail', 'window_update_statistics', 'reuse_update_buffers', 'compile_critic_encoder', 'compile_target_encoders', 'compile_actors',
         'compile_critic_block', 'compile_target_block', 'compile_shared_relations',
         'compile_snn_target_encoder', 'fused_adam', 'compile_actor_loss',
@@ -5325,6 +5381,9 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 compile_actor_objective=args.td3_block_comparison and args.td3_block_choice in ('A', 'CA'),
                 cuda_graph_critic_tail=args.critic_tail_comparison and group == 'B',
                 critic_tail_internal_timing=args.critic_tail_internal_timing and group == 'B',
+                block_attribution_wall=args.td3_block_attribution == 'wall',
+                compiled_path_profiler_updates=(args.compiled_performance_diagnostic_updates or 4) if args.td3_block_attribution == 'profiler' else 0,
+                compiled_profiler_output_dir=output / f'{group}_{repeat}_profiler' if args.td3_block_attribution == 'profiler' else None,
                 controlled_stage_step_offset=offset, bc_schedule=args.comparison_bc_schedule, **compilation)
             result['server_load_before'] = before
             result['server_load_after'] = load_snapshot()
@@ -5355,8 +5414,9 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
         'compilation_requested': compilation,
         'explicit_cpu_smoke_override': args.comparison_eager_cpu,
         'bc_schedule': args.comparison_bc_schedule,
+        'td3_block_attribution': args.td3_block_attribution,
         'critic_tail_internal_timing_requested': args.critic_tail_internal_timing,
-        'final_speed_acceptance': False if args.critic_tail_internal_timing else None,
+        'final_speed_acceptance': False if args.critic_tail_internal_timing or args.td3_block_attribution else None,
         'comparison_kind': 'merged_update_blocks' if args.td3_block_comparison else ('checked_critic_tail' if args.critic_tail_comparison else 'local_optimizations'),
         'steps': steps, 'repeats': repeats, 'runs': runs,
         'comparison': {group: {'mean_wall_seconds': averages[group],
@@ -5364,7 +5424,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
             'seconds_per_step': averages[group] / steps,
             'time_saved_percent': 100 * (1 - averages[group] / averages[baseline_group]) if stable else None,
             'speedup': averages[baseline_group] / averages[group] if stable else None} for group, values in runs.items()},
-        'limitations': 'Section wall times are submission intervals, not synchronized GPU execution; no profiler. Inspect graph growth and server load before accepting any speed conclusion.'}
+        'limitations': 'CPU wall intervals include submission/wait, not pure GPU time. Attribution profiler is separate after ordinary measurement; no speed acceptance from instrumented traces. Graph launches are not kernels. Unattributed copies/waits remain unknown. If Chrome trace lacks graph-internal kernels or copy ownership, collect only these stable updates with Nsight Systems CUDA/NVTX tracing; do not infer ownership from operation names.'}
     _strict_json_write(output / 'local_optimization_summary.json', summary)
     return summary
 
@@ -5467,6 +5527,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--td3-block-suite', action='store_true', help='Serial ANN then SNN: baseline/C/A correctness, each followed by timing only if passed.')
     parser.add_argument('--snn-bc-checkpoint', type=Path, help='Required by the two-model suite; --bc-checkpoint is ANN BC.')
     parser.add_argument('--td3-block-choice', choices=('baseline', 'C', 'A', 'CA'), default='baseline')
+    parser.add_argument('--td3-block-attribution', choices=('wall', 'profiler'), help='Diagnostic only: window CPU aggregation OR separate post-measurement trace; default off.')
     parser.add_argument('--td3-block-reference', type=Path)
     parser.add_argument('--td3-block-correctness', action='store_true')
     parser.add_argument('--td3-block-comparison', action='store_true')
@@ -5599,6 +5660,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError('Block selection/reference requires a block worker mode.')
     if args.critic_tail_internal_timing and not args.critic_tail_comparison:
         raise ValueError('--critic-tail-internal-timing requires --critic-tail-comparison (timing only).')
+    if args.td3_block_attribution and (not args.td3_block_comparison or args.td3_block_suite):
+        raise ValueError('Block attribution requires --td3-block-comparison.')
     if args.td3_block_suite:
         return run_td3_block_suite(args)
     if args.local_optimization_comparison or args.local_optimization_correctness or args.critic_tail_correctness or args.critic_tail_comparison or args.td3_block_correctness or args.td3_block_comparison:
