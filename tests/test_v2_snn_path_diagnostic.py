@@ -89,6 +89,123 @@ class TestSNNPathDiagnostic(unittest.TestCase):
                 diagnostic.compare_tensors(expected, actual, stage='different', results=results)
             self.assertFalse(results[-1]['passed'])
 
+    def test_collect_numeric_mismatch_but_stop_structural_and_nonfinite(self):
+        rows = []
+        left = {'gradient.pre_clip.weight': torch.tensor([1.]), 'later': torch.tensor([2.])}
+        right = {'gradient.pre_clip.weight': torch.tensor([1.1]), 'later': torch.tensor([2.])}
+        diagnostic.compare_tensors(left, right, stage='collect', results=rows, continue_numeric_mismatch=True)
+        self.assertFalse(rows[0]['passed'])
+        self.assertTrue(rows[1]['passed'])
+        self.assertEqual(rows[0]['element_count'], 1)
+        self.assertEqual(rows[0]['exceeded_fraction'], 1.)
+        self.assertAlmostEqual(rows[0]['relative_l2'], .1, places=6)
+        with self.assertRaises(AssertionError):  # original callers still fail fast
+            diagnostic.compare_tensors(left, right, stage='default', results=[])
+        for actual in ({}, {'x': torch.zeros(2)}, {'x': torch.zeros(1, dtype=torch.float64)},
+                       {'x': torch.tensor([float('nan')])}, {'x': torch.tensor([float('inf')])}):
+            with self.assertRaises(AssertionError):
+                diagnostic.compare_tensors({'x': torch.ones(1)}, actual, stage='structural',
+                    results=[], continue_numeric_mismatch=True)
+        with self.assertRaises(AssertionError):
+            diagnostic.compare_tensors({'counts.updates': torch.tensor(1)}, {'counts.updates': torch.tensor(2)},
+                stage='count', results=[], continue_numeric_mismatch=True)
+        rows = []
+        diagnostic.compare_tensors({'actor.spikes.l1': torch.tensor([0.])},
+            {'actor.spikes.l1': torch.tensor([1.])}, stage='spikes', results=rows, continue_numeric_mismatch=True)
+        self.assertFalse(rows[0]['passed'])
+        self.assertEqual((rows[0]['rtol'], rows[0]['atol']), (0., 0.))
+
+    def test_rng_guard_still_rejects_changed_state(self):
+        before = diagnostic.rng_state()
+        try:
+            torch.rand(1)
+            with self.assertRaisesRegex(AssertionError, 'RNG'):
+                diagnostic.assert_rng_equal(before, diagnostic.rng_state())
+        finally:
+            diagnostic.restore_rng(before)
+        diagnostic.assert_rng_equal(before, diagnostic.rng_state())
+
+    def test_update_delta_and_zero_norm_statistics(self):
+        before = {'actor.weight': torch.tensor([1000.], dtype=torch.float64)}
+        eager_after = {'actor.weight': before['actor.weight'] + .1}
+        formal_after = {'actor.weight': before['actor.weight'] + .11}
+        diagnostic.compare_tensors(eager_after, formal_after, stage='full_weight', results=[])
+        rows = []
+        diagnostic.compare_tensors(diagnostic.parameter_delta(before, eager_after),
+            diagnostic.parameter_delta(before, formal_after), stage='delta', results=rows,
+            continue_numeric_mismatch=True)
+        self.assertFalse(rows[0]['passed'])
+        self.assertAlmostEqual(rows[0]['eager_l2'], .1)
+        for eager, formal, status, ratio in ((0., 0., 'zero', 0.), (0., 1., 'zero', None),
+                                            (1e-14, 2e-14, 'near_zero', None)):
+            rows = []
+            diagnostic.compare_tensors({'update_delta.x': torch.tensor([eager], dtype=torch.float64)},
+                {'update_delta.x': torch.tensor([formal], dtype=torch.float64)}, stage='zero', results=rows,
+                continue_numeric_mismatch=True)
+            self.assertEqual(rows[0]['relative_l2_denominator'], status)
+            self.assertEqual(rows[0]['relative_l2'], ratio)
+            json.dumps(rows, allow_nan=False)
+
+    def test_completed_inconsistent_and_aborted_status_evidence_and_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            checkpoint, pool = inputs_fixture(directory)
+            hashes = [diagnostic.file_sha256(path) for path in (checkpoint, pool)]
+            original = diagnostic.compare_tensors
+            def injected(expected, actual, **kwargs):
+                if kwargs['stage'] == 'freeze_boundary.step24999':
+                    actual = dict(actual)
+                    name = next(n for n in expected if n.startswith('gradient.pre_clip.critic1.') and not n.endswith('.none'))
+                    actual[name] = expected[name] + 10.
+                return original(expected, actual, **kwargs)
+            out = directory / 'collect'
+            with mock.patch.object(diagnostic, 'compare_tensors', side_effect=injected):
+                with self.assertRaises(diagnostic.DiagnosticMismatchError):
+                    profile.main(['--model', 'snn', '--snn-path-consistency', '--checkpoint', str(checkpoint),
+                        '--validation-pool', str(pool), '--output-dir', str(out), '--device', 'cpu', '--snn-path-cpu-smoke'])
+            summary = json.loads((out / 'summary.json').read_text())
+            self.assertFalse(summary['passed'])
+            self.assertFalse(summary['cpu_smoke_passed'])
+            self.assertTrue(summary['execution_completed'])
+            self.assertEqual(summary['exit_code'], 1)
+            self.assertEqual(summary['execution_status'], 'completed_inconsistent')
+            self.assertEqual(summary['first_failure_stage'], 'freeze_boundary.step24999')
+            self.assertEqual(len(summary['completed_test_points']), 11)
+            self.assertIn('ramp_full.step75002', summary['completed_test_points'])
+            self.assertNotIn('abort_reason', summary)
+            rows = json.loads((out / 'comparisons.json').read_text())['tensors']
+            names = [row['tensor'] for row in rows if row['stage'] == 'ramp_full.step75002']
+            for prefix in ('gradient.post_clip.actor.', 'optimizer.actor.', 'update_delta.actor.', 'actor.spike_loss'):
+                self.assertTrue(any(name.startswith(prefix) for name in names), prefix)
+            self.assertTrue((out / 'first_difference.pt').exists())
+            self.assertLessEqual(len(list(out.glob('*.pt'))), 7)
+            first_hash = diagnostic.file_sha256(out / 'first_difference.pt')
+            # Later representative evidence must not overwrite the first tensor.
+            original({'gradient.post_clip.x': torch.zeros(20000)}, {'gradient.post_clip.x': torch.ones(20000)},
+                stage='later', results=[], output=out, continue_numeric_mismatch=True)
+            self.assertEqual(first_hash, diagnostic.file_sha256(out / 'first_difference.pt'))
+            evidence = torch.load(out / 'difference_post_clip.pt', weights_only=False)
+            self.assertTrue(evidence['truncated'])
+            self.assertEqual(evidence['eager'].numel(), 16384)
+            def nonfinite(expected, actual, **kwargs):
+                if kwargs['stage'] == 'freeze_boundary.step24999':
+                    actual = dict(actual)
+                    name = next(n for n in expected if n.startswith('gradient.pre_clip.critic1.') and not n.endswith('.none'))
+                    actual[name] = torch.full_like(expected[name], float('inf'))
+                return original(expected, actual, **kwargs)
+            out = directory / 'abort'
+            with mock.patch.object(diagnostic, 'compare_tensors', side_effect=nonfinite):
+                with self.assertRaises(AssertionError):
+                    diagnostic.run_snn_path_diagnostic(checkpoint=checkpoint, validation_pool=pool,
+                        output_dir=out, device='cpu', cpu_smoke=True)
+            summary = json.loads((out / 'summary.json').read_text())
+            self.assertEqual(summary['exit_code'], 1)
+            self.assertEqual(summary['execution_status'], 'aborted')
+            self.assertFalse(summary['execution_completed'])
+            self.assertIn('abort_reason', summary)
+            self.assertEqual(summary['completed_test_points'], [])
+            self.assertEqual(hashes, [diagnostic.file_sha256(path) for path in (checkpoint, pool)])
+
     def test_cpu_smoke_restores_projected_checkpoint_and_preserves_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             directory = Path(tmp)
@@ -110,6 +227,8 @@ class TestSNNPathDiagnostic(unittest.TestCase):
                 output_dir=directory / 'out', device='cpu', cpu_smoke=True,
                 expected_digest=inputs['pool'].content_digest)
             self.assertTrue(result['passed'])
+            self.assertEqual(result['exit_code'], 0)
+            self.assertEqual(result['execution_status'], 'completed_consistent')
             self.assertEqual(result['cuda_status'], 'not_run')
             self.assertEqual([c['beta'] for c in result['cases'] if c['actor_backward']], [.00004, .5, .50004, 1., 1.])
             manifest = json.loads((directory / 'out' / 'manifest.json').read_text())

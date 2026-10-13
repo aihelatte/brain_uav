@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import random
 import subprocess
 import json
+from math import isfinite
 
 import numpy as np
 import torch
@@ -56,37 +57,106 @@ def engine_snapshot(engine):
     return result
 
 
-def compare_tensors(expected, actual, *, stage, results, output=None):
-    """Compact per-tensor differences; binary spikes and discrete state are exact."""
+class DiagnosticMismatchError(AssertionError):
+    """All requested comparisons completed, but at least one failed."""
+
+
+def parameter_snapshot(engine):
+    return {f'{module_name}.{name}': parameter.detach().cpu().clone()
+        for module_name in ('actor', 'critic1', 'critic2', 'actor_target', 'critic1_target', 'critic2_target')
+        for name, parameter in getattr(engine, module_name).named_parameters()}
+
+
+def parameter_delta(before, after):
+    if before.keys() != after.keys():
+        raise AssertionError('Parameter fields changed during update')
+    for name in before:
+        if before[name].shape != after[name].shape or before[name].dtype != after[name].dtype:
+            raise AssertionError(f'Parameter shape/dtype changed during update: {name}')
+    # Subtract in double after independent snapshots, preserving small update evidence.
+    return {'update_delta.' + name: after[name].double() - value.double()
+            for name, value in before.items()}
+
+
+def _difference_evidence(output, stage, name, left, right):
+    """At most first + six representative files; bounded samples, never full engines."""
+    if output is None:
+        return []
+    output = Path(output)
+    categories = (('gradient.pre_clip.', 'pre_clip'), ('gradient.post_clip.', 'post_clip'),
+        ('update_delta.', 'delta'), ('optimizer.', 'adam'), ('.spikes.', 'spikes'), ('actor.', 'actor_terms'))
+    paths = [output / 'first_difference.pt']
+    category = next((label for prefix, label in categories if prefix in name), None)
+    if category:
+        paths.append(output / f'difference_{category}.pt')
+    saved = []
+    for path in paths:
+        if path.exists():
+            continue
+        # 16384 elements per side maximum; keep originals' shape and truncation explicit.
+        torch.save({'stage': stage, 'name': name, 'eager_shape': list(left.shape),
+            'formal_shape': list(right.shape), 'truncated': left.numel() > 16384 or right.numel() > 16384,
+            'eager': left.reshape(-1)[:16384].clone(), 'formal': right.reshape(-1)[:16384].clone()}, path)
+        saved.append(str(path))
+    return saved
+
+
+def compare_tensors(expected, actual, *, stage, results, output=None,
+                    continue_numeric_mismatch=False):
+    """Opt-in collection continues finite floating mismatches; default remains fail-fast."""
     from brain_uav.scripts.profile_v2_td3 import COMPILED_NUMERIC_RTOL, COMPILED_NUMERIC_ATOL
     if expected.keys() != actual.keys():
         results.append({'stage': stage, 'passed': False, 'tensor': 'field_set',
+                        'failure_kind': 'structural',
                         'missing': sorted(expected.keys() - actual.keys()),
                         'extra': sorted(actual.keys() - expected.keys())})
         raise AssertionError(f'{stage}: tensor fields differ')
     for name, left in expected.items():
         right = actual[name]
-        exact = (not left.is_floating_point() or '.spikes.' in name
-                 or name.startswith('counts.') or name.endswith('.step'))
+        discrete = not left.is_floating_point() or name.startswith('counts.') or name.endswith('.step')
+        exact = discrete or '.spikes.' in name
         rtol, atol = (0., 0.) if exact else (COMPILED_NUMERIC_RTOL, COMPILED_NUMERIC_ATOL)
         compatible = left.shape == right.shape and left.dtype == right.dtype
         difference = (right.double() - left.double()).abs() if compatible else None
         finite = compatible and bool(torch.isfinite(left).all() & torch.isfinite(right).all())
         mismatch = None if not finite else difference > (atol + rtol * left.double().abs())
         passed = finite and not bool(mismatch.any())
+        def scalar(value):
+            value = float(value)
+            return value if isfinite(value) else None
+        left_l2 = scalar(torch.linalg.vector_norm(left.double().reshape(-1))) if finite else None
+        right_l2 = scalar(torch.linalg.vector_norm(right.double().reshape(-1))) if finite else None
+        diff_l2 = scalar(torch.linalg.vector_norm(difference.reshape(-1))) if finite else None
+        ratio = None
+        denominator_status = 'unavailable'
+        if left_l2 is not None and diff_l2 is not None:
+            if left_l2 == 0:
+                denominator_status = 'zero'
+                ratio = 0. if diff_l2 == 0 else None
+            elif left_l2 <= 1e-12:
+                denominator_status = 'near_zero'
+            else:
+                denominator_status = 'nonzero'
+                ratio = scalar(diff_l2 / left_l2)
+        numeric = finite and not discrete
         row = {'stage': stage, 'tensor': name, 'passed': passed, 'rtol': rtol, 'atol': atol,
-               'max_abs_error': float(difference.max()) if finite and difference.numel() else None,
-               'max_relative_error': float((difference / left.double().abs().clamp_min(1e-5)).max())
+               'element_count': left.numel(), 'shape': list(left.shape),
+               'max_abs_error': scalar(difference.max()) if finite and difference.numel() else None,
+               'max_relative_error': scalar((difference / left.double().abs().clamp_min(1e-5)).max())
                    if finite and difference.numel() else None,
                'exceeded_count': int(mismatch.sum()) if finite else None,
-               'shape_dtype_match': compatible, 'finite': finite}
+               'exceeded_fraction': float(mismatch.sum()) / left.numel() if finite and left.numel() else (0. if finite else None),
+               'eager_l2': left_l2, 'formal_l2': right_l2, 'difference_l2': diff_l2,
+               'relative_l2': ratio, 'relative_l2_denominator': denominator_status,
+               'relative_l2_near_zero_threshold': 1e-12,
+               'shape_dtype_match': compatible, 'finite': finite,
+               'failure_kind': None if passed else ('numeric' if numeric else 'structural_or_discrete')}
         results.append(row)
         if not passed:
-            if output is not None:
-                # Only first failing tensor, not all states/batches, is persisted.
-                torch.save({'stage': stage, 'name': name, 'eager': left, 'formal': right},
-                           output / 'first_difference.pt')
-            raise AssertionError(f'{stage}: {name} differs')
+            row['evidence_paths'] = _difference_evidence(output, stage, name, left, right)
+            if not (continue_numeric_mismatch and numeric):
+                raise AssertionError(f'{stage}: {name} differs')
+
 
 
 def restore_engine(inputs, *, fused):
@@ -310,7 +380,7 @@ def run_snn_path_diagnostic(*, checkpoint, validation_pool, output_dir, device='
     def git(*args):
         return subprocess.check_output(['git', *args], cwd=repo, text=True).strip()
     settings = default_v2_cuda_graph_compilation(model='snn', resolved_device=device)
-    manifest = {'format': 'v2_snn_path_consistency', 'format_version': 1,
+    manifest = {'format': 'v2_snn_path_consistency', 'format_version': 2,
         'diagnostic_only': True, 'checkpoint_path': str(inputs['checkpoint_path']),
         'checkpoint_sha256': inputs['checkpoint_hash'], 'checkpoint_status': payload['status'],
         'passed_validation': payload['passed_validation'], 'training_steps': payload['training_result']['stage_steps'],
@@ -342,8 +412,16 @@ def run_snn_path_diagnostic(*, checkpoint, validation_pool, output_dir, device='
     profile._strict_json_write(output / 'manifest.json', manifest)
     summary = {'diagnostic_only': True, 'passed': False, 'cuda_status': 'not_run' if cpu_smoke else 'pending',
                'cpu_smoke_passed': None, 'cuda_passed': None,
-               'comparisons': [], 'cases': [], 'effective_compilation': [],
+               'execution_completed': False, 'execution_status': 'running', 'exit_code': 1,
+               'delta_semantics': 'Independent before/after snapshots per side; double subtraction. Later steps within a case include accumulated earlier differences; each case starts from checkpoint, not each step.',
+               'graph_evidence_scope': 'Warmup verifier proves replay for probed callable/shapes; per-update execution entries prove requested callable use, not independent cudaGraphLaunch verification for every compared call.',
+               'comparisons': [], 'cases': [], 'effective_compilation': [], 'completed_comparison_stages': [],
                'gradient_semantics': 'pre_clip and post_clip recorded before Adam, current backward only; unused retained actor gradients not consumed or rewritten.'}
+    def check(*args, **kwargs):
+        kwargs.setdefault('output', output)
+        compare_tensors(*args, **kwargs)
+        summary['completed_comparison_stages'].append(kwargs['stage'])
+
     cpu_configuration = {'requested': False, 'enabled_objects': [], 'cuda_graph': False,
         'cuda_graph_actor_update': False, 'cuda_graph_action_inference': False,
         'reason': 'Explicit CPU smoke: both engines eager, identical fused Adam; no compiled/CUDA correctness claim.'}
@@ -351,7 +429,7 @@ def run_snn_path_diagnostic(*, checkpoint, validation_pool, output_dir, device='
     try:
         eager = restore_engine(inputs, fused=True)
         formal = restore_engine(inputs, fused=True)
-        compare_tensors(engine_snapshot(eager), engine_snapshot(formal), stage='restored_initial', results=summary['comparisons'])
+        check(engine_snapshot(eager), engine_snapshot(formal), stage='restored_initial', results=summary['comparisons'])
         before = engine_snapshot(formal)
         before_rng = rng_state()
         current_stage = 'compile_warmup_and_replay_evidence'
@@ -359,7 +437,7 @@ def run_snn_path_diagnostic(*, checkpoint, validation_pool, output_dir, device='
         configured = dict(cpu_configuration) if cpu_smoke else _configure_stage_compilation(formal, warmup_pool, prepared,
             compile_critic_encoder=False, compile_target_encoders=False, **compile_settings)
         summary['effective_compilation'].append(configured)
-        compare_tensors(before, engine_snapshot(formal), stage='warmup_preserves_state', results=summary['comparisons'])
+        check(before, engine_snapshot(formal), stage='warmup_preserves_state', results=summary['comparisons'])
         assert_rng_equal(before_rng, rng_state())
         batches = [collate_v2_observations([obs], device=inputs['device']) for obs in observations]
         mixed = collate_v2_observations([observations[i % 3] for i in range(eager.batch_size)], device=inputs['device'])
@@ -375,12 +453,12 @@ def run_snn_path_diagnostic(*, checkpoint, validation_pool, output_dir, device='
                 row['select_action'] = torch.from_numpy(action.copy())
                 key = (side, index)
                 if key in repeat_reference:
-                    compare_tensors(repeat_reference[key], row, stage=f'reset_repeat.side{side}.input{index}',
-                                    results=summary['comparisons'], output=output)
+                    check(repeat_reference[key], row, stage=f'reset_repeat.side{side}.input{index}',
+                                    results=summary['comparisons'], output=output, continue_numeric_mismatch=True)
                 else:
                     repeat_reference[key] = row
                 records.append(row)
-            compare_tensors(*records, stage=f'select_action.{index}.{len(summary["comparisons"])}', results=summary['comparisons'], output=output)
+            check(*records, stage=f'select_action.{index}.{len(summary["comparisons"])}', results=summary['comparisons'], output=output, continue_numeric_mismatch=True)
         # Direct actor call used by candidate, and mixed masks not supported by select_action's singleton API.
         for index, batch in enumerate([*batches, mixed]):
             current_stage = f'candidate.input{index}'
@@ -394,7 +472,7 @@ def run_snn_path_diagnostic(*, checkpoint, validation_pool, output_dir, device='
                 finally:
                     engine.actor.train(training)
                 rows.append(row)
-            compare_tensors(*rows, stage=f'candidate.{index}', results=summary['comparisons'], output=output)
+            check(*rows, stage=f'candidate.{index}', results=summary['comparisons'], output=output, continue_numeric_mismatch=True)
             if index < len(observations):
                 for side in (0, 1):
                     previous = repeat_reference[(side, index)]
@@ -402,8 +480,8 @@ def run_snn_path_diagnostic(*, checkpoint, validation_pool, output_dir, device='
                     # comparison explicitly, never substitute one path's activity for another.
                     left = {k.replace('inference.', ''): v for k, v in previous.items() if k.startswith('inference.')}
                     right = {k.replace('candidate.', ''): v for k, v in rows[side].items()}
-                    compare_tensors(left, right, stage=f'candidate_vs_select.side{side}.input{index}',
-                                    results=summary['comparisons'], output=output)
+                    check(left, right, stage=f'candidate_vs_select.side{side}.input{index}',
+                                    results=summary['comparisons'], output=output, continue_numeric_mismatch=True)
         for label, steps in diagnostic_cases(eager):
             current_stage = label + '.restore_and_warmup'
             # Fresh complete state for every independent boundary/ramp case. Never load/replace modules after capture.
@@ -417,8 +495,8 @@ def run_snn_path_diagnostic(*, checkpoint, validation_pool, output_dir, device='
                 compile_critic_encoder=False, compile_target_encoders=False, **compile_settings)
             summary['effective_compilation'].append(configured)
             assert_rng_equal(before_rng, rng_state())
-            compare_tensors(before, engine_snapshot(formal), stage=label + '.warmup', results=summary['comparisons'])
-            compare_tensors(engine_snapshot(eager), engine_snapshot(formal), stage=label + '.initial', results=summary['comparisons'])
+            check(before, engine_snapshot(formal), stage=label + '.warmup', results=summary['comparisons'])
+            check(engine_snapshot(eager), engine_snapshot(formal), stage=label + '.initial', results=summary['comparisons'])
             for index, step in enumerate(steps):
                 current_stage = f'{label}.step{step}'
                 obs = mixed if index % 2 == 0 else profile._terminal_numeric_observation_batch(mixed, eager)
@@ -440,6 +518,7 @@ def run_snn_path_diagnostic(*, checkpoint, validation_pool, output_dir, device='
                     restore_rng(noise_rng)
                     engine.replay.sample = lambda size, fixed=fixed: fixed
                     row = {}
+                    parameters_before = parameter_snapshot(engine)
                     executions = []
                     def record(name, value):
                         row[name] = value.detach().cpu().clone()
@@ -461,27 +540,37 @@ def run_snn_path_diagnostic(*, checkpoint, validation_pool, output_dir, device='
                         if any(name not in executions for name in required):
                             raise AssertionError(f'Requested formal path not executed: {required}; got {executions}')
                     flatten(asdict(metric), 'metrics', row)
+                    row.update(parameter_delta(parameters_before, parameter_snapshot(engine)))
                     row.update(engine_snapshot(engine))
                     outputs.append(row)
                 current_stage = f'{label}.step{step}.comparison'
-                compare_tensors(*outputs, stage=f'{label}.step{step}', results=summary['comparisons'], output=output)
+                check(*outputs, stage=f'{label}.step{step}', results=summary['comparisons'], output=output, continue_numeric_mismatch=True)
                 summary['cases'].append({'case': label, 'diagnostic_stage_steps': step,
                     'actor_backward': metric.actor_updated, 'beta': metric.spike_beta_eff,
+                    'prior_updates_in_case': index, 'may_include_accumulated_differences': index > 0,
                     'bc_lambda': bc_lambda, 'fixed_input': 'mixed masks; independent next-observation storage',
                     'formal_execution_entries': executions,
                     'noise': 'same explicit torch CPU/CUDA RNG before actual update_once noise consumption'})
         if file_sha256(inputs['checkpoint_path']) != inputs['checkpoint_hash'] or file_sha256(inputs['pool_path']) != inputs['pool_hash']:
             raise AssertionError('Input artifact changed')
-        summary['passed'] = True
-        summary['cpu_smoke_passed'] = True if cpu_smoke else None
-        summary['cuda_passed'] = None if cpu_smoke else True
-        summary['cuda_status'] = 'not_run' if cpu_smoke else 'passed'
+        summary['execution_completed'] = True
+        summary['passed'] = all(row['passed'] for row in summary['comparisons'])
+        summary['exit_code'] = 0 if summary['passed'] else 1
+        summary['execution_status'] = 'completed_consistent' if summary['passed'] else 'completed_inconsistent'
+        summary['cpu_smoke_passed'] = summary['passed'] if cpu_smoke else None
+        summary['cuda_passed'] = None if cpu_smoke else summary['passed']
+        summary['cuda_status'] = 'not_run' if cpu_smoke else ('passed' if summary['passed'] else 'failed')
+        if not summary['passed']:
+            raise DiagnosticMismatchError('Diagnostic completed with tensor mismatches; see comparisons.json')
         return summary
     except Exception as exc:
         summary['error'] = f'{type(exc).__name__}: {exc}'
         summary['cpu_smoke_passed'] = False if cpu_smoke else None
         summary['cuda_passed'] = None if cpu_smoke else False
-        summary['first_failure_stage'] = current_stage
+        if not summary['execution_completed']:
+            summary['execution_status'] = 'aborted'
+            summary['abort_stage'] = current_stage
+            summary['abort_reason'] = summary['error']
         summary['cuda_status'] = 'not_run' if cpu_smoke else 'failed'
         if hasattr(exc, 'cuda_graph_evidence'):
             summary['cuda_graph_failure_evidence'] = exc.cuda_graph_evidence
@@ -500,8 +589,14 @@ def run_snn_path_diagnostic(*, checkpoint, validation_pool, output_dir, device='
                 aggregate[key] = max(aggregate[key], row.get(key) or 0.)
             aggregate['exceeded_count'] += row.get('exceeded_count') or 0
         summary['stages'] = by_stage
+        summary['failed_stages'] = [stage for stage, detail in by_stage.items() if not detail['passed']]
         summary['first_difference'] = next((r for r in comparisons if not r['passed']), None)
+        summary['first_failure_stage'] = (summary['first_difference']['stage'] if summary['first_difference'] else summary.get('abort_stage'))
+        summary['completed_test_points'] = [r['case'] + '.step' + str(r['diagnostic_stage_steps']) for r in summary['cases']]
+        summary['failed_tensor_count'] = sum(not r['passed'] for r in comparisons)
+        summary['evidence_paths'] = sorted({path for row in comparisons for path in row.get('evidence_paths', [])})
         profile._strict_json_write(output / 'summary.json', summary)
         print(json.dumps({'snn_path_consistency': {'passed': summary['passed'],
-            'cuda_status': summary['cuda_status'], 'summary': str(output / 'summary.json'),
+            'cuda_status': summary['cuda_status'], 'execution_status': summary['execution_status'],
+            'exit_code': summary['exit_code'], 'summary': str(output / 'summary.json'),
             'error': summary.get('error')}}, allow_nan=False), flush=True)
