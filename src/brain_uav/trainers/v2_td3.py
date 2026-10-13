@@ -2455,27 +2455,56 @@ class V2TD3UpdateEngine:
         if scope in ('critic_update_front', 'actor_objective'):
             self._mark_cuda_graph_step_begin()
             observation = batch.to(self.device)
-            relations = self._build_shared_relations(observation)
-            arguments = self.critic1.zone_set_encoder.prepare_tensor_forward_arguments(
-                observation.ego_features, observation.goal_features, observation.zone_features,
-                observation.presence_mask, shared_relations=relations)
             actions = torch.zeros((observation.batch_size, self.action_dim), device=self.device,
                                   requires_grad=scope == 'actor_objective')
             scalar_rows = torch.zeros((observation.batch_size, 1), device=self.device)
             if scope == 'critic_update_front':
+                # Replay has distinct current/next and reward/done/success storage.
+                following = V2ObservationBatch(*(tensor.detach().clone() for tensor in (
+                    observation.ego_features, observation.goal_features,
+                    observation.zone_features, observation.presence_mask)))
+                reward, done, success = (scalar_rows.clone() for _ in range(3))
+                inputs = []
+                def prepare_inputs():
+                    self._mark_cuda_graph_step_begin()
+                    with torch.no_grad():
+                        next_relations = self._build_shared_relations(following)
+                        noise = (torch.randn_like(actions) * self.policy_noise).clamp(
+                            -self.noise_clip, self.noise_clip)
+                        target_input = noise
+                        if self.model_type == 'snn':
+                            target_input = self.actor_target(following, shared_relations=next_relations) + noise
+                            target_input = torch.maximum(torch.minimum(target_input, self.action_high), self.action_low)
+                    current_relations = self._build_shared_relations(observation)
+                    def prepare(obs, shared):
+                        return self.critic1.zone_set_encoder.prepare_tensor_forward_arguments(
+                            obs.ego_features, obs.goal_features, obs.zone_features,
+                            obs.presence_mask, shared_relations=shared)
+                    inputs[:] = [prepare(observation, current_relations),
+                        prepare(following, next_relations), actions, target_input, reward, done, success]
                 def front_replay():
+                    result = self._compiled_critic_front(*inputs)
+                    self._require_finite_loss(result[2], component='critic', total_steps=0)
                     self.critic_optimizer.zero_grad(set_to_none=True)
-                    result = self._compiled_critic_front(arguments, arguments, actions,
-                        torch.zeros_like(actions), scalar_rows, scalar_rows, scalar_rows)
                     result[2].backward()
+                # Exclude auxiliary relation/target graphs from the scoped launch evidence.
+                front_replay.prepare_inputs = prepare_inputs
                 return front_replay
-            with torch.no_grad():
-                context = self.critic1.encode_context(observation, shared_relations=relations).clone()
-            def objective_replay():
-                actions.grad = None
+            inputs = []
+            @contextmanager
+            def prepared_objective_inputs():
+                self._mark_cuda_graph_step_begin()
+                relations = self._build_shared_relations(observation)
+                # Enter guidance before profiling; retain its head freeze and context
+                # until the scoped objective/backward has finished.
                 with self._actor_critic_guidance(observation, shared_relations=relations,
-                                                profile_sections=False):
-                    result = self._compiled_actor_objective(self.critic1, context, actions,
+                                                profile_sections=False) as critic_context:
+                    if critic_context is None:
+                        raise RuntimeError('Actor objective probe requires compiled no-grad critic context.')
+                    with torch.no_grad():
+                        context = critic_context.clone()
+                    actions.grad = None
+                    inputs[:] = [self.critic1, context, actions,
                         torch.zeros_like(actions), observation.ego_features, observation.goal_features,
                         torch.ones_like(scalar_rows), self.action_low, self.action_high,
                         torch.as_tensor(self.actor_rl_scale_alpha, device=self.device),
@@ -2486,8 +2515,12 @@ class V2TD3UpdateEngine:
                         self.terminal_geo_regularization_enabled,
                         torch.full((), .3, device=self.device, requires_grad=True) if self.model_type == 'snn' else None,
                         torch.as_tensor(self.spike_regularization.beta_max, device=self.device) if self.model_type == 'snn' else None,
-                        self.spike_regularization.target_rate)
+                        self.spike_regularization.target_rate]
+                    yield
+            def objective_replay():
+                result = self._compiled_actor_objective(*inputs)
                 result[0].backward()
+            objective_replay.prepared_inputs = prepared_objective_inputs
             return objective_replay
         if scope in ('actor_forward', 'actor_backward', 'bc_reference', 'critic_guidance'):
             # These probes own an independent forward/backward, never a live
@@ -2759,7 +2792,18 @@ class V2TD3UpdateEngine:
                         batch,
                         scope,
                     )
-                    replay_evidence = self._profile_cuda_graph_replay(replay)
+                    preparation = replay.prepared_inputs if scope == 'actor_objective' else nullcontext
+                    if scope in ('critic_update_front', 'actor_objective'):
+                        # Warm the SAME callable/input lifetime before observing steady replay.
+                        for _ in range(3):
+                            with preparation():
+                                if scope == 'critic_update_front':
+                                    replay.prepare_inputs()
+                                replay()
+                        if scope == 'critic_update_front':
+                            replay.prepare_inputs()
+                    with preparation():
+                        replay_evidence = self._profile_cuda_graph_replay(replay)
                     del replay
                     launch_count = int(
                         replay_evidence['cuda_graph_launch_count']
@@ -2768,6 +2812,8 @@ class V2TD3UpdateEngine:
                     shape_evidence = {
                         'batch_shape': batch_shape,
                         'verified': verified,
+                        'status': 'replay_observed' if verified else 'replay_not_observed',
+                        'capture_prohibition': 'not_determined; consult TORCH_LOGS=perf_hints',
                         'cuda_graph_launch_count': launch_count,
                         'event_names': replay_evidence['event_names'],
                     }
@@ -2775,6 +2821,11 @@ class V2TD3UpdateEngine:
                     if not verified:
                         scope_evidence[scope]['verified'] = False
                         missing.append((scope, batch_shape))
+        except Exception as exc:
+            exc.cuda_graph_evidence = {'verified': False, 'scope_evidence': scope_evidence,
+                'status': 'probe_error', 'capture_prohibition': 'not_determined',
+                'error': {'type': type(exc).__name__, 'detail': str(exc)}}
+            raise
         finally:
             random.setstate(python_rng)
             for module, name, value in snn_memories:
@@ -2806,11 +2857,14 @@ class V2TD3UpdateEngine:
             details = '; '.join(
                 f'{scope} shape={shape}' for scope, shape in missing
             )
-            raise RuntimeError(
+            error = RuntimeError(
                 'CUDA Graph updates were requested, but replay evidence is '
                 f'missing for: {details}. Re-run with TORCH_LOGS=perf_hints '
                 'to obtain the Inductor skip reason.'
             )
+            error.cuda_graph_evidence = {'verified': False, 'scope_evidence': scope_evidence,
+                'status': 'replay_not_observed', 'capture_prohibition': 'not_determined'}
+            raise error
         launch_count = sum(
             shape['cuda_graph_launch_count']
             for scope in scope_evidence.values()

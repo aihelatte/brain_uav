@@ -4803,6 +4803,113 @@ def run_v2_td3_timing_diagnostic(
     return summary
 
 
+TD3_BLOCK_CORRECTNESS_VERSION = 2
+
+
+def _td3_block_correctness_steps(config, count):
+    delay, freeze = config.policy_delay, config.actor_freeze_steps
+    spike = config.spike_regularization or v2_td3_module.V2SpikeRegularizationConfig()
+    first_actor = (freeze // delay + 1) * delay
+    steps = sorted({1, delay, freeze, first_actor, first_actor + 1,
+                    spike.ramp_start_steps,
+                    (spike.ramp_start_steps + spike.ramp_end_steps) // 2,
+                    spike.ramp_end_steps, spike.ramp_end_steps + delay} - {0})
+    if count < len(steps):
+        raise ValueError(f'Correctness requires at least {len(steps)} updates for increasing freeze/ramp coverage.')
+    last = steps[-1]
+    steps.extend(last + i + 1 for i in range(count - len(steps)))
+    if steps[-1] > config.max_steps:
+        raise ValueError('Correctness sequence exceeds the stage horizon.')
+    return steps
+
+
+def _validate_td3_block_reference(reference, contract, count):
+    if reference.get('contract') != contract:
+        raise ValueError('Obsolete or incompatible correctness reference; rebuild baseline reference.')
+    if len(reference['snapshots']) != count:
+        raise ValueError('Correctness reference snapshot count differs.')
+
+
+def _td3_gradient_snapshot(engine, *, actor_backward):
+    # CPU copies own their storage; never rebind or clear the live model gradients.
+    values, evidence = {}, {}
+    for module_name in ('actor', 'critic1', 'critic2'):
+        for index, (name, parameter) in enumerate(getattr(engine, module_name).named_parameters()):
+            key = f'grad.{module_name}.{index}'
+            gradient = parameter.grad
+            values[key if gradient is not None else key + '.none'] = (
+                gradient.detach().cpu().clone() if gradient is not None else torch.tensor(True))
+            evidence[key] = {'parameter_name': module_name + '.' + name,
+                'source': 'current_backward' if module_name != 'actor' or actor_backward else 'retained_no_backward',
+                'present': gradient is not None}
+    return values, evidence
+
+
+def _compare_td3_block_snapshot(expected, actual, *, context, report, output=None):
+    try:
+        if expected.keys() != actual.keys():
+            key = sorted(expected.keys() ^ actual.keys())[0]
+            raise AssertionError('Snapshot fields differ: ' + key)
+        for key in expected:
+            exact = not expected[key].is_floating_point() or key.endswith('.step')
+            _compare_compiled_numeric_tensors({key: expected[key]}, {key: actual[key]},
+                rtol=0 if exact else COMPILED_NUMERIC_RTOL,
+                atol=0 if exact else COMPILED_NUMERIC_ATOL)
+    except AssertionError:
+        failure = {**context, 'field': key}
+        evidence_key = key.removesuffix('.none')
+        failure.update(context['gradients'].get(evidence_key, {}))
+        if key in expected and key in actual and expected[key].shape == actual[key].shape:
+            difference = (actual[key].to(torch.float64) - expected[key].to(torch.float64)).abs()
+            maximum = float(difference.max()) if difference.numel() else 0.0
+            failure['maximum_absolute_error'] = maximum if isfinite(maximum) else None
+            failure['non_finite_difference'] = not isfinite(maximum)
+        report['first_snapshot_failure'] = failure
+        if output is not None:
+            evidence_path = output / 'first_snapshot_failure.pt'
+            torch.save({'context': failure, 'expected': expected.get(key),
+                        'actual': actual.get(key)}, evidence_path)
+            failure['evidence_path'] = str(evidence_path)
+        raise
+    return _compare_compiled_numeric_tensors(expected, actual,
+        rtol=COMPILED_NUMERIC_RTOL, atol=COMPILED_NUMERIC_ATOL)
+
+
+@contextmanager
+def _inject_diagnostic_inf_gradient(engine, *, component, evidence):
+    """Inject after real backward, immediately before the ORIGINAL safety barrier."""
+    original = engine._validate_and_clip_gradients
+    had_override = '_validate_and_clip_gradients' in engine.__dict__
+    override = engine.__dict__.get('_validate_and_clip_gradients')
+    evidence.update(component=component, hits=0, confirmed_inf=False)
+    names = {id(p): module_name + '.' + name
+        for module_name in ('actor', 'critic1', 'critic2')
+        for name, p in getattr(engine, module_name).named_parameters()}
+    def check(parameters, **kwargs):
+        if kwargs['component'] == component:
+            parameter = next((p for p in parameters if p.grad is not None), None)
+            if parameter is None:
+                raise AssertionError('Inf injection requires an existing backward gradient.')
+            evidence['hits'] += 1
+            evidence['parameter_name'] = names[id(parameter)]
+            with torch.no_grad():
+                parameter.grad.fill_(float('inf'))
+            evidence['confirmed_inf'] = bool(torch.isinf(parameter.grad).all())
+            if not evidence['confirmed_inf'] or evidence['hits'] != 1:
+                raise AssertionError('Diagnostic Inf injection did not hit exactly once.')
+        return original(parameters, **kwargs)
+    engine._validate_and_clip_gradients = check
+    try:
+        yield
+    finally:
+        if had_override:
+            engine._validate_and_clip_gradients = override
+        else:
+            del engine._validate_and_clip_gradients
+        if evidence['hits'] != 1 or not evidence['confirmed_inf']:
+            raise AssertionError('Diagnostic Inf injection never reached the gradient barrier.')
+
+
 def _run_local_optimization_correctness(args, *, prepared, config, pool, device, output):
     """Fixed-input CUDA updates, separate from the end-to-end timing loop."""
     from copy import deepcopy
@@ -4858,11 +4965,20 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
             if args.td3_block_reference is None:
                 raise ValueError('Candidate correctness requires independent baseline snapshots.')
             saved_reference = torch.load(args.td3_block_reference, map_location='cpu', weights_only=False)
-            reference = saved_reference['snapshots']
+    stage_steps = _td3_block_correctness_steps(config, count) if block_check else []
+    contract = {'version': TD3_BLOCK_CORRECTNESS_VERSION, 'model': args.model,
+        'seed': args.seed, 'stage_steps': stage_steps, 'config': config.to_dict(),
+        'reward_config': asdict(prepared.reward_config), 'checkpoint': report['checkpoint'],
+        'pool_digest': pool.content_digest, 'bc_schedule': args.comparison_bc_schedule}
+    if block_check:
+        report['reference_contract'] = contract
     report['comparison_kind'] = 'merged_update_blocks' if block_check else ('checked_critic_tail' if tail_comparison else 'local_optimizations')
     if tail_comparison:
         report['optimizer_execution_difference'] = 'Only critic capturable differs (A=false, B=true); excluded from numeric comparison. step, moments and other optimizer settings remain compared.'
     try:
+        if block_check and choice != 'baseline':
+            _validate_td3_block_reference(saved_reference, contract, count)
+            reference = saved_reference['snapshots']
         for group, window, buffers in groups:
             engine = build_v2_stage_engine(None, config, init_checkpoint=args.bc_checkpoint,
                 rewards=prepared.reward_config, prepared_initialization=prepared, device=device,
@@ -4884,12 +5000,18 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
             mixed, nonempty = _numeric_diagnostic_observation_batches(batches, device=device)
             fixed = [_fixed_numeric_replay_batch(obs, action_dim=engine.action_dim, device=device)
                      for obs in (mixed, nonempty)]
+            if block_check:
+                from dataclasses import replace
+                # Formal replay stores current and next observations independently.
+                fixed = [replace(b, next_obs=V2ObservationBatch(*(t.clone() for t in (
+                    b.next_obs.ego_features, b.next_obs.goal_features,
+                    b.next_obs.zone_features, b.next_obs.presence_mask)))) for b in fixed]
             # Repeated independent inference must reset both SNN layers, without an extra training forward.
             with torch.inference_mode():
                 first = engine.actor(mixed).clone()
                 second = engine.actor(mixed).clone()
             torch.testing.assert_close(first, second, rtol=COMPILED_NUMERIC_RTOL, atol=COMPILED_NUMERIC_ATOL)
-            snapshots, metrics, executions = [], [], []
+            snapshots, metrics, executions, snapshot_contexts = [], [], [], []
             report['groups'][group] = {'compilation': configured,
                 'local_optimizations': engine.local_optimization_metadata(), 'state_reset_check': True}
             for index in range(count):
@@ -4899,10 +5021,7 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
                 torch.cuda.manual_seed_all(args.seed + index)
                 total = ((1 if index == 0 else config.policy_delay) if tail_comparison and index < 2 else offset + index + 1)
                 if block_check:
-                    schedule_steps = (1, config.policy_delay, config.actor_freeze_steps,
-                                      config.actor_freeze_steps + config.policy_delay,
-                                      25000, 50000, 75000, 75000 + config.policy_delay)
-                    total = schedule_steps[index] if index < 8 else offset + index + 1
+                    total = stage_steps[index]
                 _, policy_noise, noise_clip = config.noise_schedule.values(total, max_steps=config.max_steps)
                 engine.set_target_noise(policy_noise=policy_noise, noise_clip=noise_clip)
                 entries = []
@@ -4918,8 +5037,18 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
                 flatten(engine.actor_optimizer.state_dict(), 'optimizer.actor', snapshot)
                 flatten(engine.critic_optimizer.state_dict(), 'optimizer.critic', snapshot)
                 if tail_comparison or block_check:
-                    for name in ('actor', 'critic1', 'critic2'):
-                        flatten([p.grad for p in getattr(engine, name).parameters()], 'grad.' + name, snapshot)
+                    gradients, gradient_evidence = _td3_gradient_snapshot(engine, actor_backward=metric.actor_updated)
+                    snapshot.update(gradients)
+                    snapshot_contexts.append({'snapshot_index': index, 'stage_steps': total,
+                        'actor_backward': metric.actor_updated, 'gradients': gradient_evidence})
+                    if block_check:
+                        report['groups'][group]['snapshot_evidence'] = snapshot_contexts
+                        if snapshots and not metric.actor_updated:
+                            previous = {k: v for k, v in snapshots[-1].items() if k.startswith('grad.actor.')}
+                            current = {k: v for k, v in gradients.items() if k.startswith('grad.actor.')}
+                            # Do not repair live .grad: retain evidence if graph storage was overwritten.
+                            _compare_td3_block_snapshot(previous, current,
+                                context=snapshot_contexts[-1], report=report, output=output)
                     flatten({name: getattr(engine, name) for name in ('update_count', 'critic_update_count', 'critic_target_update_count', 'actor_update_count')}, 'counts', snapshot)
                 snapshots.append(snapshot)
             engine.flush_update_statistics()
@@ -4981,8 +5110,11 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
                     base_batch = fixed[0]
                     error_batch = replace(base_batch, reward=torch.full_like(base_batch.reward, float('nan'))) if kind == 'critic_nan_loss' else base_batch
                     engine.replay.sample = lambda size, b=error_batch: b
-                    parameter = next((engine.actor if kind.startswith('actor') else engine.critic1).parameters())
-                    hook = parameter.register_hook(lambda g: torch.full_like(g, float('inf'))) if kind.endswith('inf_gradient') else None
+                    injection_evidence = {'kind': kind}
+                    report['groups'][group].setdefault('gradient_injections', []).append(injection_evidence)
+                    injection = (_inject_diagnostic_inf_gradient(engine,
+                        component='actor' if kind.startswith('actor') else 'critic',
+                        evidence=injection_evidence) if kind.endswith('inf_gradient') else nullcontext())
                     original_check = engine._require_finite_loss
                     def check(loss, *, component, total_steps):
                         if kind == 'actor_nan_loss' and component == 'actor':
@@ -4993,7 +5125,8 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
                         torch.manual_seed(args.seed + 100)
                         torch.cuda.manual_seed_all(args.seed + 100)
                         try:
-                            engine.update_once(total_steps=75002, bc_lambda=v2_bc_lambda(75002, schedule=args.comparison_bc_schedule))
+                            with injection:
+                                engine.update_once(total_steps=75002, bc_lambda=v2_bc_lambda(75002, schedule=args.comparison_bc_schedule))
                         except FloatingPointError as exc:
                             if not str(exc).startswith('Non-finite ' + ('actor' if kind.startswith('actor') else 'critic')):
                                 raise
@@ -5001,8 +5134,6 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
                             raise AssertionError('Error barrier failed: ' + kind)
                     finally:
                         engine._require_finite_loss = original_check
-                        if hook is not None:
-                            hook.remove()
                     after = error_state()
                     unchanged = [key for key in previous if (not kind.startswith('actor') or key.startswith(('actor.', 'actor_target.', 'optimizer.actor.', 'counts.actor_update_count')))]
                     _compare_compiled_numeric_tensors({k: previous[k] for k in unchanged}, {k: after[k] for k in unchanged}, rtol=0, atol=0)
@@ -5010,7 +5141,7 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
                 report['groups'][group]['error_barriers'] = True
                 if choice == 'baseline':
                     torch.save({'snapshots': snapshots, 'errors': errors,
-                                'initial': initial}, output / 'reference.pt')
+                                'initial': initial, 'contract': contract}, output / 'reference.pt')
                 else:
                     for expected, actual in zip(saved_reference['errors'], errors):
                         _compare_compiled_numeric_tensors(expected, actual, rtol=COMPILED_NUMERIC_RTOL, atol=COMPILED_NUMERIC_ATOL)
@@ -5022,21 +5153,22 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
                 reference = snapshots
             else:
                 if block_check:
-                    for expected, actual in zip(reference, snapshots):
-                        if expected.keys() != actual.keys():
-                            raise AssertionError('Snapshot fields differ.')
-                        exact = [k for k, v in expected.items() if not v.is_floating_point() or k.endswith('.step')]
-                        _compare_compiled_numeric_tensors({k: expected[k] for k in exact}, {k: actual[k] for k in exact}, rtol=0, atol=0)
-                report['groups'][group]['differences'] = [
-                    _compare_compiled_numeric_tensors(expected, actual,
-                        rtol=COMPILED_NUMERIC_RTOL, atol=COMPILED_NUMERIC_ATOL)
-                    for expected, actual in zip(reference, snapshots)]
+                    report['groups'][group]['differences'] = [
+                        _compare_td3_block_snapshot(expected, actual, context=context, report=report, output=output)
+                        for expected, actual, context in zip(reference, snapshots, snapshot_contexts)]
+                else:
+                    report['groups'][group]['differences'] = [
+                        _compare_compiled_numeric_tensors(expected, actual,
+                            rtol=COMPILED_NUMERIC_RTOL, atol=COMPILED_NUMERIC_ATOL)
+                        for expected, actual in zip(reference, snapshots)]
             del engine
             gc.collect()
             torch.cuda.empty_cache()
         report['passed'] = True
     except Exception as exc:
         report['failure'] = {'type': type(exc).__name__, 'detail': str(exc)}
+        if hasattr(exc, 'cuda_graph_evidence'):
+            report['cuda_graph_evidence'] = exc.cuda_graph_evidence
         _strict_json_write(output / 'local_optimization_correctness.json', report)
         raise
     _strict_json_write(output / 'local_optimization_correctness.json', report)
