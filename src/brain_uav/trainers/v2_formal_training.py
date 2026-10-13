@@ -1001,6 +1001,8 @@ def build_v2_stage_engine(
     window_update_statistics: bool = False,
     reuse_update_buffers: bool = False,
     cuda_graph_critic_tail: bool = False,
+    compile_critic_update_front: bool = False,
+    compile_actor_objective: bool = False,
     pinned_batch_transfer: bool = False,
 ) -> V2StageComponents:
     if scenario is not None and not isinstance(scenario, ScenarioConfig):
@@ -1233,6 +1235,8 @@ def build_v2_stage_engine(
         window_update_statistics=window_update_statistics,
         reuse_update_buffers=reuse_update_buffers,
         cuda_graph_critic_tail=cuda_graph_critic_tail,
+        compile_critic_update_front=compile_critic_update_front,
+        compile_actor_objective=compile_actor_objective,
         pinned_batch_transfer=pinned_batch_transfer,
     )
     if previous_engine_payload is not None:

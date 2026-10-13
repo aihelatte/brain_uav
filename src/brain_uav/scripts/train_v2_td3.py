@@ -93,6 +93,8 @@ def build_parser() -> argparse.ArgumentParser:
     # combination and keep their plain False default.
     parser.add_argument('--window-update-statistics', action='store_true')
     parser.add_argument('--reuse-update-buffers', action='store_true')
+    parser.add_argument('--compile-critic-update-front', action='store_true')
+    parser.add_argument('--compile-actor-objective', action='store_true')
     parser.add_argument('--cuda-graph-critic-tail', action='store_true', help='Capture checked fused critic Adam and optional critic target updates; requires CUDA.')
     parser.add_argument('--compile-critic-encoder', action='store_true')
     parser.add_argument('--compile-target-encoders', action='store_true')
@@ -467,6 +469,8 @@ def run_v2_td3_stage(
     window_update_statistics: bool = False,
     reuse_update_buffers: bool = False,
     cuda_graph_critic_tail: bool = False,
+    compile_critic_update_front: bool = False,
+    compile_actor_objective: bool = False,
     pinned_batch_transfer: bool = False,
     cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
@@ -479,6 +483,19 @@ def run_v2_td3_stage(
     )
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
+    for name, value in (('compile_critic_update_front', compile_critic_update_front),
+                        ('compile_actor_objective', compile_actor_objective)):
+        if type(value) is not bool:
+            raise TypeError(f'{name} must be a bool.')
+    if compile_critic_update_front or compile_actor_objective:
+        if cuda_graph_critic_tail or window_update_statistics or reuse_update_buffers:
+            raise ValueError('Merged blocks conflict with critic tail and local optimizations.')
+        if not (cuda_graph_updates and cuda_graph_actor_update and fused_adam
+                and compile_critic_block and compile_target_block and compile_actors
+                and compile_shared_relations and compile_actor_loss and cache_actor_loss_coefficients
+                and frozen_critic_strategy == 'compiled_no_grad_context'
+                and (model != 'snn' or compile_snn_target_encoder)):
+            raise ValueError('Merged blocks require formal CUDA compilation settings.')
     if model not in ('ann', 'snn'):
         raise ValueError('model must be "ann" or "snn".')
     validate_policy_dimensions(actor_projection_dim, actor_hidden_dim)
@@ -587,6 +604,8 @@ def run_v2_td3_stage(
         window_update_statistics=window_update_statistics,
         reuse_update_buffers=reuse_update_buffers,
         cuda_graph_critic_tail=cuda_graph_critic_tail,
+        compile_critic_update_front=compile_critic_update_front,
+        compile_actor_objective=compile_actor_objective,
         pinned_batch_transfer=pinned_batch_transfer,
     )
     compilation_metadata = _configure_stage_compilation(
@@ -847,7 +866,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(json.dumps({
         'local_optimizations_requested': {'window_update_statistics': args.window_update_statistics,
-                                          'reuse_update_buffers': args.reuse_update_buffers, 'cuda_graph_critic_tail': args.cuda_graph_critic_tail},
+                                          'reuse_update_buffers': args.reuse_update_buffers, 'cuda_graph_critic_tail': args.cuda_graph_critic_tail,
+                                          'compile_critic_update_front': args.compile_critic_update_front,
+                                          'compile_actor_objective': args.compile_actor_objective},
         'requested_device': args.device,
         'resolved_device': resolved_device,
         'resolved_v2_formal_config': config_preview.to_dict(),
@@ -905,6 +926,8 @@ def main(argv: list[str] | None = None) -> int:
         window_update_statistics=args.window_update_statistics,
         reuse_update_buffers=args.reuse_update_buffers,
         cuda_graph_critic_tail=args.cuda_graph_critic_tail,
+        compile_critic_update_front=args.compile_critic_update_front,
+        compile_actor_objective=args.compile_actor_objective,
         pinned_batch_transfer=args.pinned_batch_transfer,
         cuda_graph_updates=compilation['cuda_graph_updates'],
         cuda_graph_actor_update=compilation['cuda_graph_actor_update'],
