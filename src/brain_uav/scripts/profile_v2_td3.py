@@ -5521,7 +5521,12 @@ def run_td3_block_suite(args):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', choices=('ann', 'snn'), required=True)
-    parser.add_argument('--bc-checkpoint', type=Path, required=True)
+    parser.add_argument('--bc-checkpoint', type=Path)
+    parser.add_argument('--snn-path-consistency', action='store_true', help='Checkpoint-based eager vs formal SNN CUDA Graph consistency; no rollout or timing.')
+    parser.add_argument('--checkpoint', type=Path, help='Terminal formal checkpoint; failed is allowed only for diagnosis.')
+    parser.add_argument('--expected-pool-digest')
+    parser.add_argument('--diagnostic-trajectory', type=Path, help='Optional saved trajectory JSON for exact terminal-state observation; otherwise discover latest boundary sample beside checkpoint.')
+    parser.add_argument('--snn-path-cpu-smoke', action='store_true', help='Explicit CPU integration smoke; never CUDA evidence.')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--scenario-pool-dir', type=Path)
     parser.add_argument('--td3-block-suite', action='store_true', help='Serial ANN then SNN: baseline/C/A correctness, each followed by timing only if passed.')
@@ -5656,6 +5661,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.snn_path_consistency:
+        if args.model != 'snn' or args.checkpoint is None or args.validation_pool is None:
+            raise ValueError('SNN path diagnosis requires --model snn --checkpoint --validation-pool.')
+        if any((args.td3_block_suite, args.td3_block_correctness, args.td3_block_comparison,
+                args.local_optimization_comparison, args.local_optimization_correctness,
+                args.critic_tail_comparison, args.critic_tail_correctness, args.cuda_graph_critic_tail,
+                args.td3_block_attribution, args.compile_critic_update_front, args.compile_actor_objective,
+                args.window_update_statistics, args.reuse_update_buffers, args.pinned_batch_transfer,
+                args.aggregate_relation_values_first, args.single_observation_fast_path,
+                args.check_compiled_numerics, args.compiled_numerics_only)):
+            raise ValueError('SNN path diagnosis uses the fixed formal configuration and cannot be combined with other diagnostic/optimization modes.')
+        from brain_uav.scripts.v2_snn_path_diagnostic import run_snn_path_diagnostic
+        return run_snn_path_diagnostic(checkpoint=args.checkpoint, validation_pool=args.validation_pool,
+            output_dir=args.output_dir, device=args.device, expected_digest=args.expected_pool_digest,
+            cpu_smoke=args.snn_path_cpu_smoke, trajectory=args.diagnostic_trajectory)
+    if args.snn_path_cpu_smoke or args.checkpoint is not None or args.diagnostic_trajectory is not None or args.expected_pool_digest is not None:
+        raise ValueError('Checkpoint path options require --snn-path-consistency.')
+    if args.bc_checkpoint is None:
+        raise ValueError('--bc-checkpoint is required for existing diagnostics.')
     if (args.td3_block_choice != 'baseline' or args.td3_block_reference is not None) and not (args.td3_block_correctness or args.td3_block_comparison):
         raise ValueError('Block selection/reference requires a block worker mode.')
     if args.critic_tail_internal_timing and not args.critic_tail_comparison:

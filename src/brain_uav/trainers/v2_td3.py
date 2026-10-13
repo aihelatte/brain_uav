@@ -3238,6 +3238,7 @@ class V2TD3UpdateEngine:
         ) = None,
         diagnostic_profile_sections: bool = False,
         compiled_execution_recorder: Callable[[str], None] | None = None,
+        diagnostic_tensor_recorder: Callable[[str, torch.Tensor], None] | None = None,
         block_attribution_recorder: Callable[[dict[str, Any]], None] | None = None,
     ) -> V2TD3UpdateMetrics:
         if type(defer_statistics) is not bool:
@@ -3245,6 +3246,11 @@ class V2TD3UpdateEngine:
         if defer_statistics and not self.window_update_statistics:
             raise ValueError('defer_statistics requires window_update_statistics.')
         self._defer_statistics = defer_statistics
+        if diagnostic_tensor_recorder is not None:
+            if not callable(diagnostic_tensor_recorder):
+                raise TypeError('diagnostic_tensor_recorder must be callable.')
+            if self.compile_critic_update_front:
+                raise ValueError('Intermediate tensor diagnosis does not support the merged critic front.')
         update_timing = _OptionalUpdateWallTimer(timing_recorder)
         detail_timing = _OptionalUpdateDetailTimer(
             diagnostic_timing_recorder,
@@ -3511,6 +3517,13 @@ class V2TD3UpdateEngine:
                             (td_error * failure_mask).sum()
                             / failure_mask.sum().clamp_min(1.0)
                         )
+        if diagnostic_tensor_recorder is not None:
+            # Diagnostic-only copies are owned by the caller, before graph outputs can be reused.
+            for name, value in (('target.noise', noise), ('target.action', next_action), ('target.q1', target_q1),
+                                ('target.q2', target_q2), ('target.td', target_q),
+                                ('critic.q1', current_q1), ('critic.q2', current_q2),
+                                ('critic.loss', critic_loss)):
+                diagnostic_tensor_recorder(name, value)
         with update_timing.section('critic_backward'):
             with (
                 record_function('v2_td3.critic_backward')
@@ -3610,6 +3623,11 @@ class V2TD3UpdateEngine:
                         total_steps=total_steps_value,
                     )
                 with detail_timing.section('actor_zero_grad'):
+                    if diagnostic_tensor_recorder is not None:
+                        for name in actor_terms.__dataclass_fields__:
+                            value = getattr(actor_terms, name)
+                            if value is not None:
+                                diagnostic_tensor_recorder('actor.' + name, torch.as_tensor(value, device=self.device))
                     self.actor_optimizer.zero_grad(set_to_none=True)
                 with detail_timing.section('actor_backward'):
                     actor_terms.actor_loss.backward()
