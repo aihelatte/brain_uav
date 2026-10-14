@@ -95,6 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--reuse-update-buffers', action='store_true')
     parser.add_argument('--compile-critic-update-front', action='store_true')
     parser.add_argument('--compile-actor-objective', action='store_true')
+    parser.add_argument('--gpu-td3-update', action='store_true', help='Experimental full device replay/update; CUDA 2.5.1+cu124 only; default off.')
     parser.add_argument('--cuda-graph-critic-tail', action='store_true', help='Capture checked fused critic Adam and optional critic target updates; requires CUDA.')
     parser.add_argument('--compile-critic-encoder', action='store_true')
     parser.add_argument('--compile-target-encoders', action='store_true')
@@ -327,6 +328,11 @@ def _configure_stage_compilation(
         backend='inductor', mode='default', fullgraph=True, dynamic=True,
     )
     metadata['requested'] = True
+    if engine.gpu_td3_update:
+        metadata['update_execution_override'] = {
+            'requested': True, 'effective_after_initialization': 'manual outer GPU update executor',
+            'old_update_compilation': 'registered only; old backward/capture warmup skipped; not invoked by GPU updates',
+            'scope_preserved': 'compiled environment action inference; no nested update CUDA Graphs'}
     metadata['local_optimizations'] = engine.local_optimization_metadata()
     metadata['reduce_update_stat_syncs_requested'] = bool(
         getattr(engine, 'reduce_update_stat_syncs', False)
@@ -381,19 +387,29 @@ def _configure_stage_compilation(
         for batch in warmup_batches
     ]
     warmup_started = perf_counter()
-    if compile_actors:
+    if engine.gpu_td3_update and compile_actors:
+        import torch
+        # Preserve inference/validation compilation without first creating leaf
+        # AccumulateGrad nodes on the default stream. The manual executor owns
+        # first backward and its persistent stream across checkpoint reloads.
+        with torch.no_grad():
+            for batch in warmup_batches:
+                engine._mark_cuda_graph_step_begin()
+                for actor in (engine.actor,engine.bc_reference_actor):
+                    if actor is not None: actor(batch)
+    elif compile_actors:
         engine.warmup_actor_compile(warmup_batches)
     if compile_shared_relations:
         engine.warmup_shared_relations_compile(warmup_batches)
-    if compile_critic_block:
+    if compile_critic_block and not engine.gpu_td3_update:
         engine.warmup_full_compile(warmup_batches)
-    elif compile_critic_encoder:
+    elif compile_critic_encoder and not engine.gpu_td3_update:
         engine.warmup_online_critic_encoder_compile(warmup_batches)
         if compile_target_encoders:
             engine.warmup_target_encoder_compile(warmup_batches)
-    if compile_snn_target_encoder and not compile_target_block:
+    if compile_snn_target_encoder and not compile_target_block and not engine.gpu_td3_update:
         engine.warmup_snn_target_encoder_compile(warmup_batches)
-    if compile_actor_loss:
+    if compile_actor_loss and not engine.gpu_td3_update:
         engine.warmup_actor_loss_compile(warmup_batches)
     if compile_action_inference:
         engine.warmup_action_inference_compile(action_inference_batches)
@@ -407,10 +423,12 @@ def _configure_stage_compilation(
                 action_inference_batches
             )
         )
-    if cuda_graph_updates:
+    if cuda_graph_updates and not engine.gpu_td3_update:
         metadata['cuda_graph_evidence'] = (
             engine.verify_update_cuda_graph_capture(warmup_batches)
         )
+    elif engine.gpu_td3_update:
+        metadata['cuda_graph_evidence']={'verified':False,'reason':'full executor capture/replay pending; old update probes intentionally skipped'}
     metadata['warmup_wall_seconds'] = perf_counter() - warmup_started
     return metadata
 
@@ -469,6 +487,7 @@ def run_v2_td3_stage(
     window_update_statistics: bool = False,
     reuse_update_buffers: bool = False,
     cuda_graph_critic_tail: bool = False,
+    gpu_td3_update: bool = False,
     compile_critic_update_front: bool = False,
     compile_actor_objective: bool = False,
     pinned_batch_transfer: bool = False,
@@ -487,6 +506,10 @@ def run_v2_td3_stage(
                         ('compile_actor_objective', compile_actor_objective)):
         if type(value) is not bool:
             raise TypeError(f'{name} must be a bool.')
+    if type(gpu_td3_update) is not bool:
+        raise TypeError('gpu_td3_update must be a bool.')
+    if gpu_td3_update and any((compile_critic_update_front, compile_actor_objective, cuda_graph_critic_tail, window_update_statistics, reuse_update_buffers, pinned_batch_transfer, aggregate_relation_values_first)):
+        raise ValueError('gpu_td3_update conflicts with other experimental paths.')
     if compile_critic_update_front or compile_actor_objective:
         if cuda_graph_critic_tail or window_update_statistics or reuse_update_buffers:
             raise ValueError('Merged blocks conflict with critic tail and local optimizations.')
@@ -604,6 +627,7 @@ def run_v2_td3_stage(
         window_update_statistics=window_update_statistics,
         reuse_update_buffers=reuse_update_buffers,
         cuda_graph_critic_tail=cuda_graph_critic_tail,
+        gpu_td3_update=gpu_td3_update,
         compile_critic_update_front=compile_critic_update_front,
         compile_actor_objective=compile_actor_objective,
         pinned_batch_transfer=pinned_batch_transfer,
@@ -866,7 +890,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(json.dumps({
         'local_optimizations_requested': {'window_update_statistics': args.window_update_statistics,
-                                          'reuse_update_buffers': args.reuse_update_buffers, 'cuda_graph_critic_tail': args.cuda_graph_critic_tail,
+                                          'reuse_update_buffers': args.reuse_update_buffers, 'cuda_graph_critic_tail': args.cuda_graph_critic_tail, 'gpu_td3_update': args.gpu_td3_update,
                                           'compile_critic_update_front': args.compile_critic_update_front,
                                           'compile_actor_objective': args.compile_actor_objective},
         'requested_device': args.device,
@@ -926,6 +950,7 @@ def main(argv: list[str] | None = None) -> int:
         window_update_statistics=args.window_update_statistics,
         reuse_update_buffers=args.reuse_update_buffers,
         cuda_graph_critic_tail=args.cuda_graph_critic_tail,
+        gpu_td3_update=args.gpu_td3_update,
         compile_critic_update_front=args.compile_critic_update_front,
         compile_actor_objective=args.compile_actor_objective,
         pinned_batch_transfer=args.pinned_batch_transfer,

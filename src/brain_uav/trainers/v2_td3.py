@@ -572,6 +572,7 @@ class V2TD3UpdateEngine:
         window_update_statistics: bool = False,
         reuse_update_buffers: bool = False,
         cuda_graph_critic_tail: bool = False,
+        gpu_td3_update: bool = False,
         compile_critic_update_front: bool = False,
         compile_actor_objective: bool = False,
         pinned_batch_transfer: bool = False,
@@ -605,6 +606,23 @@ class V2TD3UpdateEngine:
         self._validate_network_architecture(actor, critic2, name='critic2')
 
         self.device = torch.device(device)
+        if type(gpu_td3_update) is not bool:
+            raise TypeError('gpu_td3_update must be a bool.')
+        if gpu_td3_update:
+            conflicts = (compile_critic_update_front, compile_actor_objective,
+                         cuda_graph_critic_tail, window_update_statistics, reuse_update_buffers,
+                         pinned_batch_transfer, aggregate_relation_values_first)
+            if any(conflicts):
+                raise ValueError('gpu_td3_update conflicts with other experimental update paths.')
+            if self.device.type != 'cuda' or not fused_adam:
+                raise ValueError('gpu_td3_update requires CUDA and fused Adam; no fallback.')
+            from .v2_gpu_update import require_cuda_abi
+            require_cuda_abi()
+        self.gpu_td3_update = gpu_td3_update
+        self._gpu_update_executor = None
+        self._gpu_update_generation = 0
+        self._gpu_update_stream = None
+        self._gpu_update_formal_configured = False
         if type(fused_adam) is not bool:
             raise TypeError('fused_adam must be a bool.')
         if type(aggregate_relation_values_first) is not bool:
@@ -1222,6 +1240,19 @@ class V2TD3UpdateEngine:
         dynamic: bool = True,
     ) -> dict[str, object]:
         """Register one explicit, non-fallback TD3 compilation configuration."""
+
+        if self.gpu_td3_update:
+            if not (backend == 'inductor' and mode == 'default' and fullgraph
+                    and cuda_graph_updates and cuda_graph_actor_update and compile_actors
+                    and compile_critic_block and compile_target_block and compile_shared_relations
+                    and compile_actor_loss and cache_actor_loss_coefficients
+                    and compile_action_inference and cuda_graph_action_inference
+                    and self.reduce_update_stat_syncs
+                    and frozen_critic_strategy == 'compiled_no_grad_context'
+                    and (self.model_type != 'snn' or compile_snn_target_encoder)):
+                raise ValueError('gpu_td3_update requires formal CUDA compilation configuration; inference remains compiled.')
+            self.invalidate_gpu_update()
+            self._gpu_update_formal_configured = True
 
         if self.compile_critic_update_front or self.compile_actor_objective:
             if not (backend == 'inductor' and mode == 'default' and fullgraph
@@ -3275,6 +3306,21 @@ class V2TD3UpdateEngine:
         if self.bc_reference_actor is None and bc_lambda_value != 0.0:
             raise ValueError('bc_lambda must be 0 when no V2 BC reference actor exists.')
 
+        if self.gpu_td3_update:
+            if not self._gpu_update_formal_configured:
+                raise RuntimeError('Configure formal CUDA paths before GPU updating.')
+            if not torch.is_grad_enabled() or torch.is_inference_mode_enabled():
+                raise RuntimeError('GPU TD3 updates require normal training grad mode, not inference/no_grad.')
+            if (defer_statistics or not reuse_shared_relations or profile_sections
+                    or diagnostic_timing_recorder or diagnostic_profile_sections
+                    or compiled_execution_recorder or diagnostic_tensor_recorder
+                    or block_attribution_recorder):
+                raise ValueError('GPU updater uses its own diagnostic interface; incompatible update instrumentation requested.')
+            if self._gpu_update_executor is None:
+                from .v2_gpu_update import GPUUpdate
+                self._gpu_update_executor = GPUUpdate(self)
+            return self._gpu_update_executor.step(total_steps_value, bc_lambda_value, timing_recorder)
+
         if ((self.compile_critic_update_front and self._compiled_critic_front is None)
                 or (self.compile_actor_objective and self._compiled_actor_objective is None)):
             raise RuntimeError('Merged update blocks must be configured before updating.')
@@ -3749,6 +3795,9 @@ class V2TD3UpdateEngine:
                        'reason': 'explicit opt-in; device-independent path'}
                 for name in ('window_update_statistics', 'reuse_update_buffers')}
         metadata.update(self.merged_update_metadata())
+        metadata['gpu_td3_update'] = (self._gpu_update_executor.metadata()
+            if self._gpu_update_executor is not None else
+            {'requested': self.gpu_td3_update, 'effective': False, 'reason': 'disabled or initialization pending'})
         metadata['cuda_graph_critic_tail'] = {
             'requested': self.cuda_graph_critic_tail,
             'effective': self._critic_tail is not None and bool(self._critic_tail.graphs),
@@ -4326,6 +4375,18 @@ class V2TD3UpdateEngine:
             )
         return state_targets
 
+    def invalidate_gpu_update(self) -> None:
+        """Invalidate BEFORE external model/optimizer/replay mutation or migration."""
+        if self._gpu_update_executor is not None:
+            self._gpu_update_executor.invalidate()
+        self._gpu_update_executor = None
+        self._gpu_update_generation += 1
+
+    def gpu_episode_submission(self):
+        """Batch successful episode uploads; baseline replay behavior unchanged."""
+        return (self._gpu_update_executor.replay.success_upload_batch()
+                if self._gpu_update_executor is not None else nullcontext())
+
     def load_network_state_dicts(self, payload: dict[str, Any]) -> None:
         """Load only the six online/target networks for a new curriculum stage.
 
@@ -4333,6 +4394,7 @@ class V2TD3UpdateEngine:
         and the destination stage's BC reference are deliberately preserved.
         """
 
+        self.invalidate_gpu_update()
         self.flush_update_statistics()
         self._statistic_buffers.clear()
         self._critic_tail = None  # Checkpoint loading invalidates captured optimizer addresses.
@@ -4354,6 +4416,7 @@ class V2TD3UpdateEngine:
     def load_checkpoint_state_dict(self, payload: dict[str, Any]) -> None:
         """Strictly restore a V2 dynamic-set TD3 checkpoint payload."""
 
+        self.invalidate_gpu_update()
         self.flush_update_statistics()
         self._statistic_buffers.clear()
         self._critic_tail = None  # Checkpoint loading invalidates captured optimizer addresses.

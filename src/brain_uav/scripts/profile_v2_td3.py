@@ -145,10 +145,11 @@ class _UpdateTimingSummary:
         total_wall_seconds: float,
         sections: Mapping[str, float],
     ) -> None:
-        if set(sections) != set(UPDATE_TIMING_SECTION_NAMES):
+        names = (*UPDATE_TIMING_SECTION_NAMES, 'gpu_td3_sample_to_result') if 'gpu_td3_sample_to_result' in sections else UPDATE_TIMING_SECTION_NAMES
+        if set(sections) != set(names):
             raise RuntimeError('TD3 update timing sections are missing or unknown.')
         total = float(total_wall_seconds)
-        values = {name: float(sections[name]) for name in UPDATE_TIMING_SECTION_NAMES}
+        values = {name: float(sections[name]) for name in names}
         if not isfinite(total) or total < 0.0:
             raise RuntimeError('TD3 update wall time must be finite and non-negative.')
         if any(not isfinite(value) or value < 0.0 for value in values.values()):
@@ -159,7 +160,7 @@ class _UpdateTimingSummary:
             bucket['update_count'] += 1
             bucket['total_wall_seconds'] += total
             for section, value in values.items():
-                bucket['sections'][section] += value
+                bucket['sections'][section] = bucket['sections'].get(section, 0.) + value
 
     @staticmethod
     def _bucket_payload(bucket: dict[str, Any]) -> dict[str, Any]:
@@ -3396,6 +3397,7 @@ def _run_diagnostic_level(
     window_update_statistics: bool = False,
     reuse_update_buffers: bool = False,
     cuda_graph_critic_tail: bool = False,
+    gpu_td3_update: bool = False,
     compile_critic_update_front: bool = False,
     compile_actor_objective: bool = False,
     critic_tail_internal_timing: bool = False,
@@ -3437,6 +3439,7 @@ def _run_diagnostic_level(
         window_update_statistics=window_update_statistics,
         reuse_update_buffers=reuse_update_buffers,
         cuda_graph_critic_tail=cuda_graph_critic_tail,
+        gpu_td3_update=gpu_td3_update,
         compile_critic_update_front=compile_critic_update_front,
         compile_actor_objective=compile_actor_objective,
         pinned_batch_transfer=pinned_batch_transfer,
@@ -3587,19 +3590,25 @@ def _run_diagnostic_level(
             for batch in warmup_batches
         ]
         warmup_started = perf_counter()
-        if compile_actors:
+        if gpu_td3_update and compile_actors:
+            with torch.no_grad():
+                for batch in warmup_batches:
+                    engine._mark_cuda_graph_step_begin()
+                    for actor in (engine.actor,engine.bc_reference_actor):
+                        if actor is not None: actor(batch)
+        elif compile_actors:
             engine.warmup_actor_compile(warmup_batches)
         if compile_shared_relations:
             engine.warmup_shared_relations_compile(warmup_batches)
-        if compile_critic_block:
+        if compile_critic_block and not gpu_td3_update:
             engine.warmup_full_compile(warmup_batches)
-        elif compile_critic_encoder:
+        elif compile_critic_encoder and not gpu_td3_update:
             engine.warmup_online_critic_encoder_compile(warmup_batches)
             if compile_target_encoders:
                 engine.warmup_target_encoder_compile(warmup_batches)
-        if compile_snn_target_encoder and not compile_target_block:
+        if compile_snn_target_encoder and not compile_target_block and not gpu_td3_update:
             engine.warmup_snn_target_encoder_compile(warmup_batches)
-        if compile_actor_loss:
+        if compile_actor_loss and not gpu_td3_update:
             engine.warmup_actor_loss_compile(warmup_batches)
         if compile_action_inference:
             action_batches = _action_inference_warmup_batches(
@@ -3619,10 +3628,12 @@ def _run_diagnostic_level(
                         action_batches
                     )
                 )
-        if cuda_graph_updates:
+        if cuda_graph_updates and not gpu_td3_update:
             compile_metadata['cuda_graph_evidence'] = (
                 engine.verify_update_cuda_graph_capture(warmup_batches)
             )
+        elif gpu_td3_update:
+            compile_metadata['cuda_graph_evidence']={'verified':False,'reason':'manual executor capture pending; old update warmup skipped'}
         compile_metadata['warmup_wall_seconds'] = perf_counter() - warmup_started
         compile_metadata['measurement_note'] = (
             'Registration and compile-triggering pure-compute warmup are excluded '
@@ -3799,6 +3810,10 @@ def _run_diagnostic_level(
                     if engine._critic_tail is None or not engine._critic_tail.graphs:
                         raise RuntimeError('Critic tail must be captured during warmup before internal timing.')
                     engine._critic_tail.reset_internal_timing(enabled=True)
+                if gpu_td3_update:
+                    if engine._gpu_update_executor is None:
+                        raise RuntimeError('GPU updater did not initialize during warmup.')
+                    engine._gpu_update_executor.begin_measurement()
                 measured_started = perf_counter()
                 actor_updates_before = engine.actor_update_count
                 critic_updates_before = engine.critic_update_count
@@ -3976,13 +3991,14 @@ def _run_diagnostic_level(
                 outcome = str(info.get('outcome', ''))
                 if outcome == 'goal':
                     def record_success() -> None:
-                        for item in episode_transitions:
-                            engine.replay.add_success_transition(
-                                item[0], item[1], item[2], item[3], item[4],
-                                near_goal=item[5],
-                                line_to_goal_safe=item[6],
-                            )
-                        engine.replay.mark_success_slots(slot_refs, success=True)
+                        with engine.gpu_episode_submission():
+                            for item in episode_transitions:
+                                engine.replay.add_success_transition(
+                                    item[0], item[1], item[2], item[3], item[4],
+                                    near_goal=item[5],
+                                    line_to_goal_safe=item[6],
+                                )
+                            engine.replay.mark_success_slots(slot_refs, success=True)
                     call('replay_write_wall_seconds', record_success)
                 else:
                     call('replay_write_wall_seconds', lambda: engine.replay.mark_failure_slots(slot_refs, failure=True))
@@ -4103,7 +4119,7 @@ def _run_diagnostic_level(
             'ordinary short-diagnostic wall time.'
         )
     )
-    return {
+    result = {
         'curriculum_level': level,
         'requested_minimum_warmup_steps': warmup_steps,
         'warmup_steps': actual_warmup_steps,
@@ -4112,6 +4128,7 @@ def _run_diagnostic_level(
         'measured_steps': measured_steps,
         'block_attribution': block_attribution.report(block_attribution_wall),
         'local_optimizations': engine.local_optimization_metadata(),
+        'gpu_update_timing_scope': ('Legacy inner update regions are unmeasured, not zero work. gpu_td3_sample_to_result covers the full contiguous path, including control inputs and terminal read.' if gpu_td3_update else None),
         'critic_tail_internal_timing': (engine._critic_tail.internal_timing_report()
             if engine._critic_tail is not None else {'enabled': False, 'calls': 0}),
         'critic_tail_timing_note': 'Critic optimizer section includes stable gradient copies and optional critic targets; target_soft_update still includes actor targets.',
@@ -4192,6 +4209,9 @@ def _run_diagnostic_level(
             ),
         },
     }
+    if gpu_td3_update:
+        engine.invalidate_gpu_update()  # Dispose graphs/hooks after capturing report values.
+    return result
 
 
 def run_v2_td3_timing_diagnostic(
@@ -5523,6 +5543,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--model', choices=('ann', 'snn'), required=True)
     parser.add_argument('--bc-checkpoint', type=Path)
     parser.add_argument('--snn-path-consistency', action='store_true', help='Checkpoint-based eager vs formal SNN CUDA Graph consistency; no rollout or timing.')
+    parser.add_argument('--gpu-td3-suite', action='store_true', help='Serial ANN/SNN baseline vs full GPU updater; correctness gates timing.')
+    parser.add_argument('--gpu-td3-sampling-cost', action='store_true', help='Standalone CUDA sample/gather cost, no network or suite; capacity 500000, batch 64.')
+    parser.add_argument('--sampling-replays', type=int, default=16)
+    parser.add_argument('--sampling-warmup', type=int, default=2)
+    parser.add_argument('--gpu-td3-worker', choices=('correctness', 'timing'), help=argparse.SUPPRESS)
+    parser.add_argument('--gpu-td3-update', action='store_true', help='Experimental full device replay and update; default off.')
+    parser.add_argument('--gpu-td3-reference', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--checkpoint', type=Path, help='Terminal formal checkpoint; failed is allowed only for diagnosis.')
     parser.add_argument('--expected-pool-digest')
     parser.add_argument('--diagnostic-trajectory', type=Path, help='Optional saved trajectory JSON for exact terminal-state observation; otherwise discover latest boundary sample beside checkpoint.')
@@ -5661,6 +5688,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.gpu_td3_suite or args.gpu_td3_worker or args.gpu_td3_sampling_cost:
+        from brain_uav.scripts.v2_gpu_td3_diagnostic import run
+        return run(args)
+    if args.gpu_td3_update or args.gpu_td3_reference:
+        raise ValueError('GPU updater diagnosis requires --gpu-td3-suite or a worker.')
     if args.snn_path_consistency:
         if args.model != 'snn' or args.checkpoint is None or args.validation_pool is None:
             raise ValueError('SNN path diagnosis requires --model snn --checkpoint --validation-pool.')

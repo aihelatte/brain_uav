@@ -1001,6 +1001,7 @@ def build_v2_stage_engine(
     window_update_statistics: bool = False,
     reuse_update_buffers: bool = False,
     cuda_graph_critic_tail: bool = False,
+    gpu_td3_update: bool = False,
     compile_critic_update_front: bool = False,
     compile_actor_objective: bool = False,
     pinned_batch_transfer: bool = False,
@@ -1235,6 +1236,7 @@ def build_v2_stage_engine(
         window_update_statistics=window_update_statistics,
         reuse_update_buffers=reuse_update_buffers,
         cuda_graph_critic_tail=cuda_graph_critic_tail,
+        gpu_td3_update=gpu_td3_update,
         compile_critic_update_front=compile_critic_update_front,
         compile_actor_objective=compile_actor_objective,
         pinned_batch_transfer=pinned_batch_transfer,
@@ -1490,17 +1492,18 @@ class V2FormalStageTrainer:
                     raise RuntimeError('Training environment returned an invalid terminal outcome.')
                 self.result.outcome_counts[outcome] += 1
                 if outcome == 'goal':
-                    for transition in transitions:
-                        self.engine.replay.add_success_transition(
-                            transition.observation,
-                            transition.action,
-                            transition.reward,
-                            transition.next_observation,
-                            transition.done,
-                            near_goal=transition.near_goal,
-                            line_to_goal_safe=transition.line_to_goal_safe,
-                        )
-                    self.engine.replay.mark_success_slots(slot_refs, success=True)
+                    with self.engine.gpu_episode_submission():
+                        for transition in transitions:
+                            self.engine.replay.add_success_transition(
+                                transition.observation,
+                                transition.action,
+                                transition.reward,
+                                transition.next_observation,
+                                transition.done,
+                                near_goal=transition.near_goal,
+                                line_to_goal_safe=transition.line_to_goal_safe,
+                            )
+                        self.engine.replay.mark_success_slots(slot_refs, success=True)
                 else:
                     self.engine.replay.mark_failure_slots(slot_refs, failure=True)
                 actor_updates = [value for value in update_metrics if value.actor_updated]
