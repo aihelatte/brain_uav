@@ -3398,6 +3398,8 @@ def _run_diagnostic_level(
     reuse_update_buffers: bool = False,
     cuda_graph_critic_tail: bool = False,
     gpu_td3_update: bool = False,
+    non_blocking_batch_transfer: bool = False,
+    batch_transfer_window_timing: bool = False,
     compile_critic_update_front: bool = False,
     compile_actor_objective: bool = False,
     critic_tail_internal_timing: bool = False,
@@ -3440,6 +3442,7 @@ def _run_diagnostic_level(
         reuse_update_buffers=reuse_update_buffers,
         cuda_graph_critic_tail=cuda_graph_critic_tail,
         gpu_td3_update=gpu_td3_update,
+        non_blocking_batch_transfer=non_blocking_batch_transfer,
         compile_critic_update_front=compile_critic_update_front,
         compile_actor_objective=compile_actor_objective,
         pinned_batch_transfer=pinned_batch_transfer,
@@ -3506,6 +3509,7 @@ def _run_diagnostic_level(
             cuda_graph_action_inference
         ),
         'pinned_batch_transfer_requested': bool(pinned_batch_transfer),
+        'non_blocking_batch_transfer_requested': bool(non_blocking_batch_transfer),
         'reduce_update_stat_syncs_requested': bool(reduce_update_stat_syncs),
         'cuda_graph_updates_requested': bool(cuda_graph_updates),
         'cuda_graph_actor_update_requested': bool(cuda_graph_actor_update),
@@ -3523,7 +3527,8 @@ def _run_diagnostic_level(
         ),
         'batch_transfer_execution': (
             'reusable_pinned_non_blocking'
-            if pinned_batch_transfer else 'blocking_to_device'
+            if pinned_batch_transfer else 'pageable_non_blocking_to_device'
+            if non_blocking_batch_transfer else 'blocking_to_device'
         ),
         'enabled_objects': [],
         'backend': 'inductor',
@@ -4017,7 +4022,9 @@ def _run_diagnostic_level(
                     slot_refs = []
         if window_update_statistics:
             engine.flush_update_statistics()
+        completion_wait_started = perf_counter() if batch_transfer_window_timing else None
         stream_seconds = timing.cuda_stream_interval_seconds()
+        completion_wait_seconds = perf_counter()-completion_wait_started if completion_wait_started is not None else None
         measured_total = perf_counter() - measured_started
         ordinary_actor_updates = engine.actor_update_count - actor_updates_before
         ordinary_critic_updates = engine.critic_update_count - critic_updates_before
@@ -4129,6 +4136,10 @@ def _run_diagnostic_level(
         'block_attribution': block_attribution.report(block_attribution_wall),
         'local_optimizations': engine.local_optimization_metadata(),
         'gpu_update_timing_scope': ('Legacy inner update regions are unmeasured, not zero work. gpu_td3_sample_to_result covers the full contiguous path, including control inputs and terminal read.' if gpu_td3_update else None),
+        'batch_transfer_window_completion': ({'wait_seconds':completion_wait_seconds,
+            'td3_wall_including_final_window_wait_seconds':update_seconds+completion_wait_seconds,
+            'scope':'Original per-call TD3 wall plus the existing diagnostic window completion wait; conservative full-stream drain, not pure GPU compute.'}
+            if batch_transfer_window_timing else None),
         'critic_tail_internal_timing': (engine._critic_tail.internal_timing_report()
             if engine._critic_tail is not None else {'enabled': False, 'calls': 0}),
         'critic_tail_timing_note': 'Critic optimizer section includes stable gradient copies and optional critic targets; target_soft_update still includes actor targets.',
@@ -5049,6 +5060,7 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
 
     initial = None
     reference = None
+    transfer_check = getattr(args, 'batch_transfer_worker', None) == 'correctness'
     block_check = getattr(args, 'td3_block_correctness', False)
     choice = getattr(args, 'td3_block_choice', 'baseline')
     if block_check and count < 8:
@@ -5066,13 +5078,14 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
         'seed': args.seed, 'stage_steps': stage_steps, 'config': config.to_dict(),
         'reward_config': asdict(prepared.reward_config), 'checkpoint': report['checkpoint'],
         'pool_digest': pool.content_digest, 'bc_schedule': args.comparison_bc_schedule}
+    if transfer_check: contract['diagnostic_kind'] = 'non_blocking_batch_transfer_v1'
     if block_check:
         report['reference_contract'] = contract
         report['gradient_comparison_contract'] = (
             'Current backward gradients remain strict at rtol=1e-4/atol=1e-5. '
             'Unused retained actor gradient values are observations; presence/shape/dtype stay strict. '
             'Actor parameters, target, optimizer and actor count must be exactly unchanged on critic-only steps.')
-    report['comparison_kind'] = 'merged_update_blocks' if block_check else ('checked_critic_tail' if tail_comparison else 'local_optimizations')
+    report['comparison_kind'] = 'non_blocking_batch_transfer' if transfer_check else ('merged_update_blocks' if block_check else ('checked_critic_tail' if tail_comparison else 'local_optimizations'))
     if tail_comparison:
         report['optimizer_execution_difference'] = 'Only critic capturable differs (A=false, B=true); excluded from numeric comparison. step, moments and other optimizer settings remain compared.'
     try:
@@ -5086,7 +5099,8 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
                 reduce_update_stat_syncs=reduced, window_update_statistics=window,
                 reuse_update_buffers=buffers, cuda_graph_critic_tail=tail_comparison and group == 'B',
                 compile_critic_update_front=block_check and choice in ('C', 'CA'),
-                compile_actor_objective=block_check and choice in ('A', 'CA')).engine
+                compile_actor_objective=block_check and choice in ('A', 'CA'),
+                non_blocking_batch_transfer=transfer_check and args.non_blocking_batch_transfer).engine
             if initial is None:
                 initial = deepcopy(engine.checkpoint_state_dict())
             if block_check and choice != 'baseline':
@@ -5100,6 +5114,10 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
             mixed, nonempty = _numeric_diagnostic_observation_batches(batches, device=device)
             fixed = [_fixed_numeric_replay_batch(obs, action_dim=engine.action_dim, device=device)
                      for obs in (mixed, nonempty)]
+            if transfer_check:
+                from brain_uav.scripts.v2_batch_transfer_diagnostic import cpu_batches, check_transfers
+                fixed = cpu_batches(mixed, nonempty, engine.action_dim, args.seed)
+                report['transfer_check'] = check_transfers(fixed, device, args.repeats)
             if block_check:
                 from dataclasses import replace
                 # Formal replay stores current and next observations independently.
@@ -5401,6 +5419,8 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 compile_actor_objective=args.td3_block_comparison and args.td3_block_choice in ('A', 'CA'),
                 cuda_graph_critic_tail=args.critic_tail_comparison and group == 'B',
                 critic_tail_internal_timing=args.critic_tail_internal_timing and group == 'B',
+                non_blocking_batch_transfer=getattr(args,'batch_transfer_worker',None)=='timing' and args.non_blocking_batch_transfer,
+                batch_transfer_window_timing=getattr(args,'batch_transfer_worker',None)=='timing',
                 block_attribution_wall=args.td3_block_attribution == 'wall',
                 compiled_path_profiler_updates=(args.compiled_performance_diagnostic_updates or 4) if args.td3_block_attribution == 'profiler' else 0,
                 compiled_profiler_output_dir=output / f'{group}_{repeat}_profiler' if args.td3_block_attribution == 'profiler' else None,
@@ -5544,6 +5564,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--bc-checkpoint', type=Path)
     parser.add_argument('--snn-path-consistency', action='store_true', help='Checkpoint-based eager vs formal SNN CUDA Graph consistency; no rollout or timing.')
     parser.add_argument('--gpu-td3-suite', action='store_true', help='Serial ANN/SNN baseline vs full GPU updater; correctness gates timing.')
+    parser.add_argument('--non-blocking-batch-transfer', action='store_true', help='Pageable CPU replay batch .to(non_blocking=True); default off.')
+    parser.add_argument('--batch-transfer-comparison', action='store_true', help='Serial isolated baseline/nonblocking correctness then short timing, one model.')
+    parser.add_argument('--batch-transfer-worker', choices=('correctness','timing'), help=argparse.SUPPRESS)
     parser.add_argument('--gpu-td3-sampling-cost', action='store_true', help='Standalone CUDA sample/gather cost, no network or suite; capacity 500000, batch 64.')
     parser.add_argument('--sampling-replays', type=int, default=16)
     parser.add_argument('--sampling-warmup', type=int, default=2)
@@ -5688,6 +5711,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.batch_transfer_comparison or args.batch_transfer_worker:
+        from brain_uav.scripts.v2_batch_transfer_diagnostic import run
+        return run(args)
+    if args.non_blocking_batch_transfer:
+        raise ValueError('Use --batch-transfer-comparison or its worker; other diagnostics do not support this transfer flag.')
     if args.gpu_td3_suite or args.gpu_td3_worker or args.gpu_td3_sampling_cost:
         from brain_uav.scripts.v2_gpu_td3_diagnostic import run
         return run(args)

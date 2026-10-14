@@ -576,6 +576,7 @@ class V2TD3UpdateEngine:
         compile_critic_update_front: bool = False,
         compile_actor_objective: bool = False,
         pinned_batch_transfer: bool = False,
+        non_blocking_batch_transfer: bool = False,
         spike_regularization: V2SpikeRegularizationConfig | None = None,
     ) -> None:
         actor_model_type = _actor_model_type(actor)
@@ -606,6 +607,14 @@ class V2TD3UpdateEngine:
         self._validate_network_architecture(actor, critic2, name='critic2')
 
         self.device = torch.device(device)
+        if type(non_blocking_batch_transfer) is not bool:
+            raise TypeError('non_blocking_batch_transfer must be a bool.')
+        if non_blocking_batch_transfer:
+            if pinned_batch_transfer or gpu_td3_update:
+                raise ValueError('non_blocking_batch_transfer conflicts with pinned_batch_transfer and gpu_td3_update.')
+            if self.device.type != 'cuda':
+                raise ValueError('non_blocking_batch_transfer requires CUDA; no fallback.')
+        self.non_blocking_batch_transfer = non_blocking_batch_transfer
         if type(gpu_td3_update) is not bool:
             raise TypeError('gpu_td3_update must be a bool.')
         if gpu_td3_update:
@@ -1494,7 +1503,8 @@ class V2TD3UpdateEngine:
             ),
             'batch_transfer_execution': (
                 'reusable_pinned_non_blocking'
-                if self.pinned_batch_transfer else 'blocking_to_device'
+                if self.pinned_batch_transfer else 'pageable_non_blocking_to_device'
+                if self.non_blocking_batch_transfer else 'blocking_to_device'
             ),
             'pinned_batch_transfer_requested': self.pinned_batch_transfer,
         }
@@ -3332,9 +3342,13 @@ class V2TD3UpdateEngine:
         with update_timing.section('replay_sample'):
             batch = self.replay.sample(self.batch_size)
         with update_timing.section('batch_preparation'):
+            # Own the copied CPU sample through this update's existing completion
+            # barriers. Replay overwrites cannot mutate its independent arrays.
+            source_batch = batch if self.non_blocking_batch_transfer else None
             batch = (
                 self._replay_batch_transfer.transfer(batch)
                 if self._replay_batch_transfer is not None
+                else batch.to(self.device, non_blocking=True) if self.non_blocking_batch_transfer
                 else batch.to(self.device)
             )
         if self._compiled_critic_front is not None:
@@ -3795,6 +3809,11 @@ class V2TD3UpdateEngine:
                        'reason': 'explicit opt-in; device-independent path'}
                 for name in ('window_update_statistics', 'reuse_update_buffers')}
         metadata.update(self.merged_update_metadata())
+        metadata['non_blocking_batch_transfer'] = {
+            'requested': self.non_blocking_batch_transfer,
+            'effective': self.non_blocking_batch_transfer and self.device.type == 'cuda',
+            'source': 'independent pageable CPU sample, retained through update',
+            'stream': 'current CUDA stream; no added synchronization'}
         metadata['gpu_td3_update'] = (self._gpu_update_executor.metadata()
             if self._gpu_update_executor is not None else
             {'requested': self.gpu_td3_update, 'effective': False, 'reason': 'disabled or initialization pending'})

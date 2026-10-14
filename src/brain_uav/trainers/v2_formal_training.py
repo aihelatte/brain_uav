@@ -1005,6 +1005,7 @@ def build_v2_stage_engine(
     compile_critic_update_front: bool = False,
     compile_actor_objective: bool = False,
     pinned_batch_transfer: bool = False,
+    non_blocking_batch_transfer: bool = False,
 ) -> V2StageComponents:
     if scenario is not None and not isinstance(scenario, ScenarioConfig):
         raise TypeError('scenario must be a ScenarioConfig when provided.')
@@ -1240,6 +1241,7 @@ def build_v2_stage_engine(
         compile_critic_update_front=compile_critic_update_front,
         compile_actor_objective=compile_actor_objective,
         pinned_batch_transfer=pinned_batch_transfer,
+        non_blocking_batch_transfer=non_blocking_batch_transfer,
     )
     if previous_engine_payload is not None:
         engine.load_network_state_dicts(dict(previous_engine_payload))

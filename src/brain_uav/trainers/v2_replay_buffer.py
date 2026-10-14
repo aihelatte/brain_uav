@@ -191,19 +191,19 @@ class V2ReplayBatch:
     def batch_size(self) -> int:
         return self.obs.batch_size
 
-    def to(self, device: torch.device | str) -> V2ReplayBatch:
+    def to(self, device: torch.device | str, *, non_blocking: bool = False) -> V2ReplayBatch:
         """Return a new replay batch on ``device`` without reading tensor data."""
 
         target = torch.device(device)
         return V2ReplayBatch(
-            obs=self.obs.to(target),
-            action=self.action.to(target),
-            reward=self.reward.to(target),
-            next_obs=self.next_obs.to(target),
-            done=self.done.to(target),
-            success=self.success.to(target),
-            near_goal=self.near_goal.to(target),
-            line_to_goal_safe=self.line_to_goal_safe.to(target),
+            obs=self.obs.to(target, non_blocking=non_blocking),
+            action=self.action.to(target, non_blocking=non_blocking),
+            reward=self.reward.to(target, non_blocking=non_blocking),
+            next_obs=self.next_obs.to(target, non_blocking=non_blocking),
+            done=self.done.to(target, non_blocking=non_blocking),
+            success=self.success.to(target, non_blocking=non_blocking),
+            near_goal=self.near_goal.to(target, non_blocking=non_blocking),
+            line_to_goal_safe=self.line_to_goal_safe.to(target, non_blocking=non_blocking),
             sample_failure_fraction=self.sample_failure_fraction,
         )
 

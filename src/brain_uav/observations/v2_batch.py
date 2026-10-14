@@ -109,15 +109,15 @@ class V2ObservationBatch:
     def max_zone_count(self) -> int:
         return int(self.zone_features.shape[1])
 
-    def to(self, device: torch.device | str) -> V2ObservationBatch:
+    def to(self, device: torch.device | str, *, non_blocking: bool = False) -> V2ObservationBatch:
         """Return a new validated batch on the requested device."""
 
         target = torch.device(device)
         return V2ObservationBatch(
-            ego_features=self.ego_features.to(target),
-            goal_features=self.goal_features.to(target),
-            zone_features=self.zone_features.to(target),
-            presence_mask=self.presence_mask.to(target),
+            ego_features=self.ego_features.to(target, non_blocking=non_blocking),
+            goal_features=self.goal_features.to(target, non_blocking=non_blocking),
+            zone_features=self.zone_features.to(target, non_blocking=non_blocking),
+            presence_mask=self.presence_mask.to(target, non_blocking=non_blocking),
         )
 
 
