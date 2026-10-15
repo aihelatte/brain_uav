@@ -13,8 +13,17 @@ import traceback
 import numpy as np
 import torch
 
-CONTRACT_VERSION = 7
+CONTRACT_VERSION = 8
 RETAINED_PARAMETER = 'actor.zone_set_encoder.empty_scene_token'
+# Original update_once order: loss barrier -> zero_grad(None) -> backward ->
+# gradient barrier -> Adam -> targets. Both actor-loss and actor-gradient
+# failures occur AFTER the critic/critic-target commit.
+EXCEPTION_GRADIENTS = {
+    'critic_loss': dict(current=[], old=['actor','critic1','critic2']),
+    'critic_gradient': dict(current=['critic1','critic2'], old=['actor']),
+    'actor_loss': dict(current=['critic1','critic2'], old=['actor']),
+    'actor_gradient': dict(current=['actor','critic1','critic2'], old=[]),
+}
 
 
 @contextmanager
@@ -151,11 +160,11 @@ def limited_retained_comparison(expected, actual, *, phase=None, actor_backward=
 
     update_once checks critic loss before either backward; both optimizers use
     zero_grad(set_to_none=True) before their next backward/gradient check/step.
-    The caller must pair these two phases with full actor recovery acceptance.
+    The caller must pair exceptions retaining old gradients with two recovery
+    updates. Old values (even NaN/Inf) are not a current backward's evidence.
     """
-    modules = (() if actor_backward else
-        ('actor','critic1','critic2') if phase == 'critic_loss_before_backward' else
-        ('actor',) if phase == 'critic_only_recovery' else ())
+    modules = (() if actor_backward else ('actor',) if phase == 'critic_only_recovery'
+        else EXCEPTION_GRADIENTS.get(phase,{}).get('old',()))
     raw = state_difference(expected,actual)
     waived = []
     for item in raw['differences']:
@@ -174,19 +183,39 @@ def limited_retained_comparison(expected, actual, *, phase=None, actor_backward=
         if (a is None or b is None or a.shape != b.shape or a.dtype != b.dtype
                 or not a.is_floating_point()):
             continue
-        if all(torch.equal(pred(a),pred(b)) for pred in
-                (torch.isnan,torch.isposinf,torch.isneginf)):
-            waived.append(dict(item,parameter_name=parameter,phase=phase,
-                reason='Not produced by this backward; cleared before next consumption; conditional on two recovery updates.'))
+        waived.append(dict(item,parameter_name=parameter,phase=phase,
+            reason='Old gradient not consumed before zero_grad; values and nonfinite locations are evidence only; conditional on recovery.'))
     remaining = [item for item in raw['differences'] if item['field'] not in {v['field'] for v in waived}]
     return dict(raw=raw,waived_fields=waived,passed=not remaining,
         first_difference=next(iter(remaining),None),differences=remaining)
 
 
+def exception_self_protection(before, after, failure):
+    """Exact own-side protection, NEVER the cross-path residual exemption."""
+    def protected(name):
+        if failure == 'critic_loss':
+            return True
+        if failure == 'critic_gradient':
+            return not name.startswith(('gradient.critic1.','gradient.critic2.'))
+        # Critic updates are legitimate on actor errors. Its target counter
+        # increments before the actor barrier; all other CPU counters stay put.
+        return (name.startswith(('actor.','actor_target.','optimizer.actor.'))
+            or (failure == 'actor_loss' and name.startswith('gradient.actor.'))
+            or (name.startswith('counts.') and name != 'counts.critic_target_update_count'))
+    return state_difference({n:t for n,t in before.items() if protected(n)},
+        {n:t for n,t in after.items() if protected(n)},exact=True)
+
+
+def current_gradient_comparison(expected, actual, modules):
+    prefixes = tuple(prefix+module+'.' for module in modules for prefix in ('grad.','gradient.'))
+    return state_difference({n:t for n,t in expected.items() if n.startswith(prefixes)},
+        {n:t for n,t in actual.items() if n.startswith(prefixes)})
+
+
 def recovery_acceptance(updates):
     return (len(updates)==2 and [item['actor_backward'] for item in updates]==[False,True]
-        and all(item.get('active_update',{'passed':True})['passed'] for item in updates)
-        and updates[-1].get('all_fields',{'passed':True})['passed'])
+        and all(item.get('active_update',{}).get('passed',item.get('comparison')=='baseline_reference_only') for item in updates)
+        and updates[-1].get('all_fields',{}).get('passed',updates[-1].get('comparison')=='baseline_reference_only'))
 
 
 def record_error_state(output, index, before, after, expected=None):
@@ -268,6 +297,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
     contract['error_recovery'] = (not contract['first_critic_loss_only']
         or getattr(args,'gpu_compute_error_recovery',False))
     contract['trace_retained_gradient'] = getattr(args,'gpu_compute_trace_retained_gradient',False)
+    contract['exception_gradient_lifecycle'] = EXCEPTION_GRADIENTS
     contract['checkpoint_sha256'] = sha256(Path(args.bc_checkpoint).read_bytes()).hexdigest()
     contract['full_pool_digest'] = full_pool_digest
     contract['pool_file_sha256'] = sha256(Path(args.validation_pool).read_bytes()).hexdigest()
@@ -366,6 +396,9 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                     expected_error = torch.load(Path(args.td3_block_reference).parent /
                         reference['error_states'][index],map_location='cpu',weights_only=False)
                 state_report = record_error_state(output,index,before_error,after_error,expected_error)
+                state_report['own_protected_state'] = exception_self_protection(
+                    before_error['values'],after_error['values'],failure)
+                state_report['backward_lifecycle'] = EXCEPTION_GRADIENTS[failure]
                 error_states[index] = Path(state_report['snapshot_path']).name
                 report.setdefault('error_states',{})[str(index)] = state_report
             actor_backward = (metric.actor_updated if metric is not None else failure == 'actor_gradient')
@@ -405,24 +438,40 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                     raise AssertionError('Reference step/context mismatch at index '+str(index))
             if reference is not None and not failure and not recovery:
                 expected = reference['snapshots'][index]
-                for name,t in snap.items():
-                    if name.startswith(('rng.','counts.','tensor.batch.')) or name.endswith('.step'):
-                        torch.testing.assert_close(t,expected[name],rtol=0,atol=0)
-                p._compare_td3_block_snapshot(expected,snap,context=context,report=report,output=output)
+                if not error_states:
+                    for name,t in snap.items():
+                        if name.startswith(('rng.','counts.','tensor.batch.')) or name.endswith('.step'):
+                            torch.testing.assert_close(t,expected[name],rtol=0,atol=0)
+                    p._compare_td3_block_snapshot(expected,snap,context=context,report=report,output=output)
+                else:
+                    # No residual exemption on these actual updates. Collect
+                    # every field and keep going to the checkpoint check.
+                    differences = {}
+                    result = state_difference(expected,snap,evidence=differences,label='post_error_update')
+                    report.setdefault('post_error_updates',[]).append(dict(context,result=result))
+                    if not result['passed']:
+                        torch.save(differences,output/f'post_error_update_{index}_differences.pt')
+                        failure_info = dict(phase='post_error_update',index=index,
+                            first_difference=result['first_difference'])
+                        report.setdefault('first_error_state_failure',failure_info)
+                        deferred_failures.append(failure_info)
             if reference is not None and failure:
                 # Preserve the original snapshot/RNG/counter contract too, but
                 # never stop before every error-state field is checked/saved.
                 report['error_states'][str(index)]['cross_snapshot'] = state_difference(reference['snapshots'][index],snap)
-                if failure == 'critic_loss' and contract['error_recovery']:
-                    state = report['error_states'][str(index)]
+                state = report['error_states'][str(index)]
+                state['current_gradients'] = current_gradient_comparison(
+                    expected_error['after']['values'],after_error['values'],EXCEPTION_GRADIENTS[failure]['current'])
+                if contract['error_recovery']:
                     state['effective_cross_after'] = limited_retained_comparison(
                         expected_error['after']['values'],after_error['values'],
-                        phase='critic_loss_before_backward',actor_backward=actor_backward)
+                        phase=failure,actor_backward=actor_backward)
                     state['effective_cross_snapshot'] = limited_retained_comparison(
-                        reference['snapshots'][index],snap,phase='critic_loss_before_backward',
+                        reference['snapshots'][index],snap,phase=failure,
                         actor_backward=actor_backward,gradients=evidence)
             if recovery:
                 item = dict(index=index,stage_steps=total,actor_backward=actor_backward,
+                    after_exception=recovery,
                     diagnostic_only=True, production_resumption_supported=False,
                     comparison='baseline_reference_only' if reference is None else 'baseline_vs_compute',
                     scope='Continuation of interrupted diagnostic engine only; not a production recovery contract.')
@@ -441,8 +490,10 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                         path = output/f'recovery_differences_{index}.pt'
                         torch.save(differences,path); item['evidence_path'] = str(path)
                     if not item['active_update']['passed']:
-                        deferred_failures.append(dict(phase='recovery',index=index,
-                            first_difference=item['active_update']['first_difference']))
+                        failure_info = dict(phase='recovery',index=index,after_exception=recovery,
+                            first_difference=item['active_update']['first_difference'])
+                        report.setdefault('first_error_state_failure',failure_info)
+                        deferred_failures.append(failure_info)
                 report.setdefault('recovery_updates',[]).append(item)
             snapshots.append(snap); contexts.append(context)
             report['checks'].append(dict(index=index,total_steps=total,failure=failure,
@@ -506,27 +557,33 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                 protected_state_exact=protected_report,cross_snapshot=state_report.get('cross_snapshot')))
             state_report['checks_path'] = str(checks_path)
             state_report['state_checks_completed'] = True
-            own_required = args.gpu_td3_compute and failure == 'critic_loss'
+            own_required = args.gpu_td3_compute
             state_report['compute_self_protection_required'] = own_required
             cross_names = ('cross_before','effective_cross_after','effective_cross_snapshot') if (
-                failure == 'critic_loss' and reference is not None and contract['error_recovery']) else (
+                reference is not None and contract['error_recovery']) else (
                 'cross_before','cross_after','cross_snapshot')
-            failed_checks = [name for name in (*cross_names,'protected_state_exact',
-                *(['own_before_after'] if own_required else []))
-                if name in state_report and not state_report[name]['passed']]
+            required_checks = ['protected_state_exact']
+            if reference is not None:
+                required_checks.extend((*cross_names,'current_gradients'))
+            if own_required:
+                required_checks.append('own_protected_state')
+            failed_checks = [name for name in required_checks
+                if name not in state_report or not state_report[name]['passed']]
             report['checks'][-1]['passed'] = not failed_checks
             if failed_checks:
-                report['first_error_state_failure'] = dict(report['location'],comparisons=failed_checks,
-                    first_difference=state_report[failed_checks[0]]['first_difference'])
+                failure_info = dict(report['location'],comparisons=failed_checks,
+                    first_difference=state_report.get(failed_checks[0],dict(first_difference=
+                        dict(field=failed_checks[0],reason='missing required check')))['first_difference'])
+                report.setdefault('first_error_state_failure',failure_info)
                 if not contract['error_recovery']:
                     raise AssertionError('Error-state mismatch after complete state collection: '+str(report['first_error_state_failure']))
-                deferred_failures.append(report['first_error_state_failure'])
-            if contract['error_recovery'] and failure == 'critic_loss':
+                deferred_failures.append(failure_info)
+            if contract['error_recovery'] and EXCEPTION_GRADIENTS[failure]['old']:
                 # Same CPU batch and explicit target-noise inputs on both sides;
                 # increasing stage steps exercise critic-only then actor update.
                 for total in (last+1,last+config.policy_delay):
                     controlled = torch.randn(config.batch_size,engine.action_dim,generator=generator)
-                    run_step(total,fixed[0],controlled,recovery=True)
+                    run_step(total,fixed[0],controlled,recovery=failure)
                 recovered = report['recovery_updates'][-2:]
                 if [item['actor_backward'] for item in recovered] != [False,True]:
                     raise AssertionError('Recovery must exercise critic-only then actor backward.')
@@ -534,15 +591,15 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                     passed=recovery_acceptance(recovered),
                     snapshot_indices=[item['index'] for item in recovered])
                 if not state_report['recovery_acceptance']['passed']:
-                    deferred_failures.append(dict(phase='recovery_gate',snapshot_index=len(snapshots)-1))
-                report['recovery_completed'] = True
+                    failure_info = dict(phase='recovery_gate',snapshot_index=len(snapshots)-1,after_exception=failure)
+                    report.setdefault('first_error_state_failure',failure_info)
+                    deferred_failures.append(failure_info)
+                report['recovery_groups_completed'] = report.get('recovery_groups_completed',0)+1
+                report['recovery_completed'] = report['recovery_groups_completed'] == (
+                    1 if contract['first_critic_loss_only'] else sum(bool(v['old']) for v in EXCEPTION_GRADIENTS.values()))
                 last += config.policy_delay
             if contract['first_critic_loss_only']:
                 break
-        if deferred_failures:
-            report['deferred_failures'] = deferred_failures
-            report['completed'] = bool(report.get('recovery_completed'))
-            raise AssertionError('Error/recovery comparisons completed but inconsistent; see diagnostic JSON.')
         # Supported load entry point must drop every old graph, then rebuild
         # from the same initial engine state; replay remains the CPU authority.
         if not contract['first_critic_loss_only']:
@@ -562,22 +619,29 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             report['omitted_checks'] = ['remaining error injections','checkpoint load/rebuild','timing']
         if args.gpu_td3_compute and profiled_modes != {'critic_only','frozen_targets','actor'}:
             raise AssertionError('Three manual update modes were not verified.')
+        report['completed'] = True
+        if deferred_failures:
+            report['deferred_failures'] = deferred_failures
+            raise AssertionError('Error/recovery comparisons completed but inconsistent; see diagnostic JSON.')
         report.update(passed=True,completed=True,compilation=configured,
             effective=engine.local_optimization_metadata(),snapshot_count=len(snapshots),
             graph_evidence_scope='one actual prewarmed update per mode profiled; not every update individually profiled')
-        report['acceptance'] = dict(semantic_passed=True,
-            comparison='baseline_reference_only' if reference is None else 'baseline_vs_compute',
-            raw_all_fields_equal=None if reference is None else not any(not state.get(name,{'passed':True})['passed']
-                for state in report.get('error_states',{}).values() for name in ('cross_after','cross_snapshot'))
-                and all(item.get('all_fields',{'passed':True})['passed'] for item in report.get('recovery_updates',[])),
-            scope='Unconsumed actor/critic old gradients only at first critic_loss before backward; only old actor gradients on immediate critic-only recovery; full actor recovery required.',
-            recovery_required=contract['error_recovery'],recovery_completed=report.get('recovery_completed',False))
         if reference is None: torch.save(dict(contract=contract,initial=initial,snapshots=snapshots,contexts=contexts,error_states=error_states),output/'reference.pt')
     except BaseException as exc:
         report['error'] = dict(type=type(exc).__name__,message=str(exc),traceback=traceback.format_exc(),gpu_context=getattr(exc,'gpu_compute_context',None))
         report['failure'] = report['error']
         raise
     finally:
+        report['acceptance'] = dict(semantic_passed=report['passed'],completed=report['completed'],
+            comparison='baseline_reference_only' if reference is None else 'baseline_vs_compute',
+            raw_all_fields_equal=None if reference is None or not report['completed'] else
+                all(state.get(name,{'passed':True})['passed'] for state in report.get('error_states',{}).values()
+                    for name in ('cross_before','cross_after','cross_snapshot'))
+                and all(item.get('all_fields',{'passed':True})['passed'] for item in report.get('recovery_updates',[]))
+                and all(item['result']['passed'] for item in report.get('post_error_updates',[])),
+            scope='Exception lifecycle table; old gradients require presence/shape/dtype across paths; all numerical/nonfinite differences recorded; current gradients unchanged.',
+            recovery_required=contract['error_recovery'],recovery_completed=report.get('recovery_completed',False),
+            checkpoint_reload=report.get('load_rebuild_verified'))
         if trace_events:
             torch.save(trace_events,output/'retained_gradient_trace.pt')
             report['retained_gradient_trace'] = retained_trace_summary(trace_events)
@@ -588,16 +652,23 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                 protected_state=[dict(index=index,passed=item.get('protected_state_exact',{}).get('passed'))
                     for index,item in report.get('error_states',{}).items()],
                 recovery=[dict(index=item['index'],steps=item['stage_steps'],actor_backward=item['actor_backward'],
+                    after_exception=item['after_exception'],
                     comparison=item['comparison'],
                     all_fields_passed=item.get('all_fields',{}).get('passed'),
                     active_update_passed=item.get('active_update',{}).get('passed'))
                     for item in report.get('recovery_updates',[])],
                 first_failure=report.get('first_error_state_failure'),evidence='correctness.json')
             compact['acceptance'] = report.get('acceptance')
+            compact['exception_checks'] = [dict(index=index,lifecycle=state['backward_lifecycle'],
+                current_gradients_passed=state.get('current_gradients',{}).get('passed'),
+                old_gradient_differences=len(state.get('effective_cross_after',{}).get('waived_fields',[])),
+                own_protection=state['own_protected_state']['passed'],
+                persistent_protection=state.get('protected_state_exact',{}).get('passed'),
+                recovery=state.get('recovery_acceptance')) for index,state in report.get('error_states',{}).items()]
             compact['retained_residuals'] = [dict(index=index,
                 waived_field_count=len(state.get('effective_cross_after',{}).get('waived_fields',[])),
                 waived_fields_evidence='correctness.json:error_states.'+index+'.effective_cross_after.waived_fields',
-                compute_self_protection=state.get('own_before_after',{}).get('passed') if args.gpu_td3_compute else None,
+                compute_self_protection=state.get('own_protected_state',{}).get('passed') if args.gpu_td3_compute else None,
                 baseline_self_unchanged=state.get('own_before_after',{}).get('passed') if not args.gpu_td3_compute else None)
                 for index,state in report.get('error_states',{}).items()]
             p._strict_json_write(output/'error_recovery_summary.json',compact)

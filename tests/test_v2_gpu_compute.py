@@ -68,23 +68,25 @@ class TestGPUCompute(TestCase):
                     self.assertIn('Traceback',report['error']['traceback'])
                     self.assertEqual(report['error'],report['failure'])
                     contract = report['inputs']
-                    self.assertEqual(contract['version'],7)
+                    self.assertEqual(contract['version'],8)
 
     def test_limited_residual_values_do_not_hide_structure_nonfinite_or_active_changes(self):
         from brain_uav.scripts.v2_gpu_compute_diagnostic import limited_retained_comparison as compare
         def at_loss(a,b,**kwargs):
-            return compare(a,b,phase='critic_loss_before_backward',**kwargs)
+            return compare(a,b,phase='critic_loss',**kwargs)
         key = 'gradient.actor.zone_set_encoder.empty_scene_token'
         a = {key:torch.ones(3)}
         result = at_loss(a,{key:torch.zeros(3)})
         self.assertTrue(result['passed']); self.assertFalse(result['raw']['passed'])
         self.assertEqual(len(result['waived_fields']),1)
         for actual in ({key+'.none':torch.tensor(True)}, {key:torch.zeros(4)},
-                {key:torch.zeros(3,dtype=torch.float64)}, {key:torch.tensor([float('nan'),0.,0.])},
-                {key:torch.tensor([float('inf'),0.,0.])}):
+                {key:torch.zeros(3,dtype=torch.float64)}):
             self.assertFalse(at_loss(a,actual)['passed'])
+        for value in (float('nan'),float('inf'),float('-inf')):
+            result = at_loss(a,{key:torch.tensor([value,0.,0.])})
+            self.assertTrue(result['passed']); self.assertFalse(result['raw']['passed'])
         self.assertFalse(compare(a,{key:torch.zeros(3)})['passed'])
-        self.assertFalse(at_loss({key:torch.tensor([float('inf'),1.,0.])},
+        self.assertTrue(at_loss({key:torch.tensor([float('inf'),1.,0.])},
             {key:torch.tensor([1.,float('inf'),0.])})['passed'])
         from brain_uav.scripts.v2_gpu_compute_diagnostic import state_difference
         # Compute's own protection is exact and never calls the waiver helper.
@@ -106,23 +108,28 @@ class TestGPUCompute(TestCase):
                 mapping = {key:dict(parameter_name=module+'.'+name)} if indexed else {}
                 expected,actual = {key:torch.ones(3)},{key:torch.zeros(3)}
                 with self.subTest(module=module,indexed=indexed):
-                    loss = compare(expected,actual,phase='critic_loss_before_backward',gradients=mapping)
+                    loss = compare(expected,actual,phase='critic_loss',gradients=mapping)
                     self.assertTrue(loss['passed']); self.assertFalse(loss['raw']['passed'])
                     self.assertEqual(loss['waived_fields'][0]['parameter_name'],module+'.'+name)
                     recovery = compare(expected,actual,phase='critic_only_recovery',gradients=mapping)
                     self.assertEqual(recovery['passed'],module=='actor')
-                    for phase in ('critic_loss_before_backward','critic_only_recovery'):
+                    for phase in ('critic_loss','critic_only_recovery'):
                         self.assertFalse(compare(expected,actual,phase=phase,actor_backward=True,gradients=mapping)['passed'])
-                    for phase in ('critic_gradient','actor_loss','actor_gradient',None):
+                    for phase in ('critic_gradient','actor_loss'):
+                        self.assertEqual(compare(expected,actual,phase=phase,gradients=mapping)['passed'],module=='actor')
+                    for phase in ('actor_gradient',None):
                         self.assertFalse(compare(expected,actual,phase=phase,gradients=mapping)['passed'])
-                    for changed in (torch.zeros(4),torch.zeros(3,dtype=torch.float64),
-                                    torch.tensor([float('inf'),0.,0.]),torch.tensor([float('nan'),0.,0.])):
-                        self.assertFalse(compare(expected,{key:changed},phase='critic_loss_before_backward',gradients=mapping)['passed'])
+                    for changed in (torch.zeros(4),torch.zeros(3,dtype=torch.float64)):
+                        self.assertFalse(compare(expected,{key:changed},phase='critic_loss',gradients=mapping)['passed'])
+                    for phase in ('critic_gradient','actor_loss','actor_gradient',None):
+                        changed = {key:torch.tensor([float('nan'),0.,0.])}
+                        self.assertEqual(compare(expected,changed,phase=phase,gradients=mapping)['passed'],
+                            module=='actor' and phase in ('critic_gradient','actor_loss'))
                     self.assertFalse(compare(expected,{key+'.none':torch.tensor(True)},
-                        phase='critic_loss_before_backward',gradients=mapping)['passed'])
+                        phase='critic_loss',gradients=mapping)['passed'])
                     if indexed:
-                        self.assertFalse(compare(expected,actual,phase='critic_loss_before_backward')['passed'])
-                        self.assertFalse(compare(expected,actual,phase='critic_loss_before_backward',
+                        self.assertFalse(compare(expected,actual,phase='critic_loss')['passed'])
+                        self.assertFalse(compare(expected,actual,phase='critic_loss',
                             gradients={key:dict(parameter_name='actor_target.'+name)})['passed'])
 
     def test_recovery_gate_requires_critic_and_full_actor_success(self):
@@ -134,6 +141,32 @@ class TestGPUCompute(TestCase):
             bad = deepcopy(updates); bad[index][field]['passed'] = False
             self.assertFalse(recovery_acceptance(bad))
         self.assertFalse(recovery_acceptance(updates[:1]))
+        self.assertFalse(recovery_acceptance([dict(actor_backward=False),dict(actor_backward=True)]))
+
+    def test_exception_own_protection_is_exact_and_current_gradient_nan_positions_remain_strict(self):
+        from brain_uav.scripts.v2_gpu_compute_diagnostic import exception_self_protection, current_gradient_comparison
+        from brain_uav.scripts.v2_gpu_compute_diagnostic import EXCEPTION_GRADIENTS
+        before = {name:torch.ones(2) for name in ('actor.weight','actor_target.weight',
+            'critic1.weight','critic1_target.weight','optimizer.actor.m','optimizer.critic.m',
+            'counts.update_count','gradient.actor.weight','gradient.critic1.weight','gradient.critic2.weight')}
+        for failure,plan in EXCEPTION_GRADIENTS.items():
+            for name in before:
+                after = deepcopy(before); after[name].add_(1)
+                protected = exception_self_protection(before,after,failure)
+                is_current_critic = name.startswith(('gradient.critic1.','gradient.critic2.'))
+                if failure=='critic_loss': expected = False
+                elif failure=='critic_gradient': expected = is_current_critic
+                else:
+                    expected = name.startswith(('critic1.','critic1_target.','optimizer.critic.',
+                        'gradient.critic1.','gradient.critic2.')) or (failure=='actor_gradient' and name.startswith('gradient.actor.'))
+                self.assertEqual(protected['passed'],expected,(failure,name))
+            for module in plan['current']:
+                key = 'gradient.'+module+'.weight'
+                a,b = {key:torch.tensor([float('inf'),1.])},{key:torch.tensor([1.,float('inf')])}
+                self.assertFalse(current_gradient_comparison(a,b,plan['current'])['passed'])
+        a = deepcopy(before); a['gradient.actor.weight'][0] = float('nan')
+        self.assertTrue(exception_self_protection(a,deepcopy(a),'actor_loss')['passed'])
+        self.assertFalse(exception_self_protection(a,before,'actor_loss')['passed'])
 
     def test_full_driver_only_starts_timing_after_both_correctness_workers(self):
         from brain_uav.scripts.profile_v2_td3 import build_parser
@@ -201,8 +234,9 @@ class TestGPUCompute(TestCase):
         from brain_uav.scripts import profile_v2_td3 as p, train_v2_td3 as single
         from brain_uav.scripts import v2_gpu_compute_diagnostic as d
         from brain_uav.config import RewardConfig
-        for inject_protected_error in (False,True):
-            with self.subTest(inject_protected_error=inject_protected_error), TemporaryDirectory() as directory:
+        for case in ('success','protected_error','checkpoint_abort'):
+            inject_protected_error = case == 'protected_error'
+            with self.subTest(case=case), TemporaryDirectory() as directory:
                 e = self.engine(); e.actor_freeze_steps = 25000
                 e.bc_reference_actor = e._frozen_target(e.actor,device=e.device)
                 config = SimpleNamespace(to_dict=lambda: {},policy_delay=2,actor_freeze_steps=25000,
@@ -215,12 +249,18 @@ class TestGPUCompute(TestCase):
                 args = SimpleNamespace(model='ann',seed=7,bc_checkpoint=checkpoint,
                     validation_pool=pool_file,gpu_td3_compute=False,snn_time_window=4,
                     correctness_updates=8,comparison_bc_schedule='smooth-final',
-                    gpu_compute_first_critic_loss_only=inject_protected_error,gpu_compute_error_recovery=True,
+                    gpu_compute_first_critic_loss_only=False,gpu_compute_error_recovery=True,
                     gpu_compute_trace_retained_gradient=True)
                 original = e._require_finite_loss
+                original_reload = d._prepare_loaded_bc_reference
+                def reload(*a,**kw):
+                    if case == 'checkpoint_abort':
+                        raise RuntimeError('checkpoint abort')
+                    return original_reload(*a,**kw)
                 def loss_check(loss,**kwargs):
                     if inject_protected_error and not bool(torch.isfinite(loss).all()):
                         e.update_count += 1  # Diagnostic test: prove protection failure remains fatal.
+                        e.actor_update_count += 1
                     return original(loss,**kwargs)
                 with mock.patch.object(p,'build_v2_stage_engine',return_value=SimpleNamespace(engine=e)), \
                         mock.patch('torch.compile',new=lambda fn,**kw: fn), \
@@ -229,8 +269,14 @@ class TestGPUCompute(TestCase):
                         mock.patch.object(p,'_numeric_diagnostic_observation_batches',return_value=(observation,observation)), \
                         mock.patch.object(d.subprocess,'run',return_value=SimpleNamespace(stdout='fixture')), \
                         mock.patch.object(torch.cuda,'get_rng_state',return_value=torch.tensor([1],dtype=torch.uint8)), \
+                        mock.patch.object(d,'_prepare_loaded_bc_reference',side_effect=reload), \
                         mock.patch.object(e,'_require_finite_loss',new=loss_check):
-                    if inject_protected_error:
+                    if case == 'checkpoint_abort':
+                        with self.assertRaisesRegex(RuntimeError,'checkpoint abort'):
+                            d.correctness(args,prepared=SimpleNamespace(reward_config=RewardConfig()),
+                                config=config,pool=SimpleNamespace(content_digest='fixture'),device='cpu',output=root,
+                                full_pool_digest='fixture')
+                    elif inject_protected_error:
                         with self.assertRaisesRegex(AssertionError,'comparisons completed but inconsistent'):
                             d.correctness(args,prepared=SimpleNamespace(reward_config=RewardConfig()),
                                 config=config,pool=SimpleNamespace(content_digest='fixture'),device='cpu',output=root,
@@ -241,16 +287,26 @@ class TestGPUCompute(TestCase):
                             full_pool_digest='fixture')
                 report = json.loads((root/'correctness.json').read_text())
                 self.assertTrue(report['recovery_completed'])
+                if case == 'checkpoint_abort':
+                    self.assertFalse(report['completed']); self.assertFalse(report['passed'])
+                    self.assertIsNot(report.get('load_rebuild_verified'),True)
+                    self.assertEqual(len(report['checks']),28)
+                    self.assertFalse(report['acceptance']['semantic_passed'])
+                    continue
                 self.assertTrue(report['completed'])
                 self.assertEqual(report['passed'],not inject_protected_error)
-                self.assertEqual(len(report['checks']),18 if inject_protected_error else 25)
-                self.assertEqual([x['actor_backward'] for x in report['recovery_updates']],[False,True])
-                self.assertEqual([x['stage_steps'] for x in report['recovery_updates']],[75013,75014])
+                self.assertEqual(len(report['checks']),29)
+                self.assertEqual([x['actor_backward'] for x in report['recovery_updates']],[False,True]*3)
+                self.assertEqual([x['stage_steps'] for x in report['recovery_updates']],
+                    [75013,75014,75019,75020,75025,75026])
+                self.assertTrue(report['load_rebuild_verified'])
                 self.assertTrue((root/'retained_gradient_trace.pt').exists())
                 compact = json.loads((root/'error_recovery_summary.json').read_text())
                 self.assertEqual(compact['protected_state'][0]['passed'],not inject_protected_error)
                 if inject_protected_error:
                     self.assertIn('Traceback',report['error']['traceback'])
+                    self.assertEqual(report['first_error_state_failure']['failure'],'critic_loss')
+                    self.assertGreaterEqual(len(report['deferred_failures']),2)
                 else:
                     self.assertTrue(report['load_rebuild_verified'])
                     self.assertEqual([v['failure'] for v in report['checks'] if v['failure']],
