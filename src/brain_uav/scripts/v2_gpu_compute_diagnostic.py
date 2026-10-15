@@ -305,7 +305,9 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
     report['code'] = {name:subprocess.run(command,capture_output=True,text=True,check=False).stdout.strip()
         for name,command in (('head',['git','rev-parse','HEAD']),('dirty',['git','status','--short']))}
     reference = None
-    if args.gpu_td3_compute:
+    # Optional, isolated ANN investigation; never selected by formal training.
+    focus = getattr(args, '_ann_common_state', None)
+    if args.gpu_td3_compute and focus is None:
         reference = torch.load(args.td3_block_reference,map_location='cpu',weights_only=False)
         if reference.get('contract') != contract: raise ValueError('Compute reference contract mismatch; rebuild baseline.')
     engine = None
@@ -317,6 +319,8 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             model_type=args.model,snn_time_window=args.snn_time_window,fused_adam=fused,
             reduce_update_stat_syncs=reduced,gpu_td3_compute=args.gpu_td3_compute).engine
         initial = reference['initial'] if reference else deepcopy(engine.checkpoint_state_dict())
+        if focus is not None:
+            initial = focus.initial(engine, initial, contract)
         engine.load_checkpoint_state_dict(initial)
         p._set_numeric_engine_modes(engine)
         configured = _configure_stage_compilation(engine,pool,prepared,
@@ -363,6 +367,8 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             engine.replay.sample = sample
             _,policy_noise,noise_clip = config.noise_schedule.values(total,max_steps=config.max_steps)
             engine.set_target_noise(policy_noise=policy_noise,noise_clip=noise_clip)
+            if focus is not None:
+                focus.before_step(engine, index, total, batch, noise, failure)
             from unittest.mock import patch
             def fixed_noise(t,**kwargs): return noise.to(t.device)
             noise_context = patch('torch.randn_like',new=fixed_noise) if noise is not None else nullcontext()
@@ -379,7 +385,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             metric = None
             before_error = error_state(engine) if failure else None
             try:
-                with noise_context,injection,trace_retained_gradient(engine,trace_events,
+                with noise_context,injection,(focus.observe_noise(index) if focus is not None else nullcontext()),trace_retained_gradient(engine,trace_events,
                         enabled=trace,context=dict(index=index,steps=total,failure=failure)):
                     metric = engine.update_once(total_steps=total,
                         bc_lambda=p.v2_bc_lambda(total,schedule=args.comparison_bc_schedule),diagnostic_tensor_recorder=collect)
@@ -498,7 +504,14 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             snapshots.append(snap); contexts.append(context)
             report['checks'].append(dict(index=index,total_steps=total,failure=failure,
                 passed=not recovery or reference is None or item['active_update']['passed']))
+            if focus is not None:
+                focus.after_step(engine, index, snap)
             return snap
+
+        if focus is not None and focus.replaying:
+            focus.replay(engine, run_step)
+            report.update(passed=True, completed=True, scope='ANN common-state single update only')
+            return report
 
         generator = torch.Generator().manual_seed(args.seed)
         profiled_modes = set()
@@ -628,6 +641,9 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             graph_evidence_scope='one actual prewarmed update per mode profiled; not every update individually profiled')
         if reference is None: torch.save(dict(contract=contract,initial=initial,snapshots=snapshots,contexts=contexts,error_states=error_states),output/'reference.pt')
     except BaseException as exc:
+        if focus is not None and focus.history_complete(exc):
+            report.update(passed=True, completed=True, scope='ANN history through index 26 only; no acceptance or timing')
+            return report
         report['error'] = dict(type=type(exc).__name__,message=str(exc),traceback=traceback.format_exc(),gpu_context=getattr(exc,'gpu_compute_context',None))
         report['failure'] = report['error']
         raise
@@ -673,7 +689,15 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                 for index,state in report.get('error_states',{}).items()]
             p._strict_json_write(output/'error_recovery_summary.json',compact)
         if engine is not None: engine.invalidate_gpu_update()
-        p._strict_json_write(output/'correctness.json',report)
+        if focus is None:
+            p._strict_json_write(output/'correctness.json',report)
+        else:
+            # Do not label a truncated investigation as full v8 acceptance.
+            p._strict_json_write(focus.root/'review'/(focus.worker+'_preparation.json'),
+                dict(completed=report['completed'], execution_passed=report['passed'],
+                    full_acceptance=False, scope=report.get('scope'), code=report.get('code'),
+                    compilation=locals().get('configured'), error=report.get('error'),
+                    selected_location=report['location']))
     return report
 
 
