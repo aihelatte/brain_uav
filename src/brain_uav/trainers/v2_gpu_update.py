@@ -146,6 +146,7 @@ class GPUUpdate:
             raise ValueError('Shared relations require identical observation scales and collision radius.')
         self.actor_params = list(engine.actor.parameters())
         self.critic_params = list(engine.critic1.parameters()) + list(engine.critic2.parameters())
+        self.initialize_actor_loss_scalars()
         if any(not p.requires_grad for p in self.actor_params+self.critic_params):
             raise ValueError('GPU updater requires the existing dense trainable topology; actor freezing uses stage counters.')
         parameter_sets=[{id(p) for p in m.parameters()} for m in self.models if m is not None]
@@ -296,6 +297,16 @@ class GPUUpdate:
     clip_gradients = staticmethod(checked_clip)
     bank_publication = False
 
+    def initialize_actor_loss_scalars(self):
+        # CPU scalar uploads must finish before any manual graph capture.
+        like = self.actor_params[0]
+        self.actor_loss_alpha = torch.tensor(self.e.actor_rl_scale_alpha,
+            device=like.device, dtype=like.dtype)
+        self.actor_loss_terminal_lambda = torch.tensor(
+            self.e.terminal_geo_lambda if self.e.terminal_geo_regularization_enabled else 0.,
+            device=like.device, dtype=like.dtype)
+        # Both values are covered by static_options(), checked before replay.
+
     def compute_batch(self, obs, following, value, sample_error, mode, *, rows=None):
         # Shared REAL TD3 arithmetic. CPU-batch executor never calls operation()
         # or DeviceReplay: no sampler, packed rows or fixed padding in its graph.
@@ -361,8 +372,8 @@ class GPUUpdate:
                 (torch.cat((context,actions),dim=-1),))
             terms = _actor_loss_tensor_block(actions,q,reference,obs.ego_features,obs.goal_features,
                 value('line_to_goal_safe'),e.action_low,e.action_high,
-                loss.new_tensor(e.actor_rl_scale_alpha),coefficients[0],
-                loss.new_tensor(e.terminal_geo_lambda if e.terminal_geo_regularization_enabled else 0.),
+                self.actor_loss_alpha,coefficients[0],
+                self.actor_loss_terminal_lambda,
                 e.actor.scales.horizontal_span,e.actor.scales.vertical_span,e.actor.scales.gamma_max,
                 e.terminal_geo_radius,e.terminal_geo_regularization_enabled,
                 rate if e.model_type=='snn' else None,coefficients[1],

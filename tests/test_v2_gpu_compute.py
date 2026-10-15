@@ -187,6 +187,7 @@ class TestGPUCompute(TestCase):
         u.e = other; u.diagnostic = False; u.compute_diagnostic = False
         u.actor_params = list(other.actor.parameters())
         u.critic_params = list(other.critic1.parameters())+list(other.critic2.parameters())
+        u.initialize_actor_loss_scalars()
         class CPUAdam:
             def __init__(self,opt): self.opt=opt
             def step(self,error):
@@ -199,7 +200,8 @@ class TestGPUCompute(TestCase):
         def noise(t,**kw): return torch.zeros_like(t)
         with mock.patch('torch.randn_like',new=noise):
             expected = e.update_once(total_steps=2)
-        values = u.compute(batch,'actor')
+        with mock.patch.object(torch.Tensor, 'new_tensor', side_effect=AssertionError('CPU scalar inside compute')):
+            values = u.compute(batch,'actor')
         self.assertEqual(int(values[0]),0)
         self.assertAlmostEqual(expected.critic_loss,float(values[1]),places=5)
         self.assertAlmostEqual(expected.actor_loss,float(values[2]),places=5)
@@ -223,6 +225,7 @@ class TestGPUCompute(TestCase):
         u = GPUCompute.__new__(GPUCompute)
         u.e=other; u.diagnostic=False; u.compute_diagnostic=False
         u.actor_params=list(other.actor.parameters()); u.critic_params=list(other.critic1.parameters())+list(other.critic2.parameters())
+        u.initialize_actor_loss_scalars()
         class CPUAdam:
             def __init__(self,opt): self.opt=opt
             def step(self,error):
@@ -232,7 +235,8 @@ class TestGPUCompute(TestCase):
         u.coefficients=torch.tensor([0.,1.,other.policy_noise,other.noise_clip]); u.failure_fraction=torch.tensor(batch.sample_failure_fraction)
         def noise(t,**kw): return torch.zeros_like(t)
         with mock.patch('torch.randn_like',new=noise): expected=e.update_once(total_steps=75002)
-        values=u.compute(batch,'actor')
+        with mock.patch.object(torch.Tensor, 'new_tensor', side_effect=AssertionError('CPU scalar inside compute')):
+            values=u.compute(batch,'actor')
         self.assertAlmostEqual(expected.actor_batch_spike_rate_l1,float(values[10]),places=6)
         self.assertAlmostEqual(expected.spike_regularization_loss,float(values[8]),places=6)
         for a,b in zip(e.actor.parameters(),other.actor.parameters()):
@@ -240,6 +244,30 @@ class TestGPUCompute(TestCase):
             torch.testing.assert_close(a.grad,b.grad,rtol=1e-4,atol=1e-5)
         self.assertEqual(other.actor.snn_head.lif1.v,0.)
         self.assertEqual(other.actor.snn_head.lif2.v,0.)
+
+    def test_preallocated_actor_loss_scalars_and_static_configuration_guard(self):
+        from brain_uav.trainers.v2_gpu_update import GPUUpdate
+        e = self.engine()
+        for executor in (GPUUpdate, GPUCompute):
+            for enabled in (False, True):
+                with self.subTest(executor=executor.__name__, terminal=enabled):
+                    e.terminal_geo_regularization_enabled = enabled
+                    u = executor.__new__(executor); u.e = e
+                    u.actor_params = list(e.actor.parameters())
+                    u.initialize_actor_loss_scalars()
+                    expected = (e.actor_rl_scale_alpha,e.terminal_geo_lambda if enabled else 0.)
+                    for tensor, value in zip((u.actor_loss_alpha,u.actor_loss_terminal_lambda), expected):
+                        self.assertEqual(tensor.shape, torch.Size([]))
+                        self.assertEqual(tensor.dtype, u.actor_params[0].dtype)
+                        self.assertEqual(tensor.device, u.actor_params[0].device)
+                        torch.testing.assert_close(tensor,torch.tensor(value),rtol=0,atol=0)
+                        self.assertFalse(tensor.requires_grad)
+                    before = executor.static_options(e)
+                    for field in ('actor_rl_scale_alpha','terminal_geo_lambda'):
+                        original = getattr(e,field)
+                        setattr(e,field,original+1.)
+                        self.assertNotEqual(executor.static_options(e),before)
+                        setattr(e,field,original)
 
     def test_load_invalidates_without_serializing_executor(self):
         e=self.engine(); state=deepcopy(e.checkpoint_state_dict())

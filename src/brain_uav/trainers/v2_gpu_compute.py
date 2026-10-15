@@ -95,6 +95,7 @@ class GPUCompute(GPUUpdate):
         self.optimizer_states = tuple(o.state for o in self.optimizers)
         self.optimizer_options = tuple(self.options(o) for o in self.optimizers)
         self.static_configuration = self.static_options(engine)
+        self.initialize_actor_loss_scalars()
         self.adams = tuple(DeviceAdam(o) for o in self.optimizers)
         self.native_states = [[o.state.get(p) for p in params] for o,params in zip(self.optimizers,self.params)]
         self.state_handles = [[(a.m[i],a.v[i],a.steps[i],a.m[i].data_ptr(),a.v[i].data_ptr(),a.steps[i].data_ptr())

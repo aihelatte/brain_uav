@@ -350,6 +350,7 @@ class TestGPUUpdate(TestCase):
             u=GPUUpdate.__new__(GPUUpdate); u.e=b
             u.diagnostic=True; u.tensor_evidence={}
             u.actor_params=list(b.actor.parameters()); u.critic_params=list(b.critic1.parameters())+list(b.critic2.parameters())
+            u.initialize_actor_loss_scalars()
             class CPUAdam:
                 def __init__(self,opt): self.opt=opt
                 def step(self,error):
@@ -398,7 +399,8 @@ class TestGPUUpdate(TestCase):
                 tensors={}
                 with mock.patch.object(a.replay,'sample',return_value=batch), mock.patch('torch.randn_like',new=lambda t: torch.full_like(t,.2)):
                     expected=a.update_once(total_steps=step,diagnostic_tensor_recorder=lambda n,t:tensors.update({n:t.detach().clone()}))
-                actual=u.operation(mode)
+                with mock.patch.object(torch.Tensor, 'new_tensor', side_effect=AssertionError('CPU scalar inside compute')):
+                    actual=u.operation(mode)
                 torch.testing.assert_close(u.tensor_evidence[mode]['replay.rows'],rows,rtol=0,atol=0)
                 if actor and model=='snn':
                     from brain_uav.scripts.v2_gpu_td3_diagnostic import complete_actor_evidence
