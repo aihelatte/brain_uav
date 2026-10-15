@@ -13,11 +13,13 @@ import traceback
 import numpy as np
 import torch
 
-CONTRACT_VERSION = 2
+CONTRACT_VERSION = 3
 
 def _prepare_loaded_bc_reference(engine, batches, compilation):
     """Rebind only the newly deep-copied BC actor; retain live engine wrappers."""
+    from brain_uav.scripts.profile_v2_td3 import _set_numeric_engine_modes
     from brain_uav.models.v2_ann import V2ANNPolicyActor
+    _set_numeric_engine_modes(engine)
     actor = engine.bc_reference_actor
     if actor is None:
         return
@@ -85,6 +87,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             reduce_update_stat_syncs=reduced,gpu_td3_compute=args.gpu_td3_compute).engine
         initial = reference['initial'] if reference else deepcopy(engine.checkpoint_state_dict())
         engine.load_checkpoint_state_dict(initial)
+        p._set_numeric_engine_modes(engine)
         configured = _configure_stage_compilation(engine,pool,prepared,
             compile_critic_encoder=False,compile_target_encoders=False,**compilation)
         batches = p._compile_warmup_batches(pool=pool,prepared=prepared,batch_size=engine.batch_size,
@@ -268,7 +271,8 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             graph_evidence_scope='one actual prewarmed update per mode profiled; not every update individually profiled')
         if reference is None: torch.save(dict(contract=contract,initial=initial,snapshots=snapshots,contexts=contexts),output/'reference.pt')
     except BaseException as exc:
-        report['failure'] = dict(type=type(exc).__name__,message=str(exc),traceback=traceback.format_exc(),gpu_context=getattr(exc,'gpu_compute_context',None))
+        report['error'] = dict(type=type(exc).__name__,message=str(exc),traceback=traceback.format_exc(),gpu_context=getattr(exc,'gpu_compute_context',None))
+        report['failure'] = report['error']
         raise
     finally:
         if engine is not None: engine.invalidate_gpu_update()

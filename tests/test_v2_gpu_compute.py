@@ -15,6 +15,61 @@ from test_v2_td3 import TestV2TD3 as Fixture, _observation
 
 
 class TestGPUCompute(TestCase):
+    def test_eval_bc_initialization_modes_before_first_compile_and_error_report(self):
+        from brain_uav.scripts import profile_v2_td3 as p, train_v2_td3 as single
+        from brain_uav.scripts import v2_gpu_compute_diagnostic as d
+        from brain_uav.config import RewardConfig
+        from test_v2_spike_regularization import TestSpikeRegularization
+        config = SimpleNamespace(to_dict=lambda: {})
+        prepared = SimpleNamespace(reward_config=RewardConfig())
+        pool = SimpleNamespace(content_digest='test-pool')
+        for model in ('ann', 'snn'):
+            with self.subTest(model=model), TemporaryDirectory() as directory:
+                root = Path(directory)
+                checkpoint = root/'bc.pt'; checkpoint.write_bytes(b'local fixture')
+                pool_file = root/'pool.json'; pool_file.write_text('{}')
+                contract = None
+                for enabled in (False, True):
+                    e = self.engine() if model == 'ann' else TestSpikeRegularization().engine(delay=2)
+                    e.actor.eval()  # Actual BC initialization mode, not default train.
+                    e.critic1.eval(); e.critic2.eval()
+                    e.bc_reference_actor = e._frozen_target(e.actor, device=e.device)
+                    initial = deepcopy(e.checkpoint_state_dict())
+                    output = root/str(enabled); output.mkdir()
+                    reference = root/'reference.pt'
+                    if enabled:
+                        torch.save(dict(contract=contract, initial=initial), reference)
+                    args = SimpleNamespace(model=model, seed=7, bc_checkpoint=checkpoint,
+                        validation_pool=pool_file, gpu_td3_compute=enabled, snn_time_window=4,
+                        correctness_updates=8, comparison_bc_schedule='smooth-final',
+                        td3_block_reference=reference)
+                    error = RuntimeError('stop at first compile')
+                    def configure(engine, *a, **kw):
+                        self.assertTrue(all(getattr(engine,n).training for n in ('actor','critic1','critic2')))
+                        for n in ('actor_target','critic1_target','critic2_target','bc_reference_actor'):
+                            module = getattr(engine,n)
+                            self.assertFalse(module.training)
+                            self.assertTrue(all(not x.requires_grad for x in module.parameters()))
+                        raise error
+                    with mock.patch.object(p, 'build_v2_stage_engine', return_value=SimpleNamespace(engine=e)), \
+                            mock.patch.object(p, '_td3_block_correctness_steps', return_value=[1]), \
+                            mock.patch.object(single, 'default_v2_cuda_graph_compilation',
+                                return_value=dict(fused_adam=False,reduce_update_stat_syncs=False)), \
+                            mock.patch.object(single, '_configure_stage_compilation', side_effect=configure), \
+                            mock.patch.object(d.subprocess, 'run', return_value=SimpleNamespace(stdout='test')):
+                        with self.assertRaises(RuntimeError) as caught:
+                            d.correctness(args,prepared=prepared,config=config,pool=pool,
+                                device='cpu',output=output,full_pool_digest='test-pool')
+                    self.assertIs(caught.exception,error)
+                    report = json.loads((output/'correctness.json').read_text())
+                    self.assertFalse(report['passed']); self.assertFalse(report['completed'])
+                    self.assertEqual(report['error']['type'],'RuntimeError')
+                    self.assertEqual(report['error']['message'],str(error))
+                    self.assertIn('Traceback',report['error']['traceback'])
+                    self.assertEqual(report['error'],report['failure'])
+                    contract = report['inputs']
+                    self.assertEqual(contract['version'],3)
+
     def test_checkpoint_reload_reuses_compilation_and_rebinds_only_bc(self):
         from brain_uav.scripts.v2_gpu_compute_diagnostic import _prepare_loaded_bc_reference
         from test_v2_spike_regularization import TestSpikeRegularization
@@ -34,6 +89,7 @@ class TestGPUCompute(TestCase):
                     old_bc = e.bc_reference_actor
                     e.load_checkpoint_state_dict(initial)
                     self.assertIsNot(e.bc_reference_actor, old_bc)
+                    e.actor.eval(); e.critic1.eval(); e.critic2.eval()
                     batch = e.replay.sample(e.batch_size).obs
                     with mock.patch.object(e, 'configure_compilation', side_effect=AssertionError('duplicate registration')):
                         _prepare_loaded_bc_reference(e, (batch,), dict(compile_actors=True,
@@ -51,14 +107,21 @@ class TestGPUCompute(TestCase):
                     self.assertEqual((bc.compiled_full_forward_config if model == 'ann'
                         else bc.zone_set_encoder.compiled_tensor_forward_config)['backend'], 'inductor')
                     self.assertFalse(bc.training)
+                    self.assertTrue(all(getattr(e,n).training for n in ('actor','critic1','critic2')))
+                    for name in ('actor_target','critic1_target','critic2_target','bc_reference_actor'):
+                        self.assertFalse(getattr(e,name).training)
+                        self.assertTrue(all(not p.requires_grad for p in getattr(e,name).parameters()))
                     self.assertTrue(all(not p.requires_grad for p in bc.parameters()))
                     self.assertIsNotNone(e.update_once(total_steps=2, bc_lambda=.2))
                     e.load_checkpoint_state_dict(initial)
                     e.gpu_td3_compute = True
+                    e.actor.eval(); e.critic1.eval(); e.critic2.eval()
                     with mock.patch('torch.compile', side_effect=AssertionError('unused BC compile')):
                         _prepare_loaded_bc_reference(e, (batch,), dict(compile_actors=True,
                             cuda_graph_actor_update=True))
                     bc = e.bc_reference_actor
+                    self.assertTrue(all(getattr(e,n).training for n in ('actor','critic1','critic2')))
+                    self.assertFalse(bc.training)
                     self.assertFalse(bc.zone_set_encoder.compiled_tensor_forward_enabled)
                     if model == 'ann':
                         self.assertFalse(bc.compiled_full_forward_enabled)
