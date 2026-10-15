@@ -5584,6 +5584,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--gpu-td3-worker', choices=('correctness', 'timing'), help=argparse.SUPPRESS)
     parser.add_argument('--gpu-td3-compute', action='store_true', help='CPU replay + full manual GPU compute; default off.')
     parser.add_argument('--gpu-compute-comparison', action='store_true', help='Isolated serial baseline/compute correctness then short A/B timing.')
+    parser.add_argument('--gpu-compute-first-critic-loss-only', action='store_true', help='GPU compute diagnostic: retain preceding updates, stop after first critic loss error-state check; no timing.')
     parser.add_argument('--gpu-compute-worker', choices=('correctness','timing'), help=argparse.SUPPRESS)
     parser.add_argument('--gpu-td3-update', action='store_true', help='Experimental full device replay and update; default off.')
     parser.add_argument('--gpu-td3-reference', type=Path, help=argparse.SUPPRESS)

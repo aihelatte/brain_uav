@@ -13,7 +13,98 @@ import traceback
 import numpy as np
 import torch
 
-CONTRACT_VERSION = 3
+CONTRACT_VERSION = 4
+
+
+def error_state(engine):
+    """Diagnostic-only owned CPU values; never rebind or mutate live gradients."""
+    from brain_uav.scripts.v2_gpu_td3_diagnostic import snapshot, flatten
+    values, _ = snapshot(engine)
+    if engine.bc_reference_actor is not None:
+        flatten(engine.bc_reference_actor.state_dict(),'bc_reference',values)
+    gradients, storage = {}, {}
+    executor = engine._gpu_update_executor
+    for module in ('actor', 'critic1', 'critic2', 'actor_target', 'critic1_target',
+                   'critic2_target', 'bc_reference_actor'):
+        model = getattr(engine, module)
+        if model is None:
+            continue
+        for name, parameter in model.named_parameters():
+            key = 'gradient.' + module + '.' + name
+            grad = parameter.grad
+            gradients[key] = dict(present=grad is not None, shape=list(parameter.shape),
+                dtype=str(parameter.dtype), gradient_dtype=None if grad is None else str(grad.dtype),
+                gradient_shape=None if grad is None else list(grad.shape))
+            values[key if grad is not None else key + '.none'] = (
+                torch.tensor(True) if grad is None else grad.detach().cpu().clone())
+            storage[key] = None if grad is None else dict(address=grad.data_ptr(),
+                banks=[] if executor is None else [(group, bank, index)
+                    for group, banks in enumerate(executor.banks)
+                    for bank, tensors in enumerate(banks) for index, tensor in enumerate(tensors)
+                    if tensor is grad])
+    return dict(values=values, gradients=gradients, storage=storage,
+        published=None if executor is None else list(executor.published),
+        graph_keys=[] if executor is None else [list(key) for key in executor.graphs])
+
+
+def state_difference(expected, actual, *, exact=False, evidence=None, label=''):
+    """Check every field before reporting failure, including nonfinite patterns."""
+    differences = []
+    for name in sorted(expected.keys() | actual.keys()):
+        a, b = expected.get(name), actual.get(name)
+        item = dict(field=name)
+        if a is None or b is None or a.shape != b.shape or a.dtype != b.dtype:
+            item.update(reason='field/shape/dtype mismatch',
+                expected=None if a is None else dict(shape=list(a.shape), dtype=str(a.dtype)),
+                actual=None if b is None else dict(shape=list(b.shape), dtype=str(b.dtype)))
+        else:
+            strict = exact or not a.is_floating_point() or name.endswith('.step') or name.startswith('counts.')
+            finite = torch.isfinite(a) & torch.isfinite(b)
+            same = (a == b) if strict else torch.isclose(a, b, rtol=1e-4, atol=1e-5)
+            same |= torch.isnan(a) & torch.isnan(b)
+            if bool(same.all()):
+                continue
+            delta = (a[finite].double() - b[finite].double()).abs()
+            def distribution(t):
+                return {key:int(fn(t).sum()) for key,fn in (
+                    ('finite',torch.isfinite),('nan',torch.isnan),
+                    ('positive_inf',torch.isposinf),('negative_inf',torch.isneginf))}
+            item.update(reason='value mismatch', shape=list(a.shape), dtype=str(a.dtype),
+                elements=a.numel(), mismatches=int((~same).sum()),
+                maximum_finite_absolute_error=float(delta.max()) if delta.numel() else None,
+                expected_nonfinite=distribution(a), actual_nonfinite=distribution(b))
+        differences.append(item)
+        # At most four small representative pairs across all comparisons.
+        if evidence is not None and len(evidence) < 4:
+            evidence[label + ':' + name] = dict(
+                expected=None if a is None else a.flatten()[:4096].clone(),
+                actual=None if b is None else b.flatten()[:4096].clone(),
+                truncated=bool((a is not None and a.numel()>4096) or (b is not None and b.numel()>4096)))
+    return dict(passed=not differences, checked_fields=len(expected.keys() | actual.keys()),
+        first_difference=next(iter(differences),None), differences=differences)
+
+
+def record_error_state(output, index, before, after, expected=None):
+    """Persist both endpoints once and compact all own/cross-side differences."""
+    evidence = {}
+    report = dict(own_before_after=state_difference(before['values'],after['values'],exact=True,
+        evidence=evidence,label='own'), gradient_inventory=dict(before=before['gradients'],after=after['gradients']),
+        storage=dict(before=before['storage'],after=after['storage']),
+        banks=dict(before=before['published'],after=after['published']),
+        graph_keys=dict(before=before['graph_keys'],after=after['graph_keys']))
+    if expected is not None:
+        for phase,actual in (('before',before),('after',after)):
+            report['cross_'+phase] = state_difference(expected[phase]['values'],actual['values'],
+                evidence=evidence,label='cross_'+phase)
+    path = output / f'error_state_{index}.pt'
+    torch.save(dict(before=before,after=after),path)
+    report['snapshot_path'] = str(path)
+    if evidence:
+        path = output / f'error_differences_{index}.pt'
+        torch.save(evidence,path); report['difference_evidence_path'] = str(path)
+    from brain_uav.scripts.profile_v2_td3 import _strict_json_write
+    _strict_json_write(output / f'error_state_{index}.json',report)
+    return report
 
 def _prepare_loaded_bc_reference(engine, batches, compilation):
     """Rebind only the newly deep-copied BC actor; retain live engine wrappers."""
@@ -68,6 +159,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
     if not 8 <= args.correctness_updates <= 16:
         raise ValueError('Compute correctness supports 8..16 controlled steps only.')
     contract['fixed_steps'] = p._td3_block_correctness_steps(config,args.correctness_updates)
+    contract['first_critic_loss_only'] = getattr(args,'gpu_compute_first_critic_loss_only',False)
     contract['checkpoint_sha256'] = sha256(Path(args.bc_checkpoint).read_bytes()).hexdigest()
     contract['full_pool_digest'] = full_pool_digest
     contract['pool_file_sha256'] = sha256(Path(args.validation_pool).read_bytes()).hexdigest()
@@ -115,7 +207,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                 engine.actor.forward_with_activity = activity
             else: engine.actor.register_forward_hook(lambda m,a,out: collect('actor.action',out))
         random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
-        snapshots,contexts = [],[]
+        snapshots,contexts,error_states = [],[],{}
 
         def run_step(total,batch=None,noise=None,failure=None):
             index = len(snapshots); collected.clear()
@@ -145,6 +237,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             if args.gpu_td3_compute and failure:
                 engine._gpu_update_executor.injections[('critic_loss','critic_gradient','actor_loss','actor_gradient').index(failure)] = 1
             metric = None
+            before_error = error_state(engine) if failure else None
             try:
                 with noise_context,injection:
                     metric = engine.update_once(total_steps=total,
@@ -155,6 +248,15 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             finally:
                 engine._require_finite_loss = old_loss
                 if args.gpu_td3_compute and engine._gpu_update_executor is not None: engine._gpu_update_executor.injections.zero_()
+            if failure:
+                after_error = error_state(engine)
+                expected_error = None
+                if reference is not None:
+                    expected_error = torch.load(Path(args.td3_block_reference).parent /
+                        reference['error_states'][index],map_location='cpu',weights_only=False)
+                state_report = record_error_state(output,index,before_error,after_error,expected_error)
+                error_states[index] = Path(state_report['snapshot_path']).name
+                report.setdefault('error_states',{})[str(index)] = state_report
             actor_backward = (metric.actor_updated if metric is not None else failure == 'actor_gradient')
             snap,evidence = snapshot(engine,metric)
             if engine.bc_reference_actor is not None:
@@ -185,19 +287,16 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                             if isinstance(node.v,torch.Tensor): assert torch.count_nonzero(node.v) == 0
                             else: assert node.v == 0
             context = dict(snapshot_index=index,stage_steps=total,actor_backward=actor_backward,gradients=evidence,failure=failure)
-            if reference is not None:
+            if reference is not None and not failure:
                 expected = reference['snapshots'][index]
                 for name,t in snap.items():
                     if name.startswith(('rng.','counts.','tensor.batch.')) or name.endswith('.step'):
                         torch.testing.assert_close(t,expected[name],rtol=0,atol=0)
-                    if failure and name.startswith('grad.') and t.is_floating_point():
-                        for pred in (torch.isnan,torch.isposinf,torch.isneginf):
-                            if not torch.equal(pred(t),pred(expected[name])): raise AssertionError('Nonfinite gradient differs: '+name)
-                        # Error gradients are part of this explicit error-state
-                        # contract, including retained values on loss failures.
-                        finite = torch.isfinite(expected[name])
-                        torch.testing.assert_close(t[finite],expected[name][finite],rtol=1e-4,atol=1e-5)
                 p._compare_td3_block_snapshot(expected,snap,context=context,report=report,output=output)
+            if reference is not None and failure:
+                # Preserve the original snapshot/RNG/counter contract too, but
+                # never stop before every error-state field is checked/saved.
+                report['error_states'][str(index)]['cross_snapshot'] = state_difference(reference['snapshots'][index],snap)
             snapshots.append(snap); contexts.append(context)
             report['checks'].append(dict(index=index,total_steps=total,failure=failure,passed=True))
             return snap
@@ -249,27 +348,47 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             actual = run_step(last,error_batch,failure=failure)
             prefixes = ('actor.','actor_target.','optimizer.actor.','counts.actor_update_count') if failure.startswith('actor') else ('actor.','critic1.','critic2.','actor_target.','critic1_target.','critic2_target.','optimizer.','counts.')
             keep = {n:t for n,t in protected.items() if n.startswith(prefixes)}
-            p._compare_compiled_numeric_tensors(keep,{n:actual[n] for n in keep},rtol=0,atol=0)
-            report['checks'][-1]['protected_state_exact'] = True
+            protected_report = state_difference(keep,{n:actual[n] for n in keep},exact=True)
+            state_report = report['error_states'][str(len(snapshots)-1)]
+            state_report['protected_state_exact'] = protected_report
+            report['checks'][-1]['protected_state_exact'] = protected_report['passed']
+            checks_path = output/f'error_state_{len(snapshots)-1}_checks.json'
+            p._strict_json_write(checks_path,dict(location=report['location'],
+                protected_state_exact=protected_report,cross_snapshot=state_report.get('cross_snapshot')))
+            state_report['checks_path'] = str(checks_path)
+            state_report['state_checks_completed'] = True
+            failed_checks = [name for name in ('cross_before','cross_after','cross_snapshot','protected_state_exact')
+                if name in state_report and not state_report[name]['passed']]
+            report['checks'][-1]['passed'] = not failed_checks
+            if failed_checks:
+                report['first_error_state_failure'] = dict(report['location'],comparisons=failed_checks,
+                    first_difference=state_report[failed_checks[0]]['first_difference'])
+                raise AssertionError('Error-state mismatch after complete state collection: '+str(report['first_error_state_failure']))
+            if contract['first_critic_loss_only']:
+                break
         # Supported load entry point must drop every old graph, then rebuild
         # from the same initial engine state; replay remains the CPU authority.
-        report['location'] = {'phase':'checkpoint_load'}
-        old_executor = engine._gpu_update_executor
-        engine.set_target_noise(policy_noise=initial['algorithm_config']['policy_noise'],
-            noise_clip=initial['algorithm_config']['noise_clip'])
-        engine.load_checkpoint_state_dict(initial)
-        if args.gpu_td3_compute and (engine._gpu_update_executor is not None or old_executor.graphs):
-            raise AssertionError('Checkpoint load did not invalidate old compute graphs.')
-        # All six live networks retain their wrappers; only BC was rebuilt.
-        _prepare_loaded_bc_reference(engine,batches,compilation)
-        run_step(last+config.policy_delay,fixed[3])
-        report['load_rebuild_verified'] = True
+        if not contract['first_critic_loss_only']:
+            report['location'] = {'phase':'checkpoint_load'}
+            old_executor = engine._gpu_update_executor
+            engine.set_target_noise(policy_noise=initial['algorithm_config']['policy_noise'],
+                noise_clip=initial['algorithm_config']['noise_clip'])
+            engine.load_checkpoint_state_dict(initial)
+            if args.gpu_td3_compute and (engine._gpu_update_executor is not None or old_executor.graphs):
+                raise AssertionError('Checkpoint load did not invalidate old compute graphs.')
+            # All six live networks retain their wrappers; only BC was rebuilt.
+            _prepare_loaded_bc_reference(engine,batches,compilation)
+            run_step(last+config.policy_delay,fixed[3])
+            report['load_rebuild_verified'] = True
+        else:
+            report['load_rebuild_verified'] = None
+            report['omitted_checks'] = ['remaining error injections','checkpoint load/rebuild','timing']
         if args.gpu_td3_compute and profiled_modes != {'critic_only','frozen_targets','actor'}:
             raise AssertionError('Three manual update modes were not verified.')
         report.update(passed=True,completed=True,compilation=configured,
             effective=engine.local_optimization_metadata(),snapshot_count=len(snapshots),
             graph_evidence_scope='one actual prewarmed update per mode profiled; not every update individually profiled')
-        if reference is None: torch.save(dict(contract=contract,initial=initial,snapshots=snapshots,contexts=contexts),output/'reference.pt')
+        if reference is None: torch.save(dict(contract=contract,initial=initial,snapshots=snapshots,contexts=contexts,error_states=error_states),output/'reference.pt')
     except BaseException as exc:
         report['error'] = dict(type=type(exc).__name__,message=str(exc),traceback=traceback.format_exc(),gpu_context=getattr(exc,'gpu_compute_context',None))
         report['failure'] = report['error']
@@ -318,6 +437,7 @@ def run(args):
             if enabled and not baseline_ok: item['skipped']='baseline correctness failed'; continue
             command=[sys.executable,'-u','-m','brain_uav.scripts.profile_v2_td3','--device','cuda']
             for name in forwarded: command+=['--'+name.replace('_','-'),str(getattr(args,name))]
+            if getattr(args,'gpu_compute_first_critic_loss_only',False): command+=['--gpu-compute-first-critic-loss-only']
             if enabled: command+=['--gpu-td3-compute','--td3-block-reference',str(output/'baseline_correctness'/'reference.pt')]
             with (output/(group+'_correctness.log')).open('w',encoding='utf-8') as log:
                 rc=subprocess.run(command+['--gpu-compute-worker','correctness','--output-dir',str(output/(group+'_correctness'))],
@@ -326,6 +446,9 @@ def run(args):
             if not enabled: baseline_ok=rc==0
         if not all(v['correctness_passed'] for v in report['groups'].values()):
             raise RuntimeError('CPU sampling/full compute correctness failed; this model timing skipped.')
+        if getattr(args,'gpu_compute_first_critic_loss_only',False):
+            report.update(passed=True,scope='first critic_loss only; no timing or later checks')
+            return report
         for enabled in (False,True):
             group='compute' if enabled else 'baseline'
             command=[sys.executable,'-u','-m','brain_uav.scripts.profile_v2_td3','--device','cuda']

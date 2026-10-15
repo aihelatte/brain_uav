@@ -68,7 +68,119 @@ class TestGPUCompute(TestCase):
                     self.assertIn('Traceback',report['error']['traceback'])
                     self.assertEqual(report['error'],report['failure'])
                     contract = report['inputs']
-                    self.assertEqual(contract['version'],3)
+                    self.assertEqual(contract['version'],4)
+
+    def test_error_state_named_owned_snapshots_preserve_none_and_live_gradients(self):
+        from brain_uav.scripts.v2_gpu_compute_diagnostic import error_state, state_difference
+        e = self.engine()
+        name, parameter = next(e.critic1.named_parameters())
+        parameter.grad = torch.ones_like(parameter)
+        reference = parameter.grad
+        before = error_state(e)
+        parameter.grad.add_(2.)
+        after = error_state(e)
+        key = 'gradient.critic1.' + name
+        self.assertIs(parameter.grad,reference)
+        torch.testing.assert_close(before['values'][key],torch.ones_like(parameter))
+        self.assertNotEqual(before['values'][key].data_ptr(),reference.data_ptr())
+        self.assertFalse(before['values'][key].requires_grad)
+        self.assertIn('gradient.critic2.'+next(e.critic2.named_parameters())[0]+'.none',before['values'])
+        difference = state_difference(before['values'],after['values'],exact=True)
+        self.assertEqual(difference['first_difference']['field'],key)
+        self.assertEqual(difference['first_difference']['maximum_finite_absolute_error'],2.)
+        self.assertTrue(any(n.startswith('optimizer.') for n in before['values']))
+        self.assertIn('counts.update_count',before['values'])
+
+    def test_error_state_collects_all_differences_and_saves_both_sides(self):
+        from brain_uav.scripts.v2_gpu_compute_diagnostic import error_state, record_error_state
+        e = self.engine()
+        e.update_once(total_steps=2)  # Populate real Adam state, one synthetic CPU update.
+        e.critic1.head[0].weight.grad = torch.ones_like(e.critic1.head[0].weight)
+        before = error_state(e); after = error_state(e)
+        expected = dict(before=deepcopy(before),after=deepcopy(after))
+        key = 'gradient.critic1.head.0.weight'
+        after['values'][key].flatten()[0] = float('inf')
+        after['values']['counts.update_count'].add_(1)
+        for prefix in ('critic1.','critic1_target.','optimizer.critic.state.'):
+            field = next(n for n,t in after['values'].items() if n.startswith(prefix) and t.is_floating_point())
+            after['values'][field].add_(1.)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = record_error_state(root,15,before,after,expected)
+            self.assertFalse(report['cross_after']['passed'])
+            self.assertEqual(len(report['cross_after']['differences']),5)
+            item = next(x for x in report['cross_after']['differences'] if x['field']==key)
+            self.assertEqual(item['actual_nonfinite']['positive_inf'],1)
+            self.assertEqual(item['expected_nonfinite']['positive_inf'],0)
+            saved = torch.load(report['snapshot_path'],weights_only=False)
+            self.assertEqual(saved['before']['values'][key].flatten()[0],1.)
+            self.assertTrue(torch.isinf(saved['after']['values'][key].flatten()[0]))
+            self.assertLessEqual(len(torch.load(report['difference_evidence_path'],weights_only=False)),4)
+            self.assertTrue((root/'error_state_15.json').exists())
+
+    def test_first_critic_loss_driver_rebuilds_reference_and_never_times(self):
+        from brain_uav.scripts.profile_v2_td3 import build_parser
+        from brain_uav.scripts.v2_gpu_compute_diagnostic import run
+        with TemporaryDirectory() as directory:
+            args = build_parser().parse_args(['--model','snn','--device','cuda',
+                '--gpu-compute-comparison','--gpu-compute-first-critic-loss-only',
+                '--bc-checkpoint','bc.pt','--validation-pool','pool.json','--output-dir',directory])
+            calls = []
+            def child(command,**kwargs):
+                calls.append(command)
+                return SimpleNamespace(returncode=0)
+            with mock.patch('brain_uav.scripts.v2_gpu_compute_diagnostic.subprocess.run',side_effect=child):
+                report = run(args)
+            self.assertTrue(report['passed'])
+            self.assertEqual(len(calls),2)
+            self.assertTrue(all('--gpu-compute-first-critic-loss-only' in c and 'correctness' in c for c in calls))
+            self.assertNotIn('--td3-block-reference',calls[0])
+            self.assertIn('--td3-block-reference',calls[1])
+
+    def test_first_critic_loss_preserves_full_preceding_sequence_cpu(self):
+        from brain_uav.scripts import profile_v2_td3 as p, train_v2_td3 as single
+        from brain_uav.scripts import v2_gpu_compute_diagnostic as d
+        from brain_uav.config import RewardConfig
+        e = self.engine(); e.actor_freeze_steps = 25000
+        e.bc_reference_actor = e._frozen_target(e.actor,device=e.device)
+        config = SimpleNamespace(to_dict=lambda: {},policy_delay=2,actor_freeze_steps=25000,
+            spike_regularization=e.spike_regularization,batch_size=e.batch_size,max_steps=500000,
+            noise_schedule=SimpleNamespace(values=lambda *a,**kw: (0.,.01,.02)))
+        observation = e.replay.sample(2).obs
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkpoint = root/'bc.pt'; checkpoint.write_bytes(b'fixture')
+            pool_file = root/'pool.json'; pool_file.write_text('{}')
+            args = SimpleNamespace(model='ann',seed=7,bc_checkpoint=checkpoint,
+                validation_pool=pool_file,gpu_td3_compute=False,snn_time_window=4,
+                correctness_updates=8,comparison_bc_schedule='smooth-final',
+                gpu_compute_first_critic_loss_only=True)
+            with mock.patch.object(p,'build_v2_stage_engine',return_value=SimpleNamespace(engine=e)), \
+                    mock.patch.object(single,'_configure_stage_compilation',return_value={}), \
+                    mock.patch.object(p,'_compile_warmup_batches',return_value=[observation]), \
+                    mock.patch.object(p,'_numeric_diagnostic_observation_batches',return_value=(observation,observation)), \
+                    mock.patch.object(d.subprocess,'run',return_value=SimpleNamespace(stdout='fixture')), \
+                    mock.patch.object(torch.cuda,'get_rng_state',return_value=torch.tensor([1],dtype=torch.uint8)):
+                report = d.correctness(args,prepared=SimpleNamespace(reward_config=RewardConfig()),
+                    config=config,pool=SimpleNamespace(content_digest='fixture'),device='cpu',output=root,
+                    full_pool_digest='fixture')
+            self.assertTrue(report['passed'])
+            self.assertEqual(len(report['checks']),16)
+            self.assertEqual(report['checks'][-1]['failure'],'critic_loss')
+            self.assertEqual(report['checks'][-1]['total_steps'],75012)
+            self.assertIsNone(report['load_rebuild_verified'])
+            reference = torch.load(root/'reference.pt',weights_only=False)
+            self.assertTrue(reference['contract']['first_critic_loss_only'])
+            self.assertEqual(set(reference['error_states']),{15})
+            self.assertTrue((root/reference['error_states'][15]).exists())
+            reference['contract']['version'] = 3
+            torch.save(reference,root/'obsolete.pt')
+            args.gpu_td3_compute = True; args.td3_block_reference = root/'obsolete.pt'
+            with mock.patch.object(d.subprocess,'run',return_value=SimpleNamespace(stdout='fixture')):
+                with self.assertRaisesRegex(ValueError,'contract mismatch'):
+                    d.correctness(args,prepared=SimpleNamespace(reward_config=RewardConfig()),
+                        config=config,pool=SimpleNamespace(content_digest='fixture'),device='cpu',output=root,
+                        full_pool_digest='fixture')
 
     def test_checkpoint_reload_reuses_compilation_and_rebinds_only_bc(self):
         from brain_uav.scripts.v2_gpu_compute_diagnostic import _prepare_loaded_bc_reference
