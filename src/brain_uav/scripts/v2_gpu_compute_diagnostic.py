@@ -13,7 +13,39 @@ import traceback
 import numpy as np
 import torch
 
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
+
+def _prepare_loaded_bc_reference(engine, batches, compilation):
+    """Rebind only the newly deep-copied BC actor; retain live engine wrappers."""
+    from brain_uav.models.v2_ann import V2ANNPolicyActor
+    actor = engine.bc_reference_actor
+    if actor is None:
+        return
+    # The loader deep-copies the online actor, including its runtime wrappers.
+    # Those wrappers are not a fresh BC-role compilation of the new module.
+    encoder = actor.zone_set_encoder
+    encoder._compiled_tensor_forward = None
+    encoder._compiled_tensor_forward_config = None
+    encoder._compiled_online_actor_contexts = {}
+    encoder._compiled_shared_relations = None
+    encoder._compiled_shared_relations_config = None
+    if isinstance(actor, V2ANNPolicyActor):
+        actor._compiled_full_forward = None
+        actor._compiled_full_forward_config = None
+    # Manual compute uses raw tensor functions, not a compiled BC callable.
+    if engine.gpu_td3_compute or not compilation['compile_actors']:
+        return
+    options = dict(backend='inductor', mode='default', fullgraph=True, dynamic=True)
+    if compilation['cuda_graph_actor_update']:
+        options.update(mode=None, options={'triton.cudagraphs': True})
+    if isinstance(actor, V2ANNPolicyActor):
+        actor.enable_compiled_full_forward(**options)
+    else:
+        encoder.enable_compiled_tensor_forward(role='bc_reference', **options)
+    with torch.no_grad():
+        for batch in batches:
+            engine._mark_cuda_graph_step_begin()
+            actor(batch, shared_relations=engine._build_shared_relations(batch))
 
 def correctness(args, *, prepared, config, pool, device, output, full_pool_digest):
     """Fixed noise, original CPU replay, exact error-state protection; no training."""
@@ -225,9 +257,8 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
         engine.load_checkpoint_state_dict(initial)
         if args.gpu_td3_compute and (engine._gpu_update_executor is not None or old_executor.graphs):
             raise AssertionError('Checkpoint load did not invalidate old compute graphs.')
-        # Loader rebuilds BC reference; register its own compiled callable again.
-        _configure_stage_compilation(engine,pool,prepared,
-            compile_critic_encoder=False,compile_target_encoders=False,**compilation)
+        # All six live networks retain their wrappers; only BC was rebuilt.
+        _prepare_loaded_bc_reference(engine,batches,compilation)
         run_step(last+config.policy_delay,fixed[3])
         report['load_rebuild_verified'] = True
         if args.gpu_td3_compute and profiled_modes != {'critic_only','frozen_targets','actor'}:

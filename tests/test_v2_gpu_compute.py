@@ -15,6 +15,54 @@ from test_v2_td3 import TestV2TD3 as Fixture, _observation
 
 
 class TestGPUCompute(TestCase):
+    def test_checkpoint_reload_reuses_compilation_and_rebinds_only_bc(self):
+        from brain_uav.scripts.v2_gpu_compute_diagnostic import _prepare_loaded_bc_reference
+        from test_v2_spike_regularization import TestSpikeRegularization
+        for model in ('ann', 'snn'):
+            with self.subTest(model=model):
+                e = self.engine() if model == 'ann' else TestSpikeRegularization().engine(delay=2)
+                e.bc_reference_actor = e._frozen_target(e.actor, device=e.device)
+                initial = deepcopy(e.checkpoint_state_dict())
+                # Real registration guards and loader, without CPU Inductor/CUDA.
+                with mock.patch('torch.compile', new=lambda fn, **kwargs: fn):
+                    e.configure_compilation(compile_actors=True, compile_shared_relations=True)
+                    models = tuple(getattr(e, name) for name in ('actor', 'actor_target',
+                        'critic1', 'critic2', 'critic1_target', 'critic2_target'))
+                    online_wrapper = (e.actor._compiled_full_forward if model == 'ann'
+                        else e.actor.zone_set_encoder._compiled_tensor_forward)
+                    relations = e.critic1.zone_set_encoder._compiled_shared_relations
+                    old_bc = e.bc_reference_actor
+                    e.load_checkpoint_state_dict(initial)
+                    self.assertIsNot(e.bc_reference_actor, old_bc)
+                    batch = e.replay.sample(e.batch_size).obs
+                    with mock.patch.object(e, 'configure_compilation', side_effect=AssertionError('duplicate registration')):
+                        _prepare_loaded_bc_reference(e, (batch,), dict(compile_actors=True,
+                            cuda_graph_actor_update=False))
+                    for name, obj in zip(('actor', 'actor_target', 'critic1', 'critic2',
+                            'critic1_target', 'critic2_target'), models):
+                        self.assertIs(getattr(e, name), obj)
+                    self.assertIs(e.critic1.zone_set_encoder._compiled_shared_relations, relations)
+                    self.assertIs(e.actor._compiled_full_forward if model == 'ann'
+                        else e.actor.zone_set_encoder._compiled_tensor_forward, online_wrapper)
+                    bc = e.bc_reference_actor
+                    wrapper = (bc._compiled_full_forward if model == 'ann'
+                        else bc.zone_set_encoder._compiled_tensor_forward)
+                    self.assertIs(wrapper.__self__, bc if model == 'ann' else bc.zone_set_encoder)
+                    self.assertEqual((bc.compiled_full_forward_config if model == 'ann'
+                        else bc.zone_set_encoder.compiled_tensor_forward_config)['backend'], 'inductor')
+                    self.assertFalse(bc.training)
+                    self.assertTrue(all(not p.requires_grad for p in bc.parameters()))
+                    self.assertIsNotNone(e.update_once(total_steps=2, bc_lambda=.2))
+                    e.load_checkpoint_state_dict(initial)
+                    e.gpu_td3_compute = True
+                    with mock.patch('torch.compile', side_effect=AssertionError('unused BC compile')):
+                        _prepare_loaded_bc_reference(e, (batch,), dict(compile_actors=True,
+                            cuda_graph_actor_update=True))
+                    bc = e.bc_reference_actor
+                    self.assertFalse(bc.zone_set_encoder.compiled_tensor_forward_enabled)
+                    if model == 'ann':
+                        self.assertFalse(bc.compiled_full_forward_enabled)
+
     def engine(self):
         f = Fixture(); f.setUp()
         e = f.make_engine()
