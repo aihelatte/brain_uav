@@ -4,7 +4,7 @@ from dataclasses import asdict, replace
 from hashlib import sha256
 from pathlib import Path
 from statistics import mean, stdev
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager, ExitStack
 import json
 import random
 import subprocess
@@ -13,7 +13,68 @@ import traceback
 import numpy as np
 import torch
 
-CONTRACT_VERSION = 4
+CONTRACT_VERSION = 5
+RETAINED_PARAMETER = 'actor.zone_set_encoder.empty_scene_token'
+
+
+@contextmanager
+def trace_retained_gradient(engine, events, *, enabled, context):
+    """One named gradient only; optional synchronous copies can perturb timing."""
+    if not enabled:
+        yield
+        return
+    from unittest.mock import patch
+    parameter = engine.actor.zone_set_encoder.empty_scene_token
+
+    def sample(boundary, **details):
+        grad = parameter.grad
+        events.append(dict(context, boundary=boundary, parameter=RETAINED_PARAMETER,
+            **details, ordinal=len(events),address=None if grad is None else grad.data_ptr(),
+            value=None if grad is None else grad.detach().cpu().clone()))
+
+    with ExitStack() as stack:
+        def wrap(obj, name):
+            original = getattr(obj,name,None)
+            if original is None:
+                return
+            def observed(*a,**kw):
+                details = dict(component=kw['component']) if 'component' in kw else {}
+                sample(name+'.before',**details)
+                try:
+                    return original(*a,**kw)
+                finally:
+                    sample(name+'.after',**details)
+            stack.enter_context(patch.object(obj,name,new=observed))
+        for name in ('_mark_cuda_graph_step_begin','_build_shared_relations',
+                     '_compiled_target_block','_compiled_target_critic_td','_compiled_critic_loss',
+                     '_require_finite_loss','_validate_and_clip_gradients'):
+            wrap(engine,name)
+        # SNN target forward is outside its compiled target-critic block.
+        if engine._compiled_target_block is None:
+            wrap(engine.actor_target,'forward')
+        wrap(engine.replay,'sample')
+        wrap(engine.actor_optimizer,'step')
+        sample('update.before')
+        try:
+            yield
+        finally:
+            sample('update.after')
+
+
+def retained_trace_summary(events):
+    failing = [event for event in events if event.get('failure') == 'critic_loss']
+    anchor = next((event for event in reversed(events)
+        if event.get('failure') is None and event['boundary']=='update.after'),None)
+    origin = anchor or (failing[0] if failing else None)
+    first = None
+    for event in (failing if anchor else failing[1:]):
+        a,b = origin['value'],event['value']
+        if (a is None) != (b is None) or (a is not None and not torch.equal(a,b)):
+            first = {k:v for k,v in event.items() if k != 'value'}
+            break
+    return dict(parameter=RETAINED_PARAMETER, sampled_boundaries=len(events),first_observed_change=first,
+        origin=None if origin is None else {k:v for k,v in origin.items() if k != 'value'},
+        warning='CPU snapshots synchronize and may perturb the phenomenon; non-reproduction is not a fix.')
 
 
 def error_state(engine):
@@ -58,7 +119,8 @@ def state_difference(expected, actual, *, exact=False, evidence=None, label=''):
                 expected=None if a is None else dict(shape=list(a.shape), dtype=str(a.dtype)),
                 actual=None if b is None else dict(shape=list(b.shape), dtype=str(b.dtype)))
         else:
-            strict = exact or not a.is_floating_point() or name.endswith('.step') or name.startswith('counts.')
+            strict = (exact or not a.is_floating_point() or name.endswith('.step')
+                or name.startswith(('counts.','rng.','tensor.batch.')))
             finite = torch.isfinite(a) & torch.isfinite(b)
             same = (a == b) if strict else torch.isclose(a, b, rtol=1e-4, atol=1e-5)
             same |= torch.isnan(a) & torch.isnan(b)
@@ -160,6 +222,10 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
         raise ValueError('Compute correctness supports 8..16 controlled steps only.')
     contract['fixed_steps'] = p._td3_block_correctness_steps(config,args.correctness_updates)
     contract['first_critic_loss_only'] = getattr(args,'gpu_compute_first_critic_loss_only',False)
+    contract['error_recovery'] = getattr(args,'gpu_compute_error_recovery',False)
+    contract['trace_retained_gradient'] = getattr(args,'gpu_compute_trace_retained_gradient',False)
+    if (contract['error_recovery'] or contract['trace_retained_gradient']) and not contract['first_critic_loss_only']:
+        raise ValueError('Recovery/retained-gradient trace requires --gpu-compute-first-critic-loss-only.')
     contract['checkpoint_sha256'] = sha256(Path(args.bc_checkpoint).read_bytes()).hexdigest()
     contract['full_pool_digest'] = full_pool_digest
     contract['pool_file_sha256'] = sha256(Path(args.validation_pool).read_bytes()).hexdigest()
@@ -171,6 +237,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
         reference = torch.load(args.td3_block_reference,map_location='cpu',weights_only=False)
         if reference.get('contract') != contract: raise ValueError('Compute reference contract mismatch; rebuild baseline.')
     engine = None
+    trace_events = []
     try:
         report['location']['phase'] = 'initialization'
         engine = p.build_v2_stage_engine(None,config,init_checkpoint=args.bc_checkpoint,
@@ -208,8 +275,9 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             else: engine.actor.register_forward_hook(lambda m,a,out: collect('actor.action',out))
         random.seed(args.seed); np.random.seed(args.seed); torch.manual_seed(args.seed)
         snapshots,contexts,error_states = [],[],{}
+        trace_events, deferred_failures = [],[]
 
-        def run_step(total,batch=None,noise=None,failure=None):
+        def run_step(total,batch=None,noise=None,failure=None,*,recovery=False,trace=False):
             index = len(snapshots); collected.clear()
             report['location'] = dict(phase='update',index=index,steps=total,failure=failure,
                 current_zones=None if batch is None else batch.obs.max_zone_count,
@@ -239,7 +307,8 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             metric = None
             before_error = error_state(engine) if failure else None
             try:
-                with noise_context,injection:
+                with noise_context,injection,trace_retained_gradient(engine,trace_events,
+                        enabled=trace,context=dict(index=index,steps=total,failure=failure)):
                     metric = engine.update_once(total_steps=total,
                         bc_lambda=p.v2_bc_lambda(total,schedule=args.comparison_bc_schedule),diagnostic_tensor_recorder=collect)
                 if failure: raise AssertionError('Injected error not rejected: '+failure)
@@ -287,7 +356,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                             if isinstance(node.v,torch.Tensor): assert torch.count_nonzero(node.v) == 0
                             else: assert node.v == 0
             context = dict(snapshot_index=index,stage_steps=total,actor_backward=actor_backward,gradients=evidence,failure=failure)
-            if reference is not None and not failure:
+            if reference is not None and not failure and not recovery:
                 expected = reference['snapshots'][index]
                 for name,t in snap.items():
                     if name.startswith(('rng.','counts.','tensor.batch.')) or name.endswith('.step'):
@@ -297,8 +366,33 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                 # Preserve the original snapshot/RNG/counter contract too, but
                 # never stop before every error-state field is checked/saved.
                 report['error_states'][str(index)]['cross_snapshot'] = state_difference(reference['snapshots'][index],snap)
+            if recovery:
+                item = dict(index=index,stage_steps=total,actor_backward=actor_backward,
+                    diagnostic_only=True, production_resumption_supported=False,
+                    comparison='baseline_reference_only' if reference is None else 'baseline_vs_compute',
+                    scope='Continuation of interrupted diagnostic engine only; not a production recovery contract.')
+                if reference is not None:
+                    expected = reference['snapshots'][index]
+                    differences = {}
+                    item['all_fields'] = state_difference(expected,snap,evidence=differences,label='recovery')
+                    # Keep residuals in all_fields; separately show only consumed
+                    # backward gradients plus all persistent state/loss evidence.
+                    active = {n:t for n,t in expected.items() if actor_backward or not n.startswith('grad.actor.')}
+                    item['active_update'] = state_difference(active,{n:t for n,t in snap.items()
+                        if actor_backward or not n.startswith('grad.actor.')})
+                    for result in (item['all_fields'],item['active_update']):
+                        for difference in result['differences']:
+                            difference.update(evidence.get(difference['field'].removesuffix('.none'),{}))
+                    if differences:
+                        path = output/f'recovery_differences_{index}.pt'
+                        torch.save(differences,path); item['evidence_path'] = str(path)
+                    if not item['all_fields']['passed']:
+                        deferred_failures.append(dict(phase='recovery',index=index,
+                            first_difference=item['all_fields']['first_difference']))
+                report.setdefault('recovery_updates',[]).append(item)
             snapshots.append(snap); contexts.append(context)
-            report['checks'].append(dict(index=index,total_steps=total,failure=failure,passed=True))
+            report['checks'].append(dict(index=index,total_steps=total,failure=failure,
+                passed=not recovery or reference is None or item['all_fields']['passed']))
             return snap
 
         generator = torch.Generator().manual_seed(args.seed)
@@ -341,11 +435,12 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
         last += 6
         for failure in ('critic_loss','critic_gradient','actor_loss','actor_gradient'):
             success = last+config.policy_delay-(last%config.policy_delay)
-            run_step(success,fixed[0])
+            tracing = contract['trace_retained_gradient'] and failure == 'critic_loss'
+            run_step(success,fixed[0],trace=tracing)
             protected,_ = snapshot(engine)
             error_batch = replace(fixed[0],reward=torch.full_like(fixed[0].reward,float('nan'))) if failure == 'critic_loss' else fixed[0]
             last = success+config.policy_delay
-            actual = run_step(last,error_batch,failure=failure)
+            actual = run_step(last,error_batch,failure=failure,trace=tracing)
             prefixes = ('actor.','actor_target.','optimizer.actor.','counts.actor_update_count') if failure.startswith('actor') else ('actor.','critic1.','critic2.','actor_target.','critic1_target.','critic2_target.','optimizer.','counts.')
             keep = {n:t for n,t in protected.items() if n.startswith(prefixes)}
             protected_report = state_difference(keep,{n:actual[n] for n in keep},exact=True)
@@ -363,9 +458,22 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             if failed_checks:
                 report['first_error_state_failure'] = dict(report['location'],comparisons=failed_checks,
                     first_difference=state_report[failed_checks[0]]['first_difference'])
-                raise AssertionError('Error-state mismatch after complete state collection: '+str(report['first_error_state_failure']))
+                if not contract['error_recovery']:
+                    raise AssertionError('Error-state mismatch after complete state collection: '+str(report['first_error_state_failure']))
+                deferred_failures.append(report['first_error_state_failure'])
+            if contract['error_recovery']:
+                # Same CPU batch and explicit target-noise inputs on both sides;
+                # increasing stage steps exercise critic-only then actor update.
+                for total in (last+1,last+config.policy_delay):
+                    controlled = torch.randn(config.batch_size,engine.action_dim,generator=generator)
+                    run_step(total,fixed[0],controlled,recovery=True)
+                report['recovery_completed'] = True
             if contract['first_critic_loss_only']:
                 break
+        if deferred_failures:
+            report['deferred_failures'] = deferred_failures
+            report['completed'] = bool(report.get('recovery_completed'))
+            raise AssertionError('Error/recovery comparisons completed but inconsistent; see diagnostic JSON.')
         # Supported load entry point must drop every old graph, then rebuild
         # from the same initial engine state; replay remains the CPU authority.
         if not contract['first_critic_loss_only']:
@@ -394,6 +502,22 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
         report['failure'] = report['error']
         raise
     finally:
+        if trace_events:
+            torch.save(trace_events,output/'retained_gradient_trace.pt')
+            report['retained_gradient_trace'] = retained_trace_summary(trace_events)
+        if contract['error_recovery'] or contract['trace_retained_gradient']:
+            compact = dict(passed=report['passed'],completed=report['completed'],parameter=RETAINED_PARAMETER,
+                recovery_completed=report.get('recovery_completed',False),
+                trace=report.get('retained_gradient_trace'),
+                protected_state=[dict(index=index,passed=item.get('protected_state_exact',{}).get('passed'))
+                    for index,item in report.get('error_states',{}).items()],
+                recovery=[dict(index=item['index'],steps=item['stage_steps'],actor_backward=item['actor_backward'],
+                    comparison=item['comparison'],
+                    all_fields_passed=item.get('all_fields',{}).get('passed'),
+                    active_update_passed=item.get('active_update',{}).get('passed'))
+                    for item in report.get('recovery_updates',[])],
+                first_failure=report.get('first_error_state_failure'),evidence='correctness.json')
+            p._strict_json_write(output/'error_recovery_summary.json',compact)
         if engine is not None: engine.invalidate_gpu_update()
         p._strict_json_write(output/'correctness.json',report)
     return report
@@ -401,6 +525,11 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
 
 def run(args):
     from brain_uav.scripts import profile_v2_td3 as p
+    recovery = getattr(args,'gpu_compute_error_recovery',False)
+    tracing = getattr(args,'gpu_compute_trace_retained_gradient',False)
+    if (recovery or tracing) and (not getattr(args,'gpu_compute_first_critic_loss_only',False)
+            or args.gpu_compute_worker == 'timing'):
+        raise ValueError('Error recovery/trace is correctness-only and requires first-critic-loss-only.')
     conflicts=('gpu_td3_update','gpu_td3_suite','gpu_td3_worker','gpu_td3_sampling_cost',
         'pinned_batch_transfer','compile_critic_update_front','compile_actor_objective','cuda_graph_critic_tail',
         'window_update_statistics','reuse_update_buffers','aggregate_relation_values_first','single_observation_fast_path',
@@ -416,7 +545,18 @@ def run(args):
         args.td3_block_correctness=args.gpu_compute_worker=='correctness'
         args.td3_block_comparison=args.gpu_compute_worker=='timing'
         args.correctness_updates=max(8,args.correctness_updates)
-        return p.run_local_optimization_comparison(args)
+        try:
+            result = p.run_local_optimization_comparison(args)
+        except Exception as exc:
+            if not (recovery or tracing):
+                raise
+            print(json.dumps(dict(passed=False,error_type=type(exc).__name__,
+                summary=str(Path(args.output_dir)/'error_recovery_summary.json'),
+                detail=str(Path(args.output_dir)/'correctness.json'))))
+            raise SystemExit(1) from None
+        if recovery or tracing:
+            print((Path(args.output_dir)/'error_recovery_summary.json').read_text(encoding='utf-8'))
+        return result
     if args.gpu_td3_compute:
         raise ValueError('The serial driver owns baseline/compute selection.')
     output=Path(args.output_dir)
@@ -438,13 +578,21 @@ def run(args):
             command=[sys.executable,'-u','-m','brain_uav.scripts.profile_v2_td3','--device','cuda']
             for name in forwarded: command+=['--'+name.replace('_','-'),str(getattr(args,name))]
             if getattr(args,'gpu_compute_first_critic_loss_only',False): command+=['--gpu-compute-first-critic-loss-only']
+            if recovery: command+=['--gpu-compute-error-recovery']
+            if tracing: command+=['--gpu-compute-trace-retained-gradient']
             if enabled: command+=['--gpu-td3-compute','--td3-block-reference',str(output/'baseline_correctness'/'reference.pt')]
             with (output/(group+'_correctness.log')).open('w',encoding='utf-8') as log:
                 rc=subprocess.run(command+['--gpu-compute-worker','correctness','--output-dir',str(output/(group+'_correctness'))],
                     stdout=log,stderr=subprocess.STDOUT,check=False).returncode
             item['correctness_exit_code']=rc; item['correctness_passed']=rc==0
+            summary_path = output/(group+'_correctness')/'error_recovery_summary.json'
+            if summary_path.exists():
+                item['error_recovery'] = json.loads(summary_path.read_text(encoding='utf-8'))
             if not enabled: baseline_ok=rc==0
         if not all(v['correctness_passed'] for v in report['groups'].values()):
+            if recovery or tracing:
+                print(json.dumps(report,ensure_ascii=False))
+                raise SystemExit(1)
             raise RuntimeError('CPU sampling/full compute correctness failed; this model timing skipped.')
         if getattr(args,'gpu_compute_first_critic_loss_only',False):
             report.update(passed=True,scope='first critic_loss only; no timing or later checks')

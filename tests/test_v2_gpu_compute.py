@@ -68,7 +68,129 @@ class TestGPUCompute(TestCase):
                     self.assertIn('Traceback',report['error']['traceback'])
                     self.assertEqual(report['error'],report['failure'])
                     contract = report['inputs']
-                    self.assertEqual(contract['version'],4)
+                    self.assertEqual(contract['version'],5)
+
+    def test_retained_trace_is_optional_owned_and_restores_wrappers(self):
+        from brain_uav.scripts.v2_gpu_compute_diagnostic import trace_retained_gradient, retained_trace_summary
+        e = self.engine(); parameter = e.actor.zone_set_encoder.empty_scene_token
+        parameter.grad = torch.ones_like(parameter)
+        original_grad = parameter.grad
+        original_mark = e._mark_cuda_graph_step_begin
+        events = []
+        with mock.patch.object(torch.Tensor,'cpu',side_effect=AssertionError('disabled trace sampled')):
+            with trace_retained_gradient(e,events,enabled=False,context={}):
+                pass
+        self.assertFalse(events)
+        # Artificial mutation only in this unit test; the observer must not
+        # restore/rebind/clear the live gradient to hide it.
+        def mark(): parameter.grad.add_(1.)
+        with mock.patch.object(e,'_mark_cuda_graph_step_begin',new=mark):
+            with trace_retained_gradient(e,events,enabled=True,context=dict(index=15,failure='critic_loss')):
+                e._mark_cuda_graph_step_begin()
+            self.assertIs(e._mark_cuda_graph_step_begin,mark)
+        self.assertEqual(e._mark_cuda_graph_step_begin,original_mark)
+        self.assertIs(parameter.grad,original_grad)
+        torch.testing.assert_close(events[0]['value'],torch.ones_like(parameter))
+        self.assertNotEqual(events[0]['value'].data_ptr(),original_grad.data_ptr())
+        summary = retained_trace_summary(events)
+        self.assertEqual(summary['first_observed_change']['boundary'],'_mark_cuda_graph_step_begin.after')
+        self.assertEqual(summary['first_observed_change']['parameter'],'actor.zone_set_encoder.empty_scene_token')
+        anchor = dict(events[0],failure=None,boundary='update.after',value=events[0]['value']-1.)
+        self.assertEqual(retained_trace_summary([anchor]+events)['first_observed_change']['boundary'],'update.before')
+
+    def test_error_recovery_worker_reports_failure_without_terminal_traceback(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from brain_uav.scripts import profile_v2_td3 as p
+        from brain_uav.scripts.v2_gpu_compute_diagnostic import run
+        args = p.build_parser().parse_args(['--model','snn','--device','cuda',
+            '--gpu-compute-worker','correctness','--gpu-compute-first-critic-loss-only',
+            '--gpu-compute-error-recovery','--bc-checkpoint','bc.pt','--validation-pool','pool.json',
+            '--output-dir','unused-mock-output'])
+        terminal = StringIO()
+        with mock.patch.object(p,'run_local_optimization_comparison',side_effect=AssertionError('mismatch')), \
+                redirect_stdout(terminal),self.assertRaises(SystemExit) as caught:
+            run(args)
+        self.assertEqual(caught.exception.code,1)
+        self.assertNotIn('Traceback',terminal.getvalue())
+        self.assertFalse(json.loads(terminal.getvalue())['passed'])
+
+    def test_error_recovery_finishes_both_steps_before_failing_cpu(self):
+        from brain_uav.scripts import profile_v2_td3 as p, train_v2_td3 as single
+        from brain_uav.scripts import v2_gpu_compute_diagnostic as d
+        from brain_uav.config import RewardConfig
+        for inject_protected_error in (False,True):
+            with self.subTest(inject_protected_error=inject_protected_error), TemporaryDirectory() as directory:
+                e = self.engine(); e.actor_freeze_steps = 25000
+                e.bc_reference_actor = e._frozen_target(e.actor,device=e.device)
+                config = SimpleNamespace(to_dict=lambda: {},policy_delay=2,actor_freeze_steps=25000,
+                    spike_regularization=e.spike_regularization,batch_size=e.batch_size,max_steps=500000,
+                    noise_schedule=SimpleNamespace(values=lambda *a,**kw: (0.,.01,.02)))
+                observation = e.replay.sample(2).obs
+                root = Path(directory)
+                checkpoint = root/'bc.pt'; checkpoint.write_bytes(b'fixture')
+                pool_file = root/'pool.json'; pool_file.write_text('{}')
+                args = SimpleNamespace(model='ann',seed=7,bc_checkpoint=checkpoint,
+                    validation_pool=pool_file,gpu_td3_compute=False,snn_time_window=4,
+                    correctness_updates=8,comparison_bc_schedule='smooth-final',
+                    gpu_compute_first_critic_loss_only=True,gpu_compute_error_recovery=True,
+                    gpu_compute_trace_retained_gradient=True)
+                original = e._require_finite_loss
+                def loss_check(loss,**kwargs):
+                    if inject_protected_error and not bool(torch.isfinite(loss).all()):
+                        e.update_count += 1  # Diagnostic test: prove protection failure remains fatal.
+                    return original(loss,**kwargs)
+                with mock.patch.object(p,'build_v2_stage_engine',return_value=SimpleNamespace(engine=e)), \
+                        mock.patch.object(single,'_configure_stage_compilation',return_value={}), \
+                        mock.patch.object(p,'_compile_warmup_batches',return_value=[observation]), \
+                        mock.patch.object(p,'_numeric_diagnostic_observation_batches',return_value=(observation,observation)), \
+                        mock.patch.object(d.subprocess,'run',return_value=SimpleNamespace(stdout='fixture')), \
+                        mock.patch.object(torch.cuda,'get_rng_state',return_value=torch.tensor([1],dtype=torch.uint8)), \
+                        mock.patch.object(e,'_require_finite_loss',new=loss_check):
+                    if inject_protected_error:
+                        with self.assertRaisesRegex(AssertionError,'comparisons completed but inconsistent'):
+                            d.correctness(args,prepared=SimpleNamespace(reward_config=RewardConfig()),
+                                config=config,pool=SimpleNamespace(content_digest='fixture'),device='cpu',output=root,
+                                full_pool_digest='fixture')
+                    else:
+                        d.correctness(args,prepared=SimpleNamespace(reward_config=RewardConfig()),
+                            config=config,pool=SimpleNamespace(content_digest='fixture'),device='cpu',output=root,
+                            full_pool_digest='fixture')
+                report = json.loads((root/'correctness.json').read_text())
+                self.assertTrue(report['recovery_completed'])
+                self.assertTrue(report['completed'])
+                self.assertEqual(report['passed'],not inject_protected_error)
+                self.assertEqual(len(report['checks']),18)
+                self.assertEqual([x['actor_backward'] for x in report['recovery_updates']],[False,True])
+                self.assertEqual([x['stage_steps'] for x in report['recovery_updates']],[75013,75014])
+                self.assertTrue((root/'retained_gradient_trace.pt').exists())
+                compact = json.loads((root/'error_recovery_summary.json').read_text())
+                self.assertEqual(compact['protected_state'][0]['passed'],not inject_protected_error)
+                if inject_protected_error:
+                    self.assertIn('Traceback',report['error']['traceback'])
+
+    def test_cpu_unused_actor_gradient_is_not_consumed_by_later_updates(self):
+        from brain_uav.scripts.v2_gpu_compute_diagnostic import error_state, state_difference
+        e = self.engine(); batch = e.replay.sample(e.batch_size)
+        def noise(t,**kw): return torch.zeros_like(t)
+        with mock.patch('torch.randn_like',new=noise):
+            e.update_once(total_steps=2)
+        other = self.engine(); other.load_checkpoint_state_dict(deepcopy(e.checkpoint_state_dict()))
+        for engine,value in ((e,1000.),(other,-1000.)):
+            # Synthetic differing stale values, not a diagnostic repair/writeback.
+            p = engine.actor.zone_set_encoder.empty_scene_token
+            p.grad = torch.full_like(p,value)
+            engine.replay.sample = lambda size: batch
+        for total in (3,4):
+            with mock.patch('torch.randn_like',new=noise):
+                e.update_once(total_steps=total); other.update_once(total_steps=total)
+            a,b = error_state(e)['values'],error_state(other)['values']
+            whole = state_difference(a,b)
+            if total == 3:
+                self.assertFalse(whole['passed'])  # Residual difference remains a difference.
+                self.assertTrue(all(x['field'].startswith('gradient.actor.') for x in whole['differences']))
+            else:
+                self.assertTrue(whole['passed'],whole['first_difference'])
 
     def test_error_state_named_owned_snapshots_preserve_none_and_live_gradients(self):
         from brain_uav.scripts.v2_gpu_compute_diagnostic import error_state, state_difference
@@ -124,6 +246,7 @@ class TestGPUCompute(TestCase):
         with TemporaryDirectory() as directory:
             args = build_parser().parse_args(['--model','snn','--device','cuda',
                 '--gpu-compute-comparison','--gpu-compute-first-critic-loss-only',
+                '--gpu-compute-error-recovery','--gpu-compute-trace-retained-gradient',
                 '--bc-checkpoint','bc.pt','--validation-pool','pool.json','--output-dir',directory])
             calls = []
             def child(command,**kwargs):
@@ -134,6 +257,7 @@ class TestGPUCompute(TestCase):
             self.assertTrue(report['passed'])
             self.assertEqual(len(calls),2)
             self.assertTrue(all('--gpu-compute-first-critic-loss-only' in c and 'correctness' in c for c in calls))
+            self.assertTrue(all('--gpu-compute-error-recovery' in c and '--gpu-compute-trace-retained-gradient' in c for c in calls))
             self.assertNotIn('--td3-block-reference',calls[0])
             self.assertIn('--td3-block-reference',calls[1])
 
