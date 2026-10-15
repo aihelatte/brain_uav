@@ -204,6 +204,8 @@ V2_TD3_UPDATE_TIMING_SECTIONS = (
     'critic_optimizer_step',
     'actor_update',
     'target_soft_update',
+    'gpu_compute_input_copy',
+    'gpu_compute_to_result',
 )
 V2_TD3_UPDATE_DETAIL_SECTIONS = (
     'critic_zero_grad',
@@ -573,6 +575,7 @@ class V2TD3UpdateEngine:
         reuse_update_buffers: bool = False,
         cuda_graph_critic_tail: bool = False,
         gpu_td3_update: bool = False,
+        gpu_td3_compute: bool = False,
         compile_critic_update_front: bool = False,
         compile_actor_objective: bool = False,
         pinned_batch_transfer: bool = False,
@@ -607,6 +610,19 @@ class V2TD3UpdateEngine:
         self._validate_network_architecture(actor, critic2, name='critic2')
 
         self.device = torch.device(device)
+        if type(gpu_td3_compute) is not bool:
+            raise TypeError('gpu_td3_compute must be a bool.')
+        if gpu_td3_compute:
+            if any((gpu_td3_update, compile_critic_update_front, compile_actor_objective,
+                    cuda_graph_critic_tail, window_update_statistics, reuse_update_buffers,
+                    pinned_batch_transfer, non_blocking_batch_transfer,
+                    aggregate_relation_values_first)):
+                raise ValueError('gpu_td3_compute conflicts with other experimental paths.')
+            if self.device.type != 'cuda' or not fused_adam:
+                raise ValueError('gpu_td3_compute requires CUDA and fused Adam; no fallback.')
+            from .v2_gpu_update import require_cuda_abi
+            require_cuda_abi()
+        self.gpu_td3_compute = gpu_td3_compute
         if type(non_blocking_batch_transfer) is not bool:
             raise TypeError('non_blocking_batch_transfer must be a bool.')
         if non_blocking_batch_transfer:
@@ -1250,7 +1266,7 @@ class V2TD3UpdateEngine:
     ) -> dict[str, object]:
         """Register one explicit, non-fallback TD3 compilation configuration."""
 
-        if self.gpu_td3_update:
+        if self.gpu_td3_update or self.gpu_td3_compute:
             if not (backend == 'inductor' and mode == 'default' and fullgraph
                     and cuda_graph_updates and cuda_graph_actor_update and compile_actors
                     and compile_critic_block and compile_target_block and compile_shared_relations
@@ -3331,6 +3347,36 @@ class V2TD3UpdateEngine:
                 self._gpu_update_executor = GPUUpdate(self)
             return self._gpu_update_executor.step(total_steps_value, bc_lambda_value, timing_recorder)
 
+        if self.gpu_td3_compute:
+            if not self._gpu_update_formal_configured:
+                raise RuntimeError('Configure formal CUDA paths before GPU compute.')
+            if not torch.is_grad_enabled() or torch.is_inference_mode_enabled():
+                raise RuntimeError('GPU compute requires normal training grad mode.')
+            if (defer_statistics or not reuse_shared_relations or profile_sections or
+                    diagnostic_timing_recorder or diagnostic_profile_sections or block_attribution_recorder):
+                raise ValueError('GPU compute does not support legacy update instrumentation.')
+            with update_timing.section('replay_sample'):
+                batch = self.replay.sample(self.batch_size)
+            with update_timing.section('batch_preparation'):
+                batch = batch.to(self.device)
+            # Same RNG call, shape and ordering as the original target block.
+            noise = torch.randn_like(batch.action)
+            if self._gpu_update_executor is None:
+                from .v2_gpu_compute import GPUCompute
+                self._gpu_update_executor = GPUCompute(self, diagnostic=diagnostic_tensor_recorder is not None)
+            executor = self._gpu_update_executor
+            if diagnostic_tensor_recorder is not None and not executor.diagnostic:
+                raise ValueError('Enable tensor diagnostics before first GPU compute capture.')
+            metric = executor.step_batch(batch, noise, total_steps_value, bc_lambda_value,
+                                         recorder=diagnostic_tensor_recorder)
+            if compiled_execution_recorder is not None:
+                compiled_execution_recorder('gpu_td3_compute_manual_replay')
+            if timing_recorder is not None:
+                sections = dict(update_timing.values)
+                sections.update(executor.last_sections)
+                timing_recorder(sections)
+            return metric
+
         if ((self.compile_critic_update_front and self._compiled_critic_front is None)
                 or (self.compile_actor_objective and self._compiled_actor_objective is None)):
             raise RuntimeError('Merged update blocks must be configured before updating.')
@@ -3814,8 +3860,11 @@ class V2TD3UpdateEngine:
             'effective': self.non_blocking_batch_transfer and self.device.type == 'cuda',
             'source': 'independent pageable CPU sample, retained through update',
             'stream': 'current CUDA stream; no added synchronization'}
+        metadata['gpu_td3_compute'] = (self._gpu_update_executor.metadata()
+            if self.gpu_td3_compute and self._gpu_update_executor is not None else
+            {'requested': self.gpu_td3_compute, 'effective': False, 'reason': 'disabled or initialization pending'})
         metadata['gpu_td3_update'] = (self._gpu_update_executor.metadata()
-            if self._gpu_update_executor is not None else
+            if self.gpu_td3_update and self._gpu_update_executor is not None else
             {'requested': self.gpu_td3_update, 'effective': False, 'reason': 'disabled or initialization pending'})
         metadata['cuda_graph_critic_tail'] = {
             'requested': self.cuda_graph_critic_tail,
@@ -4404,7 +4453,7 @@ class V2TD3UpdateEngine:
     def gpu_episode_submission(self):
         """Batch successful episode uploads; baseline replay behavior unchanged."""
         return (self._gpu_update_executor.replay.success_upload_batch()
-                if self._gpu_update_executor is not None else nullcontext())
+                if self.gpu_td3_update and self._gpu_update_executor is not None else nullcontext())
 
     def load_network_state_dicts(self, payload: dict[str, Any]) -> None:
         """Load only the six online/target networks for a new curriculum stage.

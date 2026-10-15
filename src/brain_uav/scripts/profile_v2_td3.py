@@ -3398,6 +3398,7 @@ def _run_diagnostic_level(
     reuse_update_buffers: bool = False,
     cuda_graph_critic_tail: bool = False,
     gpu_td3_update: bool = False,
+    gpu_td3_compute: bool = False,
     non_blocking_batch_transfer: bool = False,
     batch_transfer_window_timing: bool = False,
     compile_critic_update_front: bool = False,
@@ -3442,6 +3443,7 @@ def _run_diagnostic_level(
         reuse_update_buffers=reuse_update_buffers,
         cuda_graph_critic_tail=cuda_graph_critic_tail,
         gpu_td3_update=gpu_td3_update,
+        gpu_td3_compute=gpu_td3_compute,
         non_blocking_batch_transfer=non_blocking_batch_transfer,
         compile_critic_update_front=compile_critic_update_front,
         compile_actor_objective=compile_actor_objective,
@@ -3595,25 +3597,25 @@ def _run_diagnostic_level(
             for batch in warmup_batches
         ]
         warmup_started = perf_counter()
-        if gpu_td3_update and compile_actors:
+        if (gpu_td3_update or gpu_td3_compute) and compile_actors:
             with torch.no_grad():
                 for batch in warmup_batches:
                     engine._mark_cuda_graph_step_begin()
-                    for actor in (engine.actor,engine.bc_reference_actor):
+                    for actor in ((engine.actor,) if gpu_td3_compute else (engine.actor,engine.bc_reference_actor)):
                         if actor is not None: actor(batch)
         elif compile_actors:
             engine.warmup_actor_compile(warmup_batches)
-        if compile_shared_relations:
+        if compile_shared_relations and not gpu_td3_compute:
             engine.warmup_shared_relations_compile(warmup_batches)
-        if compile_critic_block and not gpu_td3_update:
+        if compile_critic_block and not (gpu_td3_update or gpu_td3_compute):
             engine.warmup_full_compile(warmup_batches)
-        elif compile_critic_encoder and not gpu_td3_update:
+        elif compile_critic_encoder and not (gpu_td3_update or gpu_td3_compute):
             engine.warmup_online_critic_encoder_compile(warmup_batches)
             if compile_target_encoders:
                 engine.warmup_target_encoder_compile(warmup_batches)
-        if compile_snn_target_encoder and not compile_target_block and not gpu_td3_update:
+        if compile_snn_target_encoder and not compile_target_block and not (gpu_td3_update or gpu_td3_compute):
             engine.warmup_snn_target_encoder_compile(warmup_batches)
-        if compile_actor_loss and not gpu_td3_update:
+        if compile_actor_loss and not (gpu_td3_update or gpu_td3_compute):
             engine.warmup_actor_loss_compile(warmup_batches)
         if compile_action_inference:
             action_batches = _action_inference_warmup_batches(
@@ -3633,11 +3635,11 @@ def _run_diagnostic_level(
                         action_batches
                     )
                 )
-        if cuda_graph_updates and not gpu_td3_update:
+        if cuda_graph_updates and not (gpu_td3_update or gpu_td3_compute):
             compile_metadata['cuda_graph_evidence'] = (
                 engine.verify_update_cuda_graph_capture(warmup_batches)
             )
-        elif gpu_td3_update:
+        elif gpu_td3_update or gpu_td3_compute:
             compile_metadata['cuda_graph_evidence']={'verified':False,'reason':'manual executor capture pending; old update warmup skipped'}
         compile_metadata['warmup_wall_seconds'] = perf_counter() - warmup_started
         compile_metadata['measurement_note'] = (
@@ -3815,7 +3817,7 @@ def _run_diagnostic_level(
                     if engine._critic_tail is None or not engine._critic_tail.graphs:
                         raise RuntimeError('Critic tail must be captured during warmup before internal timing.')
                     engine._critic_tail.reset_internal_timing(enabled=True)
-                if gpu_td3_update:
+                if gpu_td3_update or gpu_td3_compute:
                     if engine._gpu_update_executor is None:
                         raise RuntimeError('GPU updater did not initialize during warmup.')
                     engine._gpu_update_executor.begin_measurement()
@@ -4135,7 +4137,7 @@ def _run_diagnostic_level(
         'measured_steps': measured_steps,
         'block_attribution': block_attribution.report(block_attribution_wall),
         'local_optimizations': engine.local_optimization_metadata(),
-        'gpu_update_timing_scope': ('Legacy inner update regions are unmeasured, not zero work. gpu_td3_sample_to_result covers the full contiguous path, including control inputs and terminal read.' if gpu_td3_update else None),
+        'gpu_update_timing_scope': ('CPU sample/upload unchanged. gpu_compute_input_copy is added GPU-copy submission wall; gpu_compute_to_result is manual replay through terminal read. Binding checks, controls, capture and publication remain in outer TD3 wall; unmeasured old inner sections are not zero work.' if gpu_td3_compute else ('Legacy inner update regions are unmeasured, not zero work. gpu_td3_sample_to_result covers the full contiguous path, including control inputs and terminal read.' if gpu_td3_update else None)),
         'batch_transfer_window_completion': ({'wait_seconds':completion_wait_seconds,
             'td3_wall_including_final_window_wait_seconds':update_seconds+completion_wait_seconds,
             'scope':'Original per-call TD3 wall plus the existing diagnostic window completion wait; conservative full-stream drain, not pure GPU compute.'}
@@ -4220,7 +4222,7 @@ def _run_diagnostic_level(
             ),
         },
     }
-    if gpu_td3_update:
+    if gpu_td3_update or gpu_td3_compute:
         engine.invalidate_gpu_update()  # Dispose graphs/hooks after capturing report values.
     return result
 
@@ -5313,6 +5315,8 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
 
     if sum(bool(getattr(args, name)) for name in ('local_optimization_comparison', 'local_optimization_correctness', 'critic_tail_comparison', 'critic_tail_correctness', 'td3_block_correctness', 'td3_block_comparison')) > 1:
         raise ValueError('Select exactly one comparison/correctness mode.')
+    if args.gpu_td3_compute and getattr(args,'gpu_compute_worker',None) not in ('correctness','timing'):
+        raise ValueError('GPU compute requires its isolated diagnostic worker.')
     if args.critic_tail_internal_timing and not args.critic_tail_comparison:
         raise ValueError('--critic-tail-internal-timing requires --critic-tail-comparison (timing only).')
     if args.validation_pool is None:
@@ -5368,6 +5372,8 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
         expected_scenario=prepared.scenario_config,
         expected_uav_collision_radius=prepared.uav_collision_radius,
         expected_master_seed=args.validation_seed)
+    if getattr(args,'gpu_compute_worker',None) and args.expected_pool_digest and original_pool.content_digest != args.expected_pool_digest:
+        raise ValueError('GPU compute fixed pool digest differs from requested provenance.')
     count = min(_positive_int(args.scenario_count, name='scenario_count'), original_pool.scenario_count)
     pool = V2ValidationPool(curriculum_level='easy', master_seed=original_pool.master_seed,
         stage_seed=original_pool.stage_seed, scenario_config=original_pool.scenario_config,
@@ -5382,6 +5388,10 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     compilation.pop('reduce_update_stat_syncs', None)
     # All comparison groups preserve the formally adopted configuration on CUDA.
     output.mkdir(parents=True, exist_ok=True)
+    if getattr(args, 'gpu_compute_worker', None) == 'correctness':
+        from brain_uav.scripts.v2_gpu_compute_diagnostic import correctness
+        return correctness(args, prepared=prepared, config=config, pool=pool, device=target, output=output,
+                           full_pool_digest=original_pool.content_digest)
     if args.local_optimization_correctness or args.critic_tail_correctness or args.td3_block_correctness:
         return _run_local_optimization_correctness(args, prepared=prepared,
             config=config, pool=pool, device=target, output=output)
@@ -5419,8 +5429,9 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 compile_actor_objective=args.td3_block_comparison and args.td3_block_choice in ('A', 'CA'),
                 cuda_graph_critic_tail=args.critic_tail_comparison and group == 'B',
                 critic_tail_internal_timing=args.critic_tail_internal_timing and group == 'B',
+                gpu_td3_compute=getattr(args,'gpu_compute_worker',None)=='timing' and args.gpu_td3_compute,
                 non_blocking_batch_transfer=getattr(args,'batch_transfer_worker',None)=='timing' and args.non_blocking_batch_transfer,
-                batch_transfer_window_timing=getattr(args,'batch_transfer_worker',None)=='timing',
+                batch_transfer_window_timing=(getattr(args,'batch_transfer_worker',None)=='timing' or getattr(args,'gpu_compute_worker',None)=='timing'),
                 block_attribution_wall=args.td3_block_attribution == 'wall',
                 compiled_path_profiler_updates=(args.compiled_performance_diagnostic_updates or 4) if args.td3_block_attribution == 'profiler' else 0,
                 compiled_profiler_output_dir=output / f'{group}_{repeat}_profiler' if args.td3_block_attribution == 'profiler' else None,
@@ -5457,7 +5468,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
         'td3_block_attribution': args.td3_block_attribution,
         'critic_tail_internal_timing_requested': args.critic_tail_internal_timing,
         'final_speed_acceptance': False if args.critic_tail_internal_timing or args.td3_block_attribution else None,
-        'comparison_kind': 'merged_update_blocks' if args.td3_block_comparison else ('checked_critic_tail' if args.critic_tail_comparison else 'local_optimizations'),
+        'comparison_kind': 'gpu_td3_compute' if getattr(args,'gpu_compute_worker',None) else ('merged_update_blocks' if args.td3_block_comparison else ('checked_critic_tail' if args.critic_tail_comparison else 'local_optimizations')),
         'steps': steps, 'repeats': repeats, 'runs': runs,
         'comparison': {group: {'mean_wall_seconds': averages[group],
             'stdev_wall_seconds': stdev([run['timing']['total_wall_seconds'] for run in values]) if repeats > 1 else 0.0,
@@ -5571,6 +5582,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--sampling-replays', type=int, default=16)
     parser.add_argument('--sampling-warmup', type=int, default=2)
     parser.add_argument('--gpu-td3-worker', choices=('correctness', 'timing'), help=argparse.SUPPRESS)
+    parser.add_argument('--gpu-td3-compute', action='store_true', help='CPU replay + full manual GPU compute; default off.')
+    parser.add_argument('--gpu-compute-comparison', action='store_true', help='Isolated serial baseline/compute correctness then short A/B timing.')
+    parser.add_argument('--gpu-compute-worker', choices=('correctness','timing'), help=argparse.SUPPRESS)
     parser.add_argument('--gpu-td3-update', action='store_true', help='Experimental full device replay and update; default off.')
     parser.add_argument('--gpu-td3-reference', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--checkpoint', type=Path, help='Terminal formal checkpoint; failed is allowed only for diagnosis.')
@@ -5711,6 +5725,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.gpu_compute_comparison or args.gpu_compute_worker:
+        from brain_uav.scripts.v2_gpu_compute_diagnostic import run
+        return run(args)
+    if args.gpu_td3_compute:
+        raise ValueError('GPU compute diagnosis requires its comparison or worker.')
     if args.batch_transfer_comparison or args.batch_transfer_worker:
         from brain_uav.scripts.v2_batch_transfer_diagnostic import run
         return run(args)

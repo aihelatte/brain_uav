@@ -282,22 +282,30 @@ class GPUUpdate:
             return raw.tanh()*actor.action_limit, (first.mean() if actor is self.e.actor else self.noise.new_zeros(()))
 
     def operation(self, mode):
+        if self.use_fixed_rows:
+            sampled=self.fixed_rows
+            sample_error=torch.zeros((),dtype=torch.bool,device=self.e.device)
+        else:
+            sampled,sample_error=self.replay.sample_tensors(
+                self.draws,self.ranks,self.primary_count,self.success_size,
+                size=self.replay_size,expected_total=self.weight_total,return_status=True)
+        rows = torch.where(self.fixed_mode, self.fixed_rows, sampled)
+        obs, following, value = self.replay.unpack(rows)
+        return self.compute_batch(obs, following, value, sample_error, mode, rows=rows)
+
+    clip_gradients = staticmethod(checked_clip)
+    bank_publication = False
+
+    def compute_batch(self, obs, following, value, sample_error, mode, *, rows=None):
+        # Shared REAL TD3 arithmetic. CPU-batch executor never calls operation()
+        # or DeviceReplay: no sampler, packed rows or fixed padding in its graph.
         from .v2_td3 import _actor_loss_tensor_block
         e = self.e
         coefficients=self.coefficients.float()
         evidence={}
         def record(name,value):
             if self.diagnostic: evidence[name]=value.detach().clone()
-        if self.use_fixed_rows:
-            sampled=self.fixed_rows
-            sample_error=torch.zeros((),dtype=torch.bool,device=e.device)
-        else:
-            sampled,sample_error=self.replay.sample_tensors(
-                self.draws,self.ranks,self.primary_count,self.success_size,
-                size=self.replay_size,expected_total=self.weight_total,return_status=True)
-        rows = torch.where(self.fixed_mode, self.fixed_rows, sampled)
-        record('replay.rows', rows)  # Diagnostic only: actual sampler output, no steady-state readback.
-        obs, following, value = self.replay.unpack(rows)
+        if rows is not None: record('replay.rows', rows)
         record('replay.mask', obs.presence_mask)
         record('replay.next_mask', following.presence_mask)
         current, next_args = self.arguments(obs), self.arguments(following)
@@ -317,6 +325,9 @@ class GPUUpdate:
             ('critic.q1',q1),('critic.q2',q2),('critic.loss',loss)):
             record(name,value_tensor)
         loss = torch.where(self.injections[0] != 0, torch.full_like(loss,float('nan')),loss)
+        if self.bank_publication:
+            publish_critic = torch.isfinite(loss) & ~sample_error
+            publish_actor = torch.zeros_like(publish_critic)
         loss.backward()
         if self.diagnostic:
             for module_name in ('critic1','critic2'):
@@ -326,7 +337,7 @@ class GPUUpdate:
             g = self.critic_params[0].grad
             g.copy_(torch.where(self.injections[1] != 0,torch.full_like(g,float('inf')),g))
         error = torch.where(sample_error,5,0).to(torch.long)
-        error, critic_norm = checked_clip(self.critic_params,loss,error,1,2,e.critic_grad_clip_norm)
+        error, critic_norm = self.clip_gradients(self.critic_params,loss,error,1,2,e.critic_grad_clip_norm)
         self.adams[1].step((error != 0).float())
         if mode != 'critic_only':
             for online, target_model in ((e.critic1,e.critic1_target),(e.critic2,e.critic2_target)):
@@ -341,6 +352,7 @@ class GPUUpdate:
             for p in self.actor_params:
                 if p.grad is not None: p.grad.zero_()
             actions, rate = self.actor_forward(e.actor,current)
+            if getattr(self, 'compute_diagnostic', False): record('actor.action', actions)
             if self.diagnostic and e.model_type=='snn': evidence.update(self._activity_evidence)
             with torch.no_grad():
                 reference = None if e.bc_reference_actor is None else self.actor_forward(e.bc_reference_actor,current)[0]
@@ -361,6 +373,7 @@ class GPUUpdate:
             record('actor.spike_rate',rate); record('actor.spike_loss',terms[6])
             record('actor.spike_beta',coefficients[1])
             if e.model_type=='snn': record('actor.weighted_spike',terms[7])
+            if self.bank_publication: publish_actor = (error == 0) & torch.isfinite(actor_loss)
             actor_loss.backward()
             if self.diagnostic:
                 for name,p in e.actor.named_parameters():
@@ -368,10 +381,11 @@ class GPUUpdate:
             if self.actor_params[0].grad is not None:
                 g=self.actor_params[0].grad
                 g.copy_(torch.where(self.injections[3]!=0,torch.full_like(g,float('inf')),g))
-            error, actor_norm = checked_clip(self.actor_params,actor_loss,error,3,4,e.actor_grad_clip_norm)
+            error, actor_norm = self.clip_gradients(self.actor_params,actor_loss,error,3,4,e.actor_grad_clip_norm)
             self.adams[0].step((error != 0).float())
             gated_targets(self.actor_params,list(e.actor_target.parameters()),e.tau,error)
         with torch.no_grad():
+            if self.bank_publication: self.publication = torch.stack((publish_critic, publish_actor))
             if self.diagnostic: self.tensor_evidence[mode]=evidence
             td=(q1-target).abs(); failure=(value('success')<.5).float()
             return torch.stack((error.float(),loss,*terms,rate,actor_norm,
@@ -494,6 +508,17 @@ class GPUUpdate:
         e.update_count+=1; e.critic_update_count+=1
         e.critic_target_update_count+=int(targets); e.actor_update_count+=int(actor)
         e.last_total_steps=total_steps
+        m = self.metrics(values, total_steps, bc_lambda, targets, actor)
+        if timing_recorder:
+            from .v2_td3 import V2_TD3_UPDATE_TIMING_SECTIONS
+            sections={name:0. for name in V2_TD3_UPDATE_TIMING_SECTIONS}
+            sections['gpu_td3_sample_to_result']=perf_counter()-start
+            timing_recorder(sections)
+        return m
+
+    def metrics(self, values, total_steps, bc_lambda, targets, actor):
+        from .v2_td3 import V2TD3UpdateMetrics
+        e = self.e
         _,critic,*_=values
         # output: error, critic, eight actor terms, rate, norm, 3 fractions,
         # seven critic reductions and critic norm.
@@ -510,11 +535,6 @@ class GPUUpdate:
             critic_q1_mean=values[15],critic_q1_std=values[16],critic_q1_max_abs=values[17],critic_target_q_mean=values[18],
             critic_td_error_mean=values[19],critic_failure_td_error_mean=values[20],
             critic_updated=True,critic_targets_updated=targets,actor_updated=actor)
-        if timing_recorder:
-            from .v2_td3 import V2_TD3_UPDATE_TIMING_SECTIONS
-            sections={name:0. for name in V2_TD3_UPDATE_TIMING_SECTIONS}
-            sections['gpu_td3_sample_to_result']=perf_counter()-start
-            timing_recorder(sections)
         return m
 
     def metadata(self):

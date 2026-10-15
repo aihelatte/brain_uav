@@ -66,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--reuse-update-buffers', action='store_true')
     parser.add_argument('--compile-critic-update-front', action='store_true')
     parser.add_argument('--compile-actor-objective', action='store_true')
+    parser.add_argument('--gpu-td3-compute', action='store_true', help='Experimental CPU replay + complete manual GPU computation; default off.')
     parser.add_argument('--gpu-td3-update', action='store_true', help='Experimental full device replay/update; CUDA 2.5.1+cu124 only; default off.')
     parser.add_argument('--cuda-graph-critic-tail', action='store_true', help='Capture checked fused critic Adam and optional critic target updates; requires CUDA.')
     parser.add_argument('--compile-critic-encoder', action='store_true')
@@ -264,6 +265,7 @@ def run_v2_curriculum(
     reuse_update_buffers: bool = False,
     cuda_graph_critic_tail: bool = False,
     gpu_td3_update: bool = False,
+    gpu_td3_compute: bool = False,
     compile_critic_update_front: bool = False,
     compile_actor_objective: bool = False,
     pinned_batch_transfer: bool = False,
@@ -277,6 +279,10 @@ def run_v2_curriculum(
                         ('compile_actor_objective', compile_actor_objective)):
         if type(value) is not bool:
             raise TypeError(f'{name} must be a bool.')
+    if type(gpu_td3_compute) is not bool:
+        raise TypeError('gpu_td3_compute must be a bool.')
+    if gpu_td3_compute and any((gpu_td3_update, compile_critic_update_front, compile_actor_objective, cuda_graph_critic_tail, window_update_statistics, reuse_update_buffers, pinned_batch_transfer, aggregate_relation_values_first)):
+        raise ValueError('gpu_td3_compute conflicts with other experimental paths.')
     if type(gpu_td3_update) is not bool:
         raise TypeError('gpu_td3_update must be a bool.')
     if gpu_td3_update and any((compile_critic_update_front, compile_actor_objective, cuda_graph_critic_tail, window_update_statistics, reuse_update_buffers, pinned_batch_transfer, aggregate_relation_values_first)):
@@ -465,6 +471,7 @@ def run_v2_curriculum(
             reuse_update_buffers=reuse_update_buffers,
             cuda_graph_critic_tail=cuda_graph_critic_tail,
             gpu_td3_update=gpu_td3_update,
+            gpu_td3_compute=gpu_td3_compute,
             compile_critic_update_front=compile_critic_update_front,
             compile_actor_objective=compile_actor_objective,
             pinned_batch_transfer=pinned_batch_transfer,
@@ -525,7 +532,7 @@ def run_v2_curriculum(
             'aggregate_relation_values_first': aggregate_relation_values_first,
             'window_update_statistics': window_update_statistics,
             'reuse_update_buffers': reuse_update_buffers,
-            'cuda_graph_critic_tail': cuda_graph_critic_tail, 'gpu_td3_update': gpu_td3_update,
+            'cuda_graph_critic_tail': cuda_graph_critic_tail, 'gpu_td3_update': gpu_td3_update, 'gpu_td3_compute': gpu_td3_compute,
             'compile_critic_update_front': compile_critic_update_front,
             'compile_actor_objective': compile_actor_objective,
             'reduce_update_stat_syncs': reduce_update_stat_syncs,
@@ -557,7 +564,7 @@ def main(argv: list[str] | None = None) -> int:
     resolved_device = resolve_training_device(args.device)
     print(json.dumps({
         'local_optimizations_requested': {'window_update_statistics': args.window_update_statistics,
-                                          'reuse_update_buffers': args.reuse_update_buffers, 'cuda_graph_critic_tail': args.cuda_graph_critic_tail, 'gpu_td3_update': args.gpu_td3_update,
+                                          'reuse_update_buffers': args.reuse_update_buffers, 'cuda_graph_critic_tail': args.cuda_graph_critic_tail, 'gpu_td3_update': args.gpu_td3_update, 'gpu_td3_compute': args.gpu_td3_compute,
                                           'compile_critic_update_front': args.compile_critic_update_front,
                                           'compile_actor_objective': args.compile_actor_objective},
         'requested_device': args.device,
@@ -618,6 +625,7 @@ def main(argv: list[str] | None = None) -> int:
         reuse_update_buffers=args.reuse_update_buffers,
         cuda_graph_critic_tail=args.cuda_graph_critic_tail,
         gpu_td3_update=args.gpu_td3_update,
+        gpu_td3_compute=args.gpu_td3_compute,
         compile_critic_update_front=args.compile_critic_update_front,
         compile_actor_objective=args.compile_actor_objective,
         pinned_batch_transfer=args.pinned_batch_transfer,
