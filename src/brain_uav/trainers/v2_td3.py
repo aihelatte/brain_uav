@@ -647,6 +647,10 @@ class V2TD3UpdateEngine:
         self._gpu_update_executor = None
         self._gpu_update_generation = 0
         self._gpu_update_stream = None
+        # Keep default-generator graph registration alive across checkpoint loads.
+        self._gpu_compute_registration_graph = None
+        self._gpu_compute_registration_device = None
+        self._gpu_compute_registration_failed = False
         self._gpu_update_formal_configured = False
         if type(fused_adam) is not bool:
             raise TypeError('fused_adam must be a bool.')
@@ -1242,6 +1246,41 @@ class V2TD3UpdateEngine:
             )
         self.frozen_critic_strategy = strategy
 
+    def _ensure_gpu_compute_graph_registration(self) -> None:
+        """Register generator graph state outside inference, before compiled warmup."""
+        if not self.gpu_td3_compute:
+            return
+        if self._gpu_compute_registration_failed:
+            raise RuntimeError('GPU compute graph registration previously failed; use a fresh process.')
+        if self.device.type != 'cuda' or torch.is_inference_mode_enabled():
+            raise RuntimeError('GPU compute graph registration requires CUDA outside InferenceMode.')
+        device = torch.device('cuda', self.device.index if self.device.index is not None
+            else torch.cuda.current_device())
+        if self._gpu_compute_registration_graph is not None:
+            if device != self._gpu_compute_registration_device:
+                raise RuntimeError('GPU compute registration device changed; use a fresh engine/process.')
+            return
+        try:
+            with torch.cuda.device(device), torch.no_grad():
+                cpu_rng = torch.get_rng_state()
+                cuda_rng = torch.cuda.get_rng_state(device)
+                current = torch.cuda.current_stream(device)
+                stream = torch.cuda.Stream(device=device)
+                stream.wait_stream(current)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph, stream=stream):
+                    pass
+                current.wait_stream(stream)
+                torch.cuda.synchronize(device)
+                if not (torch.equal(cpu_rng, torch.get_rng_state())
+                        and torch.equal(cuda_rng, torch.cuda.get_rng_state(device))):
+                    raise RuntimeError('GPU compute early graph registration changed RNG state.')
+            self._gpu_compute_registration_graph = graph
+            self._gpu_compute_registration_device = device
+        except BaseException:
+            self._gpu_compute_registration_failed = True
+            raise
+
     def configure_compilation(
         self,
         *,
@@ -1276,6 +1315,7 @@ class V2TD3UpdateEngine:
                     and frozen_critic_strategy == 'compiled_no_grad_context'
                     and (self.model_type != 'snn' or compile_snn_target_encoder)):
                 raise ValueError('gpu_td3_update requires formal CUDA compilation configuration; inference remains compiled.')
+            self._ensure_gpu_compute_graph_registration()
             self.invalidate_gpu_update()
             self._gpu_update_formal_configured = True
 
