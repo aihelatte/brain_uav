@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest import TestCase, mock
 import inspect
 import json
+import numpy as np
 import torch
 
 from brain_uav.trainers.v2_gpu_compute import GPUCompute, clone_batch, preserving_clip, tensors
@@ -15,6 +16,122 @@ from test_v2_td3 import TestV2TD3 as Fixture, _observation
 
 
 class TestGPUCompute(TestCase):
+    def test_environment_diagnostic_cli_is_default_off_and_timing_only(self):
+        from brain_uav.scripts import profile_v2_td3 as p, v2_gpu_compute_diagnostic as d
+        base = ['--model','snn','--device','cuda','--bc-checkpoint','bc.pt',
+            '--validation-pool','pool.json','--output-dir','unused']
+        self.assertFalse(p.build_parser().parse_args(base).gpu_compute_environment_diagnostic)
+        for mode in ([], ['--gpu-compute-worker','correctness'], ['--gpu-compute-comparison'],
+                     ['--gpu-compute-worker','timing']):
+            with self.subTest(mode=mode), mock.patch.object(p,'run_local_optimization_comparison') as run:
+                with self.assertRaisesRegex(ValueError, 'timing.*gpu-td3-compute'):
+                    p.main(base+mode+['--gpu-compute-environment-diagnostic'])
+                run.assert_not_called()
+        for profiler in ('--detailed-profiler-updates','--compiled-performance-diagnostic-updates'):
+            with self.assertRaisesRegex(ValueError,'profiler'):
+                d.run(p.build_parser().parse_args(base+['--gpu-compute-worker','timing',
+                    '--gpu-td3-compute','--gpu-compute-environment-diagnostic',profiler,'2']))
+
+    def test_environment_only_recorder_does_not_instrument_gpu_update(self):
+        from brain_uav.scripts import profile_v2_td3 as p
+        from brain_uav.config import RewardConfig
+        from brain_uav.trainers.v2_formal_training import V2FormalTrainingConfig
+        from test_v2_bc import make_scenario_config, make_scenario_payload
+        e = self.engine()
+        e.bc_reference_actor = e._frozen_target(e.actor,device=e.device)
+        e.gpu_td3_compute = True
+        e._gpu_update_executor = SimpleNamespace(begin_measurement=lambda: None,invalidate=lambda: None,
+            metadata=lambda: {'requested': True})
+        original = e.update_once
+        def update(**kwargs):
+            self.assertNotIn('diagnostic_timing_recorder',kwargs)
+            self.assertFalse(kwargs.get('profile_sections',False))
+            e.gpu_td3_compute = False  # CPU orchestration test, no CUDA executor evidence.
+            try:
+                return original(**kwargs)
+            finally:
+                e.gpu_td3_compute = True
+        e.update_once = update
+        e.select_action = lambda *a,**kw: [0.,0.]
+        scenario = make_scenario_config()
+        with mock.patch.object(p,'build_v2_stage_engine',return_value=SimpleNamespace(
+                engine=e, exploration_rng=np.random.default_rng(7))), \
+                mock.patch('torch.profiler.profile',side_effect=AssertionError('profiler enabled')):
+            result = p._run_diagnostic_level(level='easy',
+                pool=SimpleNamespace(stage_seed=7, scenarios=[
+                    dict(scenario_id='fixed',payload=make_scenario_payload(0,1))]),
+                prepared=SimpleNamespace(scenario_config=scenario,reward_config=RewardConfig(),uav_collision_radius=0.),
+                formal_config=V2FormalTrainingConfig(stage='easy',batch_size=2,replay_capacity=64,actor_freeze_steps=0),
+                bc_checkpoint=Path('unused'), model='ann',snn_time_window=4,device=torch.device('cpu'),
+                warmup_steps=8,measured_steps=5,gpu_td3_compute=True,environment_performance_diagnostic=True)
+        env = result['environment_geometry_diagnostic']
+        self.assertEqual(env['step_count'],5)
+        self.assertEqual(env['duplicate_query_audit']['audited_step_count'],5)
+        self.assertTrue(env['geometry_queries'])
+        for name in p._EnvironmentGeometryDiagnostic._STEP_SECTIONS:
+            self.assertEqual(env['step_sections'][name]['calls'],5)
+        self.assertAlmostEqual(env['step_total_wall_seconds'],
+            sum(section['total_wall_seconds'] for section in env['step_sections'].values()))
+        self.assertIsNone(result['timing']['td3_nested_update_breakdown'])
+        self.assertFalse(result['detailed_profiler']['enabled'])
+
+    def test_environment_timing_wiring_and_compact_review_output(self):
+        from brain_uav.scripts import profile_v2_td3 as p, v2_gpu_compute_diagnostic as d
+        from brain_uav.config import RewardConfig
+        from test_v2_bc import make_scenario_payload
+        for enabled in (False,True):
+            with self.subTest(enabled=enabled), TemporaryDirectory() as directory:
+                root = Path(directory); bc=root/'bc.pt'; bc.write_bytes(b'fixture')
+                pool_file=root/'pool.json'; pool_file.write_text('{}')
+                output=root/'output'
+                pool=SimpleNamespace(content_digest='digest',scenario_count=1,master_seed=7,stage_seed=7,
+                    scenario_config={},uav_collision_radius=0.,curriculum_level='easy',
+                    scenarios=[dict(scenario_id='fixed',payload=make_scenario_payload(0,1))])
+                recorder=p._EnvironmentGeometryDiagnostic()
+                env=recorder.to_dict(); recorder.close()
+                result=dict(timing={'total_wall_seconds':1.,'environment_step_wall_seconds':.5,
+                        'scenario_reset_wall_seconds':.01,'pre_action_geometry_wall_seconds':.02},measured_steps=256,
+                    scenario_coverage=[dict(scenario_id='fixed',zone_count=1,measured_steps=256)],
+                    environment_geometry_diagnostic=env,critic_encoder_compile={'valid_for_speed_comparison':True})
+                args=p.build_parser().parse_args(['--model','snn','--device','cuda','--gpu-compute-worker','timing',
+                    '--gpu-td3-compute','--bc-checkpoint',str(bc),'--validation-pool',str(pool_file),
+                    '--output-dir',str(output),'--repeats','2','--steps-per-level','256','--warmup-steps','128']+
+                    (['--gpu-compute-environment-diagnostic'] if enabled else []))
+                with mock.patch.object(p,'resolve_training_device',return_value='cuda'), \
+                        mock.patch.object(p,'prepare_v2_stage_initialization',return_value=SimpleNamespace(
+                            reward_config=RewardConfig(),scenario_config={},uav_collision_radius=0.)), \
+                        mock.patch.object(p,'load_v2_validation_pool',return_value=pool), \
+                        mock.patch.object(p,'V2ValidationPool',side_effect=lambda **kw: pool), \
+                        mock.patch.object(p,'_run_diagnostic_level',side_effect=lambda **kw: deepcopy(result)) as run, \
+                        mock.patch('subprocess.run',return_value=SimpleNamespace(returncode=0,stdout='',stderr='')), \
+                        mock.patch('importlib.metadata.version',return_value='fixture'), \
+                        mock.patch('torch.cuda.empty_cache'):
+                    summary=d.run(args)
+                self.assertEqual(run.call_count,2)
+                for call in run.call_args_list:
+                    self.assertEqual(call.kwargs['environment_performance_diagnostic'],enabled)
+                    self.assertTrue(call.kwargs['gpu_td3_compute'])
+                    self.assertEqual(call.kwargs['compiled_path_profiler_updates'],0)
+                    self.assertTrue(call.kwargs['cache_ellipsoid_segment_clearance'])
+                if enabled:
+                    report=json.loads((output/'review/environment_summary.json').read_text(encoding='utf-8'))
+                    self.assertEqual(len(report['runs']),2)
+                    self.assertEqual(report['runs'][0]['environment_geometry_diagnostic'],env)
+                    self.assertEqual(report['scenarios'][0]['shape_types'],['sphere'])
+                    self.assertEqual(report['runs'][0]['measured_steps'],256)
+                    self.assertFalse(report['valid_for_speed_comparison'])
+                    self.assertFalse(summary['valid_for_speed_comparison'])
+                    self.assertFalse(summary['final_speed_acceptance'])
+                    self.assertIsNone(summary['comparison']['compute']['speedup'])
+                    self.assertEqual(set(f.name for f in (output/'review').iterdir()),{'environment_summary.json'})
+                    self.assertTrue((output/'other/local_optimization_summary.json').exists())
+                    self.assertTrue((output/'other/compute_0.json').exists())
+                    self.assertFalse(list(output.rglob('*.pt')))
+                    self.assertFalse((output/'local_optimization_summary.json').exists())
+                else:
+                    self.assertTrue((output/'local_optimization_summary.json').exists())
+                    self.assertFalse((output/'review').exists())
+
     def test_eval_bc_initialization_modes_before_first_compile_and_error_report(self):
         from brain_uav.scripts import profile_v2_td3 as p, train_v2_td3 as single
         from brain_uav.scripts import v2_gpu_compute_diagnostic as d

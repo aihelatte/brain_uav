@@ -3466,6 +3466,8 @@ def _run_diagnostic_level(
     performance_diagnostic_enabled = bool(
         environment_performance_diagnostic or compiled_path_profiler_updates > 0
     )
+    # Manual GPU compute keeps its update instrumentation unchanged.
+    nested_update_diagnostic_enabled = performance_diagnostic_enabled and not gpu_td3_compute
     environment_diagnostic = (
         _EnvironmentGeometryDiagnostic(duplicate_audit_steps=8)
         if performance_diagnostic_enabled
@@ -3939,7 +3941,7 @@ def _run_diagnostic_level(
                         total_wall_seconds=elapsed,
                         sections=update_sections,
                     )
-                    if performance_diagnostic_enabled:
+                    if nested_update_diagnostic_enabled:
                         nested_update_timing.record(
                             actor_updated=bool(result.actor_updated),
                             outer_sections=update_sections,
@@ -3975,7 +3977,7 @@ def _run_diagnostic_level(
                                     }
                                     if (
                                         measured_phase
-                                        and performance_diagnostic_enabled
+                                        and nested_update_diagnostic_enabled
                                         and not profile_sections
                                     )
                                     else {}
@@ -4120,7 +4122,7 @@ def _run_diagnostic_level(
         'as normal training throughput or for optimization speedup comparisons.'
         if profiler_overhead_included
         else (
-            'The optional environment and nested-update diagnostic is enabled. '
+            'The optional performance diagnostic is enabled. '
             'This ordinary short-run wall time includes its instrumentation '
             'overhead; the separate compiled profiler updates are excluded.'
             if performance_diagnostic_enabled
@@ -4195,7 +4197,7 @@ def _run_diagnostic_level(
             'td3_update_breakdown': update_timing.to_dict(),
             'td3_nested_update_breakdown': (
                 nested_update_timing.to_dict(environment_steps=measured_steps)
-                if performance_diagnostic_enabled
+                if nested_update_diagnostic_enabled
                 else None
             ),
             'replay_sample_wall_seconds': sample_seconds,
@@ -5313,6 +5315,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     from brain_uav.models.v2_policy_config import V2SpikeRegularizationConfig
     from brain_uav.scripts.train_v2_td3 import default_v2_cuda_graph_compilation
 
+    environment_diagnostic = getattr(args, 'gpu_compute_environment_diagnostic', False)
     if sum(bool(getattr(args, name)) for name in ('local_optimization_comparison', 'local_optimization_correctness', 'critic_tail_comparison', 'critic_tail_correctness', 'td3_block_correctness', 'td3_block_comparison')) > 1:
         raise ValueError('Select exactly one comparison/correctness mode.')
     if args.gpu_td3_compute and getattr(args,'gpu_compute_worker',None) not in ('correctness','timing'):
@@ -5388,6 +5391,8 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     compilation.pop('reduce_update_stat_syncs', None)
     # All comparison groups preserve the formally adopted configuration on CUDA.
     output.mkdir(parents=True, exist_ok=True)
+    detail_output = output / 'other' if environment_diagnostic else output
+    detail_output.mkdir(exist_ok=True)
     if getattr(args, 'gpu_compute_worker', None) == 'correctness':
         from brain_uav.scripts.v2_gpu_compute_diagnostic import correctness
         return correctness(args, prepared=prepared, config=config, pool=pool, device=target, output=output,
@@ -5432,6 +5437,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 gpu_td3_compute=getattr(args,'gpu_compute_worker',None)=='timing' and args.gpu_td3_compute,
                 non_blocking_batch_transfer=getattr(args,'batch_transfer_worker',None)=='timing' and args.non_blocking_batch_transfer,
                 batch_transfer_window_timing=(getattr(args,'batch_transfer_worker',None)=='timing' or getattr(args,'gpu_compute_worker',None)=='timing'),
+                environment_performance_diagnostic=environment_diagnostic,
                 block_attribution_wall=args.td3_block_attribution == 'wall',
                 compiled_path_profiler_updates=(args.compiled_performance_diagnostic_updates or 4) if args.td3_block_attribution == 'profiler' else 0,
                 compiled_profiler_output_dir=output / f'{group}_{repeat}_profiler' if args.td3_block_attribution == 'profiler' else None,
@@ -5440,7 +5446,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
             result['server_load_after'] = load_snapshot()
             result['repeat'] = repeat
             runs[group].append(result)
-            _strict_json_write(output / f'{group}_{repeat}.json', result)
+            _strict_json_write(detail_output / f'{group}_{repeat}.json', result)
             gc.collect()
             if target.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -5449,7 +5455,8 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 for group, values in runs.items()}
     stable = all(run['critic_encoder_compile']['valid_for_speed_comparison'] is not False
                  for values in runs.values() for run in values)
-    summary = {'valid_for_speed_comparison': stable, 'diagnostic_only': True, 'formal_training': False,
+    speed_comparison_valid = stable and not environment_diagnostic
+    summary = {'valid_for_speed_comparison': speed_comparison_valid, 'diagnostic_only': True, 'formal_training': False,
         'method': 'fresh BC initialization per group/repeat; stage counter offset only; no prior training history',
         'controlled_stage_step_offset': offset, 'requested_device': args.device, 'actual_device': str(target),
         'software': {'python': platform.python_version(), 'torch': torch.__version__, 'cuda': torch.version.cuda, 'spikingjelly': version('spikingjelly')},
@@ -5467,16 +5474,40 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
         'bc_schedule': args.comparison_bc_schedule,
         'td3_block_attribution': args.td3_block_attribution,
         'critic_tail_internal_timing_requested': args.critic_tail_internal_timing,
-        'final_speed_acceptance': False if args.critic_tail_internal_timing or args.td3_block_attribution else None,
+        'final_speed_acceptance': False if environment_diagnostic or args.critic_tail_internal_timing or args.td3_block_attribution else None,
         'comparison_kind': 'gpu_td3_compute' if getattr(args,'gpu_compute_worker',None) else ('merged_update_blocks' if args.td3_block_comparison else ('checked_critic_tail' if args.critic_tail_comparison else 'local_optimizations')),
         'steps': steps, 'repeats': repeats, 'runs': runs,
         'comparison': {group: {'mean_wall_seconds': averages[group],
             'stdev_wall_seconds': stdev([run['timing']['total_wall_seconds'] for run in values]) if repeats > 1 else 0.0,
             'seconds_per_step': averages[group] / steps,
-            'time_saved_percent': 100 * (1 - averages[group] / averages[baseline_group]) if stable else None,
-            'speedup': averages[baseline_group] / averages[group] if stable else None} for group, values in runs.items()},
+            'time_saved_percent': 100 * (1 - averages[group] / averages[baseline_group]) if speed_comparison_valid else None,
+            'speedup': averages[baseline_group] / averages[group] if speed_comparison_valid else None} for group, values in runs.items()},
         'limitations': 'CPU wall intervals include submission/wait, not pure GPU time. Attribution profiler is separate after ordinary measurement; no speed acceptance from instrumented traces. Graph launches are not kernels. Unattributed copies/waits remain unknown. If Chrome trace lacks graph-internal kernels or copy ownership, collect only these stable updates with Nsight Systems CUDA/NVTX tracing; do not infer ownership from operation names.'}
-    _strict_json_write(output / 'local_optimization_summary.json', summary)
+    _strict_json_write(detail_output / 'local_optimization_summary.json', summary)
+    if environment_diagnostic:
+        (output / 'review').mkdir()
+        _strict_json_write(output / 'review' / 'environment_summary.json', {
+            'diagnostic_only': True, 'formal_training': False,
+            'valid_for_speed_comparison': False,
+            'measurement_note': 'Environment/geometry instrumentation overhead is included; localization only, not speed acceptance. Warmup excluded. Parent and child intervals are not additive; geometry calls are included in environment sections and must not be added to them. Reset and pre-action geometry are outside env.step.',
+            'model': args.model, 'seed': args.seed, 'batch_size': args.batch_size,
+            'requested_warmup_steps': args.warmup_steps, 'controlled_stage_step_offset': offset,
+            'bc_schedule': args.comparison_bc_schedule,
+            'checkpoint': summary['checkpoint'], 'checkpoint_sha256': summary['checkpoint_sha256'],
+            'original_pool_digest': original_pool.content_digest, 'selected_pool_digest': pool.content_digest,
+            'scenarios': [{'scenario_id': record['scenario_id'],
+                'zone_count': len(record['payload']['zones']),
+                'shape_types': [zone['shape']['shape_type'] for zone in record['payload']['zones']]}
+                for record in pool.scenarios],
+            'runs': [{'group': group, 'repeat': run['repeat'],
+                'measured_steps': run['measured_steps'], 'scenario_coverage': run['scenario_coverage'],
+                'environment_geometry_diagnostic': run['environment_geometry_diagnostic'],
+                'environment_step_wall_seconds': run['timing']['environment_step_wall_seconds'],
+                'scenario_reset_wall_seconds': run['timing']['scenario_reset_wall_seconds'],
+                'pre_action_geometry_wall_seconds': run['timing']['pre_action_geometry_wall_seconds']}
+                for group, values in runs.items() for run in values],
+            'details': 'other/local_optimization_summary.json',
+        })
     return summary
 
 
@@ -5588,6 +5619,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--gpu-compute-error-recovery', action='store_true', help='Diagnostic-only: continue two updates after the first critic loss error; retain all mismatch failures.')
     parser.add_argument('--gpu-compute-trace-retained-gradient', action='store_true', help='Diagnostic-only synchronous snapshots of the known empty_scene_token gradient around the first critic loss error.')
     parser.add_argument('--gpu-compute-worker', choices=('correctness','timing'), help=argparse.SUPPRESS)
+    parser.add_argument('--gpu-compute-environment-diagnostic', action='store_true', help='Environment/geometry recorder only for --gpu-compute-worker timing --gpu-td3-compute; includes diagnostic overhead, no torch profiler or speed acceptance; default off.')
     parser.add_argument('--gpu-td3-update', action='store_true', help='Experimental full device replay and update; default off.')
     parser.add_argument('--gpu-td3-reference', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--checkpoint', type=Path, help='Terminal formal checkpoint; failed is allowed only for diagnosis.')
@@ -5728,6 +5760,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.gpu_compute_environment_diagnostic and not (args.gpu_compute_worker == 'timing' and args.gpu_td3_compute):
+        raise ValueError('Environment diagnosis requires --gpu-compute-worker timing and --gpu-td3-compute.')
     if args.gpu_compute_comparison or args.gpu_compute_worker:
         from brain_uav.scripts.v2_gpu_compute_diagnostic import run
         return run(args)
