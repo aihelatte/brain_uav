@@ -139,6 +139,18 @@ class _ConvexPolyhedron(GeometryShape):
         distance = float(np.linalg.norm(candidate - closest))
         return -distance if inside else distance
 
+    def signed_distance_and_surface_normal(
+        self, point: Any,
+    ) -> tuple[float, np.ndarray]:
+        candidate = as_point3(point)
+        closest, face_index, inside = self._closest_boundary(candidate)
+        distance = float(np.linalg.norm(candidate - closest))
+        outward = candidate - closest
+        norm = float(np.linalg.norm(outward))
+        normal = (outward / norm if not inside and norm > GEOMETRY_TOLERANCE
+                  else self._faces[face_index].normal.copy())
+        return (-distance if inside else distance), normal
+
     def closest_point(self, point: Any) -> np.ndarray:
         candidate = as_point3(point)
         closest, _, _ = self._closest_boundary(candidate)

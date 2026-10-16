@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -17,6 +18,15 @@ from .base import (
     convex_segment_clearance,
     positive_scalar,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _EllipsoidIntersection:
+    """Private call-local raw result, with owned immutable query snapshots."""
+
+    shape: Any
+    key: tuple
+    intersects: bool
 
 
 class Sphere(GeometryShape):
@@ -354,21 +364,49 @@ class Ellipsoid(GeometryShape):
                 return SegmentHit(parameter, hit_point, self.surface_normal(hit_point), False)
         return None
 
-    def segment_clearance(self, start: Any, end: Any) -> float:
+    def _intersection_key(self, start: Any, end: Any) -> tuple:
+        return tuple((value.dtype.str, value.shape, value.tobytes()) for value in (
+            as_point3(start, name='start'), as_point3(end, name='end'),
+            self._center, self._radii,
+        ))
+
+    def _segment_intersection_with_result(
+        self, start: Any, end: Any,
+    ) -> tuple[SegmentHit | None, _EllipsoidIntersection]:
+        key = self._intersection_key(start, end)
+        hit = self.segment_intersection(start, end)
+        return hit, _EllipsoidIntersection(self, key, hit is not None)
+
+    def segment_clearance(
+        self, start: Any, end: Any, *,
+        _intersection_result: _EllipsoidIntersection | None = None,
+    ) -> float:
+        intersection = None
+        if (isinstance(_intersection_result, _EllipsoidIntersection)
+                and _intersection_result.shape is self
+                and _intersection_result.key == self._intersection_key(start, end)):
+            intersection = _intersection_result.intersects
         if not self._segment_clearance_cache_enabled:
-            return convex_segment_clearance(self, start, end)
+            if intersection is None:
+                return convex_segment_clearance(self, start, end)
+            return convex_segment_clearance(self, start, end, _intersection=intersection)
 
         start_point = as_point3(start, name='start')
         end_point = as_point3(end, name='end')
         cached = self._last_segment_clearance
         if (
             cached is not None
+            # A rejected private hint may indicate changed geometry. Recompute
+            # in that case, rather than consume an older segment-only cache.
+            and (_intersection_result is None or intersection is not None)
             and np.array_equal(cached[0], start_point)
             and np.array_equal(cached[1], end_point)
         ):
             return cached[2]
 
-        clearance = convex_segment_clearance(self, start_point, end_point)
+        clearance = (convex_segment_clearance(self, start_point, end_point)
+                     if intersection is None else convex_segment_clearance(
+                         self, start_point, end_point, _intersection=intersection))
         self._last_segment_clearance = (
             start_point.copy(), end_point.copy(), clearance
         )

@@ -260,6 +260,8 @@ class TestCPUDeduplication(TestCase):
                     else:
                         report=d.run(args)
                         self.assertTrue(report['passed'])
+                        self.assertIn('both A and B', report['ab_changes']['common'][0])
+                        self.assertEqual(len(report['ab_changes']['switch']), 3)
                         self.assertEqual(len(calls),5)
                         self.assertEqual([('--cpu-deduplication-evidence' in c) for c in calls],
                             [True,True,False,False,False])

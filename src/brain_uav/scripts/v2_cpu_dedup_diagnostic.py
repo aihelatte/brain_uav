@@ -83,8 +83,11 @@ def run(args):
     (root/'review').mkdir(parents=True)
     (root/'other').mkdir()
     report=dict(passed=False,diagnostic_only=True,formal_training=False,workers={},
-        limitations=['Only reward-local clearance reuse and action-input copy removal are enabled.',
-            'No raw geometry/static-feature caching; formal training entry is not wired.',
+        ab_changes=dict(
+            common=['Pyramid distance/normal share one closest-boundary solve in both A and B; not measured by the switch delta.'],
+            switch=['Reward-local clearance reuse', 'Action-input copy removal',
+                    'Call-local ellipsoid raw intersection reuse from observation to info']),
+        limitations=['No cross-step raw-intersection or static-feature cache; formal training entry is not wired.',
             'Fixed-pool fragments do not establish full-course stability or all geometry/lifecycle coverage.'])
     try:
         for name,value in vars(args).items():

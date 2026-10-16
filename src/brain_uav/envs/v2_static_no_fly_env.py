@@ -242,12 +242,15 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         self.last_goal_reached_by_segment = False
         point_clearances, surface_normals = self._point_geometry(self.state[:3])
         self._remember_reward_clearances(point_clearances)
+        intersections = {} if self.cpu_deduplication else None
         return self._get_obs(
             zone_point_clearances=point_clearances,
             zone_surface_normals=surface_normals,
+            _ellipsoid_intersections=intersections,
         ), self._info(
             progress=0.0,
             zone_point_clearances=point_clearances,
+            _ellipsoid_intersections=intersections,
         )
 
     def step(
@@ -310,16 +313,22 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
             if new_distance < self.best_goal_distance_so_far:
                 self.best_goal_distance_so_far = new_distance
             self.prev_action = action.copy()
+        # Local to this synchronous call; no user callback or geometry mutation
+        # occurs between observation and info. Consumers also verify exact shape,
+        # endpoints and geometry snapshots. Nothing is stored on the environment.
+        intersections = {} if self.cpu_deduplication else None
         with self._diagnostic_section('observation_construction'):
             observation = self._get_obs(
                 zone_point_clearances=point_clearances,
                 zone_surface_normals=surface_normals,
+                _ellipsoid_intersections=intersections,
             )
         with self._diagnostic_section('info_construction'):
             info = self._info(
                 progress=step_progress,
                 outcome=outcome,
                 zone_point_clearances=point_clearances,
+                _ellipsoid_intersections=intersections,
             )
         self._remember_reward_clearances(point_clearances)
         return observation, float(reward), terminated, truncated, info
@@ -357,12 +366,15 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         self.last_goal_reached_by_segment = False
         point_clearances, surface_normals = self._point_geometry(self.state[:3])
         self._remember_reward_clearances(point_clearances)
+        intersections = {} if self.cpu_deduplication else None
         return self._get_obs(
             zone_point_clearances=point_clearances,
             zone_surface_normals=surface_normals,
+            _ellipsoid_intersections=intersections,
         ), self._info(
             progress=0.0,
             zone_point_clearances=point_clearances,
+            _ellipsoid_intersections=intersections,
         )
 
     def _load_scenario(self, payload: Any) -> None:
@@ -418,6 +430,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         *,
         zone_point_clearances: Sequence[float] | None = None,
         zone_surface_normals: Sequence[Sequence[float]] | None = None,
+        _ellipsoid_intersections: dict[int, Any] | None = None,
     ) -> V2Observation:
         return build_v2_observation(
             state=self.state,
@@ -427,6 +440,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
             uav_radius=self.uav_collision_radius,
             zone_point_clearances=zone_point_clearances,
             zone_surface_normals=zone_surface_normals,
+            _ellipsoid_intersections=_ellipsoid_intersections,
         )
 
     def _validated_zone_point_clearances(
@@ -661,6 +675,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         position: Any | None = None,
         *,
         clearance: float = 0.0,
+        _ellipsoid_intersections: dict[int, Any] | None = None,
     ) -> bool:
         point = (
             self.state[:3]
@@ -669,6 +684,18 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         )
         extra_clearance = _nonnegative_finite(clearance, name='clearance')
         effective_uav_radius = self.uav_collision_radius + extra_clearance
+        if _ellipsoid_intersections is not None:
+            for zone in self.zones:
+                result = _ellipsoid_intersections.get(id(zone.shape))
+                violates = (zone.violates_segment(
+                    point, self.goal, uav_radius=effective_uav_radius,
+                    _intersection_result=result,
+                ) if result is not None else zone.violates_segment(
+                    point, self.goal, uav_radius=effective_uav_radius,
+                ))
+                if violates:
+                    return False
+            return True
         return not any(
             zone.violates_segment(
                 point,
@@ -722,6 +749,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         progress: float,
         outcome: str = 'running',
         zone_point_clearances: Sequence[float] | None = None,
+        _ellipsoid_intersections: dict[int, Any] | None = None,
     ) -> dict[str, Any]:
         point_clearances = (
             self._point_clearances(self.state[:3])
@@ -749,7 +777,9 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         info = super()._info(progress=progress, outcome=outcome)
         info.update(
             {
-                'line_to_goal_safe': self.line_to_goal_is_safe(),
+                'line_to_goal_safe': (self.line_to_goal_is_safe()
+                    if _ellipsoid_intersections is None else self.line_to_goal_is_safe(
+                        _ellipsoid_intersections=_ellipsoid_intersections)),
                 'min_zone_clearance': self._minimum_zone_clearance(point_clearances),
                 'zone_warning_penalty': self._zone_warning_penalty_from_clearances(
                     point_clearances

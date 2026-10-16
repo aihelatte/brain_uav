@@ -150,12 +150,19 @@ class GeometryShape(ABC):
         return shape_to_dict(self)
 
 
-def convex_segment_clearance(shape: GeometryShape, start: Any, end: Any) -> float:
+def convex_segment_clearance(
+    shape: GeometryShape, start: Any, end: Any, *,
+    _intersection: bool | None = None,
+) -> float:
     """Minimize distance to a convex solid continuously along a segment."""
 
     start_point = as_point3(start, name='start')
     end_point = as_point3(end, name='end')
-    if shape.segment_intersection(start_point, end_point) is not None:
+    # None means not computed; False means computed and disjoint. Only an
+    # internally validated same-query result may bypass the raw intersection.
+    intersects = (_intersection if _intersection is not None else
+                  shape.segment_intersection(start_point, end_point) is not None)
+    if intersects:
         return 0.0
     direction = end_point - start_point
     segment_length = float(np.linalg.norm(direction))

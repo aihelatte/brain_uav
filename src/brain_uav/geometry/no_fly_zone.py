@@ -9,6 +9,7 @@ from typing import Any
 import numpy as np
 
 from .base import GEOMETRY_TOLERANCE, GeometryShape, as_point3, nonnegative_scalar
+from .primitives import Ellipsoid
 
 
 def _copy_json_value(value: Any, *, path: str, active_containers: set[int]) -> Any:
@@ -115,11 +116,21 @@ class NoFlyZone:
     def violates_point(self, point: Any, uav_radius: float = 0.0) -> bool:
         return bool(self.point_clearance(point, uav_radius=uav_radius) <= GEOMETRY_TOLERANCE)
 
-    def segment_clearance(self, start: Any, end: Any, uav_radius: float = 0.0) -> float:
+    def segment_clearance(
+        self, start: Any, end: Any, uav_radius: float = 0.0, *,
+        _intersection_result: Any = None,
+    ) -> float:
         radius = nonnegative_scalar(uav_radius, name='uav_radius')
+        if _intersection_result is not None and type(self.shape) is Ellipsoid:
+            return float(self.shape.segment_clearance(
+                start, end, _intersection_result=_intersection_result
+            ) - self.safety_margin - radius)
         return float(self.shape.segment_clearance(start, end) - self.safety_margin - radius)
 
-    def violates_segment(self, start: Any, end: Any, uav_radius: float = 0.0) -> bool:
+    def violates_segment(
+        self, start: Any, end: Any, uav_radius: float = 0.0, *,
+        _intersection_result: Any = None,
+    ) -> bool:
         first = as_point3(start, name='start')
         second = as_point3(end, name='end')
         radius = nonnegative_scalar(uav_radius, name='uav_radius')
@@ -133,6 +144,10 @@ class NoFlyZone:
         if (np.any(np.maximum(first, second) < bounds.min_corner - expansion)
                 or np.any(np.minimum(first, second) > bounds.max_corner + expansion)):
             return False
+        if _intersection_result is not None:
+            return bool(self.segment_clearance(
+                first, second, uav_radius=radius, _intersection_result=_intersection_result
+            ) <= GEOMETRY_TOLERANCE)
         return bool(self.segment_clearance(first, second, uav_radius=radius) <= GEOMETRY_TOLERANCE)
 
     def to_dict(self) -> dict[str, Any]:

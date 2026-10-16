@@ -129,6 +129,7 @@ def build_v2_observation(
     uav_radius: float = 0.0,
     zone_point_clearances: Sequence[float] | None = None,
     zone_surface_normals: Sequence[Sequence[float]] | None = None,
+    _ellipsoid_intersections: dict[int, Any] | None = None,
 ) -> V2Observation:
     """Build one dynamic-length V2 observation without padding or sorting."""
 
@@ -254,7 +255,11 @@ def build_v2_observation(
             1.0,
         )
 
-        hit = shape.segment_intersection(uav_position, goal_array)
+        if _ellipsoid_intersections is not None and type(shape) is Ellipsoid:
+            hit, result = shape._segment_intersection_with_result(uav_position, goal_array)
+            _ellipsoid_intersections[id(shape)] = result
+        else:
+            hit = shape.segment_intersection(uav_position, goal_array)
         row[ZONE_FEATURE_INDEX['raw_goal_path_intersects']] = (
             1.0 if hit is not None else 0.0
         )
