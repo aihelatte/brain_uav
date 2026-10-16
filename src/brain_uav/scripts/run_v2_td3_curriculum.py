@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--easy-failure-sample-bias', type=float, default=1.0)
     parser.add_argument('--medium-failure-sample-bias', type=float, default=1.0)
     parser.add_argument('--hard-failure-sample-bias', type=float, default=1.0)
-    parser.add_argument('--bc-schedule', choices=('default', 'smooth-final'), default='default',
+    parser.add_argument('--bc-schedule', choices=('default', 'smooth-final', 'smooth-mid'), default='default',
                         help='BC schedule for easy/medium; hard keeps its default schedule.')
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--model', choices=('ann', 'snn'), default='ann')

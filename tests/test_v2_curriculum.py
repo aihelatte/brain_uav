@@ -123,6 +123,24 @@ class TestV2Curriculum(unittest.TestCase):
                 300_000, schedule='smooth-final', final_drop_step=400_000
             )
 
+    def test_smooth_mid_boundaries_and_only_changed_interval(self):
+        from brain_uav.v2_curriculum import v2_bc_lambda
+        boundaries = [0, 75000, 150000, 200000, 250000, 300000, 335000, 370000]
+        values = [500., 150., 75., 30., 15., 10., 7., 5.]
+        for index, boundary in enumerate(boundaries):
+            for step in (boundary - 1, boundary, boundary + 1):
+                if step < 0:
+                    continue
+                expected = values[index - 1] if step < boundary else values[index]
+                with self.subTest(step=step):
+                    actual = v2_bc_lambda(step, schedule='smooth-mid')
+                    self.assertEqual(actual, expected)
+                    old = v2_bc_lambda(step, schedule='smooth-final')
+                    self.assertEqual(actual, 75. if 150000 <= step < 200000 else old)
+        self.assertEqual(v2_bc_lambda(1000000, schedule='smooth-mid'), 5.)
+        with self.assertRaisesRegex(ValueError, 'conflict'):
+            v2_bc_lambda(0, schedule='smooth-mid', final_drop_step=400000)
+
     def test_noise_schedule_decays_for_first_half_then_stays_final(self) -> None:
         from brain_uav.v2_curriculum import V2NoiseSchedule
 

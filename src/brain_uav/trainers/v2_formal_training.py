@@ -130,6 +130,14 @@ V2_BC_SCHEDULE_SMOOTH_FINAL_METADATA = {
 }
 
 
+V2_BC_SCHEDULE_SMOOTH_MID_METADATA = {
+    'kind': 'stage_local_piecewise_constant',
+    'name': 'smooth-mid',
+    'boundaries': [0, 75_000, 150_000, 200_000, 250_000, 300_000, 335_000, 370_000],
+    'values': [500.0, 150.0, 75.0, 30.0, 15.0, 10.0, 7.0, 5.0],
+}
+
+
 def v2_bc_schedule_metadata(
     stage: str,
     *,
@@ -142,16 +150,17 @@ def v2_bc_schedule_metadata(
         raise ValueError('stage must be easy, medium, or hard.')
     if type(final_drop_step) is not int or final_drop_step not in (300_000, 400_000):
         raise ValueError('final_drop_step must be 300000 or 400000.')
-    if schedule not in ('default', 'smooth-final'):
-        raise ValueError('schedule must be default or smooth-final.')
-    if schedule == 'smooth-final':
+    if schedule not in ('default', 'smooth-final', 'smooth-mid'):
+        raise ValueError('schedule must be default, smooth-final or smooth-mid.')
+    if schedule in ('smooth-final', 'smooth-mid'):
         if final_drop_step != 300_000:
             raise ValueError(
-                'smooth-final conflicts with --bc-final-drop-step 400000.'
+                f'{schedule} conflicts with --bc-final-drop-step 400000.'
             )
         if stage not in ('easy', 'medium'):
-            raise ValueError('smooth-final is supported only for easy or medium.')
-        return _strict_json_copy(V2_BC_SCHEDULE_SMOOTH_FINAL_METADATA)
+            raise ValueError(f'{schedule} is supported only for easy or medium.')
+        return _strict_json_copy(V2_BC_SCHEDULE_SMOOTH_MID_METADATA if schedule == 'smooth-mid'
+                                 else V2_BC_SCHEDULE_SMOOTH_FINAL_METADATA)
     if final_drop_step == 400_000:
         if stage != 'medium':
             raise ValueError('The 400000-step BC schedule is supported only for medium.')
@@ -165,6 +174,7 @@ def _validate_bc_schedule_metadata(value: Any, *, stage: str) -> None:
         accepted.append(v2_bc_schedule_metadata(stage, final_drop_step=400_000))
     if stage in ('easy', 'medium'):
         accepted.append(v2_bc_schedule_metadata(stage, schedule='smooth-final'))
+        accepted.append(v2_bc_schedule_metadata(stage, schedule='smooth-mid'))
     if not any(value == schedule for schedule in accepted):
         raise ValueError('Formal V2 checkpoint BC schedule is incompatible.')
 

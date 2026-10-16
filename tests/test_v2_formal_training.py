@@ -140,6 +140,88 @@ def _validation_result(passed: bool) -> V2ValidationResult:
 
 
 class TestV2FormalTraining(unittest.TestCase):
+    def test_smooth_mid_checkpoint_and_snapshot_strict_round_trip(self):
+        from brain_uav.trainers.v2_formal_training import v2_bc_schedule_metadata
+        expected = {
+            'kind': 'stage_local_piecewise_constant', 'name': 'smooth-mid',
+            'boundaries': [0, 75000, 150000, 200000, 250000, 300000, 335000, 370000],
+            'values': [500., 150., 75., 30., 15., 10., 7., 5.],
+        }
+        scenario = ScenarioConfig(max_steps=1)
+        engine = _engine(scenario)
+        for stage in ('easy', 'medium'):
+            with self.subTest(stage=stage):
+                config = V2FormalTrainingConfig(stage=stage, max_steps=500000)
+                result = V2FormalTrainingResult.empty(stage, global_steps_start=10)
+                result.status = 'passed'
+                result.passed_validation = True
+                result.stop_reason = 'fixed_validation_passed'
+                validation = _validation_result(True).to_dict()
+                validation['curriculum_level'] = stage
+                result.validation_records.append(validation)
+                common = dict(scenario=scenario, rewards=RewardConfig(), uav_collision_radius=0.,
+                    seed_manifest={'base_seed': 7}, initialization_source=(
+                        {'kind': 'v2_bc_best', 'path': 'bc.pt'} if stage == 'easy' else
+                        {'kind': 'validated_v2_td3_stage', 'path': 'easy.pt', 'previous_stage': 'easy'}),
+                    bc_schedule='smooth-mid')
+                payload = build_v2_formal_checkpoint(engine, result, config,
+                    validation_pool_metadata=dict(path='pool.json', format_version=1,
+                        curriculum_level=stage, master_seed=20260904, stage_seed=11,
+                        scenario_count=100, content_digest='digest'), **common)
+                snapshot = build_v2_periodic_snapshot(engine, config, stage_steps=150001, **common)
+                self.assertEqual(payload['format_version'], V2_FORMAL_CHECKPOINT_VERSION)
+                self.assertEqual(snapshot['format_version'], V2_PERIODIC_SNAPSHOT_VERSION)
+                for value, save, load in ((payload, save_v2_formal_checkpoint, load_v2_formal_checkpoint),
+                                          (snapshot, save_v2_periodic_snapshot, load_v2_periodic_snapshot)):
+                    self.assertEqual(value['bc_schedule'], expected)
+                    with tempfile.TemporaryDirectory() as directory:
+                        path = Path(directory)/'state.pt'
+                        save(path, value)
+                        self.assertEqual(load(path, expected_stage=stage)['bc_schedule'], expected)
+                    for field in ('boundaries', 'values', 'name'):
+                        tampered = deepcopy(value)
+                        if field == 'name':
+                            tampered['bc_schedule'][field] = 'smooth-final'
+                        else:
+                            tampered['bc_schedule'][field][2] += 1
+                        with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'BC schedule is incompatible'):
+                            load(tampered)
+                metadata = v2_bc_schedule_metadata(stage, schedule='smooth-mid')
+                metadata['values'][2] = 0.
+                self.assertEqual(v2_bc_schedule_metadata(stage, schedule='smooth-mid'), expected)
+        with self.assertRaisesRegex(ValueError, 'easy or medium'):
+            v2_bc_schedule_metadata('hard', schedule='smooth-mid')
+        with self.assertRaisesRegex(ValueError, 'conflict'):
+            v2_bc_schedule_metadata('medium', schedule='smooth-mid', final_drop_step=400000)
+
+    def test_smooth_mid_update_and_episode_keep_zero_based_schedule(self):
+        from brain_uav.trainers.v2_td3 import V2TD3UpdateMetrics
+        for boundary, before, after in ((150000, 150., 75.), (200000, 75., 30.)):
+            with self.subTest(boundary=boundary):
+                scenario = ScenarioConfig(max_steps=3)
+                engine = _engine(scenario)
+                payload = _scenario_payload(0)
+                payload['goal'] = [10000., 0., 100.]
+                trainer = V2FormalStageTrainer(scenario, RewardConfig(),
+                    V2FormalTrainingConfig(stage='easy', max_steps=boundary + 2,
+                        replay_capacity=16, batch_size=2), engine,
+                    scenario_sources={'easy': _Source(payload)},
+                    validation_runner=lambda actor: _validation_result(False),
+                    global_steps_start=900000, bc_schedule='smooth-mid')
+                obs, _ = trainer.env.reset(options={'scenario': payload})
+                engine.replay.add(obs, np.zeros(2, dtype=np.float32), 0., obs, False)
+                trainer.result.stage_steps = boundary - 1
+                def update(**kwargs):
+                    return V2TD3UpdateMetrics(actor_updated=True, bc_loss=2., bc_lambda=kwargs['bc_lambda'])
+                with mock.patch.object(engine, 'update_once', side_effect=update) as updates:
+                    result = trainer.run()
+                self.assertEqual([(c.kwargs['total_steps'], c.kwargs['bc_lambda'])
+                    for c in updates.call_args_list],
+                    [(boundary, before), (boundary + 1, after), (boundary + 2, after)])
+                self.assertEqual(result.episodes[0]['episode_length'], 3)
+                self.assertEqual(result.episodes[0]['bc_lambda'], after)
+                self.assertEqual(result.episodes[0]['weighted_bc_contribution'], 2. * (before + 2. * after) / 3.)
+
     def test_builder_forwards_fused_and_relation_flags_with_in_memory_initialization(self):
         scenario = make_scenario_config()
         config = V2FormalTrainingConfig(

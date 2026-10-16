@@ -103,6 +103,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
     def test_cli_trial_parameters_reach_full_chain_and_preserve_checkpoint_gates(self):
         for model, trial, failed_stage in (
             ('ann', 'baseline', None), ('snn', 'baseline', None),
+            ('ann', 'smooth-mid', None), ('snn', 'smooth-mid', None),
             ('ann', 'gamma', None), ('snn', 'gamma', None),
             ('ann', 'bias', None), ('snn', 'bias', None),
             ('ann', 'baseline', 'easy'), ('snn', 'baseline', 'medium'),
@@ -116,6 +117,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                 actor = (_make_snn_actor(scenario, time_window=4, tau=2.0)
                          if model == 'snn' else None)
                 calls = []
+                schedule = 'smooth-mid' if trial == 'smooth-mid' else 'smooth-final'
                 gamma = 0.995 if trial == 'gamma' else 0.99
                 biases = [2.0] * 3 if trial == 'bias' else [1.0, 1.5 if model == 'snn' else 1.0, 1.0]
 
@@ -139,7 +141,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
 
                 argv = ['--bc-checkpoint', str(bc), '--output-root', str(root / 'run'),
                         '--validation-pool-dir', str(root / 'pools'), '--model', model,
-                        '--device', 'cpu', '--bc-schedule', 'smooth-final',
+                        '--device', 'cpu', '--bc-schedule', schedule,
                         '--periodic-snapshot-interval-steps', '0']
                 enabled = trial == 'gamma'
                 if enabled:
@@ -179,7 +181,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                               ('gamma', 'failure_sample_bias', 'max_stage_steps', 'bc_schedule')}
                     self.assertEqual(actual, {'gamma': gamma, 'failure_sample_bias': biases[index],
                         'max_stage_steps': 500000,
-                        'bc_schedule': 'default' if stage == 'hard' else 'smooth-final'})
+                        'bc_schedule': 'default' if stage == 'hard' else schedule})
                     self.assertEqual(preview['stage_training_parameters'][stage], actual)
                     self.assertEqual(summary['stage_training_parameters'][stage], actual)
                     self.assertIsNone(call['periodic_snapshot_interval_steps'])

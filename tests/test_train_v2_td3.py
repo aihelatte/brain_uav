@@ -36,6 +36,32 @@ from brain_uav.v2_curriculum import derive_v2_component_seed
 
 
 class TestTrainV2TD3CLI(unittest.TestCase):
+    def test_smooth_mid_cli_forwards_explicit_actor_lr_for_ann_and_snn(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        for model, rates in (
+            ('ann', [7.5e-5, 1e-4, 1.25e-4, 1.55e-4, 2e-4, 2.5e-4]),
+            ('snn', [4.75e-4, 7e-4, 8.25e-4, 9.5e-4, 1.1e-3, 1.3e-3]),
+        ):
+            for rate in rates:
+                with self.subTest(model=model, rate=rate), redirect_stdout(StringIO()), mock.patch(
+                    'brain_uav.scripts.train_v2_td3.run_v2_td3_stage', return_value={'passed': True}
+                ) as runner:
+                    train_main(['--stage','easy','--model',model,'--device','cpu',
+                        '--init-checkpoint','bc.pt','--output','out.pt','--metrics-out','metrics.json',
+                        '--validation-pool','pool.json','--bc-schedule','smooth-mid','--actor-lr',str(rate)])
+                self.assertEqual(runner.call_args.kwargs['bc_schedule'], 'smooth-mid')
+                self.assertEqual(runner.call_args.kwargs['actor_lr'], rate)
+
+    def test_smooth_mid_rejects_hard_and_400k_before_initialization(self):
+        for stage, extra, error in (('hard', {}, 'easy or medium'),
+                                    ('easy', {'bc_final_drop_step': 400000}, 'conflict'),
+                                    ('medium', {'bc_final_drop_step': 400000}, 'conflict')):
+            with self.subTest(stage=stage), self.assertRaisesRegex(ValueError, error):
+                run_v2_td3_stage(stage=stage, init_checkpoint=Path('unused.pt'),
+                    output=Path('out.pt'), metrics_out=Path('metrics.json'), validation_pool=Path('pool.json'),
+                    bc_schedule='smooth-mid', **extra)
+
     def test_report_finish_failure_preserves_core_td3_artifacts_and_closes_reporter(self):
         scenario = ScenarioConfig()
         rewards = RewardConfig()
@@ -585,6 +611,12 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 resolve_training_device('cuda')
 
     def test_medium_stage_records_bc_schedule_and_resolves_auto_before_engine(self):
+        self._check_medium_stage_schedule('smooth-final')
+
+    def test_medium_stage_records_smooth_mid_everywhere(self):
+        self._check_medium_stage_schedule('smooth-mid')
+
+    def _check_medium_stage_schedule(self, schedule):
         scenario = ScenarioConfig(target_distance=1_701.0)
         rewards = RewardConfig(progress_weight=3.25)
         actor = V2ANNPolicyActor(
@@ -719,7 +751,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                     device='auto',
                     actor_lr=2e-4,
                     critic_lr=3e-4,
-                    bc_schedule='smooth-final',
+                    bc_schedule=schedule,
                     periodic_snapshot_interval_steps=100,
                     cpu_deduplication=True,
                 )
@@ -759,7 +791,11 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             'boundaries': [0, 75_000, 150_000, 250_000, 300_000, 335_000, 370_000],
             'values': [500.0, 150.0, 30.0, 15.0, 10.0, 7.0, 5.0],
         }
-        self.assertEqual(trainer_type.call_args.kwargs['bc_schedule'], 'smooth-final')
+        if schedule == 'smooth-mid':
+            expected_schedule['name'] = schedule
+            expected_schedule['boundaries'].insert(3, 200000)
+            expected_schedule['values'].insert(2, 75.)
+        self.assertEqual(trainer_type.call_args.kwargs['bc_schedule'], schedule)
         self.assertTrue(trainer_type.call_args.kwargs['cpu_deduplication'])
         execution = summary['execution_configuration']
         self.assertEqual(stage_start['execution_configuration']['cpu_deduplication'], execution['cpu_deduplication'])
@@ -772,11 +808,11 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertNotIn('cpu_deduplication', builder.call_args.args[1].to_dict())
         self.assertEqual(
             formal_checkpoint_builder.call_args.kwargs['bc_schedule'],
-            'smooth-final',
+            schedule,
         )
         self.assertEqual(
             periodic_snapshot_builder.call_args.kwargs['bc_schedule'],
-            'smooth-final',
+            schedule,
         )
         self.assertEqual(stage_start['formal_config']['actor_lr'], 2e-4)
         self.assertEqual(stage_start['formal_config']['critic_lr'], 3e-4)
