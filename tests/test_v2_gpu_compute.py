@@ -16,6 +16,28 @@ from test_v2_td3 import TestV2TD3 as Fixture, _observation
 
 
 class TestGPUCompute(TestCase):
+    def test_error_state_is_loaded_relative_to_gpu_compute_reference(self):
+        from brain_uav.scripts import v2_gpu_compute_diagnostic as diagnostic
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'baseline'
+            (source/'errors').mkdir(parents=True)
+            expected = {'before': {'values': {'weight': torch.tensor([1., 2.])}},
+                        'after': {'values': {'weight': torch.tensor([3., 4.])}}}
+            state_path = source/'errors'/'error_state_15.pt'
+            torch.save(expected, state_path)
+            reference_path = source/'reference.pt'
+            torch.save({'error_states': {15: 'errors/error_state_15.pt'}}, reference_path)
+            args = SimpleNamespace(gpu_compute_reference=reference_path, td3_block_reference=None)
+            reference = torch.load(args.gpu_compute_reference, map_location='cpu', weights_only=False)
+            actual = diagnostic._load_reference_error_state(args, reference, 15)
+            for phase in ('before', 'after'):
+                torch.testing.assert_close(actual[phase]['values']['weight'],
+                    expected[phase]['values']['weight'], rtol=0, atol=0)
+            state_path.unlink()
+            with self.assertRaises(FileNotFoundError):
+                diagnostic._load_reference_error_state(args, reference, 15)
+
     def test_environment_diagnostic_cli_is_default_off_and_timing_only(self):
         from brain_uav.scripts import profile_v2_td3 as p, v2_gpu_compute_diagnostic as d
         base = ['--model','snn','--device','cuda','--bc-checkpoint','bc.pt',

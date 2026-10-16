@@ -240,6 +240,11 @@ def record_error_state(output, index, before, after, expected=None):
     _strict_json_write(output / f'error_state_{index}.json',report)
     return report
 
+def _load_reference_error_state(args, reference, index):
+    return torch.load(Path(args.gpu_compute_reference).parent / reference['error_states'][index],
+                      map_location='cpu', weights_only=False)
+
+
 def _prepare_loaded_bc_reference(engine, batches, compilation):
     """Rebind only the newly deep-copied BC actor; retain live engine wrappers."""
     from brain_uav.scripts.profile_v2_td3 import _set_numeric_engine_modes
@@ -399,8 +404,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                 after_error = error_state(engine)
                 expected_error = None
                 if reference is not None:
-                    expected_error = torch.load(Path(None).parent /
-                        reference['error_states'][index],map_location='cpu',weights_only=False)
+                    expected_error = _load_reference_error_state(args, reference, index)
                 state_report = record_error_state(output,index,before_error,after_error,expected_error)
                 state_report['own_protected_state'] = exception_self_protection(
                     before_error['values'],after_error['values'],failure)
