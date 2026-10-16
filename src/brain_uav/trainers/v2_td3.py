@@ -4275,6 +4275,7 @@ class V2TD3UpdateEngine:
         exploration_noise: float = 0.0,
         exploration_rng: np.random.Generator | None = None,
         single_observation_fast_path: bool = False,
+        cpu_deduplication: bool = False,
     ) -> np.ndarray:
         if not isinstance(observation, V2Observation):
             raise TypeError('observation must be a V2Observation.')
@@ -4290,10 +4291,15 @@ class V2TD3UpdateEngine:
             raise TypeError('exploration_rng must be a numpy.random.Generator.')
         if type(single_observation_fast_path) is not bool:
             raise TypeError('single_observation_fast_path must be a bool.')
+        if type(cpu_deduplication) is not bool:
+            raise TypeError('cpu_deduplication must be a bool.')
+        if cpu_deduplication and single_observation_fast_path:
+            raise ValueError('CPU deduplication cannot enable the old single-observation fast path.')
         batch = (
             collate_single_v2_observation(observation, device=self.device)
             if single_observation_fast_path
-            else collate_v2_observations([observation]).to(self.device)
+            else collate_v2_observations([observation],
+                **({'deduplicate_copies': True} if cpu_deduplication else {})).to(self.device)
         )
         with torch.inference_mode():
             action = self._action_inference_tensor(batch).detach().cpu().numpy()[0]

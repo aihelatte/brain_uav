@@ -125,6 +125,7 @@ def collate_v2_observations(
     observations: Sequence[V2Observation],
     *,
     device: torch.device | str | None = None,
+    deduplicate_copies: bool = False,
 ) -> V2ObservationBatch:
     """Pad observations to this batch's largest real zone count."""
 
@@ -137,16 +138,24 @@ def collate_v2_observations(
             raise TypeError(f'observations[{index}] must be a V2Observation.')
 
     batch_size = len(observations)
+    if type(deduplicate_copies) is not bool:
+        raise TypeError('deduplicate_copies must be a bool.')
+    if deduplicate_copies and batch_size != 1:
+        raise ValueError('Copy deduplication is limited to one action observation.')
     max_zone_count = max(
         int(observation.zone_features.shape[0])
         for observation in observations
     )
-    ego_features = torch.from_numpy(
-        np.stack([observation.ego_features for observation in observations]).copy()
-    )
-    goal_features = torch.from_numpy(
-        np.stack([observation.goal_features for observation in observations]).copy()
-    )
+    if deduplicate_copies:
+        ego_features = torch.from_numpy(np.stack([observation.ego_features for observation in observations]))
+        goal_features = torch.from_numpy(np.stack([observation.goal_features for observation in observations]))
+    else:
+        ego_features = torch.from_numpy(
+            np.stack([observation.ego_features for observation in observations]).copy()
+        )
+        goal_features = torch.from_numpy(
+            np.stack([observation.goal_features for observation in observations]).copy()
+        )
     zone_features = torch.zeros(
         (batch_size, max_zone_count, ZONE_FEATURE_DIM),
         dtype=torch.float32,
@@ -158,6 +167,12 @@ def collate_v2_observations(
     for batch_index, observation in enumerate(observations):
         zone_count = int(observation.zone_features.shape[0])
         if zone_count == 0:
+            continue
+        if deduplicate_copies:
+            # Destination tensors own their memory. Read immutable NumPy sources
+            # directly into that memory, without exposing writable tensor aliases.
+            np.copyto(zone_features.numpy()[batch_index, :zone_count], observation.zone_features)
+            np.copyto(presence_mask.numpy()[batch_index, :zone_count], observation.presence_mask)
             continue
         zone_features[batch_index, :zone_count] = torch.from_numpy(
             observation.zone_features.copy()

@@ -703,6 +703,8 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
 
 def run(args):
     from brain_uav.scripts import profile_v2_td3 as p
+    if (getattr(args,'cpu_deduplication',False) or getattr(args,'cpu_deduplication_evidence',False)) and not (args.gpu_compute_worker == 'timing' and args.gpu_td3_compute):
+        raise ValueError('CPU deduplication requires --gpu-compute-worker timing --gpu-td3-compute.')
     if getattr(args,'gpu_compute_environment_diagnostic',False) and not (args.gpu_compute_worker == 'timing' and args.gpu_td3_compute):
         raise ValueError('Environment diagnosis requires --gpu-compute-worker timing and --gpu-td3-compute.')
     recovery = getattr(args,'gpu_compute_error_recovery',False)

@@ -3392,6 +3392,8 @@ def _run_diagnostic_level(
     compiled_path_profiler_updates: int = 0,
     compiled_profiler_output_dir: Path | None = None,
     environment_performance_diagnostic: bool = False,
+    cpu_deduplication: bool = False,
+    deduplication_evidence: list | None = None,
     cache_ellipsoid_segment_clearance: bool = False,
     single_observation_fast_path: bool = False,
     window_update_statistics: bool = False,
@@ -3462,6 +3464,7 @@ def _run_diagnostic_level(
         fixed_scenarios=[record['payload'] for record in pool.scenarios],
         uav_collision_radius=prepared.uav_collision_radius,
         cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
+        cpu_deduplication=cpu_deduplication,
     )
     performance_diagnostic_enabled = bool(
         environment_performance_diagnostic or compiled_path_profiler_updates > 0
@@ -3885,6 +3888,7 @@ def _run_diagnostic_level(
                         ),
                         exploration_rng=components.exploration_rng,
                         single_observation_fast_path=single_observation_fast_path,
+                        **({'cpu_deduplication': True} if cpu_deduplication else {}),
                     ),
                     cuda_event=True,
                 )
@@ -3993,6 +3997,11 @@ def _run_diagnostic_level(
                     detailed_profiler.run(perform_update)
                 else:
                     perform_update(False)
+            if deduplication_evidence is not None:
+                from brain_uav.scripts.v2_cpu_dedup_diagnostic import step_evidence
+                deduplication_evidence.append(step_evidence(engine, components.exploration_rng,
+                    step_number, measured_phase, observation, action, next_observation,
+                    reward, terminated, truncated, info, env.state, line_safe))
             observation = next_observation
             if done:
                 if window_update_statistics:
@@ -4137,6 +4146,8 @@ def _run_diagnostic_level(
         'warmup_critic_updates': critic_updates_before,
         'warmup_actor_updates': actor_updates_before,
         'measured_steps': measured_steps,
+        'cpu_deduplication': cpu_deduplication,
+        'deduplication_evidence_enabled': deduplication_evidence is not None,
         'block_attribution': block_attribution.report(block_attribution_wall),
         'local_optimizations': engine.local_optimization_metadata(),
         'gpu_update_timing_scope': ('CPU sample/upload unchanged. gpu_compute_input_copy is added GPU-copy submission wall; gpu_compute_to_result is manual replay through terminal read. Binding checks, controls, capture and publication remain in outer TD3 wall; unmeasured old inner sections are not zero work.' if gpu_td3_compute else ('Legacy inner update regions are unmeasured, not zero work. gpu_td3_sample_to_result covers the full contiguous path, including control inputs and terminal read.' if gpu_td3_update else None)),
@@ -5316,6 +5327,8 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     from brain_uav.scripts.train_v2_td3 import default_v2_cuda_graph_compilation
 
     environment_diagnostic = getattr(args, 'gpu_compute_environment_diagnostic', False)
+    cpu_deduplication = getattr(args, 'cpu_deduplication', False)
+    collect_deduplication = getattr(args, 'cpu_deduplication_evidence', False)
     if sum(bool(getattr(args, name)) for name in ('local_optimization_comparison', 'local_optimization_correctness', 'critic_tail_comparison', 'critic_tail_correctness', 'td3_block_correctness', 'td3_block_comparison')) > 1:
         raise ValueError('Select exactly one comparison/correctness mode.')
     if args.gpu_td3_compute and getattr(args,'gpu_compute_worker',None) not in ('correctness','timing'):
@@ -5391,7 +5404,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     compilation.pop('reduce_update_stat_syncs', None)
     # All comparison groups preserve the formally adopted configuration on CUDA.
     output.mkdir(parents=True, exist_ok=True)
-    detail_output = output / 'other' if environment_diagnostic else output
+    detail_output = output / 'other' if environment_diagnostic or cpu_deduplication or collect_deduplication else output
     detail_output.mkdir(exist_ok=True)
     if getattr(args, 'gpu_compute_worker', None) == 'correctness':
         from brain_uav.scripts.v2_gpu_compute_diagnostic import correctness
@@ -5420,6 +5433,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     for group, window, buffers in groups:
         runs[group] = []
         for repeat in range(repeats):
+            deduplication_evidence = [] if collect_deduplication else None
             random.seed(args.seed)
             np.random.seed(args.seed)
             torch.manual_seed(args.seed)
@@ -5438,6 +5452,8 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 non_blocking_batch_transfer=getattr(args,'batch_transfer_worker',None)=='timing' and args.non_blocking_batch_transfer,
                 batch_transfer_window_timing=(getattr(args,'batch_transfer_worker',None)=='timing' or getattr(args,'gpu_compute_worker',None)=='timing'),
                 environment_performance_diagnostic=environment_diagnostic,
+                cpu_deduplication=cpu_deduplication,
+                deduplication_evidence=deduplication_evidence,
                 block_attribution_wall=args.td3_block_attribution == 'wall',
                 compiled_path_profiler_updates=(args.compiled_performance_diagnostic_updates or 4) if args.td3_block_attribution == 'profiler' else 0,
                 compiled_profiler_output_dir=output / f'{group}_{repeat}_profiler' if args.td3_block_attribution == 'profiler' else None,
@@ -5447,6 +5463,8 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
             result['repeat'] = repeat
             runs[group].append(result)
             _strict_json_write(detail_output / f'{group}_{repeat}.json', result)
+            if collect_deduplication:
+                _strict_json_write(detail_output / f'rollout_{repeat}.json', {'steps': deduplication_evidence})
             gc.collect()
             if target.type == 'cuda':
                 torch.cuda.empty_cache()
@@ -5455,7 +5473,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 for group, values in runs.items()}
     stable = all(run['critic_encoder_compile']['valid_for_speed_comparison'] is not False
                  for values in runs.values() for run in values)
-    speed_comparison_valid = stable and not environment_diagnostic
+    speed_comparison_valid = stable and not environment_diagnostic and not collect_deduplication
     summary = {'valid_for_speed_comparison': speed_comparison_valid, 'diagnostic_only': True, 'formal_training': False,
         'method': 'fresh BC initialization per group/repeat; stage counter offset only; no prior training history',
         'controlled_stage_step_offset': offset, 'requested_device': args.device, 'actual_device': str(target),
@@ -5468,13 +5486,18 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
         'pool_sha256': sha256(Path(args.validation_pool).read_bytes()).hexdigest(),
         'original_pool_digest': original_pool.content_digest, 'selected_pool_digest': pool.content_digest,
         'scenario_ids': [record['scenario_id'] for record in pool.scenarios],
+        'scenario_shapes': [{'scenario_id': record['scenario_id'],
+            'shape_types': [zone['shape']['shape_type'] for zone in record['payload']['zones']]}
+            for record in pool.scenarios],
         'config': config.to_dict(), 'reward_config': asdict(prepared.reward_config),
         'compilation_requested': compilation,
         'explicit_cpu_smoke_override': args.comparison_eager_cpu,
         'bc_schedule': args.comparison_bc_schedule,
+        'cpu_deduplication': cpu_deduplication,
+        'cpu_deduplication_evidence': collect_deduplication,
         'td3_block_attribution': args.td3_block_attribution,
         'critic_tail_internal_timing_requested': args.critic_tail_internal_timing,
-        'final_speed_acceptance': False if environment_diagnostic or args.critic_tail_internal_timing or args.td3_block_attribution else None,
+        'final_speed_acceptance': False if environment_diagnostic or collect_deduplication or args.critic_tail_internal_timing or args.td3_block_attribution else None,
         'comparison_kind': 'gpu_td3_compute' if getattr(args,'gpu_compute_worker',None) else ('merged_update_blocks' if args.td3_block_comparison else ('checked_critic_tail' if args.critic_tail_comparison else 'local_optimizations')),
         'steps': steps, 'repeats': repeats, 'runs': runs,
         'comparison': {group: {'mean_wall_seconds': averages[group],
@@ -5491,6 +5514,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
             'valid_for_speed_comparison': False,
             'measurement_note': 'Environment/geometry instrumentation overhead is included; localization only, not speed acceptance. Warmup excluded. Parent and child intervals are not additive; geometry calls are included in environment sections and must not be added to them. Reset and pre-action geometry are outside env.step.',
             'model': args.model, 'seed': args.seed, 'batch_size': args.batch_size,
+            'cpu_deduplication': cpu_deduplication,
             'requested_warmup_steps': args.warmup_steps, 'controlled_stage_step_offset': offset,
             'bc_schedule': args.comparison_bc_schedule,
             'checkpoint': summary['checkpoint'], 'checkpoint_sha256': summary['checkpoint_sha256'],
@@ -5620,6 +5644,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--gpu-compute-trace-retained-gradient', action='store_true', help='Diagnostic-only synchronous snapshots of the known empty_scene_token gradient around the first critic loss error.')
     parser.add_argument('--gpu-compute-worker', choices=('correctness','timing'), help=argparse.SUPPRESS)
     parser.add_argument('--gpu-compute-environment-diagnostic', action='store_true', help='Environment/geometry recorder only for --gpu-compute-worker timing --gpu-td3-compute; includes diagnostic overhead, no torch profiler or speed acceptance; default off.')
+    parser.add_argument('--cpu-deduplication', action='store_true', help='Experimental reward-context and independent action-input copy reuse; GPU compute timing worker only, default off.')
+    parser.add_argument('--cpu-deduplication-evidence', action='store_true', help='Diagnostic-only exact rollout/action/RNG hashes; separate from timing, default off.')
     parser.add_argument('--gpu-td3-update', action='store_true', help='Experimental full device replay and update; default off.')
     parser.add_argument('--gpu-td3-reference', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--checkpoint', type=Path, help='Terminal formal checkpoint; failed is allowed only for diagnosis.')
@@ -5760,6 +5786,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if (args.cpu_deduplication or args.cpu_deduplication_evidence) and not (args.gpu_compute_worker == 'timing' and args.gpu_td3_compute):
+        raise ValueError('CPU deduplication requires --gpu-compute-worker timing --gpu-td3-compute.')
     if args.gpu_compute_environment_diagnostic and not (args.gpu_compute_worker == 'timing' and args.gpu_td3_compute):
         raise ValueError('Environment diagnosis requires --gpu-compute-worker timing and --gpu-td3-compute.')
     if args.gpu_compute_comparison or args.gpu_compute_worker:

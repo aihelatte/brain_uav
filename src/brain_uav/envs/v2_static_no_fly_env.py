@@ -114,6 +114,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         uav_collision_radius: float = 0.0,
         scenario_generator: V2ScenarioGenerator | None = None,
         cache_ellipsoid_segment_clearance: bool = False,
+        cpu_deduplication: bool = False,
     ) -> None:
         if not isinstance(scenario, ScenarioConfig):
             raise TypeError('scenario must be a ScenarioConfig.')
@@ -132,6 +133,8 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
             raise ValueError('scenario_generator and environment ScenarioConfig must match.')
         if type(cache_ellipsoid_segment_clearance) is not bool:
             raise TypeError('cache_ellipsoid_segment_clearance must be a bool.')
+        if type(cpu_deduplication) is not bool:
+            raise TypeError('cpu_deduplication must be a bool.')
 
         super().__init__(
             scenario=scenario,
@@ -148,6 +151,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         self._fixed_idx = 0
         self.scenario_generator = scenario_generator
         self.cache_ellipsoid_segment_clearance = cache_ellipsoid_segment_clearance
+        self.cpu_deduplication = cpu_deduplication
         self.uav_collision_radius = _nonnegative_finite(
             uav_collision_radius,
             name='uav_collision_radius',
@@ -586,7 +590,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
             return None
         point, zone_identity, radius, clearances = context
         try:
-            candidate = np.asarray(position, dtype=np.float32)
+            candidate = np.asarray(position, dtype=None if self.cpu_deduplication else np.float32)
         except (TypeError, ValueError, OverflowError):
             return None
         if (
@@ -644,7 +648,9 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         return min(clearances) if clearances else float('inf')
 
     def _nearest_zone_surface_clearance(self, pos: np.ndarray) -> float:
-        if self.rewards.breakthrough_clearance_gate_enabled:
+        # Context exists only during synchronous reward evaluation, with no
+        # geometry mutation. No persistent cache or new P1 reward gate.
+        if self.cpu_deduplication or self.rewards.breakthrough_clearance_gate_enabled:
             clearances = self._active_clearances_for(pos)
             if clearances is not None:
                 return self._minimum_zone_clearance(clearances)
