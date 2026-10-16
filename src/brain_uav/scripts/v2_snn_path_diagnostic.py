@@ -158,7 +158,6 @@ def compare_tensors(expected, actual, *, stage, results, output=None,
                 raise AssertionError(f'{stage}: {name} differs')
 
 
-
 def restore_engine(inputs, *, fused):
     """Restore full engine, including saved optimizers/reference; replay is synthetic."""
     payload = inputs['checkpoint_payload']['engine_checkpoint']
@@ -397,8 +396,7 @@ def run_snn_path_diagnostic(*, checkpoint, validation_pool, output_dir, device='
         'bc_reference_restored': payload['engine_checkpoint']['bc_reference_present'],
         'bc_schedule': payload['bc_schedule'], 'requested_compilation': settings,
         'experimental_optimizations': {'C': False, 'A': False, 'critic_tail': False,
-            'window_update_statistics': False, 'reuse_update_buffers': False, 'pinned_batch_transfer': False,
-            'aggregate_relation_values_first': False, 'single_observation_fast_path': False},
+            'window_update_statistics': False, 'reuse_update_buffers': False},
         'restoration': 'All six networks, BC reference, Adam state and saved counts restored strictly. Only last_total_steps is rebased for independent diagnostic boundary cases; all update counts start at saved values. Replay/RNG history not saved: fixed synthetic batch and matched explicit RNG. Both sides use identical fused Adam and saved target policy_noise/noise_clip (not a reconstruction of historical replay/noise).',
         'observation_sources': sources,
         'saved_failure_observations': 'Saved training terminal state included when found or explicitly supplied; intermediate attitudes are not reconstructed. No claim of reproducing a terminal-policy failed rollout.',

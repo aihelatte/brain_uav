@@ -19,6 +19,7 @@ from brain_uav.scripts.train_v2_td3 import (
     _resolve_v2_cuda_graph_compilation,
     default_v2_cuda_graph_compilation,
     run_v2_td3_stage,
+    resolve_v2_gpu_compute,
 )
 from brain_uav.trainers.v2_formal_training import (
     V2FormalTrainingConfig,
@@ -64,12 +65,9 @@ def build_parser() -> argparse.ArgumentParser:
     # unless explicitly overridden with --no-<flag>.
     parser.add_argument('--window-update-statistics', action='store_true')
     parser.add_argument('--reuse-update-buffers', action='store_true')
-    parser.add_argument('--compile-critic-update-front', action='store_true')
-    parser.add_argument('--compile-actor-objective', action='store_true')
-    parser.add_argument('--gpu-td3-compute', action='store_true', help='Experimental CPU replay + complete manual GPU computation; default off.')
-    parser.add_argument('--cpu-deduplication', action='store_true', help='Reuse existing CPU geometry results and remove redundant action-input copies; default off.')
+    parser.add_argument('--gpu-td3-compute', action=argparse.BooleanOptionalAction, default=None, help='Auto-select supported CUDA compute; --no-gpu-td3-compute forces original updates.')
+    parser.add_argument('--cpu-deduplication', action=argparse.BooleanOptionalAction, default=True, help='CPU reuse enabled by default; --no-cpu-deduplication disables it.')
     parser.add_argument('--gpu-td3-update', action='store_true', help='Experimental full device replay/update; CUDA 2.5.1+cu124 only; default off.')
-    parser.add_argument('--cuda-graph-critic-tail', action='store_true', help='Capture checked fused critic Adam and optional critic target updates; requires CUDA.')
     parser.add_argument('--compile-critic-encoder', action='store_true')
     parser.add_argument('--compile-target-encoders', action='store_true')
     parser.add_argument(
@@ -91,8 +89,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--cuda-graph-action-inference', action=argparse.BooleanOptionalAction, default=None,
     )
-    parser.add_argument('--pinned-batch-transfer', action='store_true')
-    parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument(
         '--reduce-update-stat-syncs', action=argparse.BooleanOptionalAction, default=None,
     )
@@ -260,51 +256,46 @@ def run_v2_curriculum(
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
     cuda_graph_action_inference: bool = False,
-    aggregate_relation_values_first: bool = False,
+
     reduce_update_stat_syncs: bool = False,
     window_update_statistics: bool = False,
     reuse_update_buffers: bool = False,
-    cuda_graph_critic_tail: bool = False,
+
     gpu_td3_update: bool = False,
-    gpu_td3_compute: bool = False,
-    cpu_deduplication: bool = False,
-    compile_critic_update_front: bool = False,
-    compile_actor_objective: bool = False,
-    pinned_batch_transfer: bool = False,
+    gpu_td3_compute: bool | None = None,
+    cpu_deduplication: bool = True,
+
+
     cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
     periodic_snapshot_interval_steps: int | None = None,
 ) -> dict[str, Any]:
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
-    for name, value in (('compile_critic_update_front', compile_critic_update_front),
-                        ('compile_actor_objective', compile_actor_objective)):
-        if type(value) is not bool:
-            raise TypeError(f'{name} must be a bool.')
     if type(cpu_deduplication) is not bool:
         raise TypeError('cpu_deduplication must be a bool.')
-    if type(gpu_td3_compute) is not bool:
-        raise TypeError('gpu_td3_compute must be a bool.')
-    if gpu_td3_compute and any((gpu_td3_update, compile_critic_update_front, compile_actor_objective, cuda_graph_critic_tail, window_update_statistics, reuse_update_buffers, pinned_batch_transfer, aggregate_relation_values_first)):
+    compute_resolution = resolve_v2_gpu_compute(
+        gpu_td3_compute, device=resolved_device, fused_adam=fused_adam,
+        formal_configuration=all((compile_actors, compile_critic_block, compile_target_block,
+            compile_shared_relations, compile_actor_loss, cache_actor_loss_coefficients,
+            compile_action_inference, cuda_graph_action_inference, cuda_graph_updates,
+            cuda_graph_actor_update, reduce_update_stat_syncs,
+            frozen_critic_strategy == 'compiled_no_grad_context',
+            model != 'snn' or compile_snn_target_encoder)),
+        conflicts=any((gpu_td3_update, window_update_statistics, reuse_update_buffers)),
+    )
+    gpu_td3_compute = compute_resolution['effective']
+    if gpu_td3_compute and any((gpu_td3_update,    window_update_statistics, reuse_update_buffers)):
         raise ValueError('gpu_td3_compute conflicts with other experimental paths.')
     if type(gpu_td3_update) is not bool:
         raise TypeError('gpu_td3_update must be a bool.')
-    if gpu_td3_update and any((compile_critic_update_front, compile_actor_objective, cuda_graph_critic_tail, window_update_statistics, reuse_update_buffers, pinned_batch_transfer, aggregate_relation_values_first)):
+    if gpu_td3_update and any((   window_update_statistics, reuse_update_buffers)):
         raise ValueError('gpu_td3_update conflicts with other experimental paths.')
-    if compile_critic_update_front or compile_actor_objective:
-        if cuda_graph_critic_tail or window_update_statistics or reuse_update_buffers:
-            raise ValueError('Merged blocks conflict with critic tail and local optimizations.')
-        if not (cuda_graph_updates and cuda_graph_actor_update and fused_adam
-                and compile_critic_block and compile_target_block and compile_actors
-                and compile_shared_relations and compile_actor_loss and cache_actor_loss_coefficients
-                and frozen_critic_strategy == 'compiled_no_grad_context'
-                and (model != 'snn' or compile_snn_target_encoder)):
-            raise ValueError('Merged blocks require formal CUDA compilation settings.')
     if model not in ('ann', 'snn'):
         raise ValueError('model must be "ann" or "snn".')
     if cache_actor_loss_coefficients and not compile_actor_loss:
         raise ValueError('cache_actor_loss_coefficients requires compile_actor_loss.')
-    for name, value in (('window_update_statistics', window_update_statistics), ('reuse_update_buffers', reuse_update_buffers), ('cuda_graph_critic_tail', cuda_graph_critic_tail)):
+    for name, value in (('window_update_statistics', window_update_statistics), ('reuse_update_buffers', reuse_update_buffers)):
         if type(value) is not bool:
             raise TypeError(f'{name} must be a bool.')
     if type(reduce_update_stat_syncs) is not bool:
@@ -317,8 +308,6 @@ def run_v2_curriculum(
         )
     if cuda_graph_action_inference and resolved_device != 'cuda':
         raise ValueError('cuda_graph_action_inference requires a CUDA device.')
-    if pinned_batch_transfer and resolved_device != 'cuda':
-        raise ValueError('pinned_batch_transfer requires a CUDA device.')
     if cuda_graph_actor_update and not (
         cuda_graph_updates and compile_actors
         and frozen_critic_strategy == 'compiled_no_grad_context'
@@ -469,17 +458,16 @@ def run_v2_curriculum(
             cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
             cuda_graph_action_inference=cuda_graph_action_inference,
-            aggregate_relation_values_first=aggregate_relation_values_first,
+
             reduce_update_stat_syncs=reduce_update_stat_syncs,
             window_update_statistics=window_update_statistics,
             reuse_update_buffers=reuse_update_buffers,
-            cuda_graph_critic_tail=cuda_graph_critic_tail,
+
             gpu_td3_update=gpu_td3_update,
             gpu_td3_compute=gpu_td3_compute,
             cpu_deduplication=cpu_deduplication,
-            compile_critic_update_front=compile_critic_update_front,
-            compile_actor_objective=compile_actor_objective,
-            pinned_batch_transfer=pinned_batch_transfer,
+
+
             cuda_graph_updates=cuda_graph_updates,
             cuda_graph_actor_update=cuda_graph_actor_update,
             periodic_snapshot_interval_steps=periodic_snapshot_interval_steps,
@@ -497,7 +485,7 @@ def run_v2_curriculum(
         'snn': snn_metadata,
         'seed': seed,
         'validation_seed': validated_pools['easy'].master_seed,
-        'execution_configuration': {'cpu_deduplication': {
+        'execution_configuration': {'gpu_td3_compute': compute_resolution, 'cpu_deduplication': {
             'requested': cpu_deduplication,
             'stages': {item['stage']: item.get('execution_configuration') for item in summaries},
         }},
@@ -538,14 +526,14 @@ def run_v2_curriculum(
             'cache_actor_loss_coefficients': cache_actor_loss_coefficients,
             'compile_action_inference': compile_action_inference,
             'cuda_graph_action_inference': cuda_graph_action_inference,
-            'aggregate_relation_values_first': aggregate_relation_values_first,
+
             'window_update_statistics': window_update_statistics,
             'reuse_update_buffers': reuse_update_buffers,
-            'cuda_graph_critic_tail': cuda_graph_critic_tail, 'gpu_td3_update': gpu_td3_update, 'gpu_td3_compute': gpu_td3_compute,
-            'compile_critic_update_front': compile_critic_update_front,
-            'compile_actor_objective': compile_actor_objective,
+             'gpu_td3_update': gpu_td3_update, 'gpu_td3_compute': gpu_td3_compute,
+
+
             'reduce_update_stat_syncs': reduce_update_stat_syncs,
-            'pinned_batch_transfer': pinned_batch_transfer,
+
             'cuda_graph_updates': cuda_graph_updates,
             'cuda_graph_actor_update': cuda_graph_actor_update,
             'cuda_graph': cuda_graph_updates,
@@ -573,10 +561,8 @@ def main(argv: list[str] | None = None) -> int:
     resolved_device = resolve_training_device(args.device)
     print(json.dumps({
         'local_optimizations_requested': {'window_update_statistics': args.window_update_statistics,
-                                          'reuse_update_buffers': args.reuse_update_buffers, 'cuda_graph_critic_tail': args.cuda_graph_critic_tail, 'gpu_td3_update': args.gpu_td3_update, 'gpu_td3_compute': args.gpu_td3_compute,
-                                          'cpu_deduplication': args.cpu_deduplication,
-                                          'compile_critic_update_front': args.compile_critic_update_front,
-                                          'compile_actor_objective': args.compile_actor_objective},
+                                          'reuse_update_buffers': args.reuse_update_buffers,  'gpu_td3_update': args.gpu_td3_update, 'gpu_td3_compute': args.gpu_td3_compute,
+                                          'cpu_deduplication': args.cpu_deduplication},
         'requested_device': args.device,
         'resolved_device': resolved_device,
         'model_type': args.model,
@@ -629,17 +615,16 @@ def main(argv: list[str] | None = None) -> int:
         cache_actor_loss_coefficients=compilation['cache_actor_loss_coefficients'],
         compile_action_inference=compilation['compile_action_inference'],
         cuda_graph_action_inference=compilation['cuda_graph_action_inference'],
-        aggregate_relation_values_first=args.aggregate_relation_values_first,
+
         reduce_update_stat_syncs=compilation['reduce_update_stat_syncs'],
         window_update_statistics=args.window_update_statistics,
         reuse_update_buffers=args.reuse_update_buffers,
-        cuda_graph_critic_tail=args.cuda_graph_critic_tail,
+
         gpu_td3_update=args.gpu_td3_update,
         gpu_td3_compute=args.gpu_td3_compute,
         cpu_deduplication=args.cpu_deduplication,
-        compile_critic_update_front=args.compile_critic_update_front,
-        compile_actor_objective=args.compile_actor_objective,
-        pinned_batch_transfer=args.pinned_batch_transfer,
+
+
         cuda_graph_updates=compilation['cuda_graph_updates'],
         cuda_graph_actor_update=compilation['cuda_graph_actor_update'],
         periodic_snapshot_interval_steps=(

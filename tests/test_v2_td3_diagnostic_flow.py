@@ -207,7 +207,7 @@ class TestTD3DiagnosticFlow(unittest.TestCase):
             finally: observed = False
             return dict(cuda_graph_launch_count=auxiliary_launches if replay is probe else 1, event_names=[])
         verifier = SimpleNamespace(cuda_graph_updates=True, device=SimpleNamespace(type='cuda'),
-            compile_critic_update_front=False, compile_actor_objective=True,
+
             critic1=critic, critic2=torch.nn.Linear(2, 1),
             _compiled_target_block=None, _compiled_target_critic_td=None,
             _compiled_actor_loss=None, cuda_graph_actor_update=False,
@@ -243,7 +243,7 @@ class TestTD3DiagnosticFlow(unittest.TestCase):
             replay()
             return dict(cuda_graph_launch_count=0 if replay.scope == 'critic_update_front' else 1, event_names=[])
         engine = SimpleNamespace(cuda_graph_updates=True, device=SimpleNamespace(type='cuda'),
-            compile_critic_update_front=True, compile_actor_objective=False,
+
             critic1=torch.nn.Linear(2, 1), critic2=torch.nn.Linear(2, 1),
             _compiled_target_block=None, _compiled_target_critic_td=None,
             _compiled_actor_loss=None, cuda_graph_actor_update=False,

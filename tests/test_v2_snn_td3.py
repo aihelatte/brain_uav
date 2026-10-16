@@ -60,7 +60,7 @@ class TestV2SNNTD3(unittest.TestCase):
     def make_engine(
         self, *, freeze: int = 0, bc=None,
         fused_adam: bool = False,
-        aggregate_relation_values_first: bool = False,
+
         time_window: int = 2,
     ) -> V2TD3UpdateEngine:
         actor = self.make_actor(time_window=time_window)
@@ -86,7 +86,7 @@ class TestV2SNNTD3(unittest.TestCase):
             terminal_geo_regularization_enabled=False,
             bc_reference_actor=bc,
             fused_adam=fused_adam,
-            aggregate_relation_values_first=aggregate_relation_values_first,
+
         )
         for index, count in enumerate((0, 6, 10, 2)):
             engine.replay.add(
@@ -117,17 +117,13 @@ class TestV2SNNTD3(unittest.TestCase):
     def test_snn_three_optimizations_keep_lif_reset_and_target_frozen(self) -> None:
         engine = self.make_engine(
             bc=self.make_actor(), fused_adam=True,
-            aggregate_relation_values_first=True,
+
         )
         metadata = engine.configure_compilation(
             compile_actor_loss=True, backend='eager', fullgraph=True,
         )
         self.assertEqual(metadata['actor_loss_granularity'], 'tensor_block')
         self.assertEqual(metadata['optimizer_execution'], 'fused_adam')
-        self.assertTrue(all(
-            layer.attention.aggregate_relation_values_first
-            for layer in engine.actor.zone_set_encoder.layers
-        ))
         self.assertTrue(all(not p.requires_grad for p in engine.actor_target.parameters()))
         metrics = engine.update_once(total_steps=1, bc_lambda=1.0)
         self.assertTrue(metrics.actor_updated)

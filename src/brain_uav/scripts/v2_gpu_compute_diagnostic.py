@@ -308,7 +308,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
     # Optional, isolated ANN investigation; never selected by formal training.
     focus = getattr(args, '_ann_common_state', None)
     if args.gpu_td3_compute and focus is None:
-        reference = torch.load(args.td3_block_reference,map_location='cpu',weights_only=False)
+        reference = torch.load(args.gpu_compute_reference,map_location='cpu',weights_only=False)
         if reference.get('contract') != contract: raise ValueError('Compute reference contract mismatch; rebuild baseline.')
     engine = None
     trace_events = []
@@ -399,7 +399,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                 after_error = error_state(engine)
                 expected_error = None
                 if reference is not None:
-                    expected_error = torch.load(Path(args.td3_block_reference).parent /
+                    expected_error = torch.load(Path(None).parent /
                         reference['error_states'][index],map_location='cpu',weights_only=False)
                 state_report = record_error_state(output,index,before_error,after_error,expected_error)
                 state_report['own_protected_state'] = exception_self_protection(
@@ -703,28 +703,25 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
 
 def run(args):
     from brain_uav.scripts import profile_v2_td3 as p
-    if (getattr(args,'cpu_deduplication',False) or getattr(args,'cpu_deduplication_evidence',False)) and not (args.gpu_compute_worker == 'timing' and args.gpu_td3_compute):
+    if (getattr(args,'cpu_deduplication',False) or getattr(args,'cpu_deduplication_evidence',False)) and not (args.gpu_compute_worker == 'timing'):
         raise ValueError('CPU deduplication requires --gpu-compute-worker timing --gpu-td3-compute.')
-    if getattr(args,'gpu_compute_environment_diagnostic',False) and not (args.gpu_compute_worker == 'timing' and args.gpu_td3_compute):
+    if getattr(args,'gpu_compute_environment_diagnostic',False) and not (args.gpu_compute_worker == 'timing'):
         raise ValueError('Environment diagnosis requires --gpu-compute-worker timing and --gpu-td3-compute.')
     recovery = getattr(args,'gpu_compute_error_recovery',False)
     tracing = getattr(args,'gpu_compute_trace_retained_gradient',False)
     if (recovery or tracing) and args.gpu_compute_worker == 'timing':
         raise ValueError('Error recovery/trace is correctness-only.')
     conflicts=('gpu_td3_update','gpu_td3_suite','gpu_td3_worker','gpu_td3_sampling_cost',
-        'pinned_batch_transfer','compile_critic_update_front','compile_actor_objective','cuda_graph_critic_tail',
-        'window_update_statistics','reuse_update_buffers','aggregate_relation_values_first','single_observation_fast_path',
-        'non_blocking_batch_transfer','batch_transfer_comparison','batch_transfer_worker','td3_block_suite','td3_block_correctness','td3_block_comparison','td3_block_attribution',
-        'local_optimization_correctness','local_optimization_comparison','critic_tail_correctness','critic_tail_comparison',
+
+        'window_update_statistics','reuse_update_buffers',
+        'non_blocking_batch_transfer','batch_transfer_comparison','batch_transfer_worker',
+        'local_optimization_correctness','local_optimization_comparison',
         'snn_path_consistency','detailed_profiler_updates','compiled_performance_diagnostic_updates')
     if any(getattr(args,n) for n in conflicts) or args.device!='cuda' or args.comparison_eager_cpu:
         raise ValueError('GPU compute comparison requires CUDA and original formal path, without other experiments/profiler.')
     if args.bc_checkpoint is None or args.validation_pool is None:
         raise ValueError('Matching BC and easy fixed pool are required.')
     if args.gpu_compute_worker:
-        args.td3_block_choice='compute' if args.gpu_td3_compute else 'baseline'
-        args.td3_block_correctness=args.gpu_compute_worker=='correctness'
-        args.td3_block_comparison=args.gpu_compute_worker=='timing'
         args.correctness_updates=max(8,args.correctness_updates)
         try:
             result = p.run_local_optimization_comparison(args)
@@ -761,7 +758,7 @@ def run(args):
             if getattr(args,'gpu_compute_first_critic_loss_only',False): command+=['--gpu-compute-first-critic-loss-only']
             if recovery: command+=['--gpu-compute-error-recovery']
             if tracing: command+=['--gpu-compute-trace-retained-gradient']
-            if enabled: command+=['--gpu-td3-compute','--td3-block-reference',str(output/'baseline_correctness'/'reference.pt')]
+            if enabled: command+=['--gpu-td3-compute','--gpu-compute-reference',str(output/'baseline_correctness'/'reference.pt')]
             with (output/(group+'_correctness.log')).open('w',encoding='utf-8') as log:
                 rc=subprocess.run(command+['--gpu-compute-worker','correctness','--output-dir',str(output/(group+'_correctness'))],
                     stdout=log,stderr=subprocess.STDOUT,check=False).returncode

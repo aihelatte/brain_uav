@@ -75,19 +75,16 @@ def check_transfers(batches,device,repeats):
 def run(args):
     from brain_uav.scripts import profile_v2_td3 as p
     conflicts=('gpu_td3_update','gpu_td3_suite','gpu_td3_worker','gpu_td3_sampling_cost',
-        'pinned_batch_transfer','compile_critic_update_front','compile_actor_objective','cuda_graph_critic_tail',
-        'window_update_statistics','reuse_update_buffers','aggregate_relation_values_first','single_observation_fast_path',
-        'td3_block_suite','td3_block_correctness','td3_block_comparison','td3_block_attribution',
-        'local_optimization_correctness','local_optimization_comparison','critic_tail_correctness','critic_tail_comparison',
+
+        'window_update_statistics','reuse_update_buffers',
+
+        'local_optimization_correctness','local_optimization_comparison',
         'snn_path_consistency','detailed_profiler_updates','compiled_performance_diagnostic_updates')
     if any(getattr(args,n) for n in conflicts) or args.device!='cuda' or args.comparison_eager_cpu:
         raise ValueError('Batch transfer comparison requires CUDA and original formal path, without other experiments/profiler.')
     if args.bc_checkpoint is None or args.validation_pool is None:
         raise ValueError('Matching BC and easy fixed pool are required.')
     if args.batch_transfer_worker:
-        args.td3_block_choice='nonblocking' if args.non_blocking_batch_transfer else 'baseline'
-        args.td3_block_correctness=args.batch_transfer_worker=='correctness'
-        args.td3_block_comparison=args.batch_transfer_worker=='timing'
         args.correctness_updates=max(8,args.correctness_updates)
         return p.run_local_optimization_comparison(args)
     if args.non_blocking_batch_transfer:

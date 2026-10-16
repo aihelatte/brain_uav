@@ -144,6 +144,8 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                 enabled = trial == 'gamma'
                 if enabled:
                     argv += ['--cpu-deduplication']
+                else:
+                    argv += ['--no-cpu-deduplication']
                 for stage, bias in zip(('easy', 'medium', 'hard'), biases):
                     argv += [f'--{stage}-gamma', str(gamma),
                              f'--{stage}-failure-sample-bias', str(bias),
@@ -208,8 +210,6 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertIsNone(args.hard_max_stage_steps)
         self.assertIsNone(args.easy_max_stage_steps)
         self.assertIsNone(args.medium_max_stage_steps)
-        self.assertFalse(args.pinned_batch_transfer)
-        self.assertFalse(args.aggregate_relation_values_first)
         self.assertEqual(args.periodic_snapshot_interval_steps, 150_000)
         # D1 (this diagnostic pass): tri-state, resolved by
         # _resolve_v2_cuda_graph_compilation in main() against the
@@ -358,9 +358,9 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                     cache_actor_loss_coefficients=True,
                     compile_action_inference=True,
                     cuda_graph_action_inference=True,
-                    aggregate_relation_values_first=True,
+
                     reduce_update_stat_syncs=True,
-                    pinned_batch_transfer=True,
+
                     cuda_graph_updates=True,
                 cuda_graph_actor_update=True,
                 )
@@ -384,9 +384,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertTrue(calls[0]['cache_actor_loss_coefficients'])
         self.assertTrue(calls[0]['compile_action_inference'])
         self.assertTrue(calls[0]['cuda_graph_action_inference'])
-        self.assertTrue(calls[0]['aggregate_relation_values_first'])
         self.assertTrue(calls[0]['reduce_update_stat_syncs'])
-        self.assertTrue(calls[0]['pinned_batch_transfer'])
         self.assertTrue(calls[0]['cuda_graph_updates'])
         self.assertTrue(calls[0]['cuda_graph_actor_update'])
         self.assertIs(calls[0]['prepared_initialization'], prepared)
@@ -405,9 +403,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         self.assertTrue(
             result['compilation_request']['cuda_graph_action_inference']
         )
-        self.assertTrue(result['compilation_request']['aggregate_relation_values_first'])
         self.assertTrue(result['compilation_request']['reduce_update_stat_syncs'])
-        self.assertTrue(result['compilation_request']['pinned_batch_transfer'])
         self.assertTrue(result['compilation_request']['cuda_graph_updates'])
         self.assertEqual(result['snn'], {
             'time_window': actor.time_window,

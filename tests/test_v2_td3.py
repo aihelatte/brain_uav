@@ -31,7 +31,6 @@ from brain_uav.trainers import (
     V2TD3UpdateEngine,
     V2TD3UpdateMetrics,
 )
-from brain_uav.trainers.v2_td3 import _ReusablePinnedReplayBatchTransfer
 
 
 def _observation(
@@ -113,9 +112,9 @@ class TestV2TD3(unittest.TestCase):
         actor_grad_clip_norm=1.0,
         critic_grad_clip_norm=1.0,
         fused_adam=False,
-        aggregate_relation_values_first=False,
+
         reduce_update_stat_syncs=False,
-        pinned_batch_transfer=False,
+
         device='cpu',
     ):
         if action_limit is None:
@@ -155,14 +154,11 @@ class TestV2TD3(unittest.TestCase):
             bc_reference_actor=bc_reference_actor,
             device=device,
             fused_adam=fused_adam,
-            aggregate_relation_values_first=aggregate_relation_values_first,
+
             reduce_update_stat_syncs=reduce_update_stat_syncs,
-            pinned_batch_transfer=pinned_batch_transfer,
+
         )
 
-    def test_pinned_batch_transfer_requires_cuda(self):
-        with self.assertRaisesRegex(ValueError, 'requires a CUDA device'):
-            self.make_engine(pinned_batch_transfer=True)
 
     def test_reduced_update_stat_syncs_batch_scalar_readback_and_match_updates(self):
         legacy = self.make_engine(policy_delay=2)
@@ -222,44 +218,6 @@ class TestV2TD3(unittest.TestCase):
                         actual_state['state'][parameter_id][name], expected_value,
                     )
 
-    def test_reusable_batch_transfer_preserves_fields_and_waits_before_reuse(self):
-        engine = self.make_engine(batch_size=2)
-        self.fill_replay(engine, counts=(0, 7), next_counts=(10, 2))
-        source = engine.replay.sample(2)
-        transfer = _ReusablePinnedReplayBatchTransfer(
-            device=torch.device('cpu'),
-            batch_size=2,
-            action_dim=2,
-            zone_storage_capacity=10,
-            pin_memory=False,
-        )
-        moved = transfer.transfer(source)
-        for actual, expected in (
-            (moved.obs.ego_features, source.obs.ego_features),
-            (moved.obs.goal_features, source.obs.goal_features),
-            (moved.obs.zone_features, source.obs.zone_features),
-            (moved.obs.presence_mask, source.obs.presence_mask),
-            (moved.next_obs.ego_features, source.next_obs.ego_features),
-            (moved.next_obs.zone_features, source.next_obs.zone_features),
-            (moved.action, source.action),
-            (moved.reward, source.reward),
-            (moved.done, source.done),
-            (moved.success, source.success),
-            (moved.near_goal, source.near_goal),
-            (moved.line_to_goal_safe, source.line_to_goal_safe),
-        ):
-            torch.testing.assert_close(actual, expected)
-
-        first_action_storage = moved.action.untyped_storage().data_ptr()
-        wait = mock.Mock()
-        wait.query.return_value = False
-        transfer._host_ready_event = wait
-        moved_again = transfer.transfer(engine.replay.sample(2))
-        wait.synchronize.assert_called_once_with()
-        self.assertEqual(
-            moved_again.action.untyped_storage().data_ptr(),
-            first_action_storage,
-        )
 
     def test_cuda_graph_update_compile_is_explicit_and_excludes_action_inference(self):
         engine = self.make_engine()
@@ -874,7 +832,7 @@ class TestV2TD3(unittest.TestCase):
     def test_three_optimization_flags_report_actual_scope_and_preserve_bindings(self):
         engine = self.make_engine(
             fused_adam=True,
-            aggregate_relation_values_first=True,
+
             bc_reference_actor=self.make_bc_reference(0.01),
         )
         model_names = (
@@ -891,14 +849,10 @@ class TestV2TD3(unittest.TestCase):
         metadata = engine.configure_compilation(compile_actor_loss=True, backend='eager')
         self.assertEqual(metadata['actor_loss_granularity'], 'tensor_block')
         self.assertEqual(metadata['optimizer_execution'], 'fused_adam')
-        self.assertEqual(metadata['relation_value_execution'], 'aggregate_then_project')
+        self.assertEqual(metadata['relation_value_execution'], 'project_then_aggregate')
         self.assertIn('actor_loss.tensor_block', metadata['enabled_objects'])
         for name in model_names:
             model = getattr(engine, name)
-            self.assertTrue(all(
-                layer.attention.aggregate_relation_values_first
-                for layer in model.zone_set_encoder.layers
-            ))
             self.assertEqual(
                 {key: id(p) for key, p in model.named_parameters()}, ids_before[name],
             )
@@ -3121,75 +3075,6 @@ class TestV2TD3(unittest.TestCase):
                 self.assertTrue(np.all(action >= np.array([-0.2, -0.3], dtype=np.float32)))
                 self.assertTrue(np.all(action <= np.array([0.2, 0.3], dtype=np.float32)))
 
-    def test_single_observation_fast_batch_matches_generic_dynamic_collate(self):
-        from brain_uav.observations import collate_single_v2_observation
-
-        for count in (0, 1, 6, 10):
-            observation = _observation(count, offset=2.0, scales=self.scales)
-            expected = collate_v2_observations([observation])
-            actual = collate_single_v2_observation(observation)
-            with self.subTest(zone_count=count):
-                for name in (
-                    'ego_features', 'goal_features', 'zone_features', 'presence_mask'
-                ):
-                    actual_tensor = getattr(actual, name)
-                    expected_tensor = getattr(expected, name)
-                    torch.testing.assert_close(
-                        actual_tensor, expected_tensor, rtol=0, atol=0
-                    )
-                    self.assertEqual(actual_tensor.shape, expected_tensor.shape)
-                    self.assertEqual(actual_tensor.dtype, expected_tensor.dtype)
-                    self.assertEqual(actual_tensor.device, expected_tensor.device)
-                    self.assertEqual(actual_tensor.stride(), expected_tensor.stride())
-                self.assertEqual(actual.ego_features.shape, (1, 6))
-                self.assertEqual(actual.goal_features.shape, (1, 4))
-                self.assertEqual(actual.zone_features.shape, (1, count, 19))
-                self.assertEqual(actual.presence_mask.shape, (1, count))
-                self.assertEqual(actual.ego_features.dtype, torch.float32)
-                self.assertEqual(actual.goal_features.dtype, torch.float32)
-                self.assertEqual(actual.zone_features.dtype, torch.float32)
-                self.assertEqual(actual.presence_mask.dtype, torch.bool)
-
-                source_fields = (
-                    ('ego_features', observation.ego_features),
-                    ('goal_features', observation.goal_features),
-                    ('zone_features', observation.zone_features),
-                    ('presence_mask', observation.presence_mask),
-                )
-                for name, source in source_fields:
-                    if source.size == 0:
-                        continue
-                    before = source.copy()
-                    tensor = getattr(actual, name)
-                    if tensor.dtype == torch.bool:
-                        tensor.reshape(-1)[0] = ~tensor.reshape(-1)[0]
-                    else:
-                        tensor.reshape(-1)[0] += 1.0
-                    np.testing.assert_array_equal(source, before)
-
-    def test_select_action_single_observation_fast_path_preserves_noise_rng(self):
-        engine = self.make_engine()
-        observation = _observation(6, scales=self.scales)
-        regular = engine.select_action(observation, exploration_noise=0.0)
-        fast = engine.select_action(
-            observation,
-            exploration_noise=0.0,
-            single_observation_fast_path=True,
-        )
-        np.testing.assert_array_equal(fast, regular)
-
-        regular_noisy = engine.select_action(
-            observation,
-            exploration_noise=0.05,
-            exploration_rng=np.random.default_rng(821),
-        )
-        fast_noisy = engine.select_action(
-            observation,
-            exploration_noise=0.05,
-            exploration_rng=np.random.default_rng(821),
-            single_observation_fast_path=True,
-        )
-        np.testing.assert_array_equal(fast_noisy, regular_noisy)
 
     def test_ann_action_inference_compile_is_independent_and_uses_current_parameters(self):
         torch.manual_seed(1201)

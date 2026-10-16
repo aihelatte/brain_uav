@@ -251,7 +251,7 @@ class TestGPUUpdate(TestCase):
         from brain_uav.trainers.v2_td3 import V2TD3UpdateEngine
         args=(e.actor,e.critic1,e.critic2,e.replay,.001,.001,.99,.01,.01,.02,2,2,e.action_low,e.action_high)
         with self.assertRaisesRegex(ValueError,'conflicts'):
-            V2TD3UpdateEngine(*args,gpu_td3_update=True,compile_actor_objective=True)
+            V2TD3UpdateEngine(*args,gpu_td3_update=True)
         with self.assertRaisesRegex(ValueError,'requires CUDA'):
             V2TD3UpdateEngine(*args,gpu_td3_update=True)
         with self.assertRaises(TypeError):

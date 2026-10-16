@@ -122,12 +122,10 @@ class TestBlockAttribution(unittest.TestCase):
         self.assertIn('block_attribution.record if block_attribution_wall and measured_phase and not profile_sections else None', source)
         self.assertIn('profile_total_steps = controlled_stage_step_offset + step_number + offset + 1', source)
         self.assertIn('bc_lambda=v2_bc_lambda(total_steps - 1, schedule=bc_schedule)', source)
-        self.assertIn("if compile_critic_update_front:\n            expected_compiled_entries", source)
 
     def test_cli_default_off_and_rejects_unrelated_mode(self):
         args = profile.build_parser().parse_args(['--model', 'snn', '--bc-checkpoint', 'unused.pt', '--output-dir', 'unused'])
-        self.assertIsNone(args.td3_block_attribution)
-        with self.assertRaisesRegex(ValueError, 'requires --td3-block-comparison'):
+        with self.assertRaises(SystemExit):
             profile.main(['--model', 'snn', '--bc-checkpoint', 'unused.pt', '--output-dir', 'unused',
                 '--td3-block-attribution', 'wall'])
 

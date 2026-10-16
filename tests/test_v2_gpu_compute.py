@@ -158,8 +158,7 @@ class TestGPUCompute(TestCase):
                         torch.save(dict(contract=contract, initial=initial), reference)
                     args = SimpleNamespace(model=model, seed=7, bc_checkpoint=checkpoint,
                         validation_pool=pool_file, gpu_td3_compute=enabled, snn_time_window=4,
-                        correctness_updates=8, comparison_bc_schedule='smooth-final',
-                        td3_block_reference=reference)
+                        correctness_updates=8, comparison_bc_schedule='smooth-final')
                     error = RuntimeError('stop at first compile')
                     def configure(engine, *a, **kw):
                         self.assertTrue(all(getattr(engine,n).training for n in ('actor','critic1','critic2')))
@@ -524,8 +523,8 @@ class TestGPUCompute(TestCase):
             self.assertEqual(len(calls),2)
             self.assertTrue(all('--gpu-compute-first-critic-loss-only' in c and 'correctness' in c for c in calls))
             self.assertTrue(all('--gpu-compute-error-recovery' in c and '--gpu-compute-trace-retained-gradient' in c for c in calls))
-            self.assertNotIn('--td3-block-reference',calls[0])
-            self.assertIn('--td3-block-reference',calls[1])
+            self.assertNotIn('--gpu-compute-reference',calls[0])
+            self.assertIn('--gpu-compute-reference',calls[1])
 
     def test_first_critic_loss_preserves_full_preceding_sequence_cpu(self):
         from brain_uav.scripts import profile_v2_td3 as p, train_v2_td3 as single
@@ -565,7 +564,7 @@ class TestGPUCompute(TestCase):
             self.assertTrue((root/reference['error_states'][15]).exists())
             reference['contract']['version'] = 3
             torch.save(reference,root/'obsolete.pt')
-            args.gpu_td3_compute = True; args.td3_block_reference = root/'obsolete.pt'
+            args.gpu_td3_compute = True; args.gpu_compute_reference = root/'obsolete.pt'
             with mock.patch.object(d.subprocess,'run',return_value=SimpleNamespace(stdout='fixture')):
                 with self.assertRaisesRegex(ValueError,'contract mismatch'):
                     d.correctness(args,prepared=SimpleNamespace(reward_config=RewardConfig()),
@@ -646,16 +645,16 @@ class TestGPUCompute(TestCase):
         for extra, message in ((dict(gpu_td3_compute=1),'must be a bool'),
                 (dict(gpu_td3_compute=True),'requires CUDA'),
                 (dict(gpu_td3_compute=True,gpu_td3_update=True),'conflicts'),
-                (dict(gpu_td3_compute=True,non_blocking_batch_transfer=True),'conflicts'),
-                (dict(gpu_td3_compute=True,compile_actor_objective=True),'conflicts')):
+                (dict(gpu_td3_compute=True,non_blocking_batch_transfer=True),'conflicts')):
             with self.subTest(extra=extra), self.assertRaisesRegex((TypeError,ValueError),message):
                 V2TD3UpdateEngine(**kw,**extra)
 
     def test_cli_and_api_defaults_explicit(self):
         from brain_uav.scripts import train_v2_td3 as single, run_v2_td3_curriculum as curriculum, profile_v2_td3 as profile
         from brain_uav.trainers.v2_formal_training import build_v2_stage_engine
-        for function in (single.run_v2_td3_stage,curriculum.run_v2_curriculum,build_v2_stage_engine):
-            self.assertIs(inspect.signature(function).parameters['gpu_td3_compute'].default,False)
+        for function in (single.run_v2_td3_stage,curriculum.run_v2_curriculum):
+            self.assertIsNone(inspect.signature(function).parameters['gpu_td3_compute'].default)
+        self.assertIs(inspect.signature(build_v2_stage_engine).parameters['gpu_td3_compute'].default,False)
         args = profile.build_parser().parse_args(['--model','snn','--output-dir','unused','--gpu-td3-compute'])
         self.assertTrue(args.gpu_td3_compute)
         self.assertFalse(profile.build_parser().parse_args(['--model','ann','--output-dir','unused']).gpu_td3_compute)
@@ -817,6 +816,7 @@ class TestGPUCompute(TestCase):
                     for p,v in zip(self.params,self.values):
                         if p.grad is not None: p.add_(.001); v.add_(1.)
         u.adams=(Adam(u.actor_params),Adam(u.critic_params))
+        u.initialize_actor_loss_scalars()
         u.graphs={}; u.tensor_evidence={}; u.graph_limit=8*(e.replay.zone_storage_capacity+1)**2
         u.zone_limit=e.replay.zone_storage_capacity; u.bound_device=torch.device('cpu')
         u.published=[0,0]; u.injections=torch.zeros(4)

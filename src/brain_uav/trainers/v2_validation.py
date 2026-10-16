@@ -556,7 +556,7 @@ def evaluate_v2_fixed_validation(
     max_failures: int = 5,
     device: str | torch.device = 'cpu',
     reporter: V2ExperimentReporter | None = None,
-    cpu_deduplication: bool = False,
+    cpu_deduplication: bool = True,
 ) -> V2ValidationResult:
     if type(cpu_deduplication) is not bool:
         raise TypeError('cpu_deduplication must be a bool.')

@@ -19,7 +19,7 @@ import torch
 class TestFormalCPUDeduplication(TestCase):
     def test_stage_and_curriculum_cli_default_and_explicit(self):
         for enabled in (False, True):
-            extra = ['--cpu-deduplication'] if enabled else []
+            extra = ['--cpu-deduplication'] if enabled else ['--no-cpu-deduplication']
             for module, argv, target in (
                 (stage, ['--stage','easy','--init-checkpoint','bc.pt','--output','out.pt',
                          '--metrics-out','out.json','--validation-pool','pool.json'], 'run_v2_td3_stage'),
@@ -34,7 +34,7 @@ class TestFormalCPUDeduplication(TestCase):
                     self.assertEqual(runner.call_args.kwargs['cpu_deduplication'], enabled)
         for function in (stage.run_v2_td3_stage, curriculum.run_v2_curriculum,
                          V2FormalStageTrainer):
-            self.assertIs(inspect.signature(function).parameters['cpu_deduplication'].default, False)
+            self.assertIs(inspect.signature(function).parameters['cpu_deduplication'].default, True)
 
     def test_trainer_environment_action_and_execution_record(self):
         for enabled in (False, True):

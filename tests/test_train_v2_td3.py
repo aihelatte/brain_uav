@@ -201,8 +201,6 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertIsNone(args.critic_lr)
         self.assertFalse(args.compile_critic_encoder)
         self.assertFalse(args.compile_target_encoders)
-        self.assertFalse(args.pinned_batch_transfer)
-        self.assertFalse(args.aggregate_relation_values_first)
         self.assertEqual(args.periodic_snapshot_interval_steps, 50_000)
         # D1 (this diagnostic pass): the CUDA Graph/compile flags below are
         # tri-state (None = "use the 2026-09-22-verified default", see
@@ -247,11 +245,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         enabled_optimizations = parser.parse_args([
             '--stage', 'easy', '--init-checkpoint', 'x',
             '--output', 'x', '--metrics-out', 'x', '--validation-pool', 'x',
-            '--pinned-batch-transfer',
-            '--aggregate-relation-values-first',
         ])
-        self.assertTrue(enabled_optimizations.pinned_batch_transfer)
-        self.assertTrue(enabled_optimizations.aggregate_relation_values_first)
         with self.assertRaises(SystemExit):
             parser.parse_args([
                 '--stage', 'easy_two_zone',
@@ -768,7 +762,9 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertEqual(trainer_type.call_args.kwargs['bc_schedule'], 'smooth-final')
         self.assertTrue(trainer_type.call_args.kwargs['cpu_deduplication'])
         execution = summary['execution_configuration']
-        self.assertEqual(stage_start['execution_configuration'], execution)
+        self.assertEqual(stage_start['execution_configuration']['cpu_deduplication'], execution['cpu_deduplication'])
+        self.assertEqual(stage_start['execution_configuration']['gpu_td3_compute']['phase'], 'configuration')
+        self.assertEqual(execution['gpu_td3_compute']['phase'], 'completed')
         self.assertEqual(stage_end['execution_configuration'], execution)
         self.assertEqual(metrics_writer.call_args.args[1]['execution_configuration'], execution)
         self.assertTrue(execution['cpu_deduplication']['training_environment'])

@@ -725,9 +725,9 @@ def run(args):
     if args.device!='cuda': raise ValueError('GPU TD3 diagnosis requires CUDA; CPU is not a substitute.')
     if args.comparison_eager_cpu or args.detailed_profiler_updates or args.compiled_performance_diagnostic_updates:
         raise ValueError('GPU TD3 workers use fixed formal CUDA config and no timing profiler.')
-    if any(getattr(args,n) for n in ('compile_critic_update_front','compile_actor_objective','cuda_graph_critic_tail',
-        'window_update_statistics','reuse_update_buffers','pinned_batch_transfer','aggregate_relation_values_first',
-        'single_observation_fast_path','td3_block_suite','snn_path_consistency','td3_block_attribution')):
+    if any(getattr(args,n) for n in (
+        'window_update_statistics','reuse_update_buffers',
+        'snn_path_consistency')):
         raise ValueError('GPU suite conflicts with other experimental paths.')
     if getattr(args,'gpu_td3_sampling_cost',False):
         if args.gpu_td3_suite or args.gpu_td3_worker or args.gpu_td3_update or args.gpu_td3_reference:

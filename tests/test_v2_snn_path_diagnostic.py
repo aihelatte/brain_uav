@@ -295,7 +295,7 @@ class TestSNNPathDiagnostic(unittest.TestCase):
             diagnostic.run_snn_path_diagnostic(checkpoint='unused', validation_pool='unused', output_dir='unused', device='cpu')
         with self.assertRaisesRegex(ValueError, 'cannot be combined'):
             profile.main(['--model', 'snn', '--snn-path-consistency', '--checkpoint', 'failed.pt',
-                '--validation-pool', 'pool.json', '--output-dir', 'out', '--compile-actor-objective'])
+                '--validation-pool', 'pool.json', '--output-dir', 'out', '--window-update-statistics'])
 
 
 if __name__ == '__main__':

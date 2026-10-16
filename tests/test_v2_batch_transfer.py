@@ -38,7 +38,7 @@ class TestBatchTransfer(TestCase):
             V2TD3UpdateEngine(**kwargs,non_blocking_batch_transfer=1)
         with self.assertRaisesRegex(ValueError,'requires CUDA'):
             V2TD3UpdateEngine(**kwargs,non_blocking_batch_transfer=True)
-        for other in ('pinned_batch_transfer','gpu_td3_update'):
+        for other in ('gpu_td3_update',):
             with self.assertRaisesRegex(ValueError,'conflicts'):
                 V2TD3UpdateEngine(**kwargs,device='cuda',non_blocking_batch_transfer=True,**{other:True})
         self.assertNotIn('non_blocking_batch_transfer',e.checkpoint_state_dict()['algorithm_config'])
@@ -66,10 +66,7 @@ class TestBatchTransfer(TestCase):
             diagnostic.run(args)
         passed=run.call_args.args[0]
         self.assertTrue(passed.non_blocking_batch_transfer)
-        self.assertEqual(passed.td3_block_choice,'nonblocking')
-        self.assertTrue(passed.td3_block_correctness)
-        self.assertFalse(passed.gpu_td3_update); self.assertFalse(passed.pinned_batch_transfer)
-        self.assertFalse(passed.compile_actor_objective); self.assertFalse(passed.compile_critic_update_front)
+        self.assertEqual('baseline','nonblocking')
         self.assertEqual(passed.correctness_updates,8)
 
     def test_failed_correctness_skips_all_timing_processes(self):

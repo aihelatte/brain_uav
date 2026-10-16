@@ -178,6 +178,11 @@ class TestCPUDeduplication(TestCase):
                 try: return original(**kw)
                 finally: e.gpu_td3_compute=True
             e.update_once=cpu_update
+            if enabled:
+                select = e.select_action
+                def different_policy(*a, **kw):
+                    return select(*a, **kw) + np.float32(.001)
+                e.select_action = different_policy
             rows=[]
             pool=SimpleNamespace(stage_seed=7,scenarios=[dict(scenario_id='fixed',payload=_scenario(
                 [-5.,0.,10.,0.,0.],[30.,0.,10.],[NoFlyZone('e',Ellipsoid([10.,3.,10.],2.,1.,1.))]))])
@@ -190,13 +195,17 @@ class TestCPUDeduplication(TestCase):
                     formal_config=V2FormalTrainingConfig(stage='easy',batch_size=e.batch_size,replay_capacity=64,actor_freeze_steps=0),
                     bc_checkpoint=Path('unused'),model='ann',snn_time_window=4,device=torch.device('cpu'),
                     warmup_steps=8,measured_steps=3,gpu_td3_compute=True,
-                    cpu_deduplication=enabled,deduplication_evidence=rows)
+                    cpu_deduplication=enabled,deduplication_evidence=rows,
+                    deduplication_fixed_actions=evidence[0] if enabled else None)
             self.assertEqual(result['cpu_deduplication'],enabled)
             self.assertFalse(result['environment_geometry_diagnostic']['enabled'])
             self.assertEqual(sum(row['measured'] for row in rows),3)
             evidence.append(rows)
-        comparison=compare_evidence(*evidence)
+        from brain_uav.scripts.v2_cpu_dedup_diagnostic import compare_environment_evidence
+        comparison=compare_environment_evidence(*evidence)
         self.assertTrue(comparison['passed'],comparison)
+        self.assertFalse(compare_evidence(*evidence)['passed'])
+        self.assertTrue(all(row['cpu_same_input_passed'] for row in evidence[1]))
 
     def test_server_driver_gates_timing_and_retains_failure_report(self):
         from brain_uav.scripts import profile_v2_td3 as p, v2_cpu_dedup_diagnostic as d
@@ -213,22 +222,31 @@ class TestCPUDeduplication(TestCase):
             report=json.loads((root/'review/summary.json').read_text(encoding='utf-8'))
             self.assertFalse(report['passed'])
             self.assertEqual(len(calls),1)
-            self.assertIn('--cpu-deduplication-evidence',calls[0])
+            self.assertEqual(calls[0][calls[0].index('--gpu-compute-worker')+1], 'correctness')
             self.assertNotIn('--cpu-deduplication',calls[0])
-            self.assertTrue((root/'review/correctness_A.log').exists())
+            self.assertTrue((root/'review/strict_after_baseline.log').exists())
 
     def test_server_driver_exact_gate_and_serial_timing(self):
         from brain_uav.scripts import profile_v2_td3 as p, v2_cpu_dedup_diagnostic as d
-        for mismatch in (True,False):
+        for mismatch,comparison in ((True,None),(False,None),(True,'A'),(False,'A'),(True,'B'),(False,'B'),('cross_revision','A')):
             with self.subTest(mismatch=mismatch), TemporaryDirectory() as directory:
                 root=Path(directory)/'run'
                 args=p.build_parser().parse_args(['--model','snn','--device','cuda','--gpu-td3-compute',
                     '--bc-checkpoint','bc.pt','--validation-pool','pool.json','--output-dir',str(root),
                     '--steps-per-level','3','--repeats','2','--gpu-compute-environment-diagnostic'])
+                args.acceptance_comparison=comparison
+                args.baseline_source=Path(directory)/'before'/'source'
+                (args.baseline_source/'src/brain_uav').mkdir(parents=True)
+                (args.baseline_source.parent/'manifest.json').write_text(json.dumps({'head':'saved','files':{}}))
                 calls=[]
                 def worker(command,**kw):
                     calls.append(command)
                     output=Path(command[command.index('--output-dir')+1]); (output/'other').mkdir(parents=True)
+                    if command[command.index('--gpu-compute-worker')+1]=='correctness':
+                        (output/'correctness.json').write_text(json.dumps({'passed':True}))
+                        if '-c' in command:
+                            torch.save([{'actor.weight':torch.tensor([2. if mismatch=='cross_revision' and output.name=='strict_after_compute' else 1.])}], command[5])
+                        return SimpleNamespace(returncode=0)
                     enabled='--cpu-deduplication' in command
                     evidence='--cpu-deduplication-evidence' in command
                     instrumented='--gpu-compute-environment-diagnostic' in command
@@ -240,14 +258,16 @@ class TestCPUDeduplication(TestCase):
                     item=dict(measured_steps=3,scenario_coverage=[],timing=timing,
                         batch_transfer_window_completion={'td3_wall_including_final_window_wait_seconds':1.},
                         critic_encoder_compile={'valid_for_speed_comparison':True},
-                        local_optimizations={'gpu_td3_compute':{'effective':True,'measurement_new_captures':0}},
+                        local_optimizations={'gpu_td3_compute':{'effective':'--gpu-td3-compute' in command,'measurement_new_captures':0}},
                         server_load_before={},server_load_after={})
                     rows=[dict(item,repeat=i) for i in range(int(command[command.index('--repeats')+1]))]
                     data.update(cpu_deduplication=enabled,cpu_deduplication_evidence=evidence,
                         valid_for_speed_comparison=not evidence and not instrumented,runs={'compute':rows})
                     (output/'other/local_optimization_summary.json').write_text(json.dumps(data))
                     if evidence:
-                        steps=[dict(measured=True,rng='different' if mismatch and enabled else 'same')]*3
+                        steps=[dict(step=i, measured=True,action=[0.,0.],action_bits='same',input='same',output='same',
+                            outcome='same',state='different' if mismatch and output.name.endswith('_B') else 'same',
+                            cpu_same_input_passed=True,rng=output.name) for i in range(3)]
                         (output/'other/rollout_0.json').write_text(json.dumps({'steps':steps}))
                     if instrumented:
                         (output/'review').mkdir()
@@ -256,13 +276,16 @@ class TestCPUDeduplication(TestCase):
                 with mock.patch.object(d.subprocess,'run',side_effect=worker):
                     if mismatch:
                         with self.assertRaisesRegex(RuntimeError,'timing skipped'): d.run(args)
-                        self.assertEqual(len(calls),2)
+                        self.assertEqual(len(calls),4 if mismatch=='cross_revision' else 2+(4 if comparison=='A' else 2))
+                        self.assertFalse(any('--repeats' in c and '--cpu-deduplication-evidence' not in c for c in calls))
                     else:
                         report=d.run(args)
                         self.assertTrue(report['passed'])
                         self.assertIn('both A and B', report['ab_changes']['common'][0])
-                        self.assertEqual(len(report['ab_changes']['switch']), 3)
-                        self.assertEqual(len(calls),5)
+                        self.assertEqual(len(report['ab_changes']['switch']), 1 if comparison else 3)
+                        strict_count=4 if comparison=='A' else 2
+                        self.assertEqual(len(calls),5+strict_count)
+                        calls=calls[strict_count:]
                         self.assertEqual([('--cpu-deduplication-evidence' in c) for c in calls],
                             [True,True,False,False,False])
                         self.assertEqual([('--gpu-compute-environment-diagnostic' in c) for c in calls],

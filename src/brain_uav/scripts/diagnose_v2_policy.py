@@ -222,7 +222,7 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
             'actor_eval': True, 'inference_mode': True, 'exploration_noise': 0.0,
             'compile': {'enabled': False, 'backend': None, 'cuda_graphs': False},
             'cache_ellipsoid_segment_clearance': env.cache_ellipsoid_segment_clearance,
-            'single_observation_fast_path': False,
+
             'max_scenes': max_scenes, 'evaluated_scene_count': len(records),
             'count_operations': count_operations,
             'full_pool': len(records) == pool.scenario_count,

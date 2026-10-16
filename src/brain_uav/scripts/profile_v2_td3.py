@@ -803,7 +803,7 @@ class _CompiledPathProfiler:
                 ),
             }
         available.sort(
-            key=lambda event: cls._event_value(event, self_metric) or 0.0,
+            key=lambda event: (cls._event_value(event, self_metric)),
             reverse=True,
         )
 
@@ -822,7 +822,7 @@ class _CompiledPathProfiler:
             'operation_count': len(other_events),
             'calls': sum(int(event.count) for event in other_events),
             'self_time_us': sum(
-                cls._event_value(event, self_metric) or 0.0
+                (cls._event_value(event, self_metric))
                 for event in other_events
             ),
             'total_time_us': None,
@@ -914,7 +914,7 @@ class _CompiledPathProfiler:
             rows.sort(
                 key=lambda row: (
                     row['self_time_us'] is not None,
-                    row['self_time_us'] or 0.0,
+                    (row['self_time_us']),
                 ),
                 reverse=True,
             )
@@ -957,8 +957,8 @@ class _CompiledPathProfiler:
         )
         cpu_associated_cuda_events = [
             event for event in cpu_events
-            if (self._event_value(event, 'self_device_time_total') or 0.0) > 0.0
-            or (self._event_value(event, 'device_time_total') or 0.0) > 0.0
+            if ((self._event_value(event, 'self_device_time_total'))) > 0.0
+            or ((self._event_value(event, 'device_time_total'))) > 0.0
         ]
         cpu_associated_cuda_top, cpu_associated_cuda_other = (
             self._operation_summary(
@@ -2780,9 +2780,9 @@ def _run_compiled_numerics_check(
     compile_action_inference: bool = False,
     cuda_graph_action_inference: bool = False,
     cache_ellipsoid_segment_clearance: bool = False,
-    aggregate_relation_values_first: bool = False,
+
     reduce_update_stat_syncs: bool = False,
-    pinned_batch_transfer: bool = False,
+
     cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
 ) -> dict[str, Any]:
@@ -2819,9 +2819,9 @@ def _run_compiled_numerics_check(
             snn_time_window=snn_time_window,
             prepared_initialization=prepared,
             fused_adam=fused_adam,
-            aggregate_relation_values_first=aggregate_relation_values_first,
+
             reduce_update_stat_syncs=reduce_update_stat_syncs,
-            pinned_batch_transfer=pinned_batch_transfer,
+
         )
         reference = reference_components.engine
         compiled = compiled_components.engine
@@ -3384,9 +3384,9 @@ def _run_diagnostic_level(
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
     cuda_graph_action_inference: bool = False,
-    aggregate_relation_values_first: bool = False,
+
     reduce_update_stat_syncs: bool = False,
-    pinned_batch_transfer: bool = False,
+
     cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
     compiled_path_profiler_updates: int = 0,
@@ -3394,26 +3394,22 @@ def _run_diagnostic_level(
     environment_performance_diagnostic: bool = False,
     cpu_deduplication: bool = False,
     deduplication_evidence: list | None = None,
+    deduplication_fixed_actions: list | None = None,
     cache_ellipsoid_segment_clearance: bool = False,
-    single_observation_fast_path: bool = False,
+
     window_update_statistics: bool = False,
     reuse_update_buffers: bool = False,
-    cuda_graph_critic_tail: bool = False,
+
     gpu_td3_update: bool = False,
     gpu_td3_compute: bool = False,
     non_blocking_batch_transfer: bool = False,
     batch_transfer_window_timing: bool = False,
-    compile_critic_update_front: bool = False,
-    compile_actor_objective: bool = False,
-    critic_tail_internal_timing: bool = False,
+
+
     block_attribution_wall: bool = False,
     controlled_stage_step_offset: int = 0,
     bc_schedule: str = 'default',
 ) -> dict[str, Any]:
-    if type(critic_tail_internal_timing) is not bool:
-        raise TypeError('critic_tail_internal_timing must be a bool.')
-    if critic_tail_internal_timing and not cuda_graph_critic_tail:
-        raise ValueError('Internal timing requires the critic tail path.')
     scenario_count = len(pool.scenarios)
     if scenario_count == 0 or measured_steps < scenario_count:
         raise ValueError('measured_steps must cover every fixed-pool scenario.')
@@ -3439,22 +3435,19 @@ def _run_diagnostic_level(
         snn_time_window=snn_time_window,
         prepared_initialization=prepared,
         fused_adam=fused_adam,
-        aggregate_relation_values_first=aggregate_relation_values_first,
+
         reduce_update_stat_syncs=reduce_update_stat_syncs,
         window_update_statistics=window_update_statistics,
         reuse_update_buffers=reuse_update_buffers,
-        cuda_graph_critic_tail=cuda_graph_critic_tail,
+
         gpu_td3_update=gpu_td3_update,
         gpu_td3_compute=gpu_td3_compute,
         non_blocking_batch_transfer=non_blocking_batch_transfer,
-        compile_critic_update_front=compile_critic_update_front,
-        compile_actor_objective=compile_actor_objective,
-        pinned_batch_transfer=pinned_batch_transfer,
+
+
     )
     engine = components.engine
     engine.actor.train()
-    if type(single_observation_fast_path) is not bool:
-        raise TypeError('single_observation_fast_path must be a bool.')
     if type(cache_ellipsoid_segment_clearance) is not bool:
         raise TypeError('cache_ellipsoid_segment_clearance must be a bool.')
     env = V2StaticNoFlyTrajectoryEnv(
@@ -3466,6 +3459,19 @@ def _run_diagnostic_level(
         cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
         cpu_deduplication=cpu_deduplication,
     )
+    # Evidence-only shadow: identical resets/actions, no policy or TD3 updates.
+    # Each comparison gets its own bounded action sequence, never a trained-policy hash gate.
+    shadow = None
+    if deduplication_evidence is not None:
+        from copy import deepcopy
+        from brain_uav.scripts.v2_cpu_dedup_diagnostic import digest, checked_action
+        shadow = deepcopy(env)
+        shadow.cpu_deduplication = not cpu_deduplication
+        def env_value(result, environment):
+            obs, *rest = result
+            return ([getattr(obs, name) for name in
+                ('ego_features','goal_features','zone_features','presence_mask')], rest,
+                environment.state, environment.rng.bit_generator.state)
     performance_diagnostic_enabled = bool(
         environment_performance_diagnostic or compiled_path_profiler_updates > 0
     )
@@ -3515,15 +3521,14 @@ def _run_diagnostic_level(
         'cuda_graph_action_inference_requested': bool(
             cuda_graph_action_inference
         ),
-        'pinned_batch_transfer_requested': bool(pinned_batch_transfer),
+
         'non_blocking_batch_transfer_requested': bool(non_blocking_batch_transfer),
         'reduce_update_stat_syncs_requested': bool(reduce_update_stat_syncs),
         'cuda_graph_updates_requested': bool(cuda_graph_updates),
         'cuda_graph_actor_update_requested': bool(cuda_graph_actor_update),
         'optimizer_execution': 'fused_adam' if fused_adam else 'adam',
         'relation_value_execution': (
-            'aggregate_then_project' if aggregate_relation_values_first
-            else 'project_then_aggregate'
+            'project_then_aggregate'
         ),
         'actor_loss_granularity': 'eager',
         'actor_loss_coefficient_execution': 'per_update',
@@ -3533,8 +3538,7 @@ def _run_diagnostic_level(
             if reduce_update_stat_syncs else 'per_scalar'
         ),
         'batch_transfer_execution': (
-            'reusable_pinned_non_blocking'
-            if pinned_batch_transfer else 'pageable_non_blocking_to_device'
+            'pageable_non_blocking_to_device'
             if non_blocking_batch_transfer else 'blocking_to_device'
         ),
         'enabled_objects': [],
@@ -3753,12 +3757,6 @@ def _run_diagnostic_level(
             expected_compiled_entries[expected_compiled_entries.index(
                 'target_block'
             )] = 'target_critic_td_block'
-        if compile_critic_update_front:
-            expected_compiled_entries = [name for name in expected_compiled_entries
-                if name not in ('critic_block', 'target_block', 'target_critic_td_block')]
-            expected_compiled_entries.append('critic_update_front')
-        if compile_actor_objective:
-            expected_compiled_entries.append('actor_objective')
         compiled_path_profiler = _CompiledPathProfiler(
             device,
             requested_updates=compiled_path_profiler_updates,
@@ -3818,10 +3816,6 @@ def _run_diagnostic_level(
                 if device.type == 'cuda':
                     torch.cuda.synchronize(device)
                 loop_warmup_wall_seconds = perf_counter() - loop_warmup_started
-                if critic_tail_internal_timing:
-                    if engine._critic_tail is None or not engine._critic_tail.graphs:
-                        raise RuntimeError('Critic tail must be captured during warmup before internal timing.')
-                    engine._critic_tail.reset_internal_timing(enabled=True)
                 if gpu_td3_update or gpu_td3_compute:
                     if engine._gpu_update_executor is None:
                         raise RuntimeError('GPU updater did not initialize during warmup.')
@@ -3846,12 +3840,16 @@ def _run_diagnostic_level(
                     formal_config.noise_schedule.policy_initial,
                     formal_config.noise_schedule.clip_initial))
             if observation is None:
-                observation, _ = call(
+                observation, reset_info = call(
                     'scenario_reset_wall_seconds',
                     lambda: env.reset(options={
                         'scenario': pool.scenarios[scenario_index]['payload'],
                     }),
                 )
+                if shadow is not None:
+                    shadow_result = shadow.reset(options={'scenario': pool.scenarios[scenario_index]['payload']})
+                    if digest(env_value((observation, reset_info), env)) != digest(env_value(shadow_result, shadow)):
+                        raise AssertionError('CPU reset environment/RNG mismatch; timing skipped.')
                 episode_transitions = []
                 slot_refs = []
             audit_step = (
@@ -3881,21 +3879,35 @@ def _run_diagnostic_level(
                         )
                 action = call(
                     'action_inference_wall_seconds',
-                    lambda: engine.select_action(
-                        observation,
+                    lambda: (checked_action if shadow is not None else lambda e, o, **kw: e.select_action(o, **kw))(
+                        engine, observation,
                         exploration_noise=(
                             effective_noise[0]
                         ),
                         exploration_rng=components.exploration_rng,
-                        single_observation_fast_path=single_observation_fast_path,
-                        **({'cpu_deduplication': True} if cpu_deduplication else {}),
+
+                        **({'cpu_deduplication': True} if cpu_deduplication and shadow is None else {}),
                     ),
                     cuda_event=True,
                 )
+                policy_action = np.asarray(action).copy() if shadow is not None else None
+                if deduplication_fixed_actions is not None:
+                    index = step_number
+                    if index >= len(deduplication_fixed_actions):
+                        raise AssertionError('Fixed action sequence exhausted; timing skipped.')
+                    action = np.asarray(deduplication_fixed_actions[index]['action'], dtype=np.float32).copy()
+                if shadow is not None:
+                    if line_safe != shadow.line_to_goal_is_safe(shadow.state[:3], clearance=formal_config.terminal_geo_safe_clearance):
+                        raise AssertionError('CPU pre-action geometry mismatch; timing skipped.')
                 next_observation, reward, terminated, truncated, info = call(
                     'environment_step_wall_seconds',
                     lambda: env.step(action),
                 )
+            if shadow is not None:
+                shadow_result = shadow.step(np.asarray(action).copy())
+                result_value = (next_observation, reward, terminated, truncated, info)
+                if digest(env_value(result_value, env)) != digest(env_value(shadow_result, shadow)):
+                    raise AssertionError('CPU fixed-action environment/observation/info/RNG mismatch; timing skipped.')
             done = bool(terminated or truncated)
             near_goal = _near_goal(info, radius=formal_config.near_goal_radius)
             transition = (
@@ -4002,6 +4014,9 @@ def _run_diagnostic_level(
                 deduplication_evidence.append(step_evidence(engine, components.exploration_rng,
                     step_number, measured_phase, observation, action, next_observation,
                     reward, terminated, truncated, info, env.state, line_safe))
+                deduplication_evidence[-1]['cpu_same_input_passed'] = True
+                deduplication_evidence[-1]['policy_action_bits'] = digest(policy_action)
+                deduplication_evidence[-1]['environment_rng'] = digest(env.rng.bit_generator.state)
             observation = next_observation
             if done:
                 if window_update_statistics:
@@ -4155,9 +4170,7 @@ def _run_diagnostic_level(
             'td3_wall_including_final_window_wait_seconds':update_seconds+completion_wait_seconds,
             'scope':'Original per-call TD3 wall plus the existing diagnostic window completion wait; conservative full-stream drain, not pure GPU compute.'}
             if batch_transfer_window_timing else None),
-        'critic_tail_internal_timing': (engine._critic_tail.internal_timing_report()
-            if engine._critic_tail is not None else {'enabled': False, 'calls': 0}),
-        'critic_tail_timing_note': 'Critic optimizer section includes stable gradient copies and optional critic targets; target_soft_update still includes actor targets.',
+
         'controlled_stage_step_offset': controlled_stage_step_offset,
         'bc_schedule': bc_schedule,
         'loop_warmup_wall_seconds': loop_warmup_wall_seconds,
@@ -4269,14 +4282,12 @@ def run_v2_td3_timing_diagnostic(
     cache_actor_loss_coefficients: bool = False,
     compile_action_inference: bool = False,
     cuda_graph_action_inference: bool = False,
-    aggregate_relation_values_first: bool = False,
+
     reduce_update_stat_syncs: bool = False,
     window_update_statistics: bool = False,
     reuse_update_buffers: bool = False,
-    cuda_graph_critic_tail: bool = False,
-    compile_critic_update_front: bool = False,
-    compile_actor_objective: bool = False,
-    pinned_batch_transfer: bool = False,
+
+
     cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
     check_compiled_numerics: bool = False,
@@ -4284,14 +4295,14 @@ def run_v2_td3_timing_diagnostic(
     compiled_numerics_group: str | None = None,
     compiled_performance_diagnostic_updates: int = 0,
     cache_ellipsoid_segment_clearance: bool = False,
-    single_observation_fast_path: bool = False,
+
 ) -> dict[str, Any]:
     if model not in ('ann', 'snn'):
         raise ValueError('model must be ann or snn.')
-    for name, value in (('window_update_statistics', window_update_statistics), ('reuse_update_buffers', reuse_update_buffers), ('cuda_graph_critic_tail', cuda_graph_critic_tail)):
+    for name, value in (('window_update_statistics', window_update_statistics), ('reuse_update_buffers', reuse_update_buffers)):
         if type(value) is not bool:
             raise TypeError(f'{name} must be a bool.')
-    if (window_update_statistics or reuse_update_buffers or cuda_graph_critic_tail) and (
+    if ((window_update_statistics) or (reuse_update_buffers)) and (
         check_compiled_numerics or compiled_numerics_only or compiled_numerics_group
     ):
         raise ValueError('Original compiled-numeric checker does not support local optimization flags; use the controlled comparison checks separately.')
@@ -4329,12 +4340,12 @@ def run_v2_td3_timing_diagnostic(
         ('compile_actor_loss', compile_actor_loss),
         ('cache_actor_loss_coefficients', cache_actor_loss_coefficients),
         ('compile_action_inference', compile_action_inference),
-        ('aggregate_relation_values_first', aggregate_relation_values_first),
+
         ('reduce_update_stat_syncs', reduce_update_stat_syncs),
         ('cuda_graph_updates', cuda_graph_updates),
         ('cuda_graph_actor_update', cuda_graph_actor_update),
         ('cache_ellipsoid_segment_clearance', cache_ellipsoid_segment_clearance),
-        ('single_observation_fast_path', single_observation_fast_path),
+
     ):
         if type(value) is not bool:
             raise TypeError(f'{name} must be a bool.')
@@ -4359,25 +4370,7 @@ def run_v2_td3_timing_diagnostic(
         if compiled_numerics_group not in ('A', 'B', 'C'):
             raise ValueError('compiled_numerics_group must be A, B, or C.')
         if (
-            compile_critic_encoder
-            or compile_target_encoders
-            or compile_actors
-            or compile_critic_block
-            or compile_target_block
-            or compile_shared_relations
-            or compile_snn_target_encoder
-            or fused_adam
-            or compile_actor_loss
-            or compile_action_inference
-            or aggregate_relation_values_first
-            or reduce_update_stat_syncs
-            or cuda_graph_updates
-            or cuda_graph_actor_update
-            or frozen_critic_strategy != 'eager'
-            or check_compiled_numerics
-            or compiled_numerics_only
-            or profiler_updates
-            or compiled_profiler_updates
+            (compile_critic_encoder) or (compile_target_encoders) or (compile_actors) or (compile_critic_block) or (compile_target_block) or (compile_shared_relations) or (compile_snn_target_encoder) or (fused_adam) or (compile_actor_loss) or (compile_action_inference) or (reduce_update_stat_syncs) or (cuda_graph_updates) or (cuda_graph_actor_update) or (frozen_critic_strategy != 'eager') or (check_compiled_numerics) or (compiled_numerics_only) or (profiler_updates) or (compiled_profiler_updates)
         ):
             raise ValueError(
                 'compiled_numerics_group is an isolated mode and cannot be '
@@ -4410,10 +4403,7 @@ def run_v2_td3_timing_diagnostic(
             'compiled_no_grad_context requires a compiled critic path.'
         )
     if check_compiled_numerics and not (
-        compile_target_encoders or compile_target_block or compile_snn_target_encoder
-        or fused_adam or compile_actor_loss or compile_action_inference
-        or aggregate_relation_values_first or reduce_update_stat_syncs
-        or cuda_graph_updates
+        (compile_target_encoders) or (compile_target_block) or (compile_snn_target_encoder) or (fused_adam) or (compile_actor_loss) or (compile_action_inference) or (reduce_update_stat_syncs) or (cuda_graph_updates)
     ):
         raise ValueError(
             'check_compiled_numerics requires a target compile scope or one '
@@ -4487,8 +4477,6 @@ def run_v2_td3_timing_diagnostic(
         raise ValueError(
             'cuda_graph_action_inference requires a CUDA diagnostic.'
         )
-    if pinned_batch_transfer and target_device.type != 'cuda':
-        raise ValueError('pinned_batch_transfer requires a CUDA diagnostic.')
     if compiled_numerics_group is not None and target_device.type != 'cuda':
         raise ValueError('compiled_numerics_group requires a CUDA diagnostic.')
     if compiled_profiler_updates and target_device.type != 'cuda':
@@ -4566,7 +4554,7 @@ def run_v2_td3_timing_diagnostic(
                 'cache_ellipsoid_segment_clearance': (
                     cache_ellipsoid_segment_clearance
                 ),
-                'single_observation_fast_path': single_observation_fast_path,
+
             },
             'timing_levels_executed': 0,
         }
@@ -4613,9 +4601,9 @@ def run_v2_td3_timing_diagnostic(
             compile_action_inference=compile_action_inference,
             cuda_graph_action_inference=cuda_graph_action_inference,
             cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
-            aggregate_relation_values_first=aggregate_relation_values_first,
+
             reduce_update_stat_syncs=reduce_update_stat_syncs,
-            pinned_batch_transfer=pinned_batch_transfer,
+
             cuda_graph_updates=cuda_graph_updates,
             cuda_graph_actor_update=cuda_graph_actor_update,
         )
@@ -4639,7 +4627,7 @@ def run_v2_td3_timing_diagnostic(
                 'cache_ellipsoid_segment_clearance': (
                     cache_ellipsoid_segment_clearance
                 ),
-                'single_observation_fast_path': single_observation_fast_path,
+
             },
             'timing_levels_executed': 0,
         }
@@ -4684,14 +4672,12 @@ def run_v2_td3_timing_diagnostic(
             cache_actor_loss_coefficients=cache_actor_loss_coefficients,
             compile_action_inference=compile_action_inference,
             cuda_graph_action_inference=cuda_graph_action_inference,
-            aggregate_relation_values_first=aggregate_relation_values_first,
+
             reduce_update_stat_syncs=reduce_update_stat_syncs,
             window_update_statistics=window_update_statistics,
             reuse_update_buffers=reuse_update_buffers,
-            cuda_graph_critic_tail=cuda_graph_critic_tail,
-            compile_critic_update_front=compile_critic_update_front,
-            compile_actor_objective=compile_actor_objective,
-            pinned_batch_transfer=pinned_batch_transfer,
+
+
             cuda_graph_updates=cuda_graph_updates,
             cuda_graph_actor_update=cuda_graph_actor_update,
             compiled_path_profiler_updates=(
@@ -4704,7 +4690,7 @@ def run_v2_td3_timing_diagnostic(
             ),
             environment_performance_diagnostic=bool(compiled_profiler_updates),
             cache_ellipsoid_segment_clearance=cache_ellipsoid_segment_clearance,
-            single_observation_fast_path=single_observation_fast_path,
+
         )
         level_results[level] = result
         print(json.dumps({
@@ -4838,14 +4824,11 @@ def run_v2_td3_timing_diagnostic(
             'cache_ellipsoid_segment_clearance': (
                 cache_ellipsoid_segment_clearance
             ),
-            'single_observation_fast_path': single_observation_fast_path,
-            'pinned_batch_transfer_requested': pinned_batch_transfer,
-            'aggregate_relation_values_first_requested': (
-                aggregate_relation_values_first
-            ),
+
+
             'window_update_statistics_requested': window_update_statistics,
             'reuse_update_buffers_requested': reuse_update_buffers,
-            'cuda_graph_critic_tail_requested': cuda_graph_critic_tail,
+
             'reduce_update_stat_syncs_requested': reduce_update_stat_syncs,
             'cuda_graph_updates_requested': cuda_graph_updates,
             'cuda_graph_actor_update_requested': cuda_graph_actor_update,
@@ -5058,8 +5041,6 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
         'updates': count, 'groups': {}}
 
     def flatten(value, name, result):
-        if args.critic_tail_correctness and name == 'optimizer.critic.param_groups.0.capturable':
-            return  # Execution property differs intentionally; Adam tensors and all other settings are compared.
         if isinstance(value, Mapping):
             for key, item in value.items():
                 flatten(item, f'{name}.{key}', result)
@@ -5076,50 +5057,30 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
     initial = None
     reference = None
     transfer_check = getattr(args, 'batch_transfer_worker', None) == 'correctness'
-    block_check = getattr(args, 'td3_block_correctness', False)
-    choice = getattr(args, 'td3_block_choice', 'baseline')
-    if block_check and count < 8:
-        raise ValueError('Merged block correctness requires at least 8 updates for freeze/ramp boundaries.')
-    tail_comparison = args.critic_tail_correctness
-    groups = (('A', False, False), ('B', False, False)) if tail_comparison else (('A', False, False), ('B', True, False), ('C', False, True))
-    if block_check:
-        groups = ((choice, False, False),)
-        if choice != 'baseline':
-            if args.td3_block_reference is None:
-                raise ValueError('Candidate correctness requires independent baseline snapshots.')
-            saved_reference = torch.load(args.td3_block_reference, map_location='cpu', weights_only=False)
-    stage_steps = _td3_block_correctness_steps(config, count) if block_check else []
+    groups = (('A', False, False), ('B', True, False), ('C', False, True))
+    if getattr(args, 'gpu_compute_worker', None):
+        groups = (('compute' if args.gpu_td3_compute else 'baseline', False, False),)
+    elif getattr(args, 'batch_transfer_worker', None):
+        groups = (('nonblocking' if args.non_blocking_batch_transfer else 'baseline', False, False),)
+    stage_steps = []
     contract = {'version': TD3_BLOCK_CORRECTNESS_VERSION, 'model': args.model,
         'seed': args.seed, 'stage_steps': stage_steps, 'config': config.to_dict(),
         'reward_config': asdict(prepared.reward_config), 'checkpoint': report['checkpoint'],
         'pool_digest': pool.content_digest, 'bc_schedule': args.comparison_bc_schedule}
     if transfer_check: contract['diagnostic_kind'] = 'non_blocking_batch_transfer_v1'
-    if block_check:
-        report['reference_contract'] = contract
-        report['gradient_comparison_contract'] = (
-            'Current backward gradients remain strict at rtol=1e-4/atol=1e-5. '
-            'Unused retained actor gradient values are observations; presence/shape/dtype stay strict. '
-            'Actor parameters, target, optimizer and actor count must be exactly unchanged on critic-only steps.')
-    report['comparison_kind'] = 'non_blocking_batch_transfer' if transfer_check else ('merged_update_blocks' if block_check else ('checked_critic_tail' if tail_comparison else 'local_optimizations'))
-    if tail_comparison:
-        report['optimizer_execution_difference'] = 'Only critic capturable differs (A=false, B=true); excluded from numeric comparison. step, moments and other optimizer settings remain compared.'
+    report['comparison_kind'] = 'non_blocking_batch_transfer' if transfer_check else ('local_optimizations')
     try:
-        if block_check and choice != 'baseline':
-            _validate_td3_block_reference(saved_reference, contract, count)
-            reference = saved_reference['snapshots']
         for group, window, buffers in groups:
             engine = build_v2_stage_engine(None, config, init_checkpoint=args.bc_checkpoint,
                 rewards=prepared.reward_config, prepared_initialization=prepared, device=device,
                 model_type=args.model, snn_time_window=args.snn_time_window, fused_adam=fused,
                 reduce_update_stat_syncs=reduced, window_update_statistics=window,
-                reuse_update_buffers=buffers, cuda_graph_critic_tail=tail_comparison and group == 'B',
-                compile_critic_update_front=block_check and choice in ('C', 'CA'),
-                compile_actor_objective=block_check and choice in ('A', 'CA'),
+                reuse_update_buffers=buffers,
+
+
                 non_blocking_batch_transfer=transfer_check and args.non_blocking_batch_transfer).engine
             if initial is None:
                 initial = deepcopy(engine.checkpoint_state_dict())
-            if block_check and choice != 'baseline':
-                initial = saved_reference['initial']
             engine.load_checkpoint_state_dict(initial)
             configured = _configure_stage_compilation(engine, pool, prepared,
                 compile_critic_encoder=False, compile_target_encoders=False, **compilation)
@@ -5133,12 +5094,6 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
                 from brain_uav.scripts.v2_batch_transfer_diagnostic import cpu_batches, check_transfers
                 fixed = cpu_batches(mixed, nonempty, engine.action_dim, args.seed)
                 report['transfer_check'] = check_transfers(fixed, device, args.repeats)
-            if block_check:
-                from dataclasses import replace
-                # Formal replay stores current and next observations independently.
-                fixed = [replace(b, next_obs=V2ObservationBatch(*(t.clone() for t in (
-                    b.next_obs.ego_features, b.next_obs.goal_features,
-                    b.next_obs.zone_features, b.next_obs.presence_mask)))) for b in fixed]
             # Repeated independent inference must reset both SNN layers, without an extra training forward.
             with torch.inference_mode():
                 first = engine.actor(mixed).clone()
@@ -5152,9 +5107,7 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
                 engine.replay.sample = lambda batch_size, batch=batch: batch
                 torch.manual_seed(args.seed + index)
                 torch.cuda.manual_seed_all(args.seed + index)
-                total = ((1 if index == 0 else config.policy_delay) if tail_comparison and index < 2 else offset + index + 1)
-                if block_check:
-                    total = stage_steps[index]
+                total = (offset + index + 1)
                 _, policy_noise, noise_clip = config.noise_schedule.values(total, max_steps=config.max_steps)
                 engine.set_target_noise(policy_noise=policy_noise, noise_clip=noise_clip)
                 entries = []
@@ -5169,22 +5122,6 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
                     flatten(getattr(engine, name).state_dict(), name, snapshot)
                 flatten(engine.actor_optimizer.state_dict(), 'optimizer.actor', snapshot)
                 flatten(engine.critic_optimizer.state_dict(), 'optimizer.critic', snapshot)
-                if tail_comparison or block_check:
-                    gradients, gradient_evidence = _td3_gradient_snapshot(engine, actor_backward=metric.actor_updated)
-                    snapshot.update(gradients)
-                    snapshot_contexts.append({'snapshot_index': index, 'stage_steps': total,
-                        'actor_backward': metric.actor_updated, 'gradients': gradient_evidence})
-                    flatten({name: getattr(engine, name) for name in ('update_count', 'critic_update_count', 'critic_target_update_count', 'actor_update_count')}, 'counts', snapshot)
-                    if block_check:
-                        report['groups'][group]['snapshot_evidence'] = snapshot_contexts
-                        if snapshots and not metric.actor_updated:
-                            prefixes = ('grad.actor.', 'actor.', 'actor_target.', 'optimizer.actor.', 'counts.actor_update_count')
-                            previous = {k: v for k, v in snapshots[-1].items() if k.startswith(prefixes)}
-                            current = {k: v for k, v in snapshot.items() if k.startswith(prefixes)}
-                            # Observe unused residuals; require exact unchanged actor state.
-                            _compare_td3_block_snapshot(previous, current,
-                                context={**snapshot_contexts[-1], 'comparison': 'adjacent_steps'},
-                                report=report, output=output)
                 snapshots.append(snapshot)
             engine.flush_update_statistics()
             torch.cuda.synchronize(device)
@@ -5192,110 +5129,25 @@ def _run_local_optimization_correctness(args, *, prepared, config, pool, device,
                 flatten(asdict(metric), 'metrics', snapshot)
             if not any(m.actor_updated for m in metrics) or all(m.actor_updated for m in metrics):
                 raise AssertionError('Correctness sequence must include actor and critic-only updates.')
-            if args.model == 'snn' and not (any(m.spike_beta_eff > 0 for m in metrics if m.actor_updated) if block_check else all(m.spike_beta_eff > 0 for m in metrics if m.actor_updated)):
+            if args.model == 'snn' and not (all(m.spike_beta_eff > 0 for m in metrics if m.actor_updated)):
                 raise AssertionError('SNN activity regularization did not take effect.')
-            expected_critic = 'critic_update_front' if block_check and choice in ('C', 'CA') else 'critic_block'
+            expected_critic = 'critic_block'
             if not all(expected_critic in entries for entries in executions):
                 raise AssertionError('Formal compiled critic path was not executed.')
             if not configured.get('cuda_graph') or not configured.get('cuda_graph_actor_update'):
                 raise AssertionError('Formal update CUDA Graph configuration is missing.')
             if not configured.get('cuda_graph_evidence', {}).get('verified'):
                 raise AssertionError('CUDA Graph replay evidence was not verified.')
-            if tail_comparison:
-                # Both loss and gradient errors must stop before the critic commit barrier.
-                before_error = {}
-                for name in ('critic1', 'critic2', 'critic1_target', 'critic2_target'):
-                    flatten(getattr(engine, name).state_dict(), name, before_error)
-                flatten(engine.critic_optimizer.state_dict(), 'optimizer', before_error)
-                from dataclasses import replace
-                for kind in ('nan_loss', 'inf_gradient'):
-                    error_batch = replace(fixed[0], reward=torch.full_like(fixed[0].reward, float('nan'))) if kind == 'nan_loss' else fixed[0]
-                    engine.replay.sample = lambda batch_size, batch=error_batch: batch
-                    hook = next(engine.critic1.parameters()).register_hook(lambda grad: torch.full_like(grad, float('inf'))) if kind == 'inf_gradient' else None
-                    try:
-                        try:
-                            engine.update_once(total_steps=offset + count + 1)
-                        except FloatingPointError:
-                            pass
-                        else:
-                            raise AssertionError('Invalid update was not rejected: ' + kind)
-                    finally:
-                        if hook is not None:
-                            hook.remove()
-                    after_error = {}
-                    for name in ('critic1', 'critic2', 'critic1_target', 'critic2_target'):
-                        flatten(getattr(engine, name).state_dict(), name, after_error)
-                    flatten(engine.critic_optimizer.state_dict(), 'optimizer', after_error)
-                    _compare_compiled_numeric_tensors(before_error, after_error, rtol=0, atol=0)
-                report['groups'][group]['error_barrier_verified'] = True
-                report['groups'][group]['critic_tail'] = engine.local_optimization_metadata()['cuda_graph_critic_tail']
-            if block_check:
-                errors = []
-                def error_state():
-                    result = {}
-                    for name in ('actor', 'critic1', 'critic2', 'actor_target', 'critic1_target', 'critic2_target'):
-                        flatten(getattr(engine, name).state_dict(), name, result)
-                    flatten(engine.actor_optimizer.state_dict(), 'optimizer.actor', result)
-                    flatten(engine.critic_optimizer.state_dict(), 'optimizer.critic', result)
-                    flatten({n: getattr(engine, n) for n in ('update_count', 'critic_update_count', 'critic_target_update_count', 'actor_update_count')}, 'counts', result)
-                    return result
-                from dataclasses import replace
-                for kind in ('critic_nan_loss', 'critic_inf_gradient', 'actor_nan_loss', 'actor_inf_gradient'):
-                    previous = error_state()
-                    base_batch = fixed[0]
-                    error_batch = replace(base_batch, reward=torch.full_like(base_batch.reward, float('nan'))) if kind == 'critic_nan_loss' else base_batch
-                    engine.replay.sample = lambda size, b=error_batch: b
-                    injection_evidence = {'kind': kind}
-                    report['groups'][group].setdefault('gradient_injections', []).append(injection_evidence)
-                    injection = (_inject_diagnostic_inf_gradient(engine,
-                        component='actor' if kind.startswith('actor') else 'critic',
-                        evidence=injection_evidence) if kind.endswith('inf_gradient') else nullcontext())
-                    original_check = engine._require_finite_loss
-                    def check(loss, *, component, total_steps):
-                        if kind == 'actor_nan_loss' and component == 'actor':
-                            loss = loss * float('nan')
-                        return original_check(loss, component=component, total_steps=total_steps)
-                    engine._require_finite_loss = check
-                    try:
-                        torch.manual_seed(args.seed + 100)
-                        torch.cuda.manual_seed_all(args.seed + 100)
-                        try:
-                            with injection:
-                                engine.update_once(total_steps=75002, bc_lambda=v2_bc_lambda(75002, schedule=args.comparison_bc_schedule))
-                        except FloatingPointError as exc:
-                            if not str(exc).startswith('Non-finite ' + ('actor' if kind.startswith('actor') else 'critic')):
-                                raise
-                        else:
-                            raise AssertionError('Error barrier failed: ' + kind)
-                    finally:
-                        engine._require_finite_loss = original_check
-                    after = error_state()
-                    unchanged = [key for key in previous if (not kind.startswith('actor') or key.startswith(('actor.', 'actor_target.', 'optimizer.actor.', 'counts.actor_update_count')))]
-                    _compare_compiled_numeric_tensors({k: previous[k] for k in unchanged}, {k: after[k] for k in unchanged}, rtol=0, atol=0)
-                    errors.append(after)
-                report['groups'][group]['error_barriers'] = True
-                if choice == 'baseline':
-                    torch.save({'snapshots': snapshots, 'errors': errors,
-                                'initial': initial, 'contract': contract}, output / 'reference.pt')
-                else:
-                    for expected, actual in zip(saved_reference['errors'], errors):
-                        _compare_compiled_numeric_tensors(expected, actual, rtol=COMPILED_NUMERIC_RTOL, atol=COMPILED_NUMERIC_ATOL)
-                report['groups'][group]['merged_update_blocks'] = engine.merged_update_metadata()
             report['groups'][group].update(executions=executions,
                 actor_updates=sum(m.actor_updated for m in metrics),
                 statistics=[asdict(m) for m in metrics])
             if reference is None:
                 reference = snapshots
             else:
-                if block_check:
-                    report['groups'][group]['differences'] = [
-                        _compare_td3_block_snapshot(expected, actual, context=context, report=report, output=output)
-                        for expected, actual, context in zip(reference, snapshots, snapshot_contexts)]
-                else:
-                    report['groups'][group]['differences'] = [
-                        _compare_compiled_numeric_tensors(expected, actual,
-                            rtol=COMPILED_NUMERIC_RTOL, atol=COMPILED_NUMERIC_ATOL)
-                        for expected, actual in zip(reference, snapshots)]
+                report['groups'][group]['differences'] = [
+                    _compare_compiled_numeric_tensors(expected, actual,
+                        rtol=COMPILED_NUMERIC_RTOL, atol=COMPILED_NUMERIC_ATOL)
+                    for expected, actual in zip(reference, snapshots)]
             del engine
             gc.collect()
             torch.cuda.empty_cache()
@@ -5329,29 +5181,22 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     environment_diagnostic = getattr(args, 'gpu_compute_environment_diagnostic', False)
     cpu_deduplication = getattr(args, 'cpu_deduplication', False)
     collect_deduplication = getattr(args, 'cpu_deduplication_evidence', False)
-    if sum(bool(getattr(args, name)) for name in ('local_optimization_comparison', 'local_optimization_correctness', 'critic_tail_comparison', 'critic_tail_correctness', 'td3_block_correctness', 'td3_block_comparison')) > 1:
+    if getattr(args, 'cpu_deduplication_fixed_actions', None) and not collect_deduplication:
+        raise ValueError('Fixed actions require evidence mode, never throughput timing.')
+    if sum(bool(getattr(args, name)) for name in ('local_optimization_comparison', 'local_optimization_correctness')) > 1:
         raise ValueError('Select exactly one comparison/correctness mode.')
     if args.gpu_td3_compute and getattr(args,'gpu_compute_worker',None) not in ('correctness','timing'):
         raise ValueError('GPU compute requires its isolated diagnostic worker.')
-    if args.critic_tail_internal_timing and not args.critic_tail_comparison:
-        raise ValueError('--critic-tail-internal-timing requires --critic-tail-comparison (timing only).')
     if args.validation_pool is None:
         raise ValueError('--validation-pool is required for A/B/C comparison.')
-    if args.detailed_profiler_updates or (args.compiled_performance_diagnostic_updates and args.td3_block_attribution != 'profiler'):
+    if args.detailed_profiler_updates or ((args.compiled_performance_diagnostic_updates)):
         raise ValueError('Profiler is not allowed in throughput measurement unless block attribution profiler mode is selected.')
-    if args.td3_block_attribution:
-        if not args.td3_block_comparison or args.td3_block_choice == 'CA':
-            raise ValueError('Attribution requires a baseline/C/A block comparison worker; no suite or CA.')
-        if args.critic_tail_internal_timing:
-            raise ValueError('Attribution cannot combine tail timing.')
-        if args.td3_block_attribution == 'profiler' and args.compiled_performance_diagnostic_updates not in (0, 2, 3, 4, 5, 6, 7, 8):
-            raise ValueError('Attribution profiler requires 2..8 updates.')
-    unsupported = ('compile_critic_update_front', 'compile_actor_objective', 'cuda_graph_critic_tail', 'window_update_statistics', 'reuse_update_buffers', 'compile_critic_encoder', 'compile_target_encoders', 'compile_actors',
+    unsupported = (   'window_update_statistics', 'reuse_update_buffers', 'compile_critic_encoder', 'compile_target_encoders', 'compile_actors',
         'compile_critic_block', 'compile_target_block', 'compile_shared_relations',
         'compile_snn_target_encoder', 'fused_adam', 'compile_actor_loss',
         'cache_actor_loss_coefficients', 'compile_action_inference', 'cuda_graph_action_inference',
-        'pinned_batch_transfer', 'aggregate_relation_values_first', 'reduce_update_stat_syncs',
-        'cuda_graph_updates', 'cuda_graph_actor_update', 'single_observation_fast_path',
+          'reduce_update_stat_syncs',
+        'cuda_graph_updates', 'cuda_graph_actor_update',
         'check_compiled_numerics', 'compiled_numerics_only')
     if any(getattr(args, name) for name in unsupported) or args.frozen_critic_strategy != 'eager' or args.compiled_numerics_group:
         raise ValueError('Comparison uses formal compilation defaults; original diagnostic overrides are unsupported here.')
@@ -5364,7 +5209,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     if output.exists() and any(output.iterdir()):
         raise FileExistsError('Refusing to overwrite nonempty output directory.')
     target = torch.device(resolve_training_device(args.device))
-    if (args.local_optimization_correctness or args.critic_tail_correctness or args.critic_tail_comparison or args.td3_block_correctness or args.td3_block_comparison) and (target.type != 'cuda' or args.comparison_eager_cpu):
+    if ((args.local_optimization_correctness)) and (target.type != 'cuda' or args.comparison_eager_cpu):
         raise ValueError('Local optimization correctness requires real CUDA and formal compilation; CPU/mock is unsupported.')
     regularization = V2SpikeRegularizationConfig(beta_max=1.0 if args.model == 'snn' else 0.0)
     config = formal_config or V2FormalTrainingConfig(stage='easy', max_steps=500000, seed=args.seed, batch_size=args.batch_size,
@@ -5410,7 +5255,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
         from brain_uav.scripts.v2_gpu_compute_diagnostic import correctness
         return correctness(args, prepared=prepared, config=config, pool=pool, device=target, output=output,
                            full_pool_digest=original_pool.content_digest)
-    if args.local_optimization_correctness or args.critic_tail_correctness or args.td3_block_correctness:
+    if (args.local_optimization_correctness):
         return _run_local_optimization_correctness(args, prepared=prepared,
             config=config, pool=pool, device=target, output=output)
     def query(command):
@@ -5427,9 +5272,11 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
         except OSError as exc:
             return {'unavailable': str(exc)}
     runs = {}
-    groups = (('A', False, False), ('B', False, False)) if args.critic_tail_comparison else (('A', False, False), ('B', True, False), ('C', False, True))
-    if args.td3_block_comparison:
-        groups = ((args.td3_block_choice, False, False),)
+    groups = (('A', False, False), ('B', True, False), ('C', False, True))
+    if getattr(args, 'gpu_compute_worker', None):
+        groups = (('compute' if args.gpu_td3_compute else 'baseline', False, False),)
+    elif getattr(args, 'batch_transfer_worker', None):
+        groups = (('nonblocking' if args.non_blocking_batch_transfer else 'baseline', False, False),)
     for group, window, buffers in groups:
         runs[group] = []
         for repeat in range(repeats):
@@ -5444,19 +5291,19 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 warmup_steps=args.warmup_steps, measured_steps=steps,
                 reduce_update_stat_syncs=True, cache_ellipsoid_segment_clearance=True,
                 window_update_statistics=window, reuse_update_buffers=buffers,
-                compile_critic_update_front=args.td3_block_comparison and args.td3_block_choice in ('C', 'CA'),
-                compile_actor_objective=args.td3_block_comparison and args.td3_block_choice in ('A', 'CA'),
-                cuda_graph_critic_tail=args.critic_tail_comparison and group == 'B',
-                critic_tail_internal_timing=args.critic_tail_internal_timing and group == 'B',
+
+
                 gpu_td3_compute=getattr(args,'gpu_compute_worker',None)=='timing' and args.gpu_td3_compute,
                 non_blocking_batch_transfer=getattr(args,'batch_transfer_worker',None)=='timing' and args.non_blocking_batch_transfer,
                 batch_transfer_window_timing=(getattr(args,'batch_transfer_worker',None)=='timing' or getattr(args,'gpu_compute_worker',None)=='timing'),
                 environment_performance_diagnostic=environment_diagnostic,
                 cpu_deduplication=cpu_deduplication,
                 deduplication_evidence=deduplication_evidence,
-                block_attribution_wall=args.td3_block_attribution == 'wall',
-                compiled_path_profiler_updates=(args.compiled_performance_diagnostic_updates or 4) if args.td3_block_attribution == 'profiler' else 0,
-                compiled_profiler_output_dir=output / f'{group}_{repeat}_profiler' if args.td3_block_attribution == 'profiler' else None,
+                deduplication_fixed_actions=(json.loads(Path(args.cpu_deduplication_fixed_actions).read_text(encoding='utf-8'))['steps']
+                    if getattr(args, 'cpu_deduplication_fixed_actions', None) else None),
+                block_attribution_wall=False,
+                compiled_path_profiler_updates=0,
+                compiled_profiler_output_dir=None,
                 controlled_stage_step_offset=offset, bc_schedule=args.comparison_bc_schedule, **compilation)
             result['server_load_before'] = before
             result['server_load_after'] = load_snapshot()
@@ -5468,7 +5315,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
             gc.collect()
             if target.type == 'cuda':
                 torch.cuda.empty_cache()
-    baseline_group = args.td3_block_choice if args.td3_block_comparison else 'A'
+    baseline_group = next(iter(runs))
     averages = {group: mean(run['timing']['total_wall_seconds'] for run in values)
                 for group, values in runs.items()}
     stable = all(run['critic_encoder_compile']['valid_for_speed_comparison'] is not False
@@ -5495,10 +5342,10 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
         'bc_schedule': args.comparison_bc_schedule,
         'cpu_deduplication': cpu_deduplication,
         'cpu_deduplication_evidence': collect_deduplication,
-        'td3_block_attribution': args.td3_block_attribution,
-        'critic_tail_internal_timing_requested': args.critic_tail_internal_timing,
-        'final_speed_acceptance': False if environment_diagnostic or collect_deduplication or args.critic_tail_internal_timing or args.td3_block_attribution else None,
-        'comparison_kind': 'gpu_td3_compute' if getattr(args,'gpu_compute_worker',None) else ('merged_update_blocks' if args.td3_block_comparison else ('checked_critic_tail' if args.critic_tail_comparison else 'local_optimizations')),
+
+
+        'final_speed_acceptance': False if (environment_diagnostic) or (collect_deduplication) else None,
+        'comparison_kind': 'gpu_td3_compute' if getattr(args,'gpu_compute_worker',None) else ('local_optimizations'),
         'steps': steps, 'repeats': repeats, 'runs': runs,
         'comparison': {group: {'mean_wall_seconds': averages[group],
             'stdev_wall_seconds': stdev([run['timing']['total_wall_seconds'] for run in values]) if repeats > 1 else 0.0,
@@ -5535,95 +5382,6 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     return summary
 
 
-def run_td3_block_suite(args):
-    """Small process-isolated driver; it invokes existing CUDA workers serially."""
-    import subprocess
-    import sys
-    import platform
-    import json
-    if args.device != 'cuda' or args.comparison_eager_cpu:
-        raise ValueError('TD3 block suite requires real CUDA; no CPU substitute.')
-    if args.model != 'ann' or args.td3_block_choice != 'baseline' or args.td3_block_reference is not None:
-        raise ValueError('Suite starts with ANN and owns baseline/C/A selection and references.')
-    if args.snn_bc_checkpoint is None:
-        raise ValueError('--snn-bc-checkpoint is required; --bc-checkpoint supplies ANN BC.')
-    if any(getattr(args, n) for n in ('compile_critic_update_front', 'compile_actor_objective',
-            'cuda_graph_critic_tail', 'window_update_statistics', 'reuse_update_buffers',
-            'critic_tail_internal_timing', 'local_optimization_comparison',
-            'local_optimization_correctness', 'critic_tail_comparison', 'critic_tail_correctness',
-            'td3_block_comparison', 'td3_block_correctness', 'pinned_batch_transfer',
-            'aggregate_relation_values_first', 'single_observation_fast_path',
-            'compile_critic_encoder', 'compile_target_encoders', 'compile_actors',
-            'compile_critic_block', 'compile_target_block', 'compile_shared_relations',
-            'compile_snn_target_encoder', 'fused_adam', 'compile_actor_loss',
-            'cache_actor_loss_coefficients', 'compile_action_inference',
-            'cuda_graph_action_inference', 'cuda_graph_updates', 'cuda_graph_actor_update',
-            'reduce_update_stat_syncs', 'check_compiled_numerics', 'compiled_numerics_only')):
-        raise ValueError('Suite owns block selection and prohibits other comparison modes.')
-    if args.frozen_critic_strategy != 'eager' or args.compiled_numerics_group or args.detailed_profiler_updates or args.compiled_performance_diagnostic_updates:
-        raise ValueError('Suite uses formal defaults and prohibits profiler/compile overrides.')
-    output = Path(args.output_dir)
-    if output.exists() and any(output.iterdir()):
-        raise FileExistsError('Refusing to overwrite nonempty suite output.')
-    output.mkdir(parents=True, exist_ok=True)
-    report = {'diagnostic_only': True, 'formal_training': False, 'models': {},
-              'method': 'process isolation per correctness/timing configuration; ANN before SNN',
-              'combination_automatically_tested': False, 'python': platform.python_version()}
-    forwarded = ('validation_pool', 'validation_seed', 'seed', 'batch_size', 'replay_capacity',
-                 'scenario_count', 'warmup_steps', 'steps_per_level', 'repeats',
-                 'controlled_stage_step_offset', 'comparison_bc_schedule', 'snn_time_window')
-    for model, checkpoint in (('ann', args.bc_checkpoint), ('snn', args.snn_bc_checkpoint)):
-        entries = report['models'][model] = {}
-        reference = output / model / 'baseline' / 'correctness' / 'reference.pt'
-        for choice in ('baseline', 'C', 'A'):
-            root = output / model / choice
-            root.mkdir(parents=True)
-            entry = entries[choice] = {'requested': {'compile_critic_update_front': choice == 'C',
-                                                    'compile_actor_objective': choice == 'A'}}
-            if choice != 'baseline' and not reference.exists():
-                entry.update(passed=False, failure='Independent baseline correctness unavailable', timing_skipped=True)
-                continue
-            command = [sys.executable, '-u', '-m', 'brain_uav.scripts.profile_v2_td3',
-                       '--model', model, '--bc-checkpoint', str(checkpoint), '--device', 'cuda',
-                       '--td3-block-choice', choice]
-            for name in forwarded:
-                value = getattr(args, name)
-                if value is not None:
-                    command += ['--' + name.replace('_', '-'), str(value)]
-            check = command + ['--td3-block-correctness', '--correctness-updates', str(max(8, args.correctness_updates)),
-                               '--output-dir', str(root / 'correctness')]
-            if choice != 'baseline':
-                check += ['--td3-block-reference', str(reference)]
-            with (root / 'correctness.log').open('w', encoding='utf-8') as log:
-                rc = subprocess.run(check, stdout=log, stderr=subprocess.STDOUT, check=False).returncode
-            entry['correctness_exit_code'] = rc
-            entry['passed'] = rc == 0
-            if rc:
-                entry.update(timing_skipped=True, failure='Correctness process failed; see correctness.log/report')
-                continue
-            timing = command + ['--td3-block-comparison', '--output-dir', str(root / 'timing')]
-            with (root / 'timing.log').open('w', encoding='utf-8') as log:
-                rc = subprocess.run(timing, stdout=log, stderr=subprocess.STDOUT, check=False).returncode
-            entry['timing_exit_code'] = rc
-            if rc:
-                entry['failure'] = 'Timing process failed; see timing.log'
-                continue
-            data = json.loads((root / 'timing' / 'local_optimization_summary.json').read_text(encoding='utf-8'))
-            entry['timing'] = data['comparison'][choice]
-            entry['valid_for_speed_comparison'] = data['valid_for_speed_comparison']
-            entry['effective_configuration_report'] = str(root / 'timing' / 'local_optimization_summary.json')
-        baseline = entries['baseline'].get('timing', {}).get('seconds_per_step')
-        for entry in entries.values():
-            measured = entry.get('timing', {}).get('seconds_per_step')
-            valid = entry.get('valid_for_speed_comparison') and entries['baseline'].get('valid_for_speed_comparison')
-            entry['time_saved_percent'] = 100 * (1 - measured / baseline) if valid and measured and baseline else None
-            entry['speedup'] = baseline / measured if valid and measured and baseline else None
-            entry['stable_benefit_adopted'] = False
-        _strict_json_write(output / f'{model}_suite_summary.json', report)
-    _strict_json_write(output / 'td3_block_suite_summary.json', report)
-    return report
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', choices=('ann', 'snn'), required=True)
@@ -5637,14 +5395,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--sampling-replays', type=int, default=16)
     parser.add_argument('--sampling-warmup', type=int, default=2)
     parser.add_argument('--gpu-td3-worker', choices=('correctness', 'timing'), help=argparse.SUPPRESS)
-    parser.add_argument('--gpu-td3-compute', action='store_true', help='CPU replay + full manual GPU compute; default off.')
+    parser.add_argument('--gpu-td3-compute', action=argparse.BooleanOptionalAction, default=False, help='Explicit diagnostic path; never inherits formal auto defaults.')
+    parser.add_argument('--gpu-compute-reference', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--gpu-compute-comparison', action='store_true', help='Isolated serial baseline/compute correctness then short A/B timing.')
     parser.add_argument('--gpu-compute-first-critic-loss-only', action='store_true', help='GPU compute diagnostic: retain preceding updates, stop after first critic loss error-state check; no timing.')
     parser.add_argument('--gpu-compute-error-recovery', action='store_true', help='Diagnostic-only: continue two updates after the first critic loss error; retain all mismatch failures.')
     parser.add_argument('--gpu-compute-trace-retained-gradient', action='store_true', help='Diagnostic-only synchronous snapshots of the known empty_scene_token gradient around the first critic loss error.')
     parser.add_argument('--gpu-compute-worker', choices=('correctness','timing'), help=argparse.SUPPRESS)
     parser.add_argument('--gpu-compute-environment-diagnostic', action='store_true', help='Environment/geometry recorder only for --gpu-compute-worker timing --gpu-td3-compute; includes diagnostic overhead, no torch profiler or speed acceptance; default off.')
-    parser.add_argument('--cpu-deduplication', action='store_true', help='Experimental reward-context and independent action-input copy reuse; GPU compute timing worker only, default off.')
+    parser.add_argument('--cpu-deduplication', action=argparse.BooleanOptionalAction, default=False, help='Explicit diagnostic CPU reuse; default off.')
+    parser.add_argument('--cpu-deduplication-fixed-actions', type=Path, help='Evidence-only recorded action sequence; never timing.')
     parser.add_argument('--cpu-deduplication-evidence', action='store_true', help='Diagnostic-only exact rollout/action/RNG hashes; separate from timing, default off.')
     parser.add_argument('--gpu-td3-update', action='store_true', help='Experimental full device replay and update; default off.')
     parser.add_argument('--gpu-td3-reference', type=Path, help=argparse.SUPPRESS)
@@ -5654,17 +5414,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--snn-path-cpu-smoke', action='store_true', help='Explicit CPU integration smoke; never CUDA evidence.')
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--scenario-pool-dir', type=Path)
-    parser.add_argument('--td3-block-suite', action='store_true', help='Serial ANN then SNN: baseline/C/A correctness, each followed by timing only if passed.')
     parser.add_argument('--snn-bc-checkpoint', type=Path, help='Required by the two-model suite; --bc-checkpoint is ANN BC.')
-    parser.add_argument('--td3-block-choice', choices=('baseline', 'C', 'A', 'CA'), default='baseline')
-    parser.add_argument('--td3-block-attribution', choices=('wall', 'profiler'), help='Diagnostic only: window CPU aggregation OR separate post-measurement trace; default off.')
-    parser.add_argument('--td3-block-reference', type=Path)
-    parser.add_argument('--td3-block-correctness', action='store_true')
-    parser.add_argument('--td3-block-comparison', action='store_true')
     parser.add_argument('--local-optimization-comparison', action='store_true')
-    parser.add_argument('--critic-tail-correctness', action='store_true', help='CUDA old path vs checked critic-tail correctness, separate from timing.')
-    parser.add_argument('--critic-tail-internal-timing', action='store_true', help='Diagnostic CPU wall aggregation during critic-tail A/B measurement; adds instrumentation overhead.')
-    parser.add_argument('--critic-tail-comparison', action='store_true', help='CUDA A/B short timing with both local optimizations disabled.')
     parser.add_argument('--local-optimization-correctness', action='store_true',
         help='Separate short CUDA A/B/C correctness check; never a throughput measurement.')
     parser.add_argument('--correctness-updates', type=int, default=6)
@@ -5738,14 +5489,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--compile-action-inference', action='store_true')
     parser.add_argument('--cuda-graph-action-inference', action='store_true')
     parser.add_argument('--cache-ellipsoid-segment-clearance', action='store_true')
-    parser.add_argument('--single-observation-fast-path', action='store_true')
-    parser.add_argument('--pinned-batch-transfer', action='store_true')
-    parser.add_argument('--aggregate-relation-values-first', action='store_true')
     parser.add_argument('--window-update-statistics', action='store_true')
     parser.add_argument('--reuse-update-buffers', action='store_true')
-    parser.add_argument('--compile-critic-update-front', action='store_true')
-    parser.add_argument('--compile-actor-objective', action='store_true')
-    parser.add_argument('--cuda-graph-critic-tail', action='store_true', help='Capture checked fused critic Adam and optional critic target updates; requires CUDA.')
     parser.add_argument('--reduce-update-stat-syncs', action='store_true')
     parser.add_argument('--cuda-graph-updates', action='store_true')
     parser.add_argument('--cuda-graph-actor-update', action='store_true')
@@ -5786,9 +5531,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    if (args.cpu_deduplication or args.cpu_deduplication_evidence) and not (args.gpu_compute_worker == 'timing' and args.gpu_td3_compute):
+    if args.cpu_deduplication_fixed_actions and not args.cpu_deduplication_evidence:
+        raise ValueError('Fixed actions require evidence mode, never throughput timing.')
+    if (args.cpu_deduplication or args.cpu_deduplication_evidence) and not (args.gpu_compute_worker == 'timing'):
         raise ValueError('CPU deduplication requires --gpu-compute-worker timing --gpu-td3-compute.')
-    if args.gpu_compute_environment_diagnostic and not (args.gpu_compute_worker == 'timing' and args.gpu_td3_compute):
+    if args.gpu_compute_environment_diagnostic and not (args.gpu_compute_worker == 'timing'):
         raise ValueError('Environment diagnosis requires --gpu-compute-worker timing and --gpu-td3-compute.')
     if args.gpu_compute_comparison or args.gpu_compute_worker:
         from brain_uav.scripts.v2_gpu_compute_diagnostic import run
@@ -5808,12 +5555,12 @@ def main(argv: Sequence[str] | None = None) -> None:
     if args.snn_path_consistency:
         if args.model != 'snn' or args.checkpoint is None or args.validation_pool is None:
             raise ValueError('SNN path diagnosis requires --model snn --checkpoint --validation-pool.')
-        if any((args.td3_block_suite, args.td3_block_correctness, args.td3_block_comparison,
+        if any((False, False, False,
                 args.local_optimization_comparison, args.local_optimization_correctness,
-                args.critic_tail_comparison, args.critic_tail_correctness, args.cuda_graph_critic_tail,
-                args.td3_block_attribution, args.compile_critic_update_front, args.compile_actor_objective,
-                args.window_update_statistics, args.reuse_update_buffers, args.pinned_batch_transfer,
-                args.aggregate_relation_values_first, args.single_observation_fast_path,
+                False, False, False,
+                False, False, False,
+                args.window_update_statistics, args.reuse_update_buffers, False,
+                False, False,
                 args.check_compiled_numerics, args.compiled_numerics_only)):
             raise ValueError('SNN path diagnosis uses the fixed formal configuration and cannot be combined with other diagnostic/optimization modes.')
         from brain_uav.scripts.v2_snn_path_diagnostic import run_snn_path_diagnostic
@@ -5824,15 +5571,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         raise ValueError('Checkpoint path options require --snn-path-consistency.')
     if args.bc_checkpoint is None:
         raise ValueError('--bc-checkpoint is required for existing diagnostics.')
-    if (args.td3_block_choice != 'baseline' or args.td3_block_reference is not None) and not (args.td3_block_correctness or args.td3_block_comparison):
-        raise ValueError('Block selection/reference requires a block worker mode.')
-    if args.critic_tail_internal_timing and not args.critic_tail_comparison:
-        raise ValueError('--critic-tail-internal-timing requires --critic-tail-comparison (timing only).')
-    if args.td3_block_attribution and (not args.td3_block_comparison or args.td3_block_suite):
-        raise ValueError('Block attribution requires --td3-block-comparison.')
-    if args.td3_block_suite:
-        return run_td3_block_suite(args)
-    if args.local_optimization_comparison or args.local_optimization_correctness or args.critic_tail_correctness or args.critic_tail_comparison or args.td3_block_correctness or args.td3_block_comparison:
+    if (args.local_optimization_comparison) or (args.local_optimization_correctness):
         run_local_optimization_comparison(args)
         return
     if args.scenario_pool_dir is None:
@@ -5865,14 +5604,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         cache_actor_loss_coefficients=args.cache_actor_loss_coefficients,
         compile_action_inference=args.compile_action_inference,
         cuda_graph_action_inference=args.cuda_graph_action_inference,
-        aggregate_relation_values_first=args.aggregate_relation_values_first,
+
         reduce_update_stat_syncs=args.reduce_update_stat_syncs,
         window_update_statistics=args.window_update_statistics,
         reuse_update_buffers=args.reuse_update_buffers,
-        cuda_graph_critic_tail=args.cuda_graph_critic_tail,
-        compile_critic_update_front=args.compile_critic_update_front,
-        compile_actor_objective=args.compile_actor_objective,
-        pinned_batch_transfer=args.pinned_batch_transfer,
+
+
         cuda_graph_updates=args.cuda_graph_updates,
         cuda_graph_actor_update=args.cuda_graph_actor_update,
         check_compiled_numerics=args.check_compiled_numerics,
@@ -5884,7 +5621,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         cache_ellipsoid_segment_clearance=(
             args.cache_ellipsoid_segment_clearance
         ),
-        single_observation_fast_path=args.single_observation_fast_path,
+
     )
 
 

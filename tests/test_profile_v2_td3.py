@@ -673,9 +673,9 @@ class TestProfileV2TD3(unittest.TestCase):
                         cache_actor_loss_coefficients=False,
                         compile_action_inference=False,
                         cuda_graph_action_inference=False,
-                        aggregate_relation_values_first=False,
+
                         reduce_update_stat_syncs=False,
-                        pinned_batch_transfer=False,
+
                         cuda_graph_updates=False,
                         compiled_path_profiler_updates=0,
                         compiled_profiler_output_dir=None,
@@ -694,12 +694,13 @@ class TestProfileV2TD3(unittest.TestCase):
         replay = V2ReplayBuffer(64, 2, 2)
         engine = SimpleNamespace(
             actor=torch.nn.Linear(1, 1), replay=replay, batch_size=4,
+            local_optimization_metadata=lambda: {},
             critic_update_count=0, actor_update_count=0,
             set_target_noise=lambda **kwargs: None,
             fused_adam=fused_adam,
-            aggregate_relation_values_first=aggregate_relation_values_first,
+
             reduce_update_stat_syncs=reduce_update_stat_syncs,
-            pinned_batch_transfer=pinned_batch_transfer,
+
         )
         submitted = []
         compile_calls = []
@@ -718,7 +719,7 @@ class TestProfileV2TD3(unittest.TestCase):
                         profile_sections=False, reuse_shared_relations=True,
                         diagnostic_timing_recorder=None,
                         diagnostic_profile_sections=False,
-                        compiled_execution_recorder=None):
+                        compiled_execution_recorder=None, block_attribution_recorder=None):
             del reuse_shared_relations
             replay.sample(4)
             diagnostic_profile_flags.append((
@@ -742,6 +743,8 @@ class TestProfileV2TD3(unittest.TestCase):
                     'critic_optimizer_step': 0.02,
                     'actor_update': 0.06 if actor_updated else 0.0,
                     'target_soft_update': 0.07 if actor_updated else 0.02,
+                    'gpu_compute_input_copy': 0.0,
+                    'gpu_compute_to_result': 0.0,
                 })
             if diagnostic_timing_recorder is not None:
                 diagnostic_timing_recorder({
@@ -855,8 +858,7 @@ class TestProfileV2TD3(unittest.TestCase):
                     'fused_adam' if fused_adam else 'adam'
                 ),
                 'relation_value_execution': (
-                    'aggregate_then_project' if aggregate_relation_values_first
-                    else 'project_then_aggregate'
+                    'project_then_aggregate'
                 ),
                 'frozen_critic_strategy': kwargs['frozen_critic_strategy'],
                 'select_action_execution': (
@@ -932,9 +934,9 @@ class TestProfileV2TD3(unittest.TestCase):
                 cache_actor_loss_coefficients=cache_actor_loss_coefficients,
                 compile_action_inference=compile_action_inference,
                 cuda_graph_action_inference=cuda_graph_action_inference,
-                aggregate_relation_values_first=aggregate_relation_values_first,
+
                 reduce_update_stat_syncs=reduce_update_stat_syncs,
-                pinned_batch_transfer=pinned_batch_transfer,
+
                 cuda_graph_updates=cuda_graph_updates,
                 compiled_path_profiler_updates=compiled_path_profiler_updates,
                 compiled_profiler_output_dir=compiled_profiler_output_dir,
@@ -982,15 +984,14 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertFalse(compile_info['stable_timing'])
         self.assertFalse(compile_info['valid_for_speed_comparison'])
 
-    def test_action_graph_and_pinned_transfer_are_recorded_independently(self) -> None:
+    def test_action_graph_records_original_transfer(self) -> None:
         result, _, _ = self.run_small_level(
             compile_action_inference=True,
             cuda_graph_action_inference=True,
-            pinned_batch_transfer=True,
+
         )
         compile_info = result['critic_encoder_compile']
         self.assertTrue(compile_info['cuda_graph_action_inference_requested'])
-        self.assertTrue(compile_info['pinned_batch_transfer_requested'])
         self.assertTrue(compile_info['cuda_graph_action_inference'])
         self.assertEqual(
             compile_info['cuda_graph_action_inference_evidence'][
@@ -1003,7 +1004,7 @@ class TestProfileV2TD3(unittest.TestCase):
         result, _, _ = self.run_small_level(
             fused_adam=True, compile_actor_loss=True,
             cache_actor_loss_coefficients=True,
-            aggregate_relation_values_first=True,
+
             reduce_update_stat_syncs=True,
         )
         compile_info = result['critic_encoder_compile']
@@ -1012,7 +1013,7 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertTrue(compile_info['actor_loss_coefficients_requested'])
         self.assertEqual(compile_info['actor_loss_coefficient_execution'], 'cached')
         self.assertEqual(
-            compile_info['relation_value_execution'], 'aggregate_then_project',
+            compile_info['relation_value_execution'], 'project_then_aggregate',
         )
         self.assertIn('actor_loss.tensor_block', compile_info['enabled_objects'])
         self.assertEqual(
@@ -1259,9 +1260,6 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertFalse(args.compile_action_inference)
         self.assertFalse(args.cuda_graph_action_inference)
         self.assertFalse(args.cache_ellipsoid_segment_clearance)
-        self.assertFalse(args.single_observation_fast_path)
-        self.assertFalse(args.pinned_batch_transfer)
-        self.assertFalse(args.aggregate_relation_values_first)
         self.assertFalse(args.reduce_update_stat_syncs)
         self.assertFalse(args.cuda_graph_updates)
         self.assertFalse(args.check_compiled_numerics)
@@ -1322,8 +1320,6 @@ class TestProfileV2TD3(unittest.TestCase):
             '--cache-actor-loss-coefficients',
             '--compile-action-inference',
             '--cuda-graph-action-inference',
-            '--pinned-batch-transfer',
-            '--aggregate-relation-values-first',
             '--reduce-update-stat-syncs', '--cuda-graph-updates',
         ])
         self.assertTrue(optimization_scopes.fused_adam)
@@ -1331,32 +1327,25 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertTrue(optimization_scopes.cache_actor_loss_coefficients)
         self.assertTrue(optimization_scopes.compile_action_inference)
         self.assertTrue(optimization_scopes.cuda_graph_action_inference)
-        self.assertTrue(optimization_scopes.pinned_batch_transfer)
-        self.assertTrue(optimization_scopes.aggregate_relation_values_first)
         self.assertTrue(optimization_scopes.reduce_update_stat_syncs)
         self.assertTrue(optimization_scopes.cuda_graph_updates)
         optimized_paths = build_parser().parse_args([
             '--model', 'snn', '--bc-checkpoint', 'bc.pt',
             '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
             '--cache-ellipsoid-segment-clearance',
-            '--single-observation-fast-path',
         ])
         self.assertTrue(optimized_paths.cache_ellipsoid_segment_clearance)
-        self.assertTrue(optimized_paths.single_observation_fast_path)
         cache_only = build_parser().parse_args([
             '--model', 'snn', '--bc-checkpoint', 'bc.pt',
             '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
             '--cache-ellipsoid-segment-clearance',
         ])
-        fast_path_only = build_parser().parse_args([
+        default_path = build_parser().parse_args([
             '--model', 'snn', '--bc-checkpoint', 'bc.pt',
             '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
-            '--single-observation-fast-path',
         ])
         self.assertTrue(cache_only.cache_ellipsoid_segment_clearance)
-        self.assertFalse(cache_only.single_observation_fast_path)
-        self.assertFalse(fast_path_only.cache_ellipsoid_segment_clearance)
-        self.assertTrue(fast_path_only.single_observation_fast_path)
+        self.assertFalse(default_path.cache_ellipsoid_segment_clearance)
 
     def test_speed_optimization_flags_are_forwarded_by_cli(self) -> None:
         with mock.patch(
@@ -1367,10 +1356,8 @@ class TestProfileV2TD3(unittest.TestCase):
                 '--model', 'snn', '--bc-checkpoint', 'bc.pt',
                 '--output-dir', 'diagnostic', '--scenario-pool-dir', 'pools',
                 '--cache-ellipsoid-segment-clearance',
-                '--single-observation-fast-path',
             ])
         self.assertTrue(run.call_args.kwargs['cache_ellipsoid_segment_clearance'])
-        self.assertTrue(run.call_args.kwargs['single_observation_fast_path'])
 
     def test_grouped_compile_modes_have_only_declared_warmup_differences(self) -> None:
         expected = {
@@ -2109,7 +2096,7 @@ class TestProfileV2TD3(unittest.TestCase):
         optimized = fixture.make_engine(
             policy_delay=2, terminal_enabled=True,
             bc_reference_actor=fixture.make_bc_reference(0.01),
-            fused_adam=True, aggregate_relation_values_first=True,
+            fused_adam=True,
         )
         batch = v2_td3_tests.collate_v2_observations([
             v2_td3_tests._observation(0, scales=fixture.scales),
@@ -2154,13 +2141,13 @@ class TestProfileV2TD3(unittest.TestCase):
                 compile_actors=False, compile_critic_block=False,
                 compile_target_block=False,
                 fused_adam=True, compile_actor_loss=True,
-                aggregate_relation_values_first=True,
+
             )
         self.assertTrue(result['passed'])
         self.assertEqual(result['compilation']['optimizer_execution'], 'fused_adam')
         self.assertEqual(
             result['compilation']['relation_value_execution'],
-            'aggregate_then_project',
+            'project_then_aggregate',
         )
         self.assertEqual(result['compilation']['actor_loss_granularity'], 'tensor_block')
         self.assertIs(reference.actor_optimizer.param_groups[0].get('fused'), None)
@@ -2897,7 +2884,7 @@ class TestProfileV2TD3(unittest.TestCase):
                     batch_size=2,
                     scenario_count=2,
                     cache_ellipsoid_segment_clearance=True,
-                    single_observation_fast_path=True,
+
                 )
             persisted = json.loads(
                 (output / 'diagnostic_summary.json').read_text(encoding='utf-8')
@@ -2907,7 +2894,6 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertEqual(summary['format'], DIAGNOSTIC_FORMAT)
         self.assertFalse(summary['formal_stage_passed'])
         self.assertTrue(summary['diagnostic_config']['cache_ellipsoid_segment_clearance'])
-        self.assertTrue(summary['diagnostic_config']['single_observation_fast_path'])
         self.assertEqual(tuple(summary['levels']), ('easy', 'medium', 'hard'))
         self.assertEqual(
             summary['levels']['easy']['timing']['replay_sample_relation'],
@@ -2921,7 +2907,6 @@ class TestProfileV2TD3(unittest.TestCase):
         self.assertEqual(level_runner.call_count, 3)
         for call in level_runner.call_args_list:
             self.assertTrue(call.kwargs['cache_ellipsoid_segment_clearance'])
-            self.assertTrue(call.kwargs['single_observation_fast_path'])
         self.assertFalse(any(output.glob('*.pt')))
 
     def test_existing_output_directory_is_rejected(self) -> None:

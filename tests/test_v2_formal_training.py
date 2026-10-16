@@ -171,7 +171,7 @@ class TestV2FormalTraining(unittest.TestCase):
         optimized = build_v2_stage_engine(
             scenario, config, init_checkpoint=source,
             prepared_initialization=prepared, device='cpu',
-            fused_adam=True, aggregate_relation_values_first=True,
+            fused_adam=True,
             reduce_update_stat_syncs=True,
         ).engine
         self.assertTrue(optimized.actor_optimizer.param_groups[0]['fused'])
@@ -179,10 +179,6 @@ class TestV2FormalTraining(unittest.TestCase):
         self.assertTrue(optimized.reduce_update_stat_syncs)
         self.assertEqual(eager.replay.failure_sample_bias, 3.0)
         self.assertEqual(eager.gamma, 0.995)
-        self.assertTrue(all(
-            layer.attention.aggregate_relation_values_first
-            for layer in optimized.actor.zone_set_encoder.layers
-        ))
         self.assertEqual(
             tuple(optimized.checkpoint_state_dict()),
             tuple(eager.checkpoint_state_dict()),

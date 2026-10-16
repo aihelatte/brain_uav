@@ -996,16 +996,15 @@ def build_v2_stage_engine(
     snn_time_window: int = 4,
     prepared_initialization: V2PreparedStageInitialization | None = None,
     fused_adam: bool = False,
-    aggregate_relation_values_first: bool = False,
+
     reduce_update_stat_syncs: bool = False,
     window_update_statistics: bool = False,
     reuse_update_buffers: bool = False,
-    cuda_graph_critic_tail: bool = False,
+
     gpu_td3_update: bool = False,
     gpu_td3_compute: bool = False,
-    compile_critic_update_front: bool = False,
-    compile_actor_objective: bool = False,
-    pinned_batch_transfer: bool = False,
+
+
     non_blocking_batch_transfer: bool = False,
 ) -> V2StageComponents:
     if scenario is not None and not isinstance(scenario, ScenarioConfig):
@@ -1233,16 +1232,15 @@ def build_v2_stage_engine(
         bc_reference_actor=bc_actor,
         device=device,
         fused_adam=fused_adam,
-        aggregate_relation_values_first=aggregate_relation_values_first,
+
         reduce_update_stat_syncs=reduce_update_stat_syncs,
         window_update_statistics=window_update_statistics,
         reuse_update_buffers=reuse_update_buffers,
-        cuda_graph_critic_tail=cuda_graph_critic_tail,
+
         gpu_td3_update=gpu_td3_update,
         gpu_td3_compute=gpu_td3_compute,
-        compile_critic_update_front=compile_critic_update_front,
-        compile_actor_objective=compile_actor_objective,
-        pinned_batch_transfer=pinned_batch_transfer,
+
+
         non_blocking_batch_transfer=non_blocking_batch_transfer,
     )
     if previous_engine_payload is not None:
@@ -1300,7 +1298,7 @@ class V2FormalStageTrainer:
         periodic_snapshot_interval_steps: int | None = None,
         periodic_snapshot_sink: Callable[[int], None] | None = None,
         periodic_validation_sink: Callable[[int], None] | None = None,
-        cpu_deduplication: bool = False,
+        cpu_deduplication: bool = True,
     ) -> None:
         if not isinstance(scenario, ScenarioConfig) or not isinstance(rewards, RewardConfig):
             raise TypeError('scenario and rewards must use project config classes.')
