@@ -556,7 +556,10 @@ def evaluate_v2_fixed_validation(
     max_failures: int = 5,
     device: str | torch.device = 'cpu',
     reporter: V2ExperimentReporter | None = None,
+    cpu_deduplication: bool = False,
 ) -> V2ValidationResult:
+    if type(cpu_deduplication) is not bool:
+        raise TypeError('cpu_deduplication must be a bool.')
     if not isinstance(actor, (V2ANNPolicyActor, V2SNNPolicyActor)):
         raise TypeError('actor must be a V2ANNPolicyActor or V2SNNPolicyActor.')
     if not isinstance(pool, V2ValidationPool):
@@ -596,6 +599,7 @@ def evaluate_v2_fixed_validation(
         rewards,
         fixed_scenarios=[record['payload'] for record in pool.scenarios],
         uav_collision_radius=pool.uav_collision_radius,
+        cpu_deduplication=cpu_deduplication,
     )
     was_training = actor.training
     actor.eval()
@@ -614,7 +618,10 @@ def evaluate_v2_fixed_validation(
             episode_length = 0
             actions: list[list[float]] = []
             while outcome == 'running':
-                batch = collate_v2_observations([observation], device=target_device)
+                batch = collate_v2_observations(
+                    [observation], device=target_device,
+                    **({'deduplicate_copies': True} if cpu_deduplication else {}),
+                )
                 with torch.inference_mode():
                     action = actor(batch)[0].detach().cpu().numpy().astype(np.float32)
                 observation, reward, terminated, truncated, info = env.step(action)

@@ -141,6 +141,9 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                         '--validation-pool-dir', str(root / 'pools'), '--model', model,
                         '--device', 'cpu', '--bc-schedule', 'smooth-final',
                         '--periodic-snapshot-interval-steps', '0']
+                enabled = trial == 'gamma'
+                if enabled:
+                    argv += ['--cpu-deduplication']
                 for stage, bias in zip(('easy', 'medium', 'hard'), biases):
                     argv += [f'--{stage}-gamma', str(gamma),
                              f'--{stage}-failure-sample-bias', str(bias),
@@ -168,6 +171,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                                  ('easy', 'medium', 'hard').index(failed_stage) + 1)
                 self.assertEqual(calls[0]['init_checkpoint'], bc)
                 for index, call in enumerate(calls):
+                    self.assertEqual(call['cpu_deduplication'], enabled)
                     stage = call['stage']
                     actual = {name: call[name] for name in
                               ('gamma', 'failure_sample_bias', 'max_stage_steps', 'bc_schedule')}

@@ -96,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--compile-critic-update-front', action='store_true')
     parser.add_argument('--compile-actor-objective', action='store_true')
     parser.add_argument('--gpu-td3-compute', action='store_true', help='Experimental CPU replay + complete manual GPU computation; default off.')
+    parser.add_argument('--cpu-deduplication', action='store_true', help='Reuse existing CPU geometry results and remove redundant action-input copies; default off.')
     parser.add_argument('--gpu-td3-update', action='store_true', help='Experimental full device replay/update; CUDA 2.5.1+cu124 only; default off.')
     parser.add_argument('--cuda-graph-critic-tail', action='store_true', help='Capture checked fused critic Adam and optional critic target updates; requires CUDA.')
     parser.add_argument('--compile-critic-encoder', action='store_true')
@@ -490,6 +491,7 @@ def run_v2_td3_stage(
     cuda_graph_critic_tail: bool = False,
     gpu_td3_update: bool = False,
     gpu_td3_compute: bool = False,
+    cpu_deduplication: bool = False,
     compile_critic_update_front: bool = False,
     compile_actor_objective: bool = False,
     pinned_batch_transfer: bool = False,
@@ -508,6 +510,8 @@ def run_v2_td3_stage(
                         ('compile_actor_objective', compile_actor_objective)):
         if type(value) is not bool:
             raise TypeError(f'{name} must be a bool.')
+    if type(cpu_deduplication) is not bool:
+        raise TypeError('cpu_deduplication must be a bool.')
     if type(gpu_td3_compute) is not bool:
         raise TypeError('gpu_td3_compute must be a bool.')
     if gpu_td3_compute and any((gpu_td3_update, compile_critic_update_front, compile_actor_objective, cuda_graph_critic_tail, window_update_statistics, reuse_update_buffers, pinned_batch_transfer, aggregate_relation_values_first)):
@@ -684,7 +688,7 @@ def run_v2_td3_stage(
             if isinstance(actor, V2SNNPolicyActor)
             else None
         )
-        reporter.start_stage({
+        stage_report_payload = {
             'requested_device': requested_device,
             'resolved_device': resolved_device,
             'initialization_source': dict(components.initialization_source),
@@ -697,7 +701,7 @@ def run_v2_td3_stage(
             'metrics_output': str(metrics_path),
             'snn': snn_metadata,
             'compilation': compilation_metadata,
-        })
+        }
 
     def validate(actor):
         return evaluate_v2_fixed_validation(
@@ -707,6 +711,7 @@ def run_v2_td3_stage(
             max_failures=config.validation_max_failures,
             device=resolved_device,
             reporter=reporter,
+            cpu_deduplication=cpu_deduplication,
         )
 
     periodic_snapshot_sink = None
@@ -747,6 +752,7 @@ def run_v2_td3_stage(
                 max_failures=config.validation_max_failures,
                 device=resolved_device,
                 reporter=None,
+                cpu_deduplication=cpu_deduplication,
             )
             if reporter is not None:
                 record = dict(result.to_dict())
@@ -771,7 +777,21 @@ def run_v2_td3_stage(
         periodic_snapshot_interval_steps=periodic_snapshot_interval_steps,
         periodic_snapshot_sink=periodic_snapshot_sink,
         periodic_validation_sink=periodic_validation_sink,
+        cpu_deduplication=cpu_deduplication,
     )
+    execution_configuration = trainer.execution_configuration
+    execution_configuration['cpu_deduplication'].update({
+        'candidate_validation_environment': cpu_deduplication,
+        'candidate_validation_action_input': cpu_deduplication,
+        'periodic_validation_environment': (
+            cpu_deduplication if periodic_validation_sink is not None else None),
+        'periodic_validation_action_input': (
+            cpu_deduplication if periodic_validation_sink is not None else None),
+        'compilation_warmup': 'not_applicable',
+    })
+    if reporter is not None:
+        reporter.start_stage({**stage_report_payload,
+                              'execution_configuration': execution_configuration})
     try:
         result = trainer.run()
         compilation_metadata['local_optimizations'] = components.engine.local_optimization_metadata()
@@ -833,6 +853,7 @@ def run_v2_td3_stage(
             'checkpoint': str(checkpoint_path),
             'report_directory': str(report_path) if reporter is not None else None,
             'compilation': compilation_metadata,
+            'execution_configuration': execution_configuration,
         }
         if isinstance(actor, V2SNNPolicyActor):
             metrics_payload['snn'] = {
@@ -843,7 +864,8 @@ def run_v2_td3_stage(
             }
         _write_strict_json(metrics_path, metrics_payload)
         if reporter is not None:
-            reporter.finish_stage(result.to_dict())
+            reporter.finish_stage({**result.to_dict(),
+                                   'execution_configuration': execution_configuration})
         summary = {
             'stage': stage,
             'model_type': model,
@@ -863,6 +885,7 @@ def run_v2_td3_stage(
             ),
             'report_directory': str(report_path) if reporter is not None else None,
             'compilation': compilation_metadata,
+            'execution_configuration': execution_configuration,
         }
         return summary
     finally:
@@ -896,6 +919,7 @@ def main(argv: list[str] | None = None) -> int:
         spike_regularization=spike_config,
     )
     print(json.dumps({
+        'execution_configuration': {'cpu_deduplication': {'requested': args.cpu_deduplication}},
         'local_optimizations_requested': {'window_update_statistics': args.window_update_statistics,
                                           'reuse_update_buffers': args.reuse_update_buffers, 'cuda_graph_critic_tail': args.cuda_graph_critic_tail, 'gpu_td3_update': args.gpu_td3_update, 'gpu_td3_compute': args.gpu_td3_compute,
                                           'compile_critic_update_front': args.compile_critic_update_front,
@@ -959,6 +983,7 @@ def main(argv: list[str] | None = None) -> int:
         cuda_graph_critic_tail=args.cuda_graph_critic_tail,
         gpu_td3_update=args.gpu_td3_update,
         gpu_td3_compute=args.gpu_td3_compute,
+        cpu_deduplication=args.cpu_deduplication,
         compile_critic_update_front=args.compile_critic_update_front,
         compile_actor_objective=args.compile_actor_objective,
         pinned_batch_transfer=args.pinned_batch_transfer,

@@ -1300,6 +1300,7 @@ class V2FormalStageTrainer:
         periodic_snapshot_interval_steps: int | None = None,
         periodic_snapshot_sink: Callable[[int], None] | None = None,
         periodic_validation_sink: Callable[[int], None] | None = None,
+        cpu_deduplication: bool = False,
     ) -> None:
         if not isinstance(scenario, ScenarioConfig) or not isinstance(rewards, RewardConfig):
             raise TypeError('scenario and rewards must use project config classes.')
@@ -1339,6 +1340,9 @@ class V2FormalStageTrainer:
         radius = _nonnegative_float(uav_collision_radius, name='uav_collision_radius')
         if engine.actor.uav_radius != radius:
             raise ValueError('engine actor uav_radius is incompatible.')
+        if type(cpu_deduplication) is not bool:
+            raise TypeError('cpu_deduplication must be a bool.')
+        self.cpu_deduplication = cpu_deduplication
         self.scenario = scenario
         self.rewards = rewards
         self.config = config
@@ -1377,7 +1381,17 @@ class V2FormalStageTrainer:
             scenario,
             rewards,
             uav_collision_radius=radius,
+            cpu_deduplication=cpu_deduplication,
         )
+
+    @property
+    def execution_configuration(self) -> dict[str, Any]:
+        """Execution options are separate from algorithm/checkpoint config."""
+        return {'cpu_deduplication': {
+            'requested': self.cpu_deduplication,
+            'training_environment': self.env.cpu_deduplication,
+            'training_action_input': self.cpu_deduplication,
+        }}
 
     def _new_episode(self) -> tuple[V2Observation, str]:
         level = self.selector.sample()
@@ -1427,6 +1441,7 @@ class V2FormalStageTrainer:
                 observation,
                 exploration_noise=exploration_noise,
                 exploration_rng=self.exploration_rng,
+                **({'cpu_deduplication': True} if self.cpu_deduplication else {}),
             )
             if in_warmup:
                 episode_warmup_steps += 1

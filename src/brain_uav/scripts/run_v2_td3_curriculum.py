@@ -67,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--compile-critic-update-front', action='store_true')
     parser.add_argument('--compile-actor-objective', action='store_true')
     parser.add_argument('--gpu-td3-compute', action='store_true', help='Experimental CPU replay + complete manual GPU computation; default off.')
+    parser.add_argument('--cpu-deduplication', action='store_true', help='Reuse existing CPU geometry results and remove redundant action-input copies; default off.')
     parser.add_argument('--gpu-td3-update', action='store_true', help='Experimental full device replay/update; CUDA 2.5.1+cu124 only; default off.')
     parser.add_argument('--cuda-graph-critic-tail', action='store_true', help='Capture checked fused critic Adam and optional critic target updates; requires CUDA.')
     parser.add_argument('--compile-critic-encoder', action='store_true')
@@ -266,6 +267,7 @@ def run_v2_curriculum(
     cuda_graph_critic_tail: bool = False,
     gpu_td3_update: bool = False,
     gpu_td3_compute: bool = False,
+    cpu_deduplication: bool = False,
     compile_critic_update_front: bool = False,
     compile_actor_objective: bool = False,
     pinned_batch_transfer: bool = False,
@@ -279,6 +281,8 @@ def run_v2_curriculum(
                         ('compile_actor_objective', compile_actor_objective)):
         if type(value) is not bool:
             raise TypeError(f'{name} must be a bool.')
+    if type(cpu_deduplication) is not bool:
+        raise TypeError('cpu_deduplication must be a bool.')
     if type(gpu_td3_compute) is not bool:
         raise TypeError('gpu_td3_compute must be a bool.')
     if gpu_td3_compute and any((gpu_td3_update, compile_critic_update_front, compile_actor_objective, cuda_graph_critic_tail, window_update_statistics, reuse_update_buffers, pinned_batch_transfer, aggregate_relation_values_first)):
@@ -472,6 +476,7 @@ def run_v2_curriculum(
             cuda_graph_critic_tail=cuda_graph_critic_tail,
             gpu_td3_update=gpu_td3_update,
             gpu_td3_compute=gpu_td3_compute,
+            cpu_deduplication=cpu_deduplication,
             compile_critic_update_front=compile_critic_update_front,
             compile_actor_objective=compile_actor_objective,
             pinned_batch_transfer=pinned_batch_transfer,
@@ -492,6 +497,10 @@ def run_v2_curriculum(
         'snn': snn_metadata,
         'seed': seed,
         'validation_seed': validated_pools['easy'].master_seed,
+        'execution_configuration': {'cpu_deduplication': {
+            'requested': cpu_deduplication,
+            'stages': {item['stage']: item.get('execution_configuration') for item in summaries},
+        }},
         'validation_pools': {
             stage: {
                 'path': str(pools[stage]),
@@ -565,6 +574,7 @@ def main(argv: list[str] | None = None) -> int:
     print(json.dumps({
         'local_optimizations_requested': {'window_update_statistics': args.window_update_statistics,
                                           'reuse_update_buffers': args.reuse_update_buffers, 'cuda_graph_critic_tail': args.cuda_graph_critic_tail, 'gpu_td3_update': args.gpu_td3_update, 'gpu_td3_compute': args.gpu_td3_compute,
+                                          'cpu_deduplication': args.cpu_deduplication,
                                           'compile_critic_update_front': args.compile_critic_update_front,
                                           'compile_actor_objective': args.compile_actor_objective},
         'requested_device': args.device,
@@ -626,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
         cuda_graph_critic_tail=args.cuda_graph_critic_tail,
         gpu_td3_update=args.gpu_td3_update,
         gpu_td3_compute=args.gpu_td3_compute,
+        cpu_deduplication=args.cpu_deduplication,
         compile_critic_update_front=args.compile_critic_update_front,
         compile_actor_objective=args.compile_actor_objective,
         pinned_batch_transfer=args.pinned_batch_transfer,

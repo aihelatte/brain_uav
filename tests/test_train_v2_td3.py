@@ -82,6 +82,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 critic1=model,
                 critic2=model,
                 replay=SimpleNamespace(sampling_implementation='fenwick_ppswor_v1'),
+                local_optimization_metadata=lambda: {},
             ),
             scenario_generators={'easy': object()},
             selector=object(),
@@ -155,6 +156,8 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 new=tracking_close,
             ):
                 trainer_type.return_value.run.return_value = result
+                trainer_type.return_value.execution_configuration = {'cpu_deduplication': {
+                    'requested': False, 'training_environment': False, 'training_action_input': False}}
                 with self.assertRaisesRegex(
                     RuntimeError, 'injected TD3 report finish failure'
                 ):
@@ -621,6 +624,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 replay=SimpleNamespace(
                     sampling_implementation='fenwick_ppswor_v1'
                 ),
+                local_optimization_metadata=lambda: {},
             ),
             scenario_generators={'easy': object()},
             selector=object(),
@@ -701,9 +705,17 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             ) as metrics_writer:
                 def finish_training():
                     trainer_type.call_args.kwargs['periodic_snapshot_sink'](10)
+                    with mock.patch('brain_uav.scripts.train_v2_td3.evaluate_v2_fixed_validation') as validate:
+                        validate.return_value.to_dict.return_value = {}
+                        trainer_type.call_args.kwargs['validation_runner'](actor)
+                        self.assertTrue(validate.call_args.kwargs['cpu_deduplication'])
+                        trainer_type.call_args.kwargs['periodic_validation_sink'](10)
+                        self.assertTrue(validate.call_args.kwargs['cpu_deduplication'])
                     return result
 
                 trainer_type.return_value.run.side_effect = finish_training
+                trainer_type.return_value.execution_configuration = {'cpu_deduplication': {
+                    'requested': True, 'training_environment': True, 'training_action_input': True}}
                 summary = run_v2_td3_stage(
                     stage='medium',
                     init_checkpoint=checkpoint,
@@ -715,12 +727,14 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                     critic_lr=3e-4,
                     bc_schedule='smooth-final',
                     periodic_snapshot_interval_steps=100,
+                    cpu_deduplication=True,
                 )
                 stage_start = json.loads(
                     (root / 'metrics_reports' / 'stage_start.json').read_text(
                         encoding='utf-8'
                     )
                 )
+                stage_end = json.loads((root / 'metrics_reports' / 'stage_end.json').read_text(encoding='utf-8'))
 
         resolver.assert_called_once_with('auto')
         self.assertEqual(initializer.call_args.kwargs['device'], 'cuda')
@@ -752,6 +766,14 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             'values': [500.0, 150.0, 30.0, 15.0, 10.0, 7.0, 5.0],
         }
         self.assertEqual(trainer_type.call_args.kwargs['bc_schedule'], 'smooth-final')
+        self.assertTrue(trainer_type.call_args.kwargs['cpu_deduplication'])
+        execution = summary['execution_configuration']
+        self.assertEqual(stage_start['execution_configuration'], execution)
+        self.assertEqual(stage_end['execution_configuration'], execution)
+        self.assertEqual(metrics_writer.call_args.args[1]['execution_configuration'], execution)
+        self.assertTrue(execution['cpu_deduplication']['training_environment'])
+        self.assertTrue(execution['cpu_deduplication']['candidate_validation_action_input'])
+        self.assertNotIn('cpu_deduplication', builder.call_args.args[1].to_dict())
         self.assertEqual(
             formal_checkpoint_builder.call_args.kwargs['bc_schedule'],
             'smooth-final',
