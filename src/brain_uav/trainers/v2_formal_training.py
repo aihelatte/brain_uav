@@ -1542,6 +1542,9 @@ class V2FormalStageTrainer:
                     'stage_steps': self.result.stage_steps,
                     'global_steps': self.result.global_steps_end,
                     'outcome': outcome,
+                    # km; success uses the triggering segment, failures the actual endpoint.
+                    'terminal_goal_distance': float(info[
+                        'segment_goal_distance' if outcome == 'goal' else 'goal_distance']),
                     'terminal_position': info['terminal_position'],
                     'boundary_violations': info['boundary_violations'],
                     'episode_return': episode_return,

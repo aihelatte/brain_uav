@@ -637,6 +637,9 @@ def evaluate_v2_fixed_validation(
             detail = {
                 'scenario_id': record['scenario_id'],
                 'outcome': outcome,
+                # km; success uses the triggering segment, failures the actual endpoint.
+                'terminal_goal_distance': float(info[
+                    'segment_goal_distance' if outcome == 'goal' else 'goal_distance']),
                 'terminal_position': info['terminal_position'],
                 'boundary_violations': info['boundary_violations'],
                 'episode_length': episode_length,
