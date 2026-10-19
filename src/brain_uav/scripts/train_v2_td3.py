@@ -75,8 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('--critic-lr', type=float, default=None)
     parser.add_argument(
-        '--bc-schedule', choices=('default', 'smooth-final', 'smooth-mid'), default='default',
-        help='Optional stage-local BC schedule; smooth-final/smooth-mid support easy/medium.',
+        '--bc-schedule', choices=('default', 'smooth-final', 'smooth-mid', 'smooth-mid-strong'), default='default',
+        help='Optional stage-local BC schedule; smooth variants support easy/medium.',
     )
     parser.add_argument(
         '--bc-final-drop-step',

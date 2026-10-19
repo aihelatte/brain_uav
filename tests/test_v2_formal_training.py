@@ -141,12 +141,21 @@ def _validation_result(passed: bool) -> V2ValidationResult:
 
 class TestV2FormalTraining(unittest.TestCase):
     def test_smooth_mid_checkpoint_and_snapshot_strict_round_trip(self):
+        self._check_mid_checkpoint_and_snapshot('smooth-mid')
+
+    def test_smooth_mid_strong_checkpoint_and_snapshot_strict_round_trip(self):
+        self._check_mid_checkpoint_and_snapshot('smooth-mid-strong')
+
+    def _check_mid_checkpoint_and_snapshot(self, schedule):
         from brain_uav.trainers.v2_formal_training import v2_bc_schedule_metadata
         expected = {
             'kind': 'stage_local_piecewise_constant', 'name': 'smooth-mid',
             'boundaries': [0, 75000, 150000, 200000, 250000, 300000, 335000, 370000],
             'values': [500., 150., 75., 30., 15., 10., 7., 5.],
         }
+        if schedule == 'smooth-mid-strong':
+            expected['name'] = schedule
+            expected['values'] = [500., 150., 75., 60., 30., 20., 14., 10.]
         scenario = ScenarioConfig(max_steps=1)
         engine = _engine(scenario)
         for stage in ('easy', 'medium'):
@@ -163,7 +172,7 @@ class TestV2FormalTraining(unittest.TestCase):
                     seed_manifest={'base_seed': 7}, initialization_source=(
                         {'kind': 'v2_bc_best', 'path': 'bc.pt'} if stage == 'easy' else
                         {'kind': 'validated_v2_td3_stage', 'path': 'easy.pt', 'previous_stage': 'easy'}),
-                    bc_schedule='smooth-mid')
+                    bc_schedule=schedule)
                 payload = build_v2_formal_checkpoint(engine, result, config,
                     validation_pool_metadata=dict(path='pool.json', format_version=1,
                         curriculum_level=stage, master_seed=20260904, stage_seed=11,
@@ -186,17 +195,25 @@ class TestV2FormalTraining(unittest.TestCase):
                             tampered['bc_schedule'][field][2] += 1
                         with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'BC schedule is incompatible'):
                             load(tampered)
-                metadata = v2_bc_schedule_metadata(stage, schedule='smooth-mid')
+                metadata = v2_bc_schedule_metadata(stage, schedule=schedule)
                 metadata['values'][2] = 0.
-                self.assertEqual(v2_bc_schedule_metadata(stage, schedule='smooth-mid'), expected)
+                self.assertEqual(v2_bc_schedule_metadata(stage, schedule=schedule), expected)
         with self.assertRaisesRegex(ValueError, 'easy or medium'):
-            v2_bc_schedule_metadata('hard', schedule='smooth-mid')
+            v2_bc_schedule_metadata('hard', schedule=schedule)
         with self.assertRaisesRegex(ValueError, 'conflict'):
-            v2_bc_schedule_metadata('medium', schedule='smooth-mid', final_drop_step=400000)
+            v2_bc_schedule_metadata('medium', schedule=schedule, final_drop_step=400000)
 
     def test_smooth_mid_update_and_episode_keep_zero_based_schedule(self):
+        self._check_mid_update_timing('smooth-mid', ((150000, 150., 75.), (200000, 75., 30.)))
+
+    def test_smooth_mid_strong_update_and_episode_keep_zero_based_schedule(self):
+        self._check_mid_update_timing('smooth-mid-strong',
+            ((150000, 150., 75.), (200000, 75., 60.), (250000, 60., 30.),
+             (300000, 30., 20.), (335000, 20., 14.), (370000, 14., 10.)))
+
+    def _check_mid_update_timing(self, schedule, boundaries):
         from brain_uav.trainers.v2_td3 import V2TD3UpdateMetrics
-        for boundary, before, after in ((150000, 150., 75.), (200000, 75., 30.)):
+        for boundary, before, after in boundaries:
             with self.subTest(boundary=boundary):
                 scenario = ScenarioConfig(max_steps=3)
                 engine = _engine(scenario)
@@ -207,7 +224,7 @@ class TestV2FormalTraining(unittest.TestCase):
                         replay_capacity=16, batch_size=2), engine,
                     scenario_sources={'easy': _Source(payload)},
                     validation_runner=lambda actor: _validation_result(False),
-                    global_steps_start=900000, bc_schedule='smooth-mid')
+                    global_steps_start=900000, bc_schedule=schedule)
                 obs, _ = trainer.env.reset(options={'scenario': payload})
                 engine.replay.add(obs, np.zeros(2, dtype=np.float32), 0., obs, False)
                 trainer.result.stage_steps = boundary - 1

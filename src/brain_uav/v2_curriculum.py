@@ -150,9 +150,9 @@ def v2_bc_lambda(
     final_step = _nonnegative_int(final_drop_step, name='final_drop_step')
     if final_step not in (300_000, 400_000):
         raise ValueError('final_drop_step must be 300000 or 400000.')
-    if schedule not in ('default', 'smooth-final', 'smooth-mid'):
-        raise ValueError('schedule must be default, smooth-final or smooth-mid.')
-    if schedule in ('smooth-final', 'smooth-mid'):
+    if schedule not in ('default', 'smooth-final', 'smooth-mid', 'smooth-mid-strong'):
+        raise ValueError('schedule must be default, smooth-final, smooth-mid or smooth-mid-strong.')
+    if schedule in ('smooth-final', 'smooth-mid', 'smooth-mid-strong'):
         if final_step != 300_000:
             raise ValueError(
                 f'{schedule} conflicts with --bc-final-drop-step 400000.'
@@ -161,17 +161,18 @@ def v2_bc_lambda(
             return 500.0
         if step < 150_000:
             return 150.0
-        if schedule == 'smooth-mid' and step < 200_000:
+        if schedule in ('smooth-mid', 'smooth-mid-strong') and step < 200_000:
             return 75.0
+        strength = 2.0 if schedule == 'smooth-mid-strong' else 1.0
         if step < 250_000:
-            return 30.0
+            return 30.0 * strength
         if step < 300_000:
-            return 15.0
+            return 15.0 * strength
         if step < 335_000:
-            return 10.0
+            return 10.0 * strength
         if step < 370_000:
-            return 7.0
-        return 5.0
+            return 7.0 * strength
+        return 5.0 * strength
     if step < 75_000:
         return 500.0
     if step < 150_000:

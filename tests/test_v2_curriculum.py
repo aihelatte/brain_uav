@@ -141,6 +141,23 @@ class TestV2Curriculum(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'conflict'):
             v2_bc_lambda(0, schedule='smooth-mid', final_drop_step=400000)
 
+    def test_smooth_mid_strong_boundaries_and_relation_to_smooth_mid(self):
+        from brain_uav.v2_curriculum import v2_bc_lambda
+        boundaries = [0, 75000, 150000, 200000, 250000, 300000, 335000, 370000]
+        values = [500., 150., 75., 60., 30., 20., 14., 10.]
+        for index, boundary in enumerate(boundaries):
+            for step in (boundary - 1, boundary, boundary + 1):
+                if step < 0:
+                    continue
+                with self.subTest(step=step):
+                    actual = v2_bc_lambda(step, schedule='smooth-mid-strong')
+                    self.assertEqual(actual, values[index - 1] if step < boundary else values[index])
+                    old = v2_bc_lambda(step, schedule='smooth-mid')
+                    self.assertEqual(actual, old if step < 200000 else old * 2.)
+        self.assertEqual(v2_bc_lambda(1000000, schedule='smooth-mid-strong'), 10.)
+        with self.assertRaisesRegex(ValueError, 'conflict'):
+            v2_bc_lambda(0, schedule='smooth-mid-strong', final_drop_step=400000)
+
     def test_noise_schedule_decays_for_first_half_then_stays_final(self) -> None:
         from brain_uav.v2_curriculum import V2NoiseSchedule
 

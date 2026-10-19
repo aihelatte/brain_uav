@@ -36,6 +36,25 @@ from brain_uav.v2_curriculum import derive_v2_component_seed
 
 
 class TestTrainV2TD3CLI(unittest.TestCase):
+    def test_smooth_mid_strong_cli_forwards_for_both_models_and_rejects_conflicts(self):
+        from contextlib import redirect_stdout
+        from io import StringIO
+        for model in ('ann', 'snn'):
+            with self.subTest(model=model), redirect_stdout(StringIO()), mock.patch(
+                'brain_uav.scripts.train_v2_td3.run_v2_td3_stage', return_value={'passed': True}
+            ) as runner:
+                train_main(['--stage','easy','--model',model,'--device','cpu',
+                    '--init-checkpoint','bc.pt','--output','out.pt','--metrics-out','metrics.json',
+                    '--validation-pool','pool.json','--bc-schedule','smooth-mid-strong'])
+            self.assertEqual(runner.call_args.kwargs['bc_schedule'], 'smooth-mid-strong')
+        for stage, extra, error in (('hard', {}, 'easy or medium'),
+                                    ('easy', {'bc_final_drop_step':400000}, 'conflict'),
+                                    ('medium', {'bc_final_drop_step':400000}, 'conflict')):
+            with self.subTest(stage=stage), self.assertRaisesRegex(ValueError, error):
+                run_v2_td3_stage(stage=stage, init_checkpoint=Path('unused.pt'),
+                    output=Path('out.pt'), metrics_out=Path('metrics.json'), validation_pool=Path('pool.json'),
+                    bc_schedule='smooth-mid-strong', **extra)
+
     def test_smooth_mid_cli_forwards_explicit_actor_lr_for_ann_and_snn(self):
         from contextlib import redirect_stdout
         from io import StringIO
@@ -616,6 +635,9 @@ class TestTrainV2TD3CLI(unittest.TestCase):
     def test_medium_stage_records_smooth_mid_everywhere(self):
         self._check_medium_stage_schedule('smooth-mid')
 
+    def test_medium_stage_records_smooth_mid_strong_everywhere(self):
+        self._check_medium_stage_schedule('smooth-mid-strong')
+
     def _check_medium_stage_schedule(self, schedule):
         scenario = ScenarioConfig(target_distance=1_701.0)
         rewards = RewardConfig(progress_weight=3.25)
@@ -791,10 +813,12 @@ class TestTrainV2TD3CLI(unittest.TestCase):
             'boundaries': [0, 75_000, 150_000, 250_000, 300_000, 335_000, 370_000],
             'values': [500.0, 150.0, 30.0, 15.0, 10.0, 7.0, 5.0],
         }
-        if schedule == 'smooth-mid':
+        if schedule in ('smooth-mid', 'smooth-mid-strong'):
             expected_schedule['name'] = schedule
             expected_schedule['boundaries'].insert(3, 200000)
             expected_schedule['values'].insert(2, 75.)
+            if schedule == 'smooth-mid-strong':
+                expected_schedule['values'] = [500., 150., 75., 60., 30., 20., 14., 10.]
         self.assertEqual(trainer_type.call_args.kwargs['bc_schedule'], schedule)
         self.assertTrue(trainer_type.call_args.kwargs['cpu_deduplication'])
         execution = summary['execution_configuration']

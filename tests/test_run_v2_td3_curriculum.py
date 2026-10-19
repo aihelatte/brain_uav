@@ -104,6 +104,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
         for model, trial, failed_stage in (
             ('ann', 'baseline', None), ('snn', 'baseline', None),
             ('ann', 'smooth-mid', None), ('snn', 'smooth-mid', None),
+            ('ann', 'smooth-mid-strong', None), ('snn', 'smooth-mid-strong', None),
             ('ann', 'gamma', None), ('snn', 'gamma', None),
             ('ann', 'bias', None), ('snn', 'bias', None),
             ('ann', 'baseline', 'easy'), ('snn', 'baseline', 'medium'),
@@ -117,7 +118,7 @@ class TestRunV2TD3CurriculumCLI(unittest.TestCase):
                 actor = (_make_snn_actor(scenario, time_window=4, tau=2.0)
                          if model == 'snn' else None)
                 calls = []
-                schedule = 'smooth-mid' if trial == 'smooth-mid' else 'smooth-final'
+                schedule = trial if trial in ('smooth-mid', 'smooth-mid-strong') else 'smooth-final'
                 gamma = 0.995 if trial == 'gamma' else 0.99
                 biases = [2.0] * 3 if trial == 'bias' else [1.0, 1.5 if model == 'snn' else 1.0, 1.0]
 
