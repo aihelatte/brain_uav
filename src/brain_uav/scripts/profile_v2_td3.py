@@ -3409,6 +3409,7 @@ def _run_diagnostic_level(
     block_attribution_wall: bool = False,
     controlled_stage_step_offset: int = 0,
     bc_schedule: str = 'default',
+    concurrent_window=None,
 ) -> dict[str, Any]:
     scenario_count = len(pool.scenarios)
     if scenario_count == 0 or measured_steps < scenario_count:
@@ -3424,6 +3425,10 @@ def _run_diagnostic_level(
         }
         for record in pool.scenarios
     ]
+    if concurrent_window is not None:
+        for item, record in zip(coverage, pool.scenarios):
+            item['shape_types'] = [zone['shape']['shape_type'] for zone in record['payload']['zones']]
+            item['completed_steps_in_window'] = 0
     components = build_v2_stage_engine(
         None,
         formal_config,
@@ -3778,6 +3783,9 @@ def _run_diagnostic_level(
     step_number = 0
     measured_count = 0
     actual_warmup_steps = 0
+    window = None
+    window_completed_steps = 0
+    concurrent_captures_before = None
     scenario_index = 0
     profiled_update_active = False
     # Bound failure if the expected update cadence cannot reach the warmup gate.
@@ -3799,7 +3807,11 @@ def _run_diagnostic_level(
 
     engine.replay.sample = timed_sample
     try:
-        while measured_count < measured_steps:
+        while concurrent_window is not None or measured_count < measured_steps:
+            if measured_phase and concurrent_window is not None and concurrent_window.finished():
+                break
+            if concurrent_window is not None and controlled_stage_step_offset + step_number >= formal_config.max_steps:
+                raise RuntimeError('Concurrent measurement exhausted the unchanged stage horizon.')
             if not measured_phase and (
                 step_number >= warmup_steps
                 and engine.critic_update_count >= 4
@@ -3820,6 +3832,10 @@ def _run_diagnostic_level(
                     if engine._gpu_update_executor is None:
                         raise RuntimeError('GPU updater did not initialize during warmup.')
                     engine._gpu_update_executor.begin_measurement()
+                if concurrent_window is not None:
+                    from brain_uav.scripts.v2_concurrent_diagnostic import inductor_capture_snapshot
+                    concurrent_captures_before = inductor_capture_snapshot(device)
+                    window = concurrent_window.ready()
                 measured_started = perf_counter()
                 actor_updates_before = engine.actor_update_count
                 critic_updates_before = engine.critic_update_count
@@ -4042,9 +4058,14 @@ def _run_diagnostic_level(
             if measured_phase:
                 measured_count += 1
                 coverage[scenario_index]['measured_steps'] += 1
-                if coverage[scenario_index]['measured_steps'] == budgets[scenario_index]:
+                if concurrent_window is not None and perf_counter() <= window['end']:
+                    window_completed_steps += 1
+                    coverage[scenario_index]['completed_steps_in_window'] += 1
+                if coverage[scenario_index]['measured_steps'] % budgets[scenario_index] == 0:
                     # A budget boundary ends only this fragment, never the environment episode.
                     scenario_index += 1
+                    if concurrent_window is not None:
+                        scenario_index %= scenario_count
                     observation = None
                     episode_transitions = []
                     slot_refs = []
@@ -4054,6 +4075,9 @@ def _run_diagnostic_level(
         stream_seconds = timing.cuda_stream_interval_seconds()
         completion_wait_seconds = perf_counter()-completion_wait_started if completion_wait_started is not None else None
         measured_total = perf_counter() - measured_started
+        measured_finished = perf_counter()
+        concurrent_captures_after = (inductor_capture_snapshot(device)
+            if concurrent_window is not None else None)
         ordinary_actor_updates = engine.actor_update_count - actor_updates_before
         ordinary_critic_updates = engine.critic_update_count - critic_updates_before
         ordinary_graph_count_after = (
@@ -4160,7 +4184,19 @@ def _run_diagnostic_level(
         'warmup_steps': actual_warmup_steps,
         'warmup_critic_updates': critic_updates_before,
         'warmup_actor_updates': actor_updates_before,
-        'measured_steps': measured_steps,
+        'measured_steps': measured_count,
+        'concurrent_window': (dict(window, actual_start=measured_started,
+            actual_end=measured_finished, completed_steps_in_window=window_completed_steps)
+            if window is not None else None),
+        'concurrent_inductor_captures': ({'before': concurrent_captures_before,
+            'after': concurrent_captures_after} if concurrent_window is not None else None),
+        'measurement_graph_replays': (engine._gpu_update_executor.replays
+            - engine._gpu_update_executor.measurement_replays_before
+            if concurrent_window is not None and gpu_td3_compute else None),
+        'replay_occupancy': {'capacity': engine.replay.capacity, 'size': len(engine.replay),
+            'success_capacity': engine.replay.success_capacity, 'success_size': engine.replay.success_size},
+        'environment_execution': {'cpu_deduplication': env.cpu_deduplication,
+            'cache_ellipsoid_segment_clearance': env.cache_ellipsoid_segment_clearance},
         'cpu_deduplication': cpu_deduplication,
         'deduplication_evidence_enabled': deduplication_evidence is not None,
         'block_attribution': block_attribution.report(block_attribution_wall),
@@ -4201,7 +4237,7 @@ def _run_diagnostic_level(
             ),
             'total_wall_seconds_note': total_wall_seconds_note,
             'throughput_environment_steps_per_second': (
-                measured_steps / measured_total
+                measured_count / measured_total
                 if (
                     not profiler_overhead_included
                     and compile_timing_valid
@@ -4220,7 +4256,7 @@ def _run_diagnostic_level(
             ],
             'td3_update_breakdown': update_timing.to_dict(),
             'td3_nested_update_breakdown': (
-                nested_update_timing.to_dict(environment_steps=measured_steps)
+                nested_update_timing.to_dict(environment_steps=measured_count)
                 if nested_update_diagnostic_enabled
                 else None
             ),
@@ -5212,9 +5248,13 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     if ((args.local_optimization_correctness)) and (target.type != 'cuda' or args.comparison_eager_cpu):
         raise ValueError('Local optimization correctness requires real CUDA and formal compilation; CPU/mock is unsupported.')
     regularization = V2SpikeRegularizationConfig(beta_max=1.0 if args.model == 'snn' else 0.0)
+    requested_actor_lr = getattr(args, 'comparison_actor_lr', None)
     config = formal_config or V2FormalTrainingConfig(stage='easy', max_steps=500000, seed=args.seed, batch_size=args.batch_size,
-        replay_capacity=args.replay_capacity, actor_lr=1.55e-4 if args.model == 'ann' else 9.5e-4,
-        critic_lr=2.5e-4, failure_sample_bias=2.0, spike_regularization=regularization)
+        replay_capacity=args.replay_capacity,
+        actor_lr=requested_actor_lr if requested_actor_lr is not None else (1.55e-4 if args.model == 'ann' else 9.5e-4),
+        critic_lr=getattr(args, 'comparison_critic_lr', 2.5e-4),
+        actor_rl_scale_alpha=getattr(args, 'comparison_alpha', 2.5),
+        failure_sample_bias=2.0, spike_regularization=regularization)
     if rewards is None:
         from brain_uav.config import RewardConfig
         rewards = RewardConfig(breakthrough_clearance_gate_enabled=False,
@@ -5285,6 +5325,15 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
             np.random.seed(args.seed)
             torch.manual_seed(args.seed)
             before = load_snapshot()
+            concurrent_window = None
+            if getattr(args, 'concurrent_window_dir', None) is not None:
+                from brain_uav.scripts.v2_concurrent_diagnostic import WorkerWindow
+                if (args.gpu_compute_worker != 'timing' or not args.gpu_td3_compute
+                        or not cpu_deduplication or repeats != 1
+                        or environment_diagnostic or collect_deduplication):
+                    raise ValueError('Concurrent workers require compute + CPU dedup timing only, one fresh repeat, no instrumentation.')
+                concurrent_window = WorkerWindow(args.concurrent_window_dir,
+                    args.concurrent_worker_id, timeout=args.concurrent_timeout)
             result = _run_diagnostic_level(level='easy', pool=pool, prepared=prepared,
                 formal_config=config, bc_checkpoint=args.bc_checkpoint, model=args.model,
                 snn_time_window=args.snn_time_window, device=target,
@@ -5304,10 +5353,16 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 block_attribution_wall=False,
                 compiled_path_profiler_updates=0,
                 compiled_profiler_output_dir=None,
-                controlled_stage_step_offset=offset, bc_schedule=args.comparison_bc_schedule, **compilation)
+                controlled_stage_step_offset=offset, bc_schedule=args.comparison_bc_schedule,
+                concurrent_window=concurrent_window, **compilation)
             result['server_load_before'] = before
             result['server_load_after'] = load_snapshot()
             result['repeat'] = repeat
+            if concurrent_window is not None:
+                from brain_uav.scripts.v2_concurrent_diagnostic import summarize_worker
+                validity = summarize_worker({'runs': {'compute': [result]}}, concurrent_window.window)
+                result['concurrent_validity'] = {key: validity[key]
+                    for key in ('valid_for_speed_comparison', 'invalid_reasons')}
             runs[group].append(result)
             _strict_json_write(detail_output / f'{group}_{repeat}.json', result)
             if collect_deduplication:
@@ -5320,7 +5375,9 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 for group, values in runs.items()}
     stable = all(run['critic_encoder_compile']['valid_for_speed_comparison'] is not False
                  for values in runs.values() for run in values)
-    speed_comparison_valid = stable and not environment_diagnostic and not collect_deduplication
+    speed_comparison_valid = (stable and not environment_diagnostic and not collect_deduplication
+        and all(run.get('concurrent_validity', {}).get('valid_for_speed_comparison', True)
+            for values in runs.values() for run in values))
     summary = {'valid_for_speed_comparison': speed_comparison_valid, 'diagnostic_only': True, 'formal_training': False,
         'method': 'fresh BC initialization per group/repeat; stage counter offset only; no prior training history',
         'controlled_stage_step_offset': offset, 'requested_device': args.device, 'actual_device': str(target),
@@ -5349,7 +5406,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
         'steps': steps, 'repeats': repeats, 'runs': runs,
         'comparison': {group: {'mean_wall_seconds': averages[group],
             'stdev_wall_seconds': stdev([run['timing']['total_wall_seconds'] for run in values]) if repeats > 1 else 0.0,
-            'seconds_per_step': averages[group] / steps,
+            'seconds_per_step': mean(run['timing']['total_wall_seconds'] / run['measured_steps'] for run in values),
             'time_saved_percent': 100 * (1 - averages[group] / averages[baseline_group]) if speed_comparison_valid else None,
             'speedup': averages[baseline_group] / averages[group] if speed_comparison_valid else None} for group, values in runs.items()},
         'limitations': 'CPU wall intervals include submission/wait, not pure GPU time. Attribution profiler is separate after ordinary measurement; no speed acceptance from instrumented traces. Graph launches are not kernels. Unattributed copies/waits remain unknown. If Chrome trace lacks graph-internal kernels or copy ownership, collect only these stable updates with Nsight Systems CUDA/NVTX tracing; do not infer ownership from operation names.'}
@@ -5422,7 +5479,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--validation-pool', type=Path)
     parser.add_argument('--repeats', type=int, default=2)
     parser.add_argument('--comparison-eager-cpu', action='store_true')
-    parser.add_argument('--comparison-bc-schedule', choices=('default', 'smooth-final'), default='smooth-final')
+    parser.add_argument('--comparison-bc-schedule', choices=('default', 'smooth-final', 'smooth-mid', 'smooth-mid-strong'), default='smooth-final')
+    parser.add_argument('--comparison-actor-lr', type=float, default=None)
+    parser.add_argument('--comparison-critic-lr', type=float, default=2.5e-4)
+    parser.add_argument('--comparison-alpha', type=float, default=2.5)
+    parser.add_argument('--concurrent-window-dir', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--concurrent-worker-id', help=argparse.SUPPRESS)
+    parser.add_argument('--concurrent-timeout', type=float, default=1800., help=argparse.SUPPRESS)
     parser.add_argument('--controlled-stage-step-offset', type=int, default=75000)
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--seed', type=int, default=7)

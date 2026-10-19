@@ -680,6 +680,7 @@ class TestProfileV2TD3(unittest.TestCase):
                         compiled_path_profiler_updates=0,
                         compiled_profiler_output_dir=None,
                         level='easy',
+                        concurrent_window=None,
                         dynamo_graph_counts=(10, 10)):
         # Real environment and replay; only network work and CUDA are test doubles.
         scenario = make_scenario_config()
@@ -919,6 +920,7 @@ class TestProfileV2TD3(unittest.TestCase):
                 ),
                 bc_checkpoint=Path('unused.pt'), model='ann', snn_time_window=4,
                 device=torch.device(device), warmup_steps=warmup, measured_steps=steps,
+                concurrent_window=concurrent_window,
                 detailed_profiler_updates=detailed_profiler_updates,
                 profiler_output_dir=profiler_output_dir,
                 compile_critic_encoder=compile_critic_encoder,

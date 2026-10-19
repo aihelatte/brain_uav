@@ -749,6 +749,9 @@ def run(args):
     forwarded=('model','bc_checkpoint','validation_pool','validation_seed','seed','batch_size','replay_capacity',
         'scenario_count','warmup_steps','steps_per_level','repeats','controlled_stage_step_offset',
         'comparison_bc_schedule','snn_time_window','correctness_updates')
+    forwarded += ('comparison_critic_lr', 'comparison_alpha')
+    if getattr(args, 'comparison_actor_lr', None) is not None:
+        forwarded += ('comparison_actor_lr',)
     if args.expected_pool_digest: forwarded += ('expected_pool_digest',)
     baseline_ok=False
     try:
