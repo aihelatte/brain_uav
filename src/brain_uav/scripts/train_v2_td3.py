@@ -10,6 +10,7 @@ from time import perf_counter
 from typing import Any
 
 from brain_uav.config import RewardConfig, ScenarioConfig
+from brain_uav.v2_curriculum import V2NoiseSchedule
 from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
 from brain_uav.models import V2SNNPolicyActor, require_v2_spikingjelly
 from brain_uav.models.v2_policy_config import (
@@ -57,6 +58,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--metrics-out', type=Path, required=True)
     parser.add_argument('--validation-pool', type=Path, required=True)
     parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--target-noise-scale', type=float, default=1.0)
+    parser.add_argument('--weight-snapshot-steps', type=int, nargs='+', default=(),
+                        help='Diagnostic-only snapshots at episode boundaries; no validation.')
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--model', choices=('ann', 'snn'), default='ann')
     parser.add_argument('--snn-time-window', type=int, default=4)
@@ -511,7 +515,10 @@ def run_v2_td3_stage(
     cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
     periodic_snapshot_interval_steps: int | None = None,
+    target_noise_scale: float = 1.0,
+    weight_snapshot_steps: tuple[int, ...] = (),
 ) -> dict[str, Any]:
+    noise_schedule = V2NoiseSchedule().with_target_noise_scale(target_noise_scale)
     bc_schedule_metadata = v2_bc_schedule_metadata(
         stage,
         final_drop_step=bc_final_drop_step,
@@ -561,6 +568,7 @@ def run_v2_td3_stage(
         actor_lr=_resolve_v2_actor_lr(stage, model, actor_lr),
         critic_lr=critic_lr,
         actor_rl_scale_alpha=actor_rl_scale_alpha,
+        noise_schedule=noise_schedule,
         spike_regularization=V2SpikeRegularizationConfig() if spike_regularization is None else spike_regularization,
     )
     if prepared_initialization is None:
@@ -612,8 +620,10 @@ def run_v2_td3_stage(
     failed_output_path = _failed_checkpoint_path(output_path)
     report_path = metrics_path.with_name(f'{metrics_path.stem}_reports')
     periodic_snapshot_dir = output_path.with_name(f'{output_path.stem}_periodic')
+    weight_snapshot_dir = output_path.with_name(f'{output_path.stem}_weights')
     if (output_path.exists() or failed_output_path.exists() or metrics_path.exists()
             or (reporting and report_path.exists())
+            or (weight_snapshot_steps and weight_snapshot_dir.exists())
             or (periodic_snapshot_interval_steps is not None and periodic_snapshot_dir.exists())):
         raise FileExistsError('Formal V2 stage outputs already exist.')
     pool_path = Path(validation_pool)
@@ -768,6 +778,19 @@ def run_v2_td3_stage(
                 record['global_steps'] = global_steps_start + stage_steps
                 reporter.record_periodic_validation(record)
 
+    def weight_snapshot_sink(requested_step: int, actual_step: int) -> None:
+        # Strict non-terminal format, never a formal-passed course predecessor.
+        payload = build_v2_periodic_snapshot(
+            components.engine, config, stage_steps=actual_step,
+            scenario=scenario_config, rewards=reward_config,
+            uav_collision_radius=effective_uav_collision_radius,
+            seed_manifest=components.seed_manifest,
+            initialization_source=components.initialization_source,
+            bc_final_drop_step=bc_final_drop_step, bc_schedule=bc_schedule,
+        )
+        path = weight_snapshot_dir / f'requested_{requested_step:09d}_actual_{actual_step:09d}.pt'
+        save_v2_periodic_snapshot(path, payload)
+
     trainer = V2FormalStageTrainer(
         scenario_config,
         reward_config,
@@ -784,10 +807,17 @@ def run_v2_td3_stage(
         bc_schedule=bc_schedule,
         periodic_snapshot_interval_steps=periodic_snapshot_interval_steps,
         periodic_snapshot_sink=periodic_snapshot_sink,
+        weight_snapshot_steps=weight_snapshot_steps,
+        weight_snapshot_sink=weight_snapshot_sink,
         periodic_validation_sink=periodic_validation_sink,
         cpu_deduplication=cpu_deduplication,
     )
     execution_configuration = trainer.execution_configuration
+    execution_configuration['weight_snapshots'] = {
+        'requested_steps': list(weight_snapshot_steps),
+        'purpose': 'diagnostic_only_not_formal_passed_or_predecessor',
+        'directory': str(weight_snapshot_dir), 'fixed_validation': False,
+    }
     compute_resolution['configured'] = compute_resolution['effective']
     execution_configuration['gpu_td3_compute'] = compute_resolution
     execution_configuration['cpu_deduplication'].update({
@@ -927,6 +957,7 @@ def main(argv: list[str] | None = None) -> int:
     spike_config = spike_config_from_arguments(args)
     resolved_device = resolve_training_device(args.device)
     config_preview = V2FormalTrainingConfig(
+        noise_schedule=V2NoiseSchedule().with_target_noise_scale(args.target_noise_scale),
         stage=args.stage,
         seed=args.seed,
         max_steps=args.max_stage_steps,
@@ -1011,9 +1042,12 @@ def main(argv: list[str] | None = None) -> int:
         cuda_graph_updates=compilation['cuda_graph_updates'],
         cuda_graph_actor_update=compilation['cuda_graph_actor_update'],
         periodic_snapshot_interval_steps=(
+            # Periodic full-pool validation remains independent of weight snapshots.
             None if args.periodic_snapshot_interval_steps == 0
             else args.periodic_snapshot_interval_steps
         ),
+        target_noise_scale=args.target_noise_scale,
+        weight_snapshot_steps=tuple(args.weight_snapshot_steps),
     )
     print(json.dumps(summary, indent=2, allow_nan=False))
     return 0 if summary['passed'] else 1

@@ -194,6 +194,17 @@ class V2NoiseSchedule:
     clip_final: float = 0.012
     decay_fraction: float = 0.5
 
+    def with_target_noise_scale(self, scale: float = 1.0) -> 'V2NoiseSchedule':
+        """Scale target smoothing only, preserving exploration and decay timing."""
+        from dataclasses import replace
+        scale = _finite_nonnegative(scale, name='target_noise_scale')
+        if scale <= 0.0:
+            raise ValueError('target_noise_scale must be finite and positive.')
+        return replace(self, policy_initial=self.policy_initial * scale,
+                       policy_final=self.policy_final * scale,
+                       clip_initial=self.clip_initial * scale,
+                       clip_final=self.clip_final * scale)
+
     def __post_init__(self) -> None:
         pairs = (
             ('exploration', self.exploration_initial, self.exploration_final),

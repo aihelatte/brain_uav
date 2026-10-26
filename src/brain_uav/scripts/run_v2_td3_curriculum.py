@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from brain_uav.config import RewardConfig, ScenarioConfig
+from brain_uav.v2_curriculum import V2NoiseSchedule
 from brain_uav.models import V2SNNPolicyActor, require_v2_spikingjelly
 from brain_uav.models.v2_policy_config import (
     V2SpikeRegularizationConfig, add_policy_training_arguments,
@@ -43,6 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--output-root', type=Path, required=True)
     parser.add_argument('--validation-pool-dir', type=Path, required=True)
     parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--target-noise-scale', type=float, default=1.0)
+    parser.add_argument('--weight-snapshot-steps', type=int, nargs='+', default=(),
+                        help='Diagnostic-only snapshots at episode boundaries; no validation.')
     parser.add_argument('--validation-seed', type=int, default=20260904)
     parser.add_argument('--max-stage', choices=('easy', 'medium', 'hard'), default='hard')
     parser.add_argument('--easy-max-stage-steps', type=int, default=None)
@@ -269,7 +273,10 @@ def run_v2_curriculum(
     cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
     periodic_snapshot_interval_steps: int | None = None,
+    target_noise_scale: float = 1.0,
+    weight_snapshot_steps: tuple[int, ...] = (),
 ) -> dict[str, Any]:
+    noise_schedule = V2NoiseSchedule().with_target_noise_scale(target_noise_scale)
     requested_device = device
     resolved_device = resolve_training_device(requested_device)
     if type(cpu_deduplication) is not bool:
@@ -342,7 +349,7 @@ def run_v2_curriculum(
     if not bc_path.is_file():
         raise FileNotFoundError(f'V2 BC checkpoint does not exist: {bc_path}')
     prepared_initialization = prepare_v2_stage_initialization(
-        V2FormalTrainingConfig(stage='easy', seed=seed, spike_regularization=spike_regularization,
+        V2FormalTrainingConfig(stage='easy', seed=seed, noise_schedule=noise_schedule, spike_regularization=spike_regularization,
                               actor_rl_scale_alpha=actor_rl_scale_alpha),
         init_checkpoint=bc_path,
         device='cpu',
@@ -471,6 +478,8 @@ def run_v2_curriculum(
             cuda_graph_updates=cuda_graph_updates,
             cuda_graph_actor_update=cuda_graph_actor_update,
             periodic_snapshot_interval_steps=periodic_snapshot_interval_steps,
+            target_noise_scale=target_noise_scale,
+            weight_snapshot_steps=weight_snapshot_steps,
         )
         summaries.append(summary)
         global_steps = int(summary.get('global_steps_end', global_steps + int(summary['steps'])))
@@ -631,6 +640,8 @@ def main(argv: list[str] | None = None) -> int:
             None if args.periodic_snapshot_interval_steps == 0
             else args.periodic_snapshot_interval_steps
         ),
+        target_noise_scale=args.target_noise_scale,
+        weight_snapshot_steps=tuple(args.weight_snapshot_steps),
     )
     print(json.dumps(summary, indent=2, allow_nan=False))
     return 0 if summary['passed'] else 1

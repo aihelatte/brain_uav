@@ -457,6 +457,7 @@ class V2FormalTrainingResult:
     replay_size: int
     replay_success_fraction: float
     success_replay_size: int
+    weight_snapshots: list[dict[str, int]] = field(default_factory=list)
 
     @classmethod
     def empty(cls, stage: str, *, global_steps_start: int) -> 'V2FormalTrainingResult':
@@ -1318,6 +1319,8 @@ class V2FormalStageTrainer:
         bc_schedule: str = 'default',
         periodic_snapshot_interval_steps: int | None = None,
         periodic_snapshot_sink: Callable[[int], None] | None = None,
+        weight_snapshot_steps: tuple[int, ...] = (),
+        weight_snapshot_sink: Callable[[int, int], None] | None = None,
         periodic_validation_sink: Callable[[int], None] | None = None,
         cpu_deduplication: bool = True,
     ) -> None:
@@ -1372,6 +1375,14 @@ class V2FormalStageTrainer:
         self.bc_final_drop_step = bc_final_drop_step
         self.bc_schedule_name = bc_schedule
         self.bc_schedule = bc_schedule_metadata
+        if (not isinstance(weight_snapshot_steps, (tuple, list))
+                or any(type(step) is not int or step <= 0 for step in weight_snapshot_steps)
+                or list(weight_snapshot_steps) != sorted(set(weight_snapshot_steps))):
+            raise ValueError('weight_snapshot_steps must be strictly increasing positive integers.')
+        if weight_snapshot_steps and not callable(weight_snapshot_sink):
+            raise ValueError('weight_snapshot_sink is required for requested weight snapshots.')
+        self._pending_weight_snapshot_steps = list(weight_snapshot_steps)
+        self.weight_snapshot_sink = weight_snapshot_sink
         self.periodic_snapshot_interval_steps = periodic_snapshot_interval_steps
         self.periodic_snapshot_sink = periodic_snapshot_sink
         self.periodic_validation_sink = periodic_validation_sink
@@ -1719,6 +1730,14 @@ class V2FormalStageTrainer:
                             self.result.passed_validation = True
                             self.result.stop_reason = 'fixed_validation_passed'
                             break
+                # Actual episode boundary only. Candidate early-stop above takes precedence.
+                while (self._pending_weight_snapshot_steps
+                       and self.result.stage_steps >= self._pending_weight_snapshot_steps[0]):
+                    requested = self._pending_weight_snapshot_steps.pop(0)
+                    self.weight_snapshot_sink(requested, self.result.stage_steps)
+                    self.result.weight_snapshots.append({
+                        'requested_step': requested, 'actual_step': self.result.stage_steps,
+                    })
                 # C1 in this diagnostic pass: purely observational periodic
                 # checkpoint + fixed-validation snapshots. Deliberately
                 # checked at episode boundaries only (like the candidate
@@ -2106,7 +2125,8 @@ def load_v2_formal_checkpoint(
     training_result = payload['training_result']
     if not isinstance(training_result, dict) or training_result.get('stage') != stage or training_result.get('passed_validation') != payload['passed_validation']:
         raise ValueError('Formal V2 checkpoint result is incompatible.')
-    if set(training_result) != {item.name for item in fields(V2FormalTrainingResult)}:
+    result_fields = {item.name for item in fields(V2FormalTrainingResult)}
+    if set(training_result) not in (result_fields, result_fields - {'weight_snapshots'}):
         raise ValueError('Formal V2 checkpoint result fields are incompatible.')
     validation_records = training_result.get('validation_records')
     if payload['passed_validation'] and (

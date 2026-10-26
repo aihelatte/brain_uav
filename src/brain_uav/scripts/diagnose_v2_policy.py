@@ -28,6 +28,7 @@ from brain_uav.models.v2_policy_config import projection_from_architecture
 from brain_uav.observations import V2ObservationScales, collate_v2_observations
 from brain_uav.trainers.v2_formal_training import (
     _architecture_from_engine_payload, load_v2_formal_checkpoint,
+    load_v2_periodic_snapshot, V2_PERIODIC_SNAPSHOT_FORMAT,
 )
 from brain_uav.trainers.v2_reporting import export_v2_trajectory_views
 from brain_uav.trainers.v2_td3 import V2TD3UpdateEngine
@@ -68,6 +69,14 @@ def _optional_distance(value: float) -> float | None:
     return float(value)
 
 
+def load_diagnostic_checkpoint(checkpoint, **expected):
+    """Strict dispatch: snapshots remain non-terminal, never formal-passed."""
+    raw = torch.load(checkpoint, map_location='cpu', weights_only=False)
+    if raw.get('format') == V2_PERIODIC_SNAPSHOT_FORMAT:
+        return load_v2_periodic_snapshot(raw, **expected)
+    return load_v2_formal_checkpoint(raw, require_passed=False, **expected)
+
+
 def load_diagnostic_inputs(*, model: str, checkpoint: str | Path,
                            validation_pool: str | Path, device: str) -> dict[str, Any]:
     """Use strict loaders and bind the original pool, without building an engine."""
@@ -79,21 +88,23 @@ def load_diagnostic_inputs(*, model: str, checkpoint: str | Path,
     checkpoint_path = Path(checkpoint).resolve()
     pool_path = Path(validation_pool).resolve()
     checkpoint_hash, pool_hash = file_sha256(checkpoint_path), file_sha256(pool_path)
-    payload = load_v2_formal_checkpoint(
-        checkpoint_path, expected_model_type=model, require_passed=False,
+    payload = load_diagnostic_checkpoint(
+        checkpoint_path, expected_model_type=model,
     )
     scenario = scenario_config_from_snapshot(payload['scenario_config'])
     rewards = RewardConfig(**payload['reward_config'])
     radius = float(payload['uav_collision_radius'])
-    pool_metadata = payload['validation_pool']
-    if pool_metadata['format_version'] != V2_VALIDATION_POOL_VERSION:
+    pool_metadata = payload.get('validation_pool')
+    if pool_metadata is not None and pool_metadata['format_version'] != V2_VALIDATION_POOL_VERSION:
         raise ValueError('Checkpoint validation pool format version is incompatible.')
     pool = load_v2_validation_pool(
         pool_path, expected_level=payload['stage'], expected_scenario=scenario,
-        expected_count=pool_metadata['scenario_count'], expected_uav_collision_radius=radius,
-        expected_master_seed=pool_metadata['master_seed'], expected_stage_seed=pool_metadata['stage_seed'],
+        expected_count=pool_metadata['scenario_count'] if pool_metadata else None,
+        expected_uav_collision_radius=radius,
+        expected_master_seed=pool_metadata['master_seed'] if pool_metadata else None,
+        expected_stage_seed=pool_metadata['stage_seed'] if pool_metadata else None,
     )
-    if pool.content_digest != pool_metadata['content_digest']:
+    if pool_metadata is not None and pool.content_digest != pool_metadata['content_digest']:
         raise ValueError('Validation pool content_digest differs from checkpoint provenance.')
     engine_payload = payload['engine_checkpoint']
     if engine_payload.get('observation_contract') != V2TD3UpdateEngine._observation_contract():
@@ -200,10 +211,12 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
         'checkpoint': {
             'path': str(inputs['checkpoint_path']), 'sha256': inputs['checkpoint_hash'],
             'format': payload['format'], 'format_version': payload['format_version'],
-            'status': payload['status'], 'passed_validation': payload['passed_validation'],
-            'stage': payload['stage'], 'stage_steps': payload['training_result']['stage_steps'],
-            'global_steps_end': payload['training_result']['global_steps_end'],
-            'stop_reason': payload['training_result']['stop_reason'],
+            'status': payload.get('status', 'diagnostic_snapshot'),
+            'passed_validation': payload.get('passed_validation'),
+            'stage': payload['stage'],
+            'stage_steps': payload.get('training_result', payload)['stage_steps'],
+            'global_steps_end': payload.get('training_result', {}).get('global_steps_end'),
+            'stop_reason': payload.get('training_result', {}).get('stop_reason'),
             'seed_manifest': payload['seed_manifest'],
             'initialization_source': payload['initialization_source'],
             'architecture': payload['engine_checkpoint']['architecture'],
@@ -212,7 +225,7 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
         'pool': {'path': str(inputs['pool_path']), 'sha256': inputs['pool_hash'],
                  'content_digest': pool.content_digest, 'scenario_count': pool.scenario_count,
                  'master_seed': pool.master_seed, 'stage_seed': pool.stage_seed,
-                 'checkpoint_provenance': payload['validation_pool']},
+                 'checkpoint_provenance': payload.get('validation_pool')},
         'scenario_config': payload['scenario_config'], 'reward_config': payload['reward_config'],
         'uav_collision_radius': payload['uav_collision_radius'],
         'formal_config': payload['formal_config'], 'bc_schedule': payload['bc_schedule'],
@@ -371,7 +384,8 @@ def run_policy_diagnostic(*, model: str, checkpoint: str | Path, validation_pool
             writer.writerow(flat)
     summary = {
         'diagnostic_only': True, 'execution_status': 'completed',
-        'checkpoint_status': payload['status'], 'checkpoint_passed_validation': payload['passed_validation'],
+        'checkpoint_status': payload.get('status', 'diagnostic_snapshot'),
+        'checkpoint_passed_validation': payload.get('passed_validation'),
         'pool_content_digest': pool.content_digest, 'full_pool': len(records) == pool.scenario_count,
         'overall': _statistics(rows),
         'by_outcome': {name: _statistics([row for row in rows if row['outcome'] == name]) for name in OUTCOMES},

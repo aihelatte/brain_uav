@@ -21,9 +21,10 @@ from brain_uav.models import V2ANNCritic
 from brain_uav.observations import collate_v2_observations
 from brain_uav.scripts.diagnose_v2_policy import (
     OUTCOMES, _software_versions, _write_json, file_sha256, load_diagnostic_inputs,
+    load_diagnostic_checkpoint,
 )
 from brain_uav.trainers.v2_formal_training import (
-    _architecture_from_engine_payload, load_v2_formal_checkpoint,
+    _architecture_from_engine_payload,
 )
 from brain_uav.trainers.v2_td3 import V2TD3UpdateEngine
 from brain_uav.trainers.v2_validation import load_v2_validation_pool
@@ -72,8 +73,8 @@ def discounted_return(rewards, gamma):
 
 
 def load_models(checkpoint, pool_path, device):
-    # Formal loader accepts failed only for this independent diagnostic.
-    payload = load_v2_formal_checkpoint(checkpoint, require_passed=False, expected_stage='easy')
+    # Independent diagnostics accept strictly validated non-terminal snapshots too.
+    payload = load_diagnostic_checkpoint(checkpoint, expected_stage='easy')
     model = payload.get('model_type', 'ann')
     data = load_diagnostic_inputs(model=model, checkpoint=checkpoint, validation_pool=pool_path, device=device)
     engine = data['checkpoint_payload']['engine_checkpoint']
@@ -116,7 +117,7 @@ def compare_inputs(a, b):
     if a['gamma'] != b['gamma'] or a['pool'].content_digest != b['pool'].content_digest:
         raise ValueError('Inputs disagree on gamma/pool.')
     keys = ('formal_config', 'bc_schedule', 'seed_manifest', 'validation_pool', 'initialization_source')
-    result = [row for key in keys for row in differences(pa[key], pb[key], key)]
+    result = [row for key in keys for row in differences(pa.get(key), pb.get(key), key)]
     result += differences(pa['engine_checkpoint']['algorithm_config'], pb['engine_checkpoint']['algorithm_config'], 'algorithm_config')
     return result
 
@@ -324,10 +325,11 @@ def run(*, checkpoint_a, checkpoint_b, validation_pool, output_dir, device='cpu'
     def metadata(data):
         p = data['checkpoint_payload']
         return {'path': str(data['checkpoint_path']), 'sha256': data['checkpoint_hash'],
-            'model': data['model'], **{k: p[k] for k in ('status', 'passed_validation', 'stage', 'formal_config',
+            'model': data['model'], **{k: p.get(k) for k in ('status', 'passed_validation', 'stage', 'formal_config',
                 'bc_schedule', 'scenario_config', 'reward_config', 'uav_collision_radius', 'seed_manifest', 'validation_pool', 'initialization_source')},
-            'stage_steps': p['training_result']['stage_steps'],
-            'training_outcomes': p['training_result']['outcome_counts'],
+            'checkpoint_format': p['format'],
+            'stage_steps': p.get('training_result', p)['stage_steps'],
+            'training_outcomes': p.get('training_result', {}).get('outcome_counts'),
             'saved_optimizer_lr_groups': {name: [g['lr'] for g in p['engine_checkpoint'][f'{name}_optimizer_state_dict']['param_groups']]
                                          for name in ('actor', 'critic')},
             'engine': {k: p['engine_checkpoint'][k] for k in ('architecture', 'algorithm_config', 'action_low', 'action_high', 'update_counts')}}
