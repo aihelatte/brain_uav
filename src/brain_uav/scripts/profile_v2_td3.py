@@ -3410,7 +3410,12 @@ def _run_diagnostic_level(
     controlled_stage_step_offset: int = 0,
     bc_schedule: str = 'default',
     concurrent_window=None,
+    batch_preparation_diagnostic=None,
 ) -> dict[str, Any]:
+    if batch_preparation_diagnostic is not None and (
+            concurrent_window is None or not gpu_td3_compute or detailed_profiler_updates
+            or compiled_path_profiler_updates or environment_performance_diagnostic):
+        raise ValueError('Batch diagnosis requires concurrent GPU compute without other instrumentation.')
     scenario_count = len(pool.scenarios)
     if scenario_count == 0 or measured_steps < scenario_count:
         raise ValueError('measured_steps must cover every fixed-pool scenario.')
@@ -3961,6 +3966,8 @@ def _run_diagnostic_level(
 
                 def capture_update_sections(sections: Mapping[str, float]) -> None:
                     update_sections.update(sections)
+                    if batch_preparation_diagnostic is not None:
+                        batch_preparation_diagnostic.record_outer_total(sections)
 
                 def capture_update_details(details: Mapping[str, Any]) -> None:
                     update_details.update(details)
@@ -3980,7 +3987,7 @@ def _run_diagnostic_level(
                             detail=update_details,
                         )
 
-                def perform_update(profile_sections: bool):
+                def perform_update(profile_sections: bool, transfer_diagnostic=None):
                     nonlocal profiled_update_active
                     profiled_update_active = profile_sections
                     try:
@@ -4001,6 +4008,8 @@ def _run_diagnostic_level(
                                     else None
                                 ),
                                 profile_sections=profile_sections,
+                                **({'batch_transfer_diagnostic': transfer_diagnostic}
+                                   if transfer_diagnostic is not None else {}),
                                 **(
                                     {
                                         'diagnostic_timing_recorder': (
@@ -4022,7 +4031,12 @@ def _run_diagnostic_level(
                         profiled_update_active = False
 
                 if measured_phase:
-                    detailed_profiler.run(perform_update)
+                    if batch_preparation_diagnostic is not None:
+                        batch_preparation_diagnostic.run(
+                            lambda transfer: perform_update(False, transfer),
+                            update_index=controlled_stage_step_offset + step_number, window=window)
+                    else:
+                        detailed_profiler.run(perform_update)
                 else:
                     perform_update(False)
             if deduplication_evidence is not None:
@@ -4138,6 +4152,8 @@ def _run_diagnostic_level(
         if compiled_path_profiler is not None:
             compiled_path_profiler.close()
         profiler_metadata = detailed_profiler.finish()
+        batch_preparation_metadata = (batch_preparation_diagnostic.finish()
+            if batch_preparation_diagnostic is not None else None)
 
     update_seconds = timing.wall_seconds['td3_update_wall_seconds']
     sample_seconds = timing.wall_seconds['replay_sample_wall_seconds']
@@ -4165,6 +4181,8 @@ def _run_diagnostic_level(
     profiler_overhead_included = bool(profiler_metadata['enabled'])
     compile_timing_valid = compile_metadata['valid_for_speed_comparison'] is not False
     total_wall_seconds_note = (
+        'Instrumented batch preparation/trace run; not a pure throughput measurement.'
+        if batch_preparation_metadata is not None else
         'This is wall time for the diagnostic run including detailed profiler '
         'collection, startup, and activity-switching overhead. It must not be used '
         'as normal training throughput or for optimization speedup comparisons.'
@@ -4193,6 +4211,7 @@ def _run_diagnostic_level(
         'measurement_graph_replays': (engine._gpu_update_executor.replays
             - engine._gpu_update_executor.measurement_replays_before
             if concurrent_window is not None and gpu_td3_compute else None),
+        'batch_preparation_diagnostic': batch_preparation_metadata,
         'replay_occupancy': {'capacity': engine.replay.capacity, 'size': len(engine.replay),
             'success_capacity': engine.replay.success_capacity, 'success_size': engine.replay.success_size},
         'environment_execution': {'cpu_deduplication': env.cpu_deduplication,
@@ -4240,6 +4259,7 @@ def _run_diagnostic_level(
                 measured_count / measured_total
                 if (
                     not profiler_overhead_included
+                    and batch_preparation_metadata is None
                     and compile_timing_valid
                     and measured_total > 0.0
                 )
@@ -5215,6 +5235,17 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     from brain_uav.scripts.train_v2_td3 import default_v2_cuda_graph_compilation
 
     environment_diagnostic = getattr(args, 'gpu_compute_environment_diagnostic', False)
+    batch_updates = getattr(args, 'batch_preparation_updates', 0)
+    batch_trace_updates = getattr(args, 'batch_preparation_trace_updates', 0)
+    batch_instrumented = bool(batch_updates or batch_trace_updates)
+    if batch_instrumented:
+        if (args.gpu_compute_worker != 'timing' or not args.gpu_td3_compute
+                or getattr(args, 'concurrent_window_dir', None) is None
+                or environment_diagnostic or getattr(args, 'cpu_deduplication_evidence', False)):
+            raise ValueError('Batch preparation diagnosis requires isolated concurrent GPU compute timing.')
+        limit = batch_trace_updates or batch_updates
+        if batch_updates and batch_trace_updates or not 2 <= limit <= (8 if batch_trace_updates else 64):
+            raise ValueError('Select tensor-wall 2..64 OR trace 2..8 updates.')
     cpu_deduplication = getattr(args, 'cpu_deduplication', False)
     collect_deduplication = getattr(args, 'cpu_deduplication_evidence', False)
     if getattr(args, 'cpu_deduplication_fixed_actions', None) and not collect_deduplication:
@@ -5334,6 +5365,12 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                     raise ValueError('Concurrent workers require compute + CPU dedup timing only, one fresh repeat, no instrumentation.')
                 concurrent_window = WorkerWindow(args.concurrent_window_dir,
                     args.concurrent_worker_id, timeout=args.concurrent_timeout)
+            batch_diagnostic = None
+            if batch_instrumented:
+                from brain_uav.scripts.v2_batch_transfer_diagnostic import BatchPreparationDiagnostic
+                batch_diagnostic = BatchPreparationDiagnostic(
+                    updates=batch_trace_updates or batch_updates, trace=bool(batch_trace_updates),
+                    output_dir=output, worker_id=args.concurrent_worker_id, model=args.model)
             result = _run_diagnostic_level(level='easy', pool=pool, prepared=prepared,
                 formal_config=config, bc_checkpoint=args.bc_checkpoint, model=args.model,
                 snn_time_window=args.snn_time_window, device=target,
@@ -5354,7 +5391,9 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 compiled_path_profiler_updates=0,
                 compiled_profiler_output_dir=None,
                 controlled_stage_step_offset=offset, bc_schedule=args.comparison_bc_schedule,
-                concurrent_window=concurrent_window, **compilation)
+                concurrent_window=concurrent_window,
+                **({'batch_preparation_diagnostic': batch_diagnostic} if batch_diagnostic is not None else {}),
+                **compilation)
             result['server_load_before'] = before
             result['server_load_after'] = load_snapshot()
             result['repeat'] = repeat
@@ -5362,7 +5401,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 from brain_uav.scripts.v2_concurrent_diagnostic import summarize_worker
                 validity = summarize_worker({'runs': {'compute': [result]}}, concurrent_window.window)
                 result['concurrent_validity'] = {key: validity[key]
-                    for key in ('valid_for_speed_comparison', 'invalid_reasons')}
+                    for key in ('valid_for_speed_comparison', 'invalid_reasons', 'diagnostic_valid')}
             runs[group].append(result)
             _strict_json_write(detail_output / f'{group}_{repeat}.json', result)
             if collect_deduplication:
@@ -5375,7 +5414,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 for group, values in runs.items()}
     stable = all(run['critic_encoder_compile']['valid_for_speed_comparison'] is not False
                  for values in runs.values() for run in values)
-    speed_comparison_valid = (stable and not environment_diagnostic and not collect_deduplication
+    speed_comparison_valid = (stable and not environment_diagnostic and not collect_deduplication and not batch_instrumented
         and all(run.get('concurrent_validity', {}).get('valid_for_speed_comparison', True)
             for values in runs.values() for run in values))
     summary = {'valid_for_speed_comparison': speed_comparison_valid, 'diagnostic_only': True, 'formal_training': False,
@@ -5401,7 +5440,10 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
         'cpu_deduplication_evidence': collect_deduplication,
 
 
-        'final_speed_acceptance': False if (environment_diagnostic) or (collect_deduplication) else None,
+        'final_speed_acceptance': False if environment_diagnostic or collect_deduplication or batch_instrumented else None,
+        **({'instrumented': True, 'diagnostic_valid': all(
+            run['concurrent_validity']['diagnostic_valid'] for values in runs.values() for run in values)}
+            if batch_instrumented else {}),
         'comparison_kind': 'gpu_td3_compute' if getattr(args,'gpu_compute_worker',None) else ('local_optimizations'),
         'steps': steps, 'repeats': repeats, 'runs': runs,
         'comparison': {group: {'mean_wall_seconds': averages[group],
@@ -5486,6 +5528,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--concurrent-window-dir', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--concurrent-worker-id', help=argparse.SUPPRESS)
     parser.add_argument('--concurrent-timeout', type=float, default=1800., help=argparse.SUPPRESS)
+    batch_group = parser.add_mutually_exclusive_group()
+    batch_group.add_argument('--batch-preparation-updates', type=int, default=0,
+        help='Concurrent worker only: instrument 2..64 steady updates; no speed acceptance.')
+    batch_group.add_argument('--batch-preparation-trace-updates', type=int, default=0,
+        help='Concurrent worker only: trace 2..8 steady updates; separate from tensor-wall/throughput runs.')
     parser.add_argument('--controlled-stage-step-offset', type=int, default=75000)
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--seed', type=int, default=7)
@@ -5594,6 +5641,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if (args.batch_preparation_updates or args.batch_preparation_trace_updates) and not (
+            args.gpu_compute_worker == 'timing' and args.gpu_td3_compute
+            and args.concurrent_window_dir is not None):
+        raise ValueError('Batch diagnosis requires concurrent GPU compute timing worker.')
     if args.cpu_deduplication_fixed_actions and not args.cpu_deduplication_evidence:
         raise ValueError('Fixed actions require evidence mode, never throughput timing.')
     if (args.cpu_deduplication or args.cpu_deduplication_evidence) and not (args.gpu_compute_worker == 'timing'):

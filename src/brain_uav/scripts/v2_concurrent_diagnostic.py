@@ -97,6 +97,10 @@ def worker_command(args, model, worker_id, root):
                 'steps_per_level', 'controlled_stage_step_offset', 'snn_time_window'):
         value = getattr(args, key)
         command += ['--' + key.replace('_', '-'), str(value.resolve() if isinstance(value, Path) else value)]
+    if worker_id in args.batch_preparation_workers:
+        for key in ('batch_preparation_updates', 'batch_preparation_trace_updates'):
+            if getattr(args, key):
+                command += ['--' + key.replace('_', '-'), str(getattr(args, key))]
     return command
 
 
@@ -121,6 +125,14 @@ def build_plan(args):
         raise ValueError('Invalid repeat/warmup/scenario budget or stage offset.')
     if len(set(args.concurrency)) != len(args.concurrency):
         raise ValueError('Repeated concurrency conditions are not allowed.')
+    diagnostic_updates = args.batch_preparation_updates or args.batch_preparation_trace_updates
+    if diagnostic_updates:
+        if not 2 <= diagnostic_updates <= (8 if args.batch_preparation_trace_updates else 64):
+            raise ValueError('Select tensor-wall 2..64 OR trace 2..8 updates.')
+        eligible = {f'{model}_{i}' for model in ('ann', 'snn') for i in range(min(args.concurrency) // 2)}
+        if (not args.batch_preparation_workers or len(set(args.batch_preparation_workers)) != len(args.batch_preparation_workers)
+                or not set(args.batch_preparation_workers) <= eligible):
+            raise ValueError('Batch diagnostic worker ids must exist in every condition, without duplicates.')
     pool = load_v2_validation_pool(args.validation_pool, expected_level='easy',
                                    expected_master_seed=args.validation_seed)
     if pool.content_digest != args.expected_pool_digest:
@@ -145,8 +157,11 @@ def build_plan(args):
     repo = Path(__file__).resolve().parents[3]
     def git(*command):
         return subprocess.run(['git', *command], cwd=repo, capture_output=True,
-                              text=True, check=True).stdout.strip()
+                              text=True, encoding='utf-8', check=True).stdout.strip()
     return {'diagnostic_only': True, 'formal_training': False,
+        'batch_preparation_diagnostic': {'instrumented': bool(diagnostic_updates),
+            'mode': 'trace' if args.batch_preparation_trace_updates else ('tensor_wall' if diagnostic_updates else 'off'),
+            'updates': diagnostic_updates, 'workers': args.batch_preparation_workers},
         'conditions': args.concurrency, 'repeats': args.repeats,
         'output_dir': str(args.output_dir.resolve()),
         'measurement_seconds': args.measurement_seconds, 'warmup_steps': args.warmup_steps,
@@ -219,7 +234,16 @@ def summarize_worker(summary, window, *, start_tolerance=.1):
     parents = {key: timing[key] for key in parent_keys}
     # Final drain/statistics event readback is inside total, outside these sections.
     other = timing['total_wall_seconds'] - sum(parents.values())
+    batch_diagnostic = run.get('batch_preparation_diagnostic')
+    instrumented = bool(batch_diagnostic)
+    if batch_diagnostic and not batch_diagnostic['diagnostic_valid']:
+        reasons.extend(batch_diagnostic['invalid_reasons'])
+    diagnostic_valid = not reasons
+    if instrumented:
+        reasons = reasons + ['Batch preparation instrumentation/profiler overhead; not pure throughput.']
     return {
+        'instrumented': instrumented, 'diagnostic_valid': diagnostic_valid,
+        'batch_preparation_diagnostic': batch_diagnostic,
         'valid_for_speed_comparison': not reasons, 'invalid_reasons': reasons,
         'window': measured, 'steps': run['measured_steps'],
         'seconds_per_step_including_final_drain': timing['total_wall_seconds'] / run['measured_steps'],
@@ -255,7 +279,7 @@ def run_batch(args, count, repeat, root):
     control.mkdir()
     processes, logs = {}, []
     report = {'concurrency': count, 'repeat': repeat, 'completed': False,
-              'valid_for_speed_comparison': False, 'workers': {}}
+              'valid_for_speed_comparison': False, 'diagnostic_valid': False, 'workers': {}}
     try:
         for model in ('ann', 'snn'):
             for index in range(count // 2):
@@ -279,10 +303,21 @@ def run_batch(args, count, repeat, root):
         for name in processes:
             detail = root / 'other' / name / 'other' / 'local_optimization_summary.json'
             result = summarize_worker(read_json(detail), window)
+            requested = (name in args.batch_preparation_workers
+                and bool(args.batch_preparation_updates or args.batch_preparation_trace_updates))
+            result['batch_preparation_execution'] = {'requested': requested,
+                'effective': result['instrumented'],
+                'reason': 'Worker returned bounded instrumentation evidence' if result['instrumented']
+                    else 'No batch preparation instrumentation evidence'}
+            if requested != result['instrumented']:
+                result['invalid_reasons'].append('Requested/actual batch instrumentation mismatch.')
+                result['diagnostic_valid'] = result['valid_for_speed_comparison'] = False
             result['model'] = name.split('_')[0]
             result['detail'] = str(detail.relative_to(root))
             report['workers'][name] = result
         report['completed'] = True
+        report['instrumented'] = any(r['instrumented'] for r in report['workers'].values())
+        report['diagnostic_valid'] = all(r['diagnostic_valid'] for r in report['workers'].values())
         report['valid_for_speed_comparison'] = all(r['valid_for_speed_comparison'] for r in report['workers'].values())
         report['batch_steps_per_second'] = sum(r['window_steps_per_second'] for r in report['workers'].values())
         report['actual_concurrent_overlap'] = {
@@ -305,6 +340,7 @@ def run_batch(args, count, repeat, root):
             except (OSError, subprocess.TimeoutExpired) as exc:
                 report.setdefault('cleanup_errors', {})[name] = str(exc)
                 report['valid_for_speed_comparison'] = False
+                report['diagnostic_valid'] = False
             report.setdefault('exit_codes', {})[name] = process.returncode
         for log in logs:
             log.close()
@@ -318,7 +354,9 @@ def summarize_batches(reports, expected_batches):
     for count in sorted({r['concurrency'] for r in reports}):
         batches = [r for r in reports if r['concurrency'] == count]
         valid = all(r['valid_for_speed_comparison'] for r in batches)
-        item = {'valid_for_speed_comparison': valid, 'completed_repeats': len(batches)}
+        item = {'valid_for_speed_comparison': valid, 'completed_repeats': len(batches),
+            'instrumented': any(r.get('instrumented', False) for r in batches),
+            'diagnostic_valid': all(r.get('diagnostic_valid', r['valid_for_speed_comparison']) for r in batches)}
         if valid:
             item['mean_batch_steps_per_second'] = mean(r['batch_steps_per_second'] for r in batches)
             item['models'] = {model: {
@@ -329,6 +367,9 @@ def summarize_batches(reports, expected_batches):
                 for model in ('ann', 'snn')}
         conditions[str(count)] = item
     return {'batches': reports, 'conditions': conditions,
+        'diagnostic_valid': len(reports) == expected_batches
+            and all(r.get('diagnostic_valid', r['valid_for_speed_comparison']) for r in reports),
+        'instrumented': any(r.get('instrumented', False) for r in reports),
         'valid_for_speed_comparison': len(reports) == expected_batches
             and all(r['valid_for_speed_comparison'] for r in reports),
         'timing_note': 'Whole-step totals contain TD3 and environment; TD3 children are not additive. '
@@ -363,6 +404,13 @@ def build_parser():
     p.add_argument('--scenario-count', type=int, default=3)
     p.add_argument('--controlled-stage-step-offset', type=int, default=75000)
     p.add_argument('--snn-time-window', type=int, default=4)
+    group = p.add_mutually_exclusive_group()
+    group.add_argument('--batch-preparation-updates', type=int, default=0,
+        help='Separate instrumented run: 2..64 steady updates, default off.')
+    group.add_argument('--batch-preparation-trace-updates', type=int, default=0,
+        help='Separate trace run: 2..8 steady updates, default off; perturbs concurrency.')
+    p.add_argument('--batch-preparation-workers', nargs='+', default=['ann_0', 'snn_0'],
+        help='Only these workers collect batch detail/trace; others sustain normal load.')
     return p
 
 
@@ -383,7 +431,7 @@ def main(argv=None):
             for repeat in range(args.repeats):
                 report = run_batch(args, count, repeat, args.output_dir / f'{count}_{repeat}')
                 reports.append(report)
-                if not report['valid_for_speed_comparison']:
+                if not report.get('diagnostic_valid', report['valid_for_speed_comparison']):
                     return 1
         return 0
     finally:

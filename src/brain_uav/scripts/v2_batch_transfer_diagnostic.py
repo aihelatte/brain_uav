@@ -7,8 +7,231 @@ import subprocess
 import sys
 import numpy as np
 import torch
+from contextlib import nullcontext
+from brain_uav.observations import V2ObservationBatch
+from brain_uav.trainers.v2_replay_buffer import V2ReplayBatch
 from brain_uav.observations import V2Observation
 from brain_uav.trainers.v2_replay_buffer import V2ReplayBuffer
+
+
+class BatchPreparationDiagnostic:
+    """Bounded, opt-in observation of the existing blocking transfer sequence.
+
+    No tensor contents or tensor references survive an update. Wall intervals
+    include allocation/copy/waits; only the optional trace can separate visible
+    runtime activity. This is never a throughput acceptance measurement.
+    """
+    def __init__(self, *, updates, trace, output_dir, worker_id, model):
+        if not 2 <= updates <= (8 if trace else 64):
+            raise ValueError('Batch diagnosis needs 2..64 updates (trace: 2..8).')
+        self.limit, self.trace = updates, trace
+        self.output = Path(output_dir)
+        self.worker_id, self.model = worker_id, model
+        self.records, self.error = [], None
+        self.profiler = None
+        self.trace_stopped = False
+        self.current = None
+
+    def _start_trace(self):
+        activities = torch.profiler.supported_activities()
+        if torch.profiler.ProfilerActivity.CUDA not in activities:
+            raise RuntimeError('Batch trace unavailable: torch.profiler has no CUDA activity support.')
+        self.activities = [torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+        profiler = torch.profiler.profile(activities=self.activities,
+            record_shapes=False, profile_memory=True, with_stack=False)
+        profiler.__enter__()
+        self.profiler = profiler
+
+    def _stop_trace(self):
+        if self.profiler is not None and not self.trace_stopped:
+            # Mark before stopping: neither finish nor error cleanup retries exit.
+            self.trace_stopped = True
+            try:
+                self.profiler.__exit__(None, None, None)
+            except Exception as exc:
+                self.error = {'type': type(exc).__name__, 'message': 'Trace stop: ' + str(exc)}
+                raise
+
+    def run(self, operation, *, update_index, window=None):
+        if len(self.records) >= self.limit:
+            return operation(None)
+        started = perf_counter()
+        if window is not None and not window['start'] <= started < window['end']:
+            self._stop_trace()
+            return operation(None)
+        record = {'worker': self.worker_id, 'model': self.model, 'update_index': update_index,
+                  'sample_index': len(self.records), 'tensor_calls': [], 'constructors': [],
+                  'sample_started': started}
+        self.current = record
+        try:
+            if self.trace:
+                if self.profiler is None:
+                    self._start_trace()
+                else:
+                    self.profiler.toggle_collection_dynamic(True, self.activities)
+            with (torch.profiler.record_function(f'batch_diagnostic.update.{update_index}')
+                  if self.trace else nullcontext()):
+                result = operation(self.transfer)
+            if 'batch_preparation_wall_seconds' not in record:
+                raise RuntimeError('Batch diagnostic callback was not called by GPU compute.')
+            record['actor_updated'] = bool(result.actor_updated)
+            record['sample_completed'] = perf_counter()
+            record['within_common_window'] = (window is None or
+                window['start'] <= started < window['end'] and record['sample_completed'] <= window['end'])
+            self.records.append(record)
+            return result
+        except Exception as exc:
+            self.error = {'type': type(exc).__name__, 'message': str(exc)}
+            raise
+        finally:
+            self.current = None
+            if self.profiler is not None:
+                if (self.error or len(self.records) >= self.limit
+                        or self.records and not self.records[-1]['within_common_window']):
+                    self._stop_trace()
+                else:
+                    try:
+                        self.profiler.toggle_collection_dynamic(False, self.activities)
+                        self.profiler.step()
+                    except Exception as exc:
+                        self.error = {'type': type(exc).__name__, 'message': str(exc)}
+                        self._stop_trace()
+                        raise
+
+    def _call(self, name, operation, *, tensor=None):
+        # Metadata/scopes are outside the individual call interval, inside total.
+        metadata = {'name': name}
+        if tensor is not None:
+            metadata.update(dtype=str(tensor.dtype), shape=list(tensor.shape),
+                stride=list(tensor.stride()), bytes=tensor.numel() * tensor.element_size(),
+                source_device=str(tensor.device), pinned=tensor.is_pinned(), layout=str(tensor.layout))
+        with (torch.profiler.record_function('batch_preparation.' + name)
+              if self.trace else nullcontext()):
+            start = perf_counter()
+            value = operation()
+            metadata['cpu_wall_seconds'] = perf_counter() - start
+        self.current['tensor_calls' if tensor is not None else 'constructors'].append(metadata)
+        return value
+
+    def transfer(self, batch, device):
+        """Same evaluation order as V2ReplayBatch.to; constructors timed alone."""
+        start = perf_counter()
+        target = torch.device(device)
+        self.current.update(target_device=str(target), non_blocking=False,
+            obs_shape=list(batch.obs.zone_features.shape),
+            next_obs_shape=list(batch.next_obs.zone_features.shape))
+
+        def move(name, tensor):
+            return self._call(name, lambda: tensor.to(target, non_blocking=False), tensor=tensor)
+
+        def observation(prefix, source):
+            # Evaluate all .to arguments BEFORE starting the constructor timer.
+            values = {name: move(prefix + '.' + name, getattr(source, name))
+                for name in ('ego_features', 'goal_features', 'zone_features', 'presence_mask')}
+            return self._call(prefix + '.V2ObservationBatch', lambda: V2ObservationBatch(**values))
+
+        obs = observation('obs', batch.obs)
+        action = move('action', batch.action)
+        reward = move('reward', batch.reward)
+        next_obs = observation('next_obs', batch.next_obs)
+        remaining = {name: move(name, getattr(batch, name))
+            for name in ('done', 'success', 'near_goal', 'line_to_goal_safe')}
+        result = self._call('V2ReplayBatch', lambda: V2ReplayBatch(
+            obs=obs, action=action, reward=reward, next_obs=next_obs,
+            **remaining, sample_failure_fraction=batch.sample_failure_fraction))
+        total = perf_counter() - start
+        covered = sum(c['cpu_wall_seconds'] for key in ('tensor_calls', 'constructors')
+                      for c in self.current[key])
+        self.current.update(batch_preparation_wall_seconds=total,
+            total_source='transfer_callback',
+            uncovered_wall_seconds=total - covered,
+            bytes=sum(c['bytes'] for c in self.current['tensor_calls']))
+        return result
+
+    def record_outer_total(self, sections):
+        if self.current is not None and 'batch_preparation_wall_seconds' in self.current:
+            # The existing engine timer also includes our final bookkeeping.
+            total = sections['batch_preparation']
+            covered = sum(c['cpu_wall_seconds'] for key in ('tensor_calls', 'constructors')
+                          for c in self.current[key])
+            self.current.update(batch_preparation_wall_seconds=total,
+                total_source='existing_engine_batch_preparation_timer', uncovered_wall_seconds=total - covered)
+
+    def finish(self):
+        """Called after the common window, also on failure; no per-step file I/O."""
+        from brain_uav.scripts.v2_concurrent_diagnostic import write_json
+        other, review = self.output / 'other', self.output / 'review'
+        other.mkdir(parents=True, exist_ok=True)
+        review.mkdir(parents=True, exist_ok=True)
+        trace_evidence = None
+        if self.profiler is not None:
+            try:
+                self._stop_trace()
+                path = other / 'batch_preparation_trace.json'
+                self.profiler.export_chrome_trace(str(path))
+                trace_evidence = self._trace_evidence(path)
+            except Exception as exc:
+                self.error = {'type': type(exc).__name__, 'message': 'Trace finalization: ' + str(exc)}
+            finally:
+                self.profiler = None
+        reasons = []
+        if self.error:
+            reasons.append(self.error['message'])
+        valid_records = [r for r in self.records if r['within_common_window']]
+        if len(valid_records) != self.limit:
+            reasons.append('Bounded batch sample incomplete within common measurement window.')
+        roles = {r['actor_updated'] for r in valid_records}
+        if roles != {False, True}:
+            reasons.append('Batch samples must include critic-only and actor updates.')
+        if self.trace and (trace_evidence is None or not trace_evidence['cuda_activity_observed']):
+            reasons.append('CUDA trace activity unavailable; copy/allocation/wait attribution unknown.')
+        names = [c['name'] for r in self.records for c in r['tensor_calls'] + r['constructors']]
+        from statistics import mean
+        summary = {'instrumented': True, 'mode': 'trace' if self.trace else 'tensor_wall',
+            'diagnostic_valid': not reasons, 'invalid_reasons': reasons,
+            'valid_for_speed_comparison': False, 'error': self.error,
+            'requested_updates': self.limit, 'captured_updates': len(self.records),
+            'valid_samples_in_window': len(valid_records),
+            'worker': self.worker_id, 'model': self.model,
+            'actor_updates': sum(r['actor_updated'] for r in self.records),
+            'calls': {name: {'count': names.count(name), 'mean_cpu_wall_seconds': mean(
+                c['cpu_wall_seconds'] for r in self.records
+                for c in r['tensor_calls'] + r['constructors'] if c['name'] == name)}
+                for name in dict.fromkeys(names)},
+            'mean_batch_preparation_wall_seconds': (mean(r['batch_preparation_wall_seconds'] for r in self.records)
+                if self.records else None),
+            'mean_uncovered_wall_seconds': (mean(r['uncovered_wall_seconds'] for r in self.records)
+                if self.records else None),
+            'trace': trace_evidence, 'records': 'other/batch_preparation_records.json',
+            'note': 'Instrumented CPU wall includes allocation/copy/submission/waits. Constructors exclude child .to calls. '
+                'Residual includes metadata, scopes and timer overhead; parent/child times are not additive. '
+                'No added CUDA synchronization or tensor-content readback. Driver queueing and other GPU processes are unknown. '
+                'Trace/profiler may synchronize and perturb all concurrent workers; never a pure throughput result.'}
+        write_json(other / 'batch_preparation_records.json', {'updates': self.records, 'error': self.error})
+        write_json(review / 'batch_preparation.json', summary)
+        return summary
+
+    @staticmethod
+    def _trace_evidence(path):
+        events = json.loads(path.read_text(encoding='utf-8'))['traceEvents']
+        copies = [e for e in events if 'gpu_memcpy' in e.get('cat', '').lower()]
+        kernels = [e for e in events if e.get('cat') == 'kernel']
+        htod = [e for e in copies if 'htod' in e.get('name', '').lower()]
+        byte_values = [e.get('args', {}).get('bytes') for e in copies]
+        htod_bytes = [e.get('args', {}).get('bytes') for e in htod]
+        return {'path': str(path), 'cuda_activity_observed': bool(copies or kernels),
+            'gpu_copy_events': len(copies) if copies else None,
+            'htod_copy_events': len(htod) if htod else None,
+            'copy_event_note': 'null means no copy activity observed; transfer attribution is unknown, not zero.',
+            'copy_bytes': sum(byte_values) if copies and all(isinstance(n, (int, float)) for n in byte_values) else None,
+            'htod_bytes': sum(htod_bytes) if htod and all(isinstance(n, (int, float)) for n in htod_bytes) else None,
+            'copy_bytes_note': 'Visible trace events only; null means bytes unavailable, not zero transfer.',
+            'runtime_calls': {name: {'count': sum(e.get('name') == name for e in events),
+                'cpu_wall_seconds': sum(e.get('dur', 0) for e in events if e.get('name') == name) / 1e6}
+                for name in sorted({e['name'] for e in events if e.get('cat') == 'cuda_runtime'})},
+            'memory_events_observed': sum(e.get('name') == '[memory]' for e in events) or None,
+            'runtime_memory_note': 'Observed profiler events only; allocator reuse, synchronization ownership and unseen activity require timeline inspection.',
+            'driver_queueing': 'unknown', 'other_gpu_process_activity': 'unknown'}
 
 
 def cpu_batches(mixed, nonempty, action_dim, seed):

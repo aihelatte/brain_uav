@@ -2932,9 +2932,15 @@ class V2TD3UpdateEngine:
         compiled_execution_recorder: Callable[[str], None] | None = None,
         diagnostic_tensor_recorder: Callable[[str, torch.Tensor], None] | None = None,
         block_attribution_recorder: Callable[[dict[str, Any]], None] | None = None,
+        batch_transfer_diagnostic: Callable | None = None,
     ) -> V2TD3UpdateMetrics:
         if type(defer_statistics) is not bool:
             raise TypeError('defer_statistics must be a bool.')
+        if batch_transfer_diagnostic is not None:
+            if not callable(batch_transfer_diagnostic):
+                raise TypeError('batch_transfer_diagnostic must be callable.')
+            if not self.gpu_td3_compute:
+                raise ValueError('Batch transfer diagnosis requires GPU compute.')
         if defer_statistics and not self.window_update_statistics:
             raise ValueError('defer_statistics requires window_update_statistics.')
         self._defer_statistics = defer_statistics
@@ -2991,7 +2997,8 @@ class V2TD3UpdateEngine:
             with update_timing.section('replay_sample'):
                 batch = self.replay.sample(self.batch_size)
             with update_timing.section('batch_preparation'):
-                batch = batch.to(self.device)
+                batch = (batch.to(self.device) if batch_transfer_diagnostic is None
+                         else batch_transfer_diagnostic(batch, self.device))
             # Same RNG call, shape and ordering as the original target block.
             noise = torch.randn_like(batch.action)
             if self._gpu_update_executor is None:

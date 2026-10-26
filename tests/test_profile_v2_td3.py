@@ -681,6 +681,8 @@ class TestProfileV2TD3(unittest.TestCase):
                         compiled_profiler_output_dir=None,
                         level='easy',
                         concurrent_window=None,
+                        batch_preparation_diagnostic=None,
+                        gpu_td3_compute=False,
                         dynamo_graph_counts=(10, 10)):
         # Real environment and replay; only network work and CUDA are test doubles.
         scenario = make_scenario_config()
@@ -703,6 +705,11 @@ class TestProfileV2TD3(unittest.TestCase):
             reduce_update_stat_syncs=reduce_update_stat_syncs,
 
         )
+        if gpu_td3_compute:
+            executor = SimpleNamespace(replays=0, measurement_replays_before=0)
+            executor.begin_measurement = lambda: setattr(executor, 'measurement_replays_before', executor.replays)
+            engine._gpu_update_executor = executor
+            engine.invalidate_gpu_update = lambda: None
         submitted = []
         compile_calls = []
         compile_warmup_shapes = []
@@ -720,9 +727,14 @@ class TestProfileV2TD3(unittest.TestCase):
                         profile_sections=False, reuse_shared_relations=True,
                         diagnostic_timing_recorder=None,
                         diagnostic_profile_sections=False,
-                        compiled_execution_recorder=None, block_attribution_recorder=None):
+                        compiled_execution_recorder=None, block_attribution_recorder=None,
+                        batch_transfer_diagnostic=None):
             del reuse_shared_relations
-            replay.sample(4)
+            batch = replay.sample(4)
+            if batch_transfer_diagnostic is not None:
+                batch_transfer_diagnostic(batch, 'cpu')
+            if gpu_td3_compute:
+                executor.replays += 1
             diagnostic_profile_flags.append((
                 profile_sections,
                 diagnostic_profile_sections,
@@ -921,6 +933,8 @@ class TestProfileV2TD3(unittest.TestCase):
                 bc_checkpoint=Path('unused.pt'), model='ann', snn_time_window=4,
                 device=torch.device(device), warmup_steps=warmup, measured_steps=steps,
                 concurrent_window=concurrent_window,
+                batch_preparation_diagnostic=batch_preparation_diagnostic,
+                gpu_td3_compute=gpu_td3_compute,
                 detailed_profiler_updates=detailed_profiler_updates,
                 profiler_output_dir=profiler_output_dir,
                 compile_critic_encoder=compile_critic_encoder,
