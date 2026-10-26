@@ -92,6 +92,8 @@ def worker_command(args, model, worker_id, root):
         '--concurrent-window-dir', str(root / 'other' / 'control'), '--concurrent-worker-id', worker_id,
         '--concurrent-timeout', str(args.ready_timeout),
         '--output-dir', str(root / 'other' / worker_id)]
+    if args.non_blocking_batch_transfer:
+        command += ['--non-blocking-batch-transfer']
     for key in ('validation_pool', 'expected_pool_digest', 'validation_seed', 'seed',
                 'replay_capacity', 'batch_size', 'scenario_count', 'warmup_steps',
                 'steps_per_level', 'controlled_stage_step_offset', 'snn_time_window'):
@@ -126,6 +128,8 @@ def build_plan(args):
     if len(set(args.concurrency)) != len(args.concurrency):
         raise ValueError('Repeated concurrency conditions are not allowed.')
     diagnostic_updates = args.batch_preparation_updates or args.batch_preparation_trace_updates
+    if diagnostic_updates and args.non_blocking_batch_transfer:
+        raise ValueError('Nonblocking A/B must run separately from batch instrumentation/trace.')
     if diagnostic_updates:
         if not 2 <= diagnostic_updates <= (8 if args.batch_preparation_trace_updates else 64):
             raise ValueError('Select tensor-wall 2..64 OR trace 2..8 updates.')
@@ -176,6 +180,7 @@ def build_plan(args):
                 'shape_types': [z['shape']['shape_type'] for z in r['payload']['zones']]}
                 for r in pool.scenarios[:args.scenario_count]]},
         'execution_requested': {'gpu_td3_compute': True, 'cpu_deduplication': True,
+            'non_blocking_batch_transfer': args.non_blocking_batch_transfer,
             'cache_ellipsoid_segment_clearance': True, 'other_experiments': False},
         'limitations': ['Fresh BC + stage offset is not historical training resume.',
             'Short loop omits formal reporting, three-view and candidate load; no 500k speed guarantee.',
@@ -302,7 +307,15 @@ def run_batch(args, count, repeat, root):
             timeout=args.start_delay + args.measurement_seconds + args.completion_timeout)
         for name in processes:
             detail = root / 'other' / name / 'other' / 'local_optimization_summary.json'
-            result = summarize_worker(read_json(detail), window)
+            worker_detail = read_json(detail)
+            result = summarize_worker(worker_detail, window)
+            transfer = worker_detail['runs']['compute'][0]['local_optimizations'].get('non_blocking_batch_transfer')
+            result['execution']['non_blocking_batch_transfer'] = transfer
+            if (transfer and transfer['requested'] != args.non_blocking_batch_transfer
+                    or args.non_blocking_batch_transfer and (not transfer or not transfer['effective']
+                    or not transfer['requested'] or transfer.get('transfer_calls', 0) <= 0)):
+                result['invalid_reasons'].append('Requested nonblocking GPUCompute upload evidence missing.')
+                result['diagnostic_valid'] = result['valid_for_speed_comparison'] = False
             requested = (name in args.batch_preparation_workers
                 and bool(args.batch_preparation_updates or args.batch_preparation_trace_updates))
             result['batch_preparation_execution'] = {'requested': requested,
@@ -379,6 +392,8 @@ def summarize_batches(reports, expected_batches):
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--launch', action='store_true', help='Explicitly start short CUDA timing workers.')
+    p.add_argument('--non-blocking-batch-transfer', action='store_true',
+        help='Opt-in GPUCompute pageable nonblocking upload A/B; default blocking.')
     p.add_argument('--output-dir', type=Path, required=True)
     p.add_argument('--ann-bc-checkpoint', type=Path, required=True)
     p.add_argument('--snn-bc-checkpoint', type=Path, required=True)

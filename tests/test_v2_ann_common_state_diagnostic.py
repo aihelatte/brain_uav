@@ -197,6 +197,7 @@ class TestANNCommonState(TestCase):
             focus = a.Focus('history',root,root/'other/common_state.pt')
             args = SimpleNamespace(model='ann',seed=7,bc_checkpoint=bc,validation_pool=pool,
                 gpu_td3_compute=False,snn_time_window=4,correctness_updates=8,
+                non_blocking_batch_transfer=False,
                 comparison_bc_schedule='smooth-final',_ann_common_state=focus)
             with mock.patch.object(p,'build_v2_stage_engine',return_value=SimpleNamespace(engine=e)), \
                     mock.patch.object(single,'_configure_stage_compilation',return_value={}), \

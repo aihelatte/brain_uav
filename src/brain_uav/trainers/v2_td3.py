@@ -461,8 +461,7 @@ class V2TD3UpdateEngine:
             raise TypeError('gpu_td3_compute must be a bool.')
         if gpu_td3_compute:
             if any((gpu_td3_update,
-                     window_update_statistics, reuse_update_buffers,
-                     non_blocking_batch_transfer)):
+                     window_update_statistics, reuse_update_buffers)):
                 raise ValueError('gpu_td3_compute conflicts with other experimental paths.')
             if self.device.type != 'cuda' or not fused_adam:
                 raise ValueError('gpu_td3_compute requires CUDA and fused Adam; no fallback.')
@@ -2916,6 +2915,21 @@ class V2TD3UpdateEngine:
                 )
         return None
 
+    @contextmanager
+    def _gpu_compute_source_lifetime(self, source):
+        """Own an immutable replay sample through the existing terminal barrier."""
+        stream = torch.cuda.current_stream(self.device) if self.non_blocking_batch_transfer else None
+        try:
+            yield
+        except BaseException:
+            if stream is not None:
+                # Upload, binding/capture or injected-error failures can precede
+                # output.cpu(). Keep the CPU allocation alive while draining.
+                self._pending_gpu_compute_transfer = (source, stream)
+                stream.synchronize()
+                self._pending_gpu_compute_transfer = None
+            raise
+
     def update_once(
         self,
         *,
@@ -2987,6 +3001,8 @@ class V2TD3UpdateEngine:
             return self._gpu_update_executor.step(total_steps_value, bc_lambda_value, timing_recorder)
 
         if self.gpu_td3_compute:
+            if getattr(self, '_pending_gpu_compute_transfer', None) is not None:
+                raise RuntimeError('Prior GPU compute transfer failed to drain; source retained, no further updates allowed.')
             if not self._gpu_update_formal_configured:
                 raise RuntimeError('Configure formal CUDA paths before GPU compute.')
             if not torch.is_grad_enabled() or torch.is_inference_mode_enabled():
@@ -2996,19 +3012,26 @@ class V2TD3UpdateEngine:
                 raise ValueError('GPU compute does not support legacy update instrumentation.')
             with update_timing.section('replay_sample'):
                 batch = self.replay.sample(self.batch_size)
-            with update_timing.section('batch_preparation'):
-                batch = (batch.to(self.device) if batch_transfer_diagnostic is None
-                         else batch_transfer_diagnostic(batch, self.device))
-            # Same RNG call, shape and ordering as the original target block.
-            noise = torch.randn_like(batch.action)
-            if self._gpu_update_executor is None:
-                from .v2_gpu_compute import GPUCompute
-                self._gpu_update_executor = GPUCompute(self, diagnostic=diagnostic_tensor_recorder is not None)
-            executor = self._gpu_update_executor
-            if diagnostic_tensor_recorder is not None and not executor.diagnostic:
-                raise ValueError('Enable tensor diagnostics before first GPU compute capture.')
-            metric = executor.step_batch(batch, noise, total_steps_value, bc_lambda_value,
-                                         recorder=diagnostic_tensor_recorder)
+            with self._gpu_compute_source_lifetime(batch):
+                with update_timing.section('batch_preparation'):
+                    if batch_transfer_diagnostic is not None:
+                        if self.non_blocking_batch_transfer:
+                            raise ValueError('Nonblocking comparison requires uninstrumented batch transfer.')
+                        batch = batch_transfer_diagnostic(batch, self.device)
+                    else:
+                        batch = (batch.to(self.device, non_blocking=True) if self.non_blocking_batch_transfer
+                                 else batch.to(self.device))
+                    self._gpu_compute_transfer_count = getattr(self, '_gpu_compute_transfer_count', 0) + 1
+                # Same RNG call, shape and ordering as the original target block.
+                noise = torch.randn_like(batch.action)
+                if self._gpu_update_executor is None:
+                    from .v2_gpu_compute import GPUCompute
+                    self._gpu_update_executor = GPUCompute(self, diagnostic=diagnostic_tensor_recorder is not None)
+                executor = self._gpu_update_executor
+                if diagnostic_tensor_recorder is not None and not executor.diagnostic:
+                    raise ValueError('Enable tensor diagnostics before first GPU compute capture.')
+                metric = executor.step_batch(batch, noise, total_steps_value, bc_lambda_value,
+                                             recorder=diagnostic_tensor_recorder)
             if compiled_execution_recorder is not None:
                 compiled_execution_recorder('gpu_td3_compute_manual_replay')
             if timing_recorder is not None:
@@ -3445,6 +3468,14 @@ class V2TD3UpdateEngine:
             'effective': self.non_blocking_batch_transfer and self.device.type == 'cuda',
             'source': 'independent pageable CPU sample, retained through update',
             'stream': 'current CUDA stream; no added synchronization'}
+        if self.gpu_td3_compute:
+            count = getattr(self, '_gpu_compute_transfer_count', 0)
+            metadata['non_blocking_batch_transfer'].update(
+                effective=self.non_blocking_batch_transfer and count > 0,
+                transfer_calls=count, actual_path=('V2ReplayBatch.to(non_blocking=True)' if self.non_blocking_batch_transfer
+                    else 'V2ReplayBatch.to(blocking)'),
+                stream='current CUDA stream; original terminal barrier, exception-only drain for nonblocking',
+                reason='GPUCompute upload observed' if count else 'GPUCompute upload not yet observed')
         metadata['gpu_td3_compute'] = (self._gpu_update_executor.metadata()
             if self.gpu_td3_compute and self._gpu_update_executor is not None else
             {'requested': self.gpu_td3_compute, 'effective': False, 'reason': 'disabled or initialization pending'})

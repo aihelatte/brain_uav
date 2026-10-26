@@ -180,6 +180,7 @@ class TestGPUCompute(TestCase):
                         torch.save(dict(contract=contract, initial=initial), reference)
                     args = SimpleNamespace(model=model, seed=7, bc_checkpoint=checkpoint,
                         validation_pool=pool_file, gpu_td3_compute=enabled, snn_time_window=4,
+                        non_blocking_batch_transfer=False,
                         correctness_updates=8, comparison_bc_schedule='smooth-final')
                     error = RuntimeError('stop at first compile')
                     def configure(engine, *a, **kw):
@@ -386,6 +387,7 @@ class TestGPUCompute(TestCase):
                 pool_file = root/'pool.json'; pool_file.write_text('{}')
                 args = SimpleNamespace(model='ann',seed=7,bc_checkpoint=checkpoint,
                     validation_pool=pool_file,gpu_td3_compute=False,snn_time_window=4,
+                    non_blocking_batch_transfer=False,
                     correctness_updates=8,comparison_bc_schedule='smooth-final',
                     gpu_compute_first_critic_loss_only=False,gpu_compute_error_recovery=True,
                     gpu_compute_trace_retained_gradient=True)
@@ -564,6 +566,7 @@ class TestGPUCompute(TestCase):
             pool_file = root/'pool.json'; pool_file.write_text('{}')
             args = SimpleNamespace(model='ann',seed=7,bc_checkpoint=checkpoint,
                 validation_pool=pool_file,gpu_td3_compute=False,snn_time_window=4,
+                non_blocking_batch_transfer=False,
                 correctness_updates=8,comparison_bc_schedule='smooth-final',
                 gpu_compute_first_critic_loss_only=True)
             with mock.patch.object(p,'build_v2_stage_engine',return_value=SimpleNamespace(engine=e)), \
@@ -667,7 +670,7 @@ class TestGPUCompute(TestCase):
         for extra, message in ((dict(gpu_td3_compute=1),'must be a bool'),
                 (dict(gpu_td3_compute=True),'requires CUDA'),
                 (dict(gpu_td3_compute=True,gpu_td3_update=True),'conflicts'),
-                (dict(gpu_td3_compute=True,non_blocking_batch_transfer=True),'conflicts')):
+                (dict(gpu_td3_compute=True,non_blocking_batch_transfer=True),'requires CUDA')):
             with self.subTest(extra=extra), self.assertRaisesRegex((TypeError,ValueError),message):
                 V2TD3UpdateEngine(**kw,**extra)
 

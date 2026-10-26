@@ -5238,6 +5238,8 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     batch_updates = getattr(args, 'batch_preparation_updates', 0)
     batch_trace_updates = getattr(args, 'batch_preparation_trace_updates', 0)
     batch_instrumented = bool(batch_updates or batch_trace_updates)
+    if batch_instrumented and args.non_blocking_batch_transfer:
+        raise ValueError('Nonblocking A/B must run separately from batch instrumentation/trace.')
     if batch_instrumented:
         if (args.gpu_compute_worker != 'timing' or not args.gpu_td3_compute
                 or getattr(args, 'concurrent_window_dir', None) is None
@@ -5380,7 +5382,8 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
 
 
                 gpu_td3_compute=getattr(args,'gpu_compute_worker',None)=='timing' and args.gpu_td3_compute,
-                non_blocking_batch_transfer=getattr(args,'batch_transfer_worker',None)=='timing' and args.non_blocking_batch_transfer,
+                non_blocking_batch_transfer=(getattr(args,'batch_transfer_worker',None)=='timing'
+                    or getattr(args,'gpu_compute_worker',None)=='timing') and args.non_blocking_batch_transfer,
                 batch_transfer_window_timing=(getattr(args,'batch_transfer_worker',None)=='timing' or getattr(args,'gpu_compute_worker',None)=='timing'),
                 environment_performance_diagnostic=environment_diagnostic,
                 cpu_deduplication=cpu_deduplication,
@@ -5496,6 +5499,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--gpu-td3-worker', choices=('correctness', 'timing'), help=argparse.SUPPRESS)
     parser.add_argument('--gpu-td3-compute', action=argparse.BooleanOptionalAction, default=False, help='Explicit diagnostic path; never inherits formal auto defaults.')
     parser.add_argument('--gpu-compute-reference', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--gpu-compute-write-reference', action='store_true',
+        help='Correctness worker only: save a GPUCompute blocking reference for transfer A/B.')
     parser.add_argument('--gpu-compute-comparison', action='store_true', help='Isolated serial baseline/compute correctness then short A/B timing.')
     parser.add_argument('--gpu-compute-first-critic-loss-only', action='store_true', help='GPU compute diagnostic: retain preceding updates, stop after first critic loss error-state check; no timing.')
     parser.add_argument('--gpu-compute-error-recovery', action='store_true', help='Diagnostic-only: continue two updates after the first critic loss error; retain all mismatch failures.')

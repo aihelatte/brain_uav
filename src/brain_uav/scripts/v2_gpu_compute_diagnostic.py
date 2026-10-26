@@ -245,6 +245,16 @@ def _load_reference_error_state(args, reference, index):
                       map_location='cpu', weights_only=False)
 
 
+def _load_compute_reference(args, contract):
+    reference = torch.load(args.gpu_compute_reference, map_location='cpu', weights_only=False)
+    if reference.get('contract') != contract:
+        raise ValueError('Compute reference contract mismatch; rebuild baseline.')
+    if args.non_blocking_batch_transfer and reference.get('transfer_reference') != {
+            'gpu_td3_compute': True, 'non_blocking_batch_transfer': False}:
+        raise ValueError('Nonblocking correctness requires an original GPUCompute blocking reference.')
+    return reference
+
+
 def _prepare_loaded_bc_reference(engine, batches, compilation):
     """Rebind only the newly deep-copied BC actor; retain live engine wrappers."""
     from brain_uav.scripts.profile_v2_td3 import _set_numeric_engine_modes
@@ -312,9 +322,8 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
     reference = None
     # Optional, isolated ANN investigation; never selected by formal training.
     focus = getattr(args, '_ann_common_state', None)
-    if args.gpu_td3_compute and focus is None:
-        reference = torch.load(args.gpu_compute_reference,map_location='cpu',weights_only=False)
-        if reference.get('contract') != contract: raise ValueError('Compute reference contract mismatch; rebuild baseline.')
+    if args.gpu_td3_compute and focus is None and not getattr(args, 'gpu_compute_write_reference', False):
+        reference = _load_compute_reference(args, contract)
     engine = None
     trace_events = []
     try:
@@ -322,7 +331,8 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
         engine = p.build_v2_stage_engine(None,config,init_checkpoint=args.bc_checkpoint,
             rewards=prepared.reward_config,prepared_initialization=prepared,device=device,
             model_type=args.model,snn_time_window=args.snn_time_window,fused_adam=fused,
-            reduce_update_stat_syncs=reduced,gpu_td3_compute=args.gpu_td3_compute).engine
+            reduce_update_stat_syncs=reduced,gpu_td3_compute=args.gpu_td3_compute,
+            non_blocking_batch_transfer=args.non_blocking_batch_transfer).engine
         initial = reference['initial'] if reference else deepcopy(engine.checkpoint_state_dict())
         if focus is not None:
             initial = focus.initial(engine, initial, contract)
@@ -643,7 +653,9 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
         report.update(passed=True,completed=True,compilation=configured,
             effective=engine.local_optimization_metadata(),snapshot_count=len(snapshots),
             graph_evidence_scope='one actual prewarmed update per mode profiled; not every update individually profiled')
-        if reference is None: torch.save(dict(contract=contract,initial=initial,snapshots=snapshots,contexts=contexts,error_states=error_states),output/'reference.pt')
+        if reference is None: torch.save(dict(contract=contract,initial=initial,snapshots=snapshots,contexts=contexts,error_states=error_states,
+            transfer_reference=dict(gpu_td3_compute=args.gpu_td3_compute,
+                non_blocking_batch_transfer=args.non_blocking_batch_transfer)),output/'reference.pt')
     except BaseException as exc:
         if focus is not None and focus.history_complete(exc):
             report.update(passed=True, completed=True, scope='ANN history through index 26 only; no acceptance or timing')
@@ -707,6 +719,14 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
 
 def run(args):
     from brain_uav.scripts import profile_v2_td3 as p
+    if getattr(args, 'gpu_compute_write_reference', False) and not (
+            args.gpu_compute_worker == 'correctness' and args.gpu_td3_compute
+            and not args.non_blocking_batch_transfer and args.gpu_compute_reference is None):
+        raise ValueError('Writing transfer reference requires GPUCompute blocking correctness only.')
+    if args.non_blocking_batch_transfer and not (args.gpu_compute_worker and args.gpu_td3_compute):
+        raise ValueError('Nonblocking GPUCompute requires explicit compute worker; no serial baseline substitution.')
+    if args.non_blocking_batch_transfer and args.gpu_compute_worker == 'correctness' and args.gpu_compute_reference is None:
+        raise ValueError('Nonblocking correctness requires a GPUCompute blocking reference file.')
     if (getattr(args,'cpu_deduplication',False) or getattr(args,'cpu_deduplication_evidence',False)) and not (args.gpu_compute_worker == 'timing'):
         raise ValueError('CPU deduplication requires --gpu-compute-worker timing --gpu-td3-compute.')
     if getattr(args,'gpu_compute_environment_diagnostic',False) and not (args.gpu_compute_worker == 'timing'):
@@ -718,7 +738,7 @@ def run(args):
     conflicts=('gpu_td3_update','gpu_td3_suite','gpu_td3_worker','gpu_td3_sampling_cost',
 
         'window_update_statistics','reuse_update_buffers',
-        'non_blocking_batch_transfer','batch_transfer_comparison','batch_transfer_worker',
+        'batch_transfer_comparison','batch_transfer_worker',
         'local_optimization_correctness','local_optimization_comparison',
         'snn_path_consistency','detailed_profiler_updates','compiled_performance_diagnostic_updates')
     if any(getattr(args,n) for n in conflicts) or args.device!='cuda' or args.comparison_eager_cpu:
