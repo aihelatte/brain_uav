@@ -1028,6 +1028,8 @@ def build_v2_stage_engine(
 
 
     non_blocking_batch_transfer: bool = False,
+    gpu_compute_non_blocking_coefficients: bool = False,
+    gpu_compute_lightweight_timing: bool = False,
 ) -> V2StageComponents:
     if scenario is not None and not isinstance(scenario, ScenarioConfig):
         raise TypeError('scenario must be a ScenarioConfig when provided.')
@@ -1264,6 +1266,8 @@ def build_v2_stage_engine(
 
 
         non_blocking_batch_transfer=non_blocking_batch_transfer,
+        gpu_compute_non_blocking_coefficients=gpu_compute_non_blocking_coefficients,
+        gpu_compute_lightweight_timing=gpu_compute_lightweight_timing,
     )
     if previous_engine_payload is not None:
         engine.load_network_state_dicts(dict(previous_engine_payload))

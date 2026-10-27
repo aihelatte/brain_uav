@@ -1,5 +1,127 @@
 # GPUCompute pageable blocking/nonblocking A/B（命令草案，待审查）
 
+## 新一轮：直接系数上传 + 无 profiler 轻量计时
+
+两个独立默认关闭开关：`--gpu-compute-non-blocking-coefficients`、
+`--gpu-compute-lightweight-timing`，仅接 engine 和既有诊断，不接正式训练 CLI。
+都要求 GPUCompute + batch nonblocking=True，不支持时明确失败。
+系数开关关：保留 CUDA 临时张量 + copy_；开：同四值转 CPU FP32，
+直接 copy_(cpu_source, non_blocking=True) 到原 coefficients 地址。
+未添加 pinned、packing、独立流、缓存系数、fill_ 或新数学计算。
+CPU 源由既有异常生命周期作用域持有至原 output.cpu().tolist()；冷捕获、绑定、
+中断异常均排空原流，排空失败保留全部嵌套源并阻止继续更新。checkpoint 格式不变。
+
+执行报告 `local_optimizations.gpu_compute_non_blocking_coefficients` 含
+requested/effective/reason/actual_path、execution_count（直接上传次数）、
+coefficient_submission_count（两路径的实际系数提交次数）。请求不等于执行证据。
+轻量计时仅使用 perf_counter，输出在 GPUCompute metadata 的 lightweight_timing.by_mode；
+critic_only/frozen_targets/actor 各记录 count、coefficients_seconds、graph_replay_call_seconds、
+result_completion_seconds。预热后清零，按与吞吐相同的步骤完成时刻排除窗口外尾步。
+不增加 profiler、CUDA event、同步或 tensor 读取，不逐步写盘；关闭时无新增零值计时键。
+这些是 CPU 提交/排队/等待墙钟，三项不覆盖完整 update，也不可与完整 TD3 父项重复相加。
+轻量计时轮标记 instrumented，不作为最终纯吞吐验收。
+
+本轮 correctness 必须显式使用 `--gpu-compute-coefficient-comparison`：
+A 为 GPUCompute + batch nonblocking + 原系数路径；B 仅开启直接系数上传。
+reference 的 coefficient_reference 精确限定 A 的来源，拒绝旧 batch blocking reference、
+B 自产物或缺失来源。旧搬运 A/B 的 blocking 来源检查不放宽。原容差、恢复更新、
+异常保护和 checkpoint 检查保留；严格失败即停止，不新增 ANN 豁免或工程自动放行。
+
+下面是独立命令草案：定义函数后 `uav_coeff_ab` 只打印 A/B 计划；
+审查后才执行 `uav_coeff_ab --launch`。条件内并发，ANN/SNN correctness 和所有
+2/8 条件顺序运行；各测速轮30秒、重复2次。不会创建 tmux。
+
+```bash
+uav_coeff_ab() {
+  if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != --launch ]; }; then
+    printf 'Usage: uav_coeff_ab [--launch]\n' >&2
+    return 2
+  fi
+  if ! cd /home/zj/projects/my_project; then return 1; fi
+  py=/home/zj/envs/uav_torch/bin/python
+  root="outputs/v2_coeff_ab_$(date +%Y%m%d_%H%M%S_%N)"
+  if ! mkdir -p "$root/review" "$root/other"; then return 1; fi
+  ann=outputs/v2_projected_head_round1/ann_20261012_102839/bc/bc_v2_ann_best.pt
+  snn=outputs/v2_projected_head_round1/snn_20261012_102848/bc/bc_v2_snn_best.pt
+  pool=outputs/v2_box085_round1_20261003_003948/validation_pools_600km_seed20260904/v2_validation_easy.json
+  digest=2e3199a60b8ff23f9cb8f8395d6f44bcb7d73abeddf2ff5a31f1c95c19332f4b
+  _uav_coeff_run() {
+    log="$1"; shift
+    started=$(date +%s)
+    "$@" 2>&1 | tee "$log"
+    rc=${PIPESTATUS[0]}
+    elapsed=$(( $(date +%s) - started ))
+    printf 'exit_code=%s\nprocess_wall_seconds=%s\n' "$rc" "$elapsed" | tee -a "$log"
+    return "$rc"
+  }
+  concurrent=(--ann-bc-checkpoint "$ann" --snn-bc-checkpoint "$snn"
+    --validation-pool "$pool" --expected-pool-digest "$digest"
+    --ann-actor-lr 1.55e-4 --snn-actor-lr 8.25e-4 --critic-lr 2.5e-4 --alpha 2.5
+    --bc-schedule smooth-mid --seed 7 --validation-seed 20260904
+    --batch-size 64 --replay-capacity 500000 --scenario-count 3 --snn-time-window 4
+    --controlled-stage-step-offset 75000 --warmup-steps 128 --steps-per-level 256
+    --measurement-seconds 30 --repeats 2 --concurrency 2 8
+    --ready-timeout 1800 --completion-timeout 120 --non-blocking-batch-transfer)
+  for mode in A B; do
+    flags=(); if [ "$mode" = B ]; then flags=(--gpu-compute-non-blocking-coefficients); fi
+    _uav_coeff_run "$root/review/plan_$mode.log" env PYTHONPATH=src "$py" -u \
+      -m brain_uav.scripts.v2_concurrent_diagnostic "${concurrent[@]}" "${flags[@]}" \
+      --output-dir "$root/plan_$mode" || return "$?"
+  done
+  if [ "$#" -eq 0 ]; then printf 'Plan only: %s\n' "$root"; return 0; fi
+  correct=(--device cuda --gpu-td3-compute --non-blocking-batch-transfer
+    --gpu-compute-worker correctness --gpu-compute-coefficient-comparison
+    --validation-pool "$pool" --expected-pool-digest "$digest"
+    --seed 7 --validation-seed 20260904 --batch-size 64 --replay-capacity 500000
+    --scenario-count 3 --snn-time-window 4 --comparison-critic-lr 2.5e-4 --comparison-alpha 2.5
+    --comparison-bc-schedule smooth-mid --controlled-stage-step-offset 75000
+    --warmup-steps 128 --steps-per-level 256 --repeats 1 --correctness-updates 8)
+  for model in ann snn; do
+    if [ "$model" = ann ]; then bc="$ann"; lr=1.55e-4; else bc="$snn"; lr=8.25e-4; fi
+    for mode in A B; do
+      flags=(--gpu-compute-write-reference)
+      if [ "$mode" = B ]; then
+        flags=(--gpu-compute-non-blocking-coefficients
+          --gpu-compute-reference "$root/other/${model}_A/reference.pt")
+      fi
+      out="$root/other/${model}_$mode"
+      _uav_coeff_run "$root/review/correct_${model}_$mode.log" env PYTHONPATH=src "$py" -u \
+        -m brain_uav.scripts.profile_v2_td3 "${correct[@]}" --model "$model" \
+        --bc-checkpoint "$bc" --comparison-actor-lr "$lr" "${flags[@]}" --output-dir "$out" || return "$?"
+      _uav_coeff_run "$root/review/gate_${model}_$mode.log" "$py" -u -c \
+        'import json,sys; r=json.load(open(sys.argv[1])); ok=r.get("passed") is True and r.get("completed") is True; json.dump({"strict_passed":ok,"engineering_accepted":False},open(sys.argv[2],"w")); sys.exit(0 if ok else 1)' \
+        "$out/correctness.json" "$root/review/gate_${model}_$mode.json" || return "$?"
+    done
+  done
+  for round in lightweight throughput; do
+    for mode in A B; do
+      flags=(); if [ "$mode" = B ]; then flags+=(--gpu-compute-non-blocking-coefficients); fi
+      if [ "$round" = lightweight ]; then flags+=(--gpu-compute-lightweight-timing); fi
+      _uav_coeff_run "$root/review/${round}_$mode.log" env PYTHONPATH=src "$py" -u \
+        -m brain_uav.scripts.v2_concurrent_diagnostic "${concurrent[@]}" "${flags[@]}" \
+        --output-dir "$root/${round}_$mode" --launch || return "$?"
+    done
+  done
+  printf 'Review root: %s\n' "$root"
+  return 0
+}
+uav_coeff_ab
+# 审查后单独执行：uav_coeff_ab --launch
+```
+
+两侧 batch nonblocking 始终为 True；唯一优化变量为系数开关，轻量计时两侧一致。
+正式编译组合、GPUCompute、CPU 去重、精确椭球缓存、P1关/P2P3开由现有 worker 固定，
+其余未采用性能选项关闭。沿用同 BC best、固定池/digest、场景前缀、seed、采样和日程。
+summary 的实际场景覆盖、requested/effective、测量期新增编译/Graph 捕获、负载都必须审查；
+新增编译/捕获、覆盖不足、实际路径证据缺失仍失败，不静默回退。
+仅 fresh BC + offset，不是历史状态恢复，不完整包含正式报告/三视图/candidate 负载。
+小型配置、汇总和日志在 review，reference/异常状态/详细记录在 other；不复制 BC 模型。
+比较完整单步（含原末屏障及最终统计回读）、完整 TD3、batch_preparation、执行器
+input_copy/replay_to_result、动作推理及共同窗口集群吞吐；窗口外尾步不进入吞吐分子。
+若系数墙钟减少但等待移至后段、完整单步无稳定改善，应报告未取得稳定整步收益。
+不能把少量 profiler 的 Graph 提交8–10ms视为正常固定成本，不能相加父子时间。
+本轮没有执行服务器命令，CPU/mock 不证明 CUDA 正确性或任何加速。
+
 本轮只接通现有 `non_blocking_batch_transfer`；正式默认仍为 False。
 两侧 GPUCompute、CPU 去重、椭球缓存和正式编译不变。
 不使用 pinned、打包、预取、额外 stream 或 DeviceReplay。

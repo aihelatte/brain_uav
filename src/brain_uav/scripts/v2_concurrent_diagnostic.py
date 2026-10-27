@@ -94,6 +94,9 @@ def worker_command(args, model, worker_id, root):
         '--output-dir', str(root / 'other' / worker_id)]
     if args.non_blocking_batch_transfer:
         command += ['--non-blocking-batch-transfer']
+    for name in ('gpu_compute_non_blocking_coefficients', 'gpu_compute_lightweight_timing'):
+        if getattr(args, name):
+            command += ['--' + name.replace('_', '-')]
     for key in ('validation_pool', 'expected_pool_digest', 'validation_seed', 'seed',
                 'replay_capacity', 'batch_size', 'scenario_count', 'warmup_steps',
                 'steps_per_level', 'controlled_stage_step_offset', 'snn_time_window'):
@@ -128,6 +131,10 @@ def build_plan(args):
     if len(set(args.concurrency)) != len(args.concurrency):
         raise ValueError('Repeated concurrency conditions are not allowed.')
     submission_updates = args.gpu_compute_submission_trace_updates
+    if (args.gpu_compute_non_blocking_coefficients or args.gpu_compute_lightweight_timing) and not args.non_blocking_batch_transfer:
+        raise ValueError('Coefficient experiment/timing requires nonblocking batch GPUCompute.')
+    if args.gpu_compute_lightweight_timing and (submission_updates or args.batch_preparation_updates or args.batch_preparation_trace_updates):
+        raise ValueError('Lightweight timing must be separate from profiler/instrumented batch diagnosis.')
     diagnostic_updates = args.batch_preparation_updates or args.batch_preparation_trace_updates or submission_updates
     if (args.batch_preparation_updates or args.batch_preparation_trace_updates) and args.non_blocking_batch_transfer:
         raise ValueError('Nonblocking A/B must run separately from batch instrumentation/trace.')
@@ -185,6 +192,8 @@ def build_plan(args):
                 'shape_types': [z['shape']['shape_type'] for z in r['payload']['zones']]}
                 for r in pool.scenarios[:args.scenario_count]]},
         'execution_requested': {'gpu_td3_compute': True, 'cpu_deduplication': True,
+            'gpu_compute_non_blocking_coefficients': args.gpu_compute_non_blocking_coefficients,
+            'gpu_compute_lightweight_timing': args.gpu_compute_lightweight_timing,
             'non_blocking_batch_transfer': args.non_blocking_batch_transfer,
             'cache_ellipsoid_segment_clearance': True, 'other_experiments': False},
         'limitations': ['Fresh BC + stage offset is not historical training resume.',
@@ -245,12 +254,12 @@ def summarize_worker(summary, window, *, start_tolerance=.1):
     # Final drain/statistics event readback is inside total, outside these sections.
     other = timing['total_wall_seconds'] - sum(parents.values())
     batch_diagnostic = run.get('batch_preparation_diagnostic')
-    instrumented = bool(batch_diagnostic)
+    instrumented = bool(batch_diagnostic or compute.get('lightweight_timing'))
     if batch_diagnostic and not batch_diagnostic['diagnostic_valid']:
         reasons.extend(batch_diagnostic['invalid_reasons'])
     diagnostic_valid = not reasons
     if instrumented:
-        reasons = reasons + ['Batch preparation instrumentation/profiler overhead; not pure throughput.']
+        reasons = reasons + ['Diagnostic instrumentation overhead; not pure throughput.']
     return {
         'instrumented': instrumented, 'diagnostic_valid': diagnostic_valid,
         'batch_preparation_diagnostic': batch_diagnostic,
@@ -315,6 +324,19 @@ def run_batch(args, count, repeat, root):
             worker_detail = read_json(detail)
             result = summarize_worker(worker_detail, window)
             transfer = worker_detail['runs']['compute'][0]['local_optimizations'].get('non_blocking_batch_transfer')
+            coefficient = worker_detail['runs']['compute'][0]['local_optimizations'].get('gpu_compute_non_blocking_coefficients')
+            result['execution']['gpu_compute_non_blocking_coefficients'] = coefficient
+            result['execution']['gpu_compute_lightweight_timing'] = worker_detail['runs']['compute'][0]['local_optimizations']['gpu_td3_compute'].get('lightweight_timing')
+            light = result['execution']['gpu_compute_lightweight_timing']
+            if bool(light) != args.gpu_compute_lightweight_timing or (light and not any(
+                    row['count'] > 0 for row in light['by_mode'].values())):
+                result['invalid_reasons'].append('Requested lightweight measurement evidence missing/mismatched.')
+                result['diagnostic_valid'] = result['valid_for_speed_comparison'] = False
+            if (coefficient and coefficient['requested'] != args.gpu_compute_non_blocking_coefficients
+                    or args.gpu_compute_non_blocking_coefficients and (not coefficient or not coefficient['effective']
+                    or coefficient.get('execution_count', 0) <= 0)):
+                result['invalid_reasons'].append('Requested coefficient upload execution evidence missing.')
+                result['diagnostic_valid'] = result['valid_for_speed_comparison'] = False
             result['execution']['non_blocking_batch_transfer'] = transfer
             if (transfer and transfer['requested'] != args.non_blocking_batch_transfer
                     or args.non_blocking_batch_transfer and (not transfer or not transfer['effective']
@@ -324,10 +346,10 @@ def run_batch(args, count, repeat, root):
             requested = (name in args.batch_preparation_workers
                 and bool(args.batch_preparation_updates or args.batch_preparation_trace_updates or args.gpu_compute_submission_trace_updates))
             result['batch_preparation_execution'] = {'requested': requested,
-                'effective': result['instrumented'],
-                'reason': 'Worker returned bounded instrumentation evidence' if result['instrumented']
+                'effective': bool(result['batch_preparation_diagnostic']),
+                'reason': 'Worker returned bounded instrumentation evidence' if result['batch_preparation_diagnostic']
                     else 'No batch preparation instrumentation evidence'}
-            if requested != result['instrumented']:
+            if requested != bool(result['batch_preparation_diagnostic']):
                 result['invalid_reasons'].append('Requested/actual batch instrumentation mismatch.')
                 result['diagnostic_valid'] = result['valid_for_speed_comparison'] = False
             if requested and args.gpu_compute_submission_trace_updates:
@@ -437,6 +459,8 @@ def build_parser():
         help='Separate trace run: 2..8 steady updates, default off; perturbs concurrency.')
     group.add_argument('--gpu-compute-submission-trace-updates', type=int, default=0,
         help='Real nonblocking GPUCompute submission observer: 2..8 updates, default off.')
+    p.add_argument('--gpu-compute-non-blocking-coefficients', action='store_true')
+    p.add_argument('--gpu-compute-lightweight-timing', action='store_true')
     p.add_argument('--batch-preparation-workers', nargs='+', default=['ann_0', 'snn_0'],
         help='Only these workers collect batch detail/trace; others sustain normal load.')
     return p

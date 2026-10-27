@@ -427,6 +427,8 @@ class V2TD3UpdateEngine:
 
 
         non_blocking_batch_transfer: bool = False,
+        gpu_compute_non_blocking_coefficients: bool = False,
+        gpu_compute_lightweight_timing: bool = False,
         spike_regularization: V2SpikeRegularizationConfig | None = None,
     ) -> None:
         actor_model_type = _actor_model_type(actor)
@@ -476,6 +478,13 @@ class V2TD3UpdateEngine:
             if self.device.type != 'cuda':
                 raise ValueError('non_blocking_batch_transfer requires CUDA; no fallback.')
         self.non_blocking_batch_transfer = non_blocking_batch_transfer
+        for name, value in (('gpu_compute_non_blocking_coefficients', gpu_compute_non_blocking_coefficients),
+                            ('gpu_compute_lightweight_timing', gpu_compute_lightweight_timing)):
+            if type(value) is not bool:
+                raise TypeError(f'{name} must be a bool.')
+            if value and not (gpu_td3_compute and non_blocking_batch_transfer):
+                raise ValueError(f'{name} requires GPUCompute and non_blocking_batch_transfer.')
+            setattr(self, name, value)
         if type(gpu_td3_update) is not bool:
             raise TypeError('gpu_td3_update must be a bool.')
         if gpu_td3_update:
@@ -2925,7 +2934,8 @@ class V2TD3UpdateEngine:
             if stream is not None:
                 # Upload, binding/capture or injected-error failures can precede
                 # output.cpu(). Keep the CPU allocation alive while draining.
-                self._pending_gpu_compute_transfer = (source, stream)
+                self._pending_gpu_compute_transfer = (source, stream,
+                    getattr(self, '_pending_gpu_compute_transfer', None))
                 stream.synchronize()
                 self._pending_gpu_compute_transfer = None
             raise
@@ -3491,6 +3501,16 @@ class V2TD3UpdateEngine:
         metadata['gpu_td3_compute'] = (self._gpu_update_executor.metadata()
             if self.gpu_td3_compute and self._gpu_update_executor is not None else
             {'requested': self.gpu_td3_compute, 'effective': False, 'reason': 'disabled or initialization pending'})
+        coefficient_count = getattr(self, '_gpu_compute_coefficient_uploads', 0)
+        coefficient_submissions = getattr(self, '_gpu_compute_coefficient_submissions', 0)
+        metadata['gpu_compute_non_blocking_coefficients'] = {
+            'requested': self.gpu_compute_non_blocking_coefficients,
+            'effective': self.gpu_compute_non_blocking_coefficients and coefficient_count > 0,
+            'execution_count': coefficient_count,
+            'coefficient_submission_count': coefficient_submissions,
+            'actual_path': ('coefficients.copy_(CPU FP32, non_blocking=True)'
+                if coefficient_count else ('original CUDA temporary + coefficients.copy_' if coefficient_submissions else 'not observed')),
+            'reason': 'Direct upload observed' if coefficient_count else 'disabled or no direct upload observed'}
         metadata['gpu_td3_update'] = (self._gpu_update_executor.metadata()
             if self.gpu_td3_update and self._gpu_update_executor is not None else
             {'requested': self.gpu_td3_update, 'effective': False, 'reason': 'disabled or initialization pending'})

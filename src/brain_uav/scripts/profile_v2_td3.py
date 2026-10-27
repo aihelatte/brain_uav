@@ -3411,6 +3411,8 @@ def _run_diagnostic_level(
     bc_schedule: str = 'default',
     concurrent_window=None,
     batch_preparation_diagnostic=None,
+    gpu_compute_non_blocking_coefficients: bool = False,
+    gpu_compute_lightweight_timing: bool = False,
 ) -> dict[str, Any]:
     if batch_preparation_diagnostic is not None and (
             concurrent_window is None or not gpu_td3_compute or detailed_profiler_updates
@@ -3453,6 +3455,8 @@ def _run_diagnostic_level(
         gpu_td3_update=gpu_td3_update,
         gpu_td3_compute=gpu_td3_compute,
         non_blocking_batch_transfer=non_blocking_batch_transfer,
+        gpu_compute_non_blocking_coefficients=gpu_compute_non_blocking_coefficients,
+        gpu_compute_lightweight_timing=gpu_compute_lightweight_timing,
 
 
     )
@@ -4076,7 +4080,10 @@ def _run_diagnostic_level(
             if measured_phase:
                 measured_count += 1
                 coverage[scenario_index]['measured_steps'] += 1
-                if concurrent_window is not None and perf_counter() <= window['end']:
+                completed_in_window = concurrent_window is None or perf_counter() <= window['end']
+                if gpu_compute_lightweight_timing and engine._gpu_update_executor is not None:
+                    engine._gpu_update_executor.record_lightweight_step(completed_in_window)
+                if concurrent_window is not None and completed_in_window:
                     window_completed_steps += 1
                     coverage[scenario_index]['completed_steps_in_window'] += 1
                 if coverage[scenario_index]['measured_steps'] % budgets[scenario_index] == 0:
@@ -4263,6 +4270,7 @@ def _run_diagnostic_level(
                 measured_count / measured_total
                 if (
                     not profiler_overhead_included
+                    and not gpu_compute_lightweight_timing
                     and batch_preparation_metadata is None
                     and compile_timing_valid
                     and measured_total > 0.0
@@ -5241,6 +5249,20 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     environment_diagnostic = getattr(args, 'gpu_compute_environment_diagnostic', False)
     batch_updates = getattr(args, 'batch_preparation_updates', 0)
     batch_trace_updates = getattr(args, 'batch_preparation_trace_updates', 0)
+    if args.gpu_compute_non_blocking_coefficients and not (
+            args.gpu_td3_compute and args.non_blocking_batch_transfer and (
+                args.gpu_compute_worker == 'timing' or (
+                    args.gpu_compute_worker == 'correctness' and args.gpu_compute_coefficient_comparison
+                    and (args.gpu_compute_write_reference or args.gpu_compute_reference is not None)))):
+        raise ValueError('Coefficient experiment requires nonblocking GPUCompute timing or explicit coefficient correctness comparison.')
+    if args.gpu_compute_lightweight_timing and not (
+            args.gpu_compute_worker == 'timing' and args.gpu_td3_compute and args.non_blocking_batch_transfer):
+        raise ValueError('Lightweight timing requires nonblocking GPUCompute timing worker.')
+    if args.gpu_compute_lightweight_timing and (batch_updates or batch_trace_updates or
+            getattr(args, 'gpu_compute_submission_trace_updates', 0)):
+        raise ValueError('Lightweight timing cannot use profiler/batch instrumentation.')
+    if args.gpu_compute_lightweight_timing and getattr(args, 'concurrent_window_dir', None) is None:
+        raise ValueError('Lightweight timing requires the common concurrent measurement window.')
     submission_updates = getattr(args, 'gpu_compute_submission_trace_updates', 0)
     batch_instrumented = bool(batch_updates or batch_trace_updates or submission_updates)
     if (batch_updates or batch_trace_updates) and args.non_blocking_batch_transfer:
@@ -5393,6 +5415,8 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 gpu_td3_compute=getattr(args,'gpu_compute_worker',None)=='timing' and args.gpu_td3_compute,
                 non_blocking_batch_transfer=(getattr(args,'batch_transfer_worker',None)=='timing'
                     or getattr(args,'gpu_compute_worker',None)=='timing') and args.non_blocking_batch_transfer,
+                gpu_compute_non_blocking_coefficients=args.gpu_compute_non_blocking_coefficients,
+                gpu_compute_lightweight_timing=args.gpu_compute_lightweight_timing,
                 batch_transfer_window_timing=(getattr(args,'batch_transfer_worker',None)=='timing' or getattr(args,'gpu_compute_worker',None)=='timing'),
                 environment_performance_diagnostic=environment_diagnostic,
                 cpu_deduplication=cpu_deduplication,
@@ -5426,7 +5450,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 for group, values in runs.items()}
     stable = all(run['critic_encoder_compile']['valid_for_speed_comparison'] is not False
                  for values in runs.values() for run in values)
-    speed_comparison_valid = (stable and not environment_diagnostic and not collect_deduplication and not batch_instrumented
+    speed_comparison_valid = (stable and not environment_diagnostic and not collect_deduplication and not batch_instrumented and not args.gpu_compute_lightweight_timing
         and all(run.get('concurrent_validity', {}).get('valid_for_speed_comparison', True)
             for values in runs.values() for run in values))
     summary = {'valid_for_speed_comparison': speed_comparison_valid, 'diagnostic_only': True, 'formal_training': False,
@@ -5452,10 +5476,10 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
         'cpu_deduplication_evidence': collect_deduplication,
 
 
-        'final_speed_acceptance': False if environment_diagnostic or collect_deduplication or batch_instrumented else None,
+        'final_speed_acceptance': False if environment_diagnostic or collect_deduplication or batch_instrumented or args.gpu_compute_lightweight_timing else None,
         **({'instrumented': True, 'diagnostic_valid': all(
             run['concurrent_validity']['diagnostic_valid'] for values in runs.values() for run in values)}
-            if batch_instrumented else {}),
+            if batch_instrumented or args.gpu_compute_lightweight_timing else {}),
         'comparison_kind': 'gpu_td3_compute' if getattr(args,'gpu_compute_worker',None) else ('local_optimizations'),
         'steps': steps, 'repeats': repeats, 'runs': runs,
         'comparison': {group: {'mean_wall_seconds': averages[group],
@@ -5549,6 +5573,12 @@ def build_parser() -> argparse.ArgumentParser:
         help='Concurrent worker only: trace 2..8 steady updates; separate from tensor-wall/throughput runs.')
     batch_group.add_argument('--gpu-compute-submission-trace-updates', type=int, default=0,
         help='Concurrent nonblocking GPUCompute observer: 2..8 steady updates; no throughput acceptance.')
+    parser.add_argument('--gpu-compute-non-blocking-coefficients', action='store_true',
+        help='Experimental direct CPU FP32 coefficient upload; requires GPUCompute + nonblocking batch.')
+    parser.add_argument('--gpu-compute-lightweight-timing', action='store_true',
+        help='CPU wall timing only: coefficient upload, replay call, original result barrier; no profiler.')
+    parser.add_argument('--gpu-compute-coefficient-comparison', action='store_true',
+        help='Explicit correctness provenance: nonblocking batch, original vs direct coefficients.')
     parser.add_argument('--controlled-stage-step-offset', type=int, default=75000)
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--seed', type=int, default=7)
@@ -5657,6 +5687,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if (args.gpu_compute_non_blocking_coefficients or args.gpu_compute_lightweight_timing
+            or args.gpu_compute_coefficient_comparison) and not (
+            args.gpu_compute_worker and args.gpu_td3_compute and args.non_blocking_batch_transfer):
+        raise ValueError('Coefficient experiment/timing requires explicit nonblocking GPUCompute worker.')
     if (args.batch_preparation_updates or args.batch_preparation_trace_updates or args.gpu_compute_submission_trace_updates) and not (
             args.gpu_compute_worker == 'timing' and args.gpu_td3_compute
             and args.concurrent_window_dir is not None):

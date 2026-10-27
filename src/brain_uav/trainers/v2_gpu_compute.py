@@ -305,6 +305,16 @@ class GPUCompute(GPUUpdate):
                         elif node.v != 0: raise RuntimeError('SNN reset failed.')
 
     def step_batch(self, batch, noise, total_steps, bc_lambda, *, recorder=None, submission_diagnostic=None):
+        if getattr(self.e, '_pending_gpu_compute_transfer', None) is not None:
+            raise RuntimeError('Prior GPU compute transfer failed to drain; source retained, no further updates allowed.')
+        sources = []
+        with (self.e._gpu_compute_source_lifetime(sources)
+              if self.e.gpu_compute_non_blocking_coefficients else nullcontext()):
+            return self._step_batch(batch, noise, total_steps, bc_lambda, recorder=recorder,
+                                    submission_diagnostic=submission_diagnostic, owned_sources=sources)
+
+    def _step_batch(self, batch, noise, total_steps, bc_lambda, *, recorder=None,
+                    submission_diagnostic=None, owned_sources):
         start = perf_counter()
         self.validate_binding()
         targets = total_steps % self.e.policy_delay == 0
@@ -314,7 +324,16 @@ class GPUCompute(GPUUpdate):
         with (submission_diagnostic.scope('noise_fixed_input_copy') if submission_diagnostic is not None else nullcontext()):
             self.noise.copy_(noise)
         with (submission_diagnostic.scope('coefficients_construct_and_upload') if submission_diagnostic is not None else nullcontext()):
-            self.coefficients.copy_(torch.tensor([bc_lambda,self.e.spike_regularization.beta(total_steps),self.e.policy_noise,self.e.noise_clip],device=self.e.device))
+            coefficient_started = perf_counter() if self.e.gpu_compute_lightweight_timing else None
+            if self.e.gpu_compute_non_blocking_coefficients:
+                source = torch.tensor([bc_lambda,self.e.spike_regularization.beta(total_steps),self.e.policy_noise,self.e.noise_clip],dtype=torch.float32,device='cpu')
+                owned_sources.append(source)
+                self.coefficients.copy_(source, non_blocking=True)
+                self.e._gpu_compute_coefficient_uploads = getattr(self.e, '_gpu_compute_coefficient_uploads', 0) + 1
+            else:
+                self.coefficients.copy_(torch.tensor([bc_lambda,self.e.spike_regularization.beta(total_steps),self.e.policy_noise,self.e.noise_clip],device=self.e.device))
+            self.e._gpu_compute_coefficient_submissions = getattr(self.e, '_gpu_compute_coefficient_submissions', 0) + 1
+            coefficient_seconds = perf_counter() - coefficient_started if coefficient_started is not None else None
         if key not in self.graphs: self.capture_shape(key,batch)
         graph,stable,fraction,output,presence,evidence = self.graphs[key]
         copy_started = perf_counter()
@@ -329,10 +348,16 @@ class GPUCompute(GPUUpdate):
         self.copy_seconds += copy_elapsed
         replay_started = perf_counter()
         with (submission_diagnostic.scope('graph_replay_submit') if submission_diagnostic is not None else nullcontext()):
+            submit_started = perf_counter() if self.e.gpu_compute_lightweight_timing else None
             graph.replay(); self.replays += 1
+            submit_seconds = perf_counter() - submit_started if submit_started is not None else None
         self.mode_replays[mode] += 1
         with (submission_diagnostic.scope('result_read_and_completion') if submission_diagnostic is not None else nullcontext()):
+            result_started = perf_counter() if self.e.gpu_compute_lightweight_timing else None
             values = output.cpu().tolist()  # sole terminal state/statistics barrier
+            result_seconds = perf_counter() - result_started if result_started is not None else None
+        if self.e.gpu_compute_lightweight_timing:
+            self.last_lightweight_timing = (mode, coefficient_seconds, submit_seconds, result_seconds)
         compute_elapsed = perf_counter()-replay_started
         self.compute_seconds += compute_elapsed
         self.handoffs += 2  # coefficient submission + combined status/statistics read; batch/noise copies separately accounted
@@ -371,14 +396,30 @@ class GPUCompute(GPUUpdate):
         self.graphs.clear(); self.tensor_evidence.clear()
 
     def begin_measurement(self):
+        if self.e.gpu_compute_lightweight_timing:
+            self.lightweight_timing = {}
+            self.last_lightweight_timing = None
         self.measurement_captures_before = self.captures
         self.measurement_copy_before = self.copy_seconds
         self.measurement_compute_before = self.compute_seconds
         self.measurement_ready_before = self.ready_to_result_seconds
         self.measurement_replays_before = self.replays
 
+    def record_lightweight_step(self, in_window):
+        if not self.e.gpu_compute_lightweight_timing:
+            return
+        sample = self.last_lightweight_timing
+        self.last_lightweight_timing = None
+        if in_window and sample is not None:
+            mode, *values = sample
+            row = self.lightweight_timing.setdefault(mode, dict(count=0,
+                coefficients_seconds=0., graph_replay_call_seconds=0., result_completion_seconds=0.))
+            row['count'] += 1
+            for name, value in zip(('coefficients_seconds','graph_replay_call_seconds','result_completion_seconds'), values):
+                row[name] += value
+
     def metadata(self):
-        return dict(requested=True,effective=bool(self.graphs),graphs=len(self.graphs),graph_limit=self.graph_limit,
+        result = dict(requested=True,effective=bool(self.graphs),graphs=len(self.graphs),graph_limit=self.graph_limit,
             capture_seconds=self.capture_seconds,initialization_seconds=self.initialization_seconds,
             replays=self.replays,measurement_new_captures=self.captures-self.measurement_captures_before,
             replay_submissions_by_mode=dict(self.mode_replays),
@@ -395,3 +436,8 @@ class GPUCompute(GPUUpdate):
             lifecycle='loads invalidate; cached parent registrations detect parameter replacement/address changes; direct nested optimizer-state mutation requires invalidate before mutation',
             validity_checks='nonrecursive cached parent/parameter/buffer/Adam handles; no repr, named_parameters or state_dict scan per step',
             exception_temporary_state='unconsumed backward may run in private bank; public gradients/Adam/targets/counts protected; true-model safety requires CUDA correctness')
+        if self.e.gpu_compute_lightweight_timing:
+            result['lightweight_timing'] = {'requested': True, 'by_mode': self.lightweight_timing,
+                'note': 'CPU wall submission/queue/wait; three children do not cover full update. '
+                    'No profiler/events/additional synchronization. Warmup and window tail excluded; do not add to parent TD3.'}
+        return result

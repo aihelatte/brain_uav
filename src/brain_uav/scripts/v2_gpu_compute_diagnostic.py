@@ -249,7 +249,13 @@ def _load_compute_reference(args, contract):
     reference = torch.load(args.gpu_compute_reference, map_location='cpu', weights_only=False)
     if reference.get('contract') != contract:
         raise ValueError('Compute reference contract mismatch; rebuild baseline.')
-    if args.non_blocking_batch_transfer and reference.get('transfer_reference') != {
+    if getattr(args, 'gpu_compute_coefficient_comparison', False):
+        if reference.get('coefficient_reference') != {
+                'gpu_td3_compute': True, 'non_blocking_batch_transfer': True,
+                'gpu_compute_non_blocking_coefficients': False} or reference.get('transfer_reference') != {
+                'gpu_td3_compute': True, 'non_blocking_batch_transfer': True}:
+            raise ValueError('Coefficient correctness requires GPUCompute nonblocking batch + original coefficient reference.')
+    elif args.non_blocking_batch_transfer and reference.get('transfer_reference') != {
             'gpu_td3_compute': True, 'non_blocking_batch_transfer': False}:
         raise ValueError('Nonblocking correctness requires an original GPUCompute blocking reference.')
     return reference
@@ -332,7 +338,8 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             rewards=prepared.reward_config,prepared_initialization=prepared,device=device,
             model_type=args.model,snn_time_window=args.snn_time_window,fused_adam=fused,
             reduce_update_stat_syncs=reduced,gpu_td3_compute=args.gpu_td3_compute,
-            non_blocking_batch_transfer=args.non_blocking_batch_transfer).engine
+            non_blocking_batch_transfer=args.non_blocking_batch_transfer,
+            gpu_compute_non_blocking_coefficients=getattr(args, 'gpu_compute_non_blocking_coefficients', False)).engine
         initial = reference['initial'] if reference else deepcopy(engine.checkpoint_state_dict())
         if focus is not None:
             initial = focus.initial(engine, initial, contract)
@@ -654,6 +661,8 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             effective=engine.local_optimization_metadata(),snapshot_count=len(snapshots),
             graph_evidence_scope='one actual prewarmed update per mode profiled; not every update individually profiled')
         if reference is None: torch.save(dict(contract=contract,initial=initial,snapshots=snapshots,contexts=contexts,error_states=error_states,
+            **({'coefficient_reference': dict(gpu_td3_compute=True, non_blocking_batch_transfer=True,
+                gpu_compute_non_blocking_coefficients=False)} if getattr(args, 'gpu_compute_coefficient_comparison', False) else {}),
             transfer_reference=dict(gpu_td3_compute=args.gpu_td3_compute,
                 non_blocking_batch_transfer=args.non_blocking_batch_transfer)),output/'reference.pt')
     except BaseException as exc:
@@ -719,13 +728,30 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
 
 def run(args):
     from brain_uav.scripts import profile_v2_td3 as p
+    coefficient_comparison = getattr(args, 'gpu_compute_coefficient_comparison', False)
+    direct_coefficients = getattr(args, 'gpu_compute_non_blocking_coefficients', False)
+    light_timing = getattr(args, 'gpu_compute_lightweight_timing', False)
+    write_reference = getattr(args, 'gpu_compute_write_reference', False)
+    if (direct_coefficients or light_timing or coefficient_comparison) and not (
+            args.gpu_td3_compute and args.non_blocking_batch_transfer and args.gpu_compute_worker):
+        raise ValueError('Coefficient experiment requires explicit nonblocking GPUCompute worker.')
+    if coefficient_comparison and not (args.gpu_compute_worker == 'correctness'
+            and (write_reference or args.gpu_compute_reference is not None)):
+        raise ValueError('Coefficient comparison requires correctness reference write/read.')
+    if direct_coefficients and args.gpu_compute_worker == 'correctness' and not coefficient_comparison:
+        raise ValueError('Direct coefficient correctness requires its explicit coefficient comparison contract.')
+    if light_timing and args.gpu_compute_worker != 'timing':
+        raise ValueError('Lightweight timing requires timing worker.')
+    if write_reference and coefficient_comparison and (direct_coefficients or args.gpu_compute_reference is not None):
+        raise ValueError('Coefficient reference must use original coefficients and no input reference.')
     if getattr(args, 'gpu_compute_write_reference', False) and not (
             args.gpu_compute_worker == 'correctness' and args.gpu_td3_compute
-            and not args.non_blocking_batch_transfer and args.gpu_compute_reference is None):
+            and (not args.non_blocking_batch_transfer or coefficient_comparison)
+            and args.gpu_compute_reference is None):
         raise ValueError('Writing transfer reference requires GPUCompute blocking correctness only.')
     if args.non_blocking_batch_transfer and not (args.gpu_compute_worker and args.gpu_td3_compute):
         raise ValueError('Nonblocking GPUCompute requires explicit compute worker; no serial baseline substitution.')
-    if args.non_blocking_batch_transfer and args.gpu_compute_worker == 'correctness' and args.gpu_compute_reference is None:
+    if args.non_blocking_batch_transfer and args.gpu_compute_worker == 'correctness' and args.gpu_compute_reference is None and not (coefficient_comparison and write_reference):
         raise ValueError('Nonblocking correctness requires a GPUCompute blocking reference file.')
     if (getattr(args,'cpu_deduplication',False) or getattr(args,'cpu_deduplication_evidence',False)) and not (args.gpu_compute_worker == 'timing'):
         raise ValueError('CPU deduplication requires --gpu-compute-worker timing --gpu-td3-compute.')
