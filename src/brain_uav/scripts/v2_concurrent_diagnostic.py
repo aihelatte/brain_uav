@@ -100,7 +100,7 @@ def worker_command(args, model, worker_id, root):
         value = getattr(args, key)
         command += ['--' + key.replace('_', '-'), str(value.resolve() if isinstance(value, Path) else value)]
     if worker_id in args.batch_preparation_workers:
-        for key in ('batch_preparation_updates', 'batch_preparation_trace_updates'):
+        for key in ('batch_preparation_updates', 'batch_preparation_trace_updates', 'gpu_compute_submission_trace_updates'):
             if getattr(args, key):
                 command += ['--' + key.replace('_', '-'), str(getattr(args, key))]
     return command
@@ -127,11 +127,15 @@ def build_plan(args):
         raise ValueError('Invalid repeat/warmup/scenario budget or stage offset.')
     if len(set(args.concurrency)) != len(args.concurrency):
         raise ValueError('Repeated concurrency conditions are not allowed.')
-    diagnostic_updates = args.batch_preparation_updates or args.batch_preparation_trace_updates
-    if diagnostic_updates and args.non_blocking_batch_transfer:
+    submission_updates = args.gpu_compute_submission_trace_updates
+    diagnostic_updates = args.batch_preparation_updates or args.batch_preparation_trace_updates or submission_updates
+    if (args.batch_preparation_updates or args.batch_preparation_trace_updates) and args.non_blocking_batch_transfer:
         raise ValueError('Nonblocking A/B must run separately from batch instrumentation/trace.')
+    if submission_updates and (not args.non_blocking_batch_transfer
+            or args.batch_preparation_updates or args.batch_preparation_trace_updates):
+        raise ValueError('Submission trace requires real nonblocking, separate from blocking batch diagnosis.')
     if diagnostic_updates:
-        if not 2 <= diagnostic_updates <= (8 if args.batch_preparation_trace_updates else 64):
+        if not 2 <= diagnostic_updates <= (8 if args.batch_preparation_trace_updates or submission_updates else 64):
             raise ValueError('Select tensor-wall 2..64 OR trace 2..8 updates.')
         eligible = {f'{model}_{i}' for model in ('ann', 'snn') for i in range(min(args.concurrency) // 2)}
         if (not args.batch_preparation_workers or len(set(args.batch_preparation_workers)) != len(args.batch_preparation_workers)
@@ -164,7 +168,8 @@ def build_plan(args):
                               text=True, encoding='utf-8', check=True).stdout.strip()
     return {'diagnostic_only': True, 'formal_training': False,
         'batch_preparation_diagnostic': {'instrumented': bool(diagnostic_updates),
-            'mode': 'trace' if args.batch_preparation_trace_updates else ('tensor_wall' if diagnostic_updates else 'off'),
+            'mode': 'gpu_compute_submission_trace' if submission_updates else
+                    ('trace' if args.batch_preparation_trace_updates else ('tensor_wall' if diagnostic_updates else 'off')),
             'updates': diagnostic_updates, 'workers': args.batch_preparation_workers},
         'conditions': args.concurrency, 'repeats': args.repeats,
         'output_dir': str(args.output_dir.resolve()),
@@ -317,7 +322,7 @@ def run_batch(args, count, repeat, root):
                 result['invalid_reasons'].append('Requested nonblocking GPUCompute upload evidence missing.')
                 result['diagnostic_valid'] = result['valid_for_speed_comparison'] = False
             requested = (name in args.batch_preparation_workers
-                and bool(args.batch_preparation_updates or args.batch_preparation_trace_updates))
+                and bool(args.batch_preparation_updates or args.batch_preparation_trace_updates or args.gpu_compute_submission_trace_updates))
             result['batch_preparation_execution'] = {'requested': requested,
                 'effective': result['instrumented'],
                 'reason': 'Worker returned bounded instrumentation evidence' if result['instrumented']
@@ -325,6 +330,12 @@ def run_batch(args, count, repeat, root):
             if requested != result['instrumented']:
                 result['invalid_reasons'].append('Requested/actual batch instrumentation mismatch.')
                 result['diagnostic_valid'] = result['valid_for_speed_comparison'] = False
+            if requested and args.gpu_compute_submission_trace_updates:
+                evidence = result['batch_preparation_diagnostic'] or {}
+                if (evidence.get('mode') != 'gpu_compute_submission_trace'
+                        or not evidence.get('execution', {}).get('effective')):
+                    result['invalid_reasons'].append('Real nonblocking submission trace evidence missing.')
+                    result['diagnostic_valid'] = result['valid_for_speed_comparison'] = False
             result['model'] = name.split('_')[0]
             result['detail'] = str(detail.relative_to(root))
             report['workers'][name] = result
@@ -424,6 +435,8 @@ def build_parser():
         help='Separate instrumented run: 2..64 steady updates, default off.')
     group.add_argument('--batch-preparation-trace-updates', type=int, default=0,
         help='Separate trace run: 2..8 steady updates, default off; perturbs concurrency.')
+    group.add_argument('--gpu-compute-submission-trace-updates', type=int, default=0,
+        help='Real nonblocking GPUCompute submission observer: 2..8 updates, default off.')
     p.add_argument('--batch-preparation-workers', nargs='+', default=['ann_0', 'snn_0'],
         help='Only these workers collect batch detail/trace; others sustain normal load.')
     return p

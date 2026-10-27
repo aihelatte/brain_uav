@@ -104,3 +104,97 @@ batch_transfer_window_completion 和 total_wall_seconds/seconds_per_step_includi
 review 放小型计划、门控、汇总、错误和日志；other 放 reference、异常状态及详细记录。
 不复制 BC/checkpoint 到 review。CPU/mock 测试不证明 pageable CUDA 异步复制正确性或收益；
 服务器必须重新通过上述严格正确性检查，才可解释纯测速结果。
+
+## 系数上传屏障旁观 trace（独立运行，命令仅准备）
+
+`--gpu-compute-submission-trace-updates 4` 默认关闭，仅允许真实 nonblocking
+GPUCompute 并发 worker。它不调用旧的 blocking transfer 回调，原 14 次 `.to()`
+仍由原 `V2ReplayBatch.to(non_blocking=True)` 执行。旧 batch 细测/trace 与
+nonblocking 的互斥保护保留，新选项也不能与旧细测或深 profiler 混用。
+
+沿用上轮配置：GPUCompute/CPU 去重/精确椭球缓存与正式编译开启，其他实验关闭；
+500k 日程、P1 关/P2/P3 开、batch64、seed7、offset75000、smooth-mid；
+ANN actor_lr=1.55e-4、SNN=8.25e-4、critic_lr=2.5e-4、alpha=2.5。
+fresh BC 加阶段偏移不是恢复历史训练状态；短循环也不完整复现正式报告及 candidate 负载。
+
+以下函数每次调用使用独立时间戳目录。定义后执行 `uav_submission_trace` 只检查并打印计划；
+审查授权后执行 `uav_submission_trace --launch` 才启动短测，不创建 tmux。
+2 和 8 条件顺序执行，各一次 30 秒共同窗口，条件内 worker 并发；仅 ann_0/snn_0
+在预热后采 4 次更新，其余 worker 持续负载。未采满、跨窗、角色/场景覆盖不足、
+新增编译/捕获或真实路径证据缺失均判诊断无效，不延窗或自动重试。
+
+```bash
+uav_submission_trace() {
+  if cd /home/zj/projects/my_project; then
+    py=/home/zj/envs/uav_torch/bin/python
+    root="outputs/v2_nonblocking_submission_$(date +%Y%m%d_%H%M%S_%N)"
+    ann="outputs/v2_projected_head_round1/ann_20261012_102839/bc/bc_v2_ann_best.pt"
+    snn="outputs/v2_projected_head_round1/snn_20261012_102848/bc/bc_v2_snn_best.pt"
+    pool="outputs/v2_box085_round1_20261003_003948/validation_pools_600km_seed20260904/v2_validation_easy.json"
+    digest="2e3199a60b8ff23f9cb8f8395d6f44bcb7d73abeddf2ff5a31f1c95c19332f4b"
+    if mkdir -p "$root/review"; then
+      started=$(date +%s)
+      PYTHONPATH=src "$py" -u -m brain_uav.scripts.v2_concurrent_diagnostic \
+        --output-dir "$root/run" --ann-bc-checkpoint "$ann" --snn-bc-checkpoint "$snn" \
+        --validation-pool "$pool" --expected-pool-digest "$digest" \
+        --ann-actor-lr 1.55e-4 --snn-actor-lr 8.25e-4 --critic-lr 2.5e-4 --alpha 2.5 \
+        --bc-schedule smooth-mid --seed 7 --validation-seed 20260904 \
+        --batch-size 64 --replay-capacity 500000 --scenario-count 3 --snn-time-window 4 \
+        --controlled-stage-step-offset 75000 --warmup-steps 128 --steps-per-level 256 \
+        --measurement-seconds 30 --repeats 1 --concurrency 2 8 \
+        --ready-timeout 1800 --completion-timeout 120 \
+        --non-blocking-batch-transfer --gpu-compute-submission-trace-updates 4 \
+        --batch-preparation-workers ann_0 snn_0 "$@" \
+        2>&1 | tee "$root/review/driver.log"
+      rc=${PIPESTATUS[0]}
+      elapsed=$(( $(date +%s) - started ))
+      printf 'exit_code=%s\nprocess_wall_seconds=%s\noutput_root=%s\n' \
+        "$rc" "$elapsed" "$root" | tee -a "$root/review/driver.log"
+      return "$rc"
+    else
+      printf 'Cannot create output directory; nothing started\n' >&2
+      return 1
+    fi
+  else
+    printf 'cd failed; nothing started\n' >&2
+    return 1
+  fi
+}
+uav_submission_trace
+# 审查后单独执行：uav_submission_trace --launch
+```
+
+每个所选 worker 的 `review/gpu_compute_submission.json` 保存小型摘要，
+`other/gpu_compute_submission_records.json` 保存有限记录，
+`other/gpu_compute_submission_trace.json` 保留原始 runtime、memcpy、kernel、stream、
+correlation/flow 信息（以实际 profiler 可见信息为准）。根 review 保留计划、日志与汇总。
+不保存张量、checkpoint，不逐步写盘；导出在共同窗口之后。
+
+每样本记录 total_steps、actor_updated、当前/下一 zone shape、起止时刻和各 scope CPU 墙钟。
+scope 为 batch_upload、noise_preparation、noise_fixed_input_copy、
+coefficients_construct_and_upload、graph_fixed_input_copy、graph_replay_submit、
+result_read_and_completion。包含整个 update 的父 scope 不与子项相加。
+达到上限立即停止 profiler；异常和 finish 清理幂等，导出延后。
+profiler 启停可能同步并扰动并发，因此 instrumented=true、valid_for_speed_comparison=false；
+diagnostic_valid 独立判断，有效插桩结果不会阻止继续运行八组条件。
+
+用 correlation/flow 将某次 CPU runtime 上传与 GPU memcpy 对应，再检查对应同步区间及
+后续 Graph 提交时间。CPU scope 是提交/等待墙钟，不能称为 GPU 计算时间；
+有效性逐采样 update 分别核对 batch 与系数 scope 内 runtime 到 GPU HtoD 的实际关联及
+非空输入对应的复制字节；External id 或字段名存在不能证明关联。空张量不要求复制事件，
+也不要求必须出现同步事件。缺任一必要关联时标记 unknown、归因不完整、诊断无效。
+16B 上传的邻接关系本身不能证明它等待了前面的 batch。缺少关联时标 unknown，
+不能补零或推断整卡空闲。单进程 trace 不能证明具体跨进程锁或整卡资源竞争；
+本轮不会自动宣布假设成立。CPU/mock 测试不构成 CUDA、速度或根因证据。
+
+可选的服务器只读能力检查（本轮未执行，不安装或修改配置）：
+
+```bash
+if command -v nsys >/dev/null 2>&1; then
+  nsys --version
+  nsys status --environment
+  nsys profile --help
+else
+  printf 'Nsight Systems unavailable; full-process timeline capability unknown\n'
+fi
+```

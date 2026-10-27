@@ -5,6 +5,7 @@ bind physical gradient-bank addresses; publication only happens at the final
 status read. Direct optimizer-state mutation must invalidate before mutation.
 """
 from dataclasses import replace
+from contextlib import nullcontext
 from time import perf_counter
 import torch
 
@@ -303,30 +304,35 @@ class GPUCompute(GPUUpdate):
                             if bool(torch.count_nonzero(node.v)): raise RuntimeError('SNN reset failed.')
                         elif node.v != 0: raise RuntimeError('SNN reset failed.')
 
-    def step_batch(self, batch, noise, total_steps, bc_lambda, *, recorder=None):
+    def step_batch(self, batch, noise, total_steps, bc_lambda, *, recorder=None, submission_diagnostic=None):
         start = perf_counter()
         self.validate_binding()
         targets = total_steps % self.e.policy_delay == 0
         actor = targets and total_steps > self.e.actor_freeze_steps
         mode = 'actor' if actor else 'frozen_targets' if targets else 'critic_only'
         key = self.key(batch,mode)
-        self.noise.copy_(noise)
-        self.coefficients.copy_(torch.tensor([bc_lambda,self.e.spike_regularization.beta(total_steps),self.e.policy_noise,self.e.noise_clip],device=self.e.device))
+        with (submission_diagnostic.scope('noise_fixed_input_copy') if submission_diagnostic is not None else nullcontext()):
+            self.noise.copy_(noise)
+        with (submission_diagnostic.scope('coefficients_construct_and_upload') if submission_diagnostic is not None else nullcontext()):
+            self.coefficients.copy_(torch.tensor([bc_lambda,self.e.spike_regularization.beta(total_steps),self.e.policy_noise,self.e.noise_clip],device=self.e.device))
         if key not in self.graphs: self.capture_shape(key,batch)
         graph,stable,fraction,output,presence,evidence = self.graphs[key]
         copy_started = perf_counter()
-        floats, booleans = [], []
-        for dst,src in zip(tensors(stable),tensors(batch)):
-            (booleans if dst.dtype == torch.bool else floats).append((dst,src))
-        for pairs in (floats,booleans):
-            torch._foreach_copy_([p[0] for p in pairs],[p[1] for p in pairs])
-        fraction.fill_(batch.sample_failure_fraction)
+        with (submission_diagnostic.scope('graph_fixed_input_copy') if submission_diagnostic is not None else nullcontext()):
+            floats, booleans = [], []
+            for dst,src in zip(tensors(stable),tensors(batch)):
+                (booleans if dst.dtype == torch.bool else floats).append((dst,src))
+            for pairs in (floats,booleans):
+                torch._foreach_copy_([p[0] for p in pairs],[p[1] for p in pairs])
+            fraction.fill_(batch.sample_failure_fraction)
         copy_elapsed = perf_counter()-copy_started
         self.copy_seconds += copy_elapsed
         replay_started = perf_counter()
-        graph.replay(); self.replays += 1
+        with (submission_diagnostic.scope('graph_replay_submit') if submission_diagnostic is not None else nullcontext()):
+            graph.replay(); self.replays += 1
         self.mode_replays[mode] += 1
-        values = output.cpu().tolist()  # sole terminal state/statistics barrier
+        with (submission_diagnostic.scope('result_read_and_completion') if submission_diagnostic is not None else nullcontext()):
+            values = output.cpu().tolist()  # sole terminal state/statistics barrier
         compute_elapsed = perf_counter()-replay_started
         self.compute_seconds += compute_elapsed
         self.handoffs += 2  # coefficient submission + combined status/statistics read; batch/noise copies separately accounted

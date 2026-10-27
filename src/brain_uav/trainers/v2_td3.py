@@ -2947,7 +2947,12 @@ class V2TD3UpdateEngine:
         diagnostic_tensor_recorder: Callable[[str, torch.Tensor], None] | None = None,
         block_attribution_recorder: Callable[[dict[str, Any]], None] | None = None,
         batch_transfer_diagnostic: Callable | None = None,
+        gpu_compute_submission_diagnostic=None,
     ) -> V2TD3UpdateMetrics:
+        if gpu_compute_submission_diagnostic is not None and (
+                not self.gpu_td3_compute or not self.non_blocking_batch_transfer
+                or batch_transfer_diagnostic is not None):
+            raise ValueError('Submission trace requires real nonblocking GPUCompute without transfer replacement.')
         if type(defer_statistics) is not bool:
             raise TypeError('defer_statistics must be a bool.')
         if batch_transfer_diagnostic is not None:
@@ -3013,7 +3018,10 @@ class V2TD3UpdateEngine:
             with update_timing.section('replay_sample'):
                 batch = self.replay.sample(self.batch_size)
             with self._gpu_compute_source_lifetime(batch):
-                with update_timing.section('batch_preparation'):
+                with (gpu_compute_submission_diagnostic.scope('batch_upload')
+                      if gpu_compute_submission_diagnostic is not None else nullcontext()), update_timing.section('batch_preparation'):
+                    if gpu_compute_submission_diagnostic is not None:
+                        gpu_compute_submission_diagnostic.observe_batch(batch)
                     if batch_transfer_diagnostic is not None:
                         if self.non_blocking_batch_transfer:
                             raise ValueError('Nonblocking comparison requires uninstrumented batch transfer.')
@@ -3023,7 +3031,9 @@ class V2TD3UpdateEngine:
                                  else batch.to(self.device))
                     self._gpu_compute_transfer_count = getattr(self, '_gpu_compute_transfer_count', 0) + 1
                 # Same RNG call, shape and ordering as the original target block.
-                noise = torch.randn_like(batch.action)
+                with (gpu_compute_submission_diagnostic.scope('noise_preparation')
+                      if gpu_compute_submission_diagnostic is not None else nullcontext()):
+                    noise = torch.randn_like(batch.action)
                 if self._gpu_update_executor is None:
                     from .v2_gpu_compute import GPUCompute
                     self._gpu_update_executor = GPUCompute(self, diagnostic=diagnostic_tensor_recorder is not None)
@@ -3031,7 +3041,9 @@ class V2TD3UpdateEngine:
                 if diagnostic_tensor_recorder is not None and not executor.diagnostic:
                     raise ValueError('Enable tensor diagnostics before first GPU compute capture.')
                 metric = executor.step_batch(batch, noise, total_steps_value, bc_lambda_value,
-                                             recorder=diagnostic_tensor_recorder)
+                    recorder=diagnostic_tensor_recorder,
+                    **({'submission_diagnostic': gpu_compute_submission_diagnostic}
+                       if gpu_compute_submission_diagnostic is not None else {}))
             if compiled_execution_recorder is not None:
                 compiled_execution_recorder('gpu_td3_compute_manual_replay')
             if timing_recorder is not None:

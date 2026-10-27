@@ -7,7 +7,7 @@ import subprocess
 import sys
 import numpy as np
 import torch
-from contextlib import nullcontext
+from contextlib import nullcontext, contextmanager
 from brain_uav.observations import V2ObservationBatch
 from brain_uav.trainers.v2_replay_buffer import V2ReplayBatch
 from brain_uav.observations import V2Observation
@@ -232,6 +232,230 @@ class BatchPreparationDiagnostic:
             'memory_events_observed': sum(e.get('name') == '[memory]' for e in events) or None,
             'runtime_memory_note': 'Observed profiler events only; allocator reuse, synchronization ownership and unseen activity require timeline inspection.',
             'driver_queueing': 'unknown', 'other_gpu_process_activity': 'unknown'}
+
+
+class GPUComputeSubmissionDiagnostic(BatchPreparationDiagnostic):
+    """Bounded observer; never replaces ReplayBatch.to or reads tensor contents.
+
+    Reuses the blocking diagnostic's profiler/window lifecycle, not its transfer.
+    """
+    observes_submission = True
+    required_scopes = ('batch_upload', 'noise_preparation', 'noise_fixed_input_copy',
+        'coefficients_construct_and_upload', 'graph_fixed_input_copy',
+        'graph_replay_submit', 'result_read_and_completion')
+
+    def __init__(self, **kwargs):
+        super().__init__(trace=True, **kwargs)
+        self.finished = None
+
+    def _stop_trace(self):
+        # Cleanup failure is evidence, never a replacement for the update exception.
+        try:
+            super()._stop_trace()
+        except Exception:
+            pass  # Base implementation already retained the concrete stop error.
+
+    def run(self, operation, *, update_index, window=None):
+        try:
+            return super().run(lambda unused_transfer: operation(
+                self if unused_transfer is not None else None), update_index=update_index, window=window)
+        except BaseException as exc:
+            if self.error is None:
+                self.error = {'type': type(exc).__name__, 'message': str(exc)}
+            self._stop_trace()
+            raise
+
+    def observe_batch(self, batch):
+        sources = [('obs.' + name, getattr(batch.obs, name)) for name in
+                   ('ego_features', 'goal_features', 'zone_features', 'presence_mask')]
+        sources += [(name, getattr(batch, name)) for name in ('action', 'reward')]
+        sources += [('next_obs.' + name, getattr(batch.next_obs, name)) for name in
+                    ('ego_features', 'goal_features', 'zone_features', 'presence_mask')]
+        sources += [(name, getattr(batch, name)) for name in
+                    ('done', 'success', 'near_goal', 'line_to_goal_safe')]
+        self.current.update(total_steps=self.current['update_index'], non_blocking=True,
+            actual_path='original V2ReplayBatch.to(non_blocking=True)',
+            obs_shape=list(batch.obs.zone_features.shape),
+            next_obs_shape=list(batch.next_obs.zone_features.shape),
+            upload_sources=[{'name': name, 'shape': list(tensor.shape),
+                'dtype': str(tensor.dtype), 'source_device': str(tensor.device),
+                'bytes': tensor.numel() * tensor.element_size()} for name, tensor in sources],
+            coefficient_upload_bytes=4 * torch.finfo(torch.get_default_dtype()).bits // 8)
+
+    @contextmanager
+    def scope(self, name):
+        with torch.profiler.record_function('gpu_compute_submission.' + name):
+            started = perf_counter()
+            try:
+                yield
+            finally:
+                completed = perf_counter()
+                self.current['constructors'].append({'name': name,
+                    'started': started, 'completed': completed,
+                    'cpu_wall_seconds': completed - started})
+                if name == 'batch_upload':
+                    # Existing lifecycle checks that the observed upload really ran.
+                    self.current['batch_preparation_wall_seconds'] = completed - started
+
+    def record_outer_total(self, sections):
+        pass  # Scope wall times are kept separately; no parent/child double counting.
+
+    def finish(self):
+        if self.finished is not None:
+            return self.finished
+        from brain_uav.scripts.v2_concurrent_diagnostic import write_json
+        other, review = self.output / 'other', self.output / 'review'
+        other.mkdir(parents=True, exist_ok=True)
+        review.mkdir(parents=True, exist_ok=True)
+        trace = None
+        if self.profiler is not None:
+            try:
+                self._stop_trace()
+                path = other / 'gpu_compute_submission_trace.json'
+                self.profiler.export_chrome_trace(str(path))
+                trace = self._trace_evidence(path)
+                # Full exported trace retains runtime/device correlation, stream and flows.
+                events = json.loads(path.read_text(encoding='utf-8'))['traceEvents']
+                trace['upload_attribution'] = self._upload_attribution(events,
+                    [r for r in self.records if r['within_common_window']])
+            except Exception as exc:
+                self.error = {'type': type(exc).__name__, 'message': 'Trace finalization: ' + str(exc)}
+            finally:
+                self.profiler = None
+        valid = [r for r in self.records if r['within_common_window']]
+        reasons = [self.error['message']] if self.error else []
+        if len(valid) != self.limit:
+            reasons.append('Submission sample incomplete within common measurement window.')
+        if {r['actor_updated'] for r in valid} != {False, True}:
+            reasons.append('Submission samples must include critic-only and actor updates.')
+        if any([c['name'] for c in r['constructors']] != list(self.required_scopes) for r in valid):
+            reasons.append('Real submission scope sequence incomplete.')
+        if not trace or not trace['cuda_activity_observed'] or not trace['runtime_calls']:
+            reasons.append('CUDA runtime/device trace unavailable; attribution unknown.')
+        if trace and not trace.get('upload_attribution', {}).get('complete', False):
+            reasons.append('Batch/coefficient runtime-to-HtoD attribution incomplete; unknown.')
+        summary = {'instrumented': True, 'mode': 'gpu_compute_submission_trace',
+            'diagnostic_valid': not reasons, 'valid_for_speed_comparison': False,
+            'invalid_reasons': reasons, 'error': self.error,
+            'worker': self.worker_id, 'model': self.model,
+            'execution': {'requested': True,
+                'effective': bool(valid) and all(r.get('non_blocking') is True for r in valid),
+                'actual_path': 'original V2ReplayBatch.to(non_blocking=True)',
+                'reason': 'Observed original upload inside bounded submission scopes' if valid
+                    else 'No complete sample observed'},
+            'requested_updates': self.limit, 'captured_updates': len(self.records),
+            'valid_samples_in_window': len(valid), 'trace': trace,
+            'scopes': list(self.required_scopes),
+            'records': 'other/gpu_compute_submission_records.json',
+            'coefficient_barrier_hypothesis': 'unknown; correlate runtime and device events in trace',
+            'note': 'CPU scope wall is submission/wait, not GPU time. Update contains child scopes; '
+                'do not sum parents and children. Profiler start/stop may synchronize and perturb '
+                'concurrency. No additional synchronization/content readback. Single-process trace '
+                'cannot prove cross-process locks or whole-device idle; unseen queueing is unknown.'}
+        write_json(other / 'gpu_compute_submission_records.json', {'updates': self.records, 'error': self.error})
+        write_json(review / 'gpu_compute_submission.json', summary)
+        self.finished = summary
+        return summary
+
+    @staticmethod
+    def _upload_attribution(events, records):
+        """Join runtime to device copies within each sampled update and CPU scope.
+
+        External id is an operator annotation, not a runtime/device correlation.
+        Missing byte or linkage evidence is unknown, never proof of no waiting.
+        """
+        def contains(outer, inner, same_thread=False):
+            return (all(isinstance(e.get('ts'), (int, float)) for e in (outer, inner))
+                and outer['ts'] <= inner['ts']
+                and inner['ts'] + inner.get('dur', 0) <= outer['ts'] + outer.get('dur', 0)
+                and (not same_thread or (outer.get('pid'), outer.get('tid')) ==
+                     (inner.get('pid'), inner.get('tid'))))
+
+        def correlation(event):
+            for key, value in event.get('args', {}).items():
+                if (key.lower() in ('correlation', 'correlation id')
+                        and not isinstance(value, bool) and isinstance(value, (int, str))
+                        and str(value).isdigit()):
+                    return str(int(value))
+            return None
+
+        def flow_key(event):
+            value = event.get('id', event.get('id2'))
+            return (event.get('cat'), json.dumps(value, sort_keys=True)) if value is not None else None
+
+        # Index endpoints by flow key, then by CPU/device thread and timestamp.
+        # Cache interval key sets: unrelated flows never create start x end pairs.
+        from bisect import bisect_left, bisect_right
+        flows = {}
+        for event in events:
+            phase, key = event.get('ph'), flow_key(event)
+            if phase in ('s', 'f') and key is not None and isinstance(event.get('ts'), (int, float)):
+                flows.setdefault(key, {'s': [], 'f': []})[phase].append(event)
+        endpoints = {'s': {}, 'f': {}}
+        for key, phases in flows.items():
+            for phase, values in phases.items():
+                for event in values:
+                    thread = (event.get('pid'), event.get('tid'))
+                    endpoints[phase].setdefault(thread, []).append((event['ts'], key))
+        for phase in endpoints.values():
+            for thread, values in phase.items():
+                values.sort(key=lambda value: value[0])
+                phase[thread] = ([value[0] for value in values], [value[1] for value in values])
+        interval_keys = {}
+
+        def keys_inside(event, phase):
+            cache_key = (id(event), phase)
+            if cache_key not in interval_keys:
+                times, keys = endpoints[phase].get((event.get('pid'), event.get('tid')), ([], []))
+                start = event['ts']
+                interval_keys[cache_key] = set(keys[bisect_left(times, start):
+                    bisect_right(times, start + event.get('dur', 0))])
+            return interval_keys[cache_key]
+
+        def linked(runtime, copy):
+            a, b = correlation(runtime), correlation(copy)
+            if a is not None and b is not None:
+                return a == b
+            return bool(keys_inside(runtime, 's') & keys_inside(copy, 'f'))
+
+        copies = [e for e in events if 'gpu_memcpy' in e.get('cat', '').lower()
+                  and any(s in e.get('name', '').lower() for s in ('htod', 'h2d', 'host to device'))]
+        runtime = [e for e in events if e.get('cat') == 'cuda_runtime'
+                   and 'memcpy' in e.get('name', '').lower()]
+        rows = []
+        for record in records:
+            updates = [e for e in events if e.get('ph') == 'X'
+                       and e.get('cat') == 'user_annotation'
+                       and e.get('name') == f"batch_diagnostic.update.{record['update_index']}"]
+            for name in ('batch_upload', 'coefficients_construct_and_upload'):
+                expected = ([t['bytes'] for t in record['upload_sources']
+                             if t['source_device'] == 'cpu' and t['bytes'] > 0]
+                            if name == 'batch_upload' else [record['coefficient_upload_bytes']])
+                scopes = [(update, scope) for update in updates for scope in events
+                          if scope.get('ph') == 'X'
+                          and scope.get('cat') == 'user_annotation'
+                          and scope.get('name') == 'gpu_compute_submission.' + name
+                          and contains(update, scope, True)]
+                matched = []
+                if len(scopes) == 1:
+                    update, scope = scopes[0]
+                    calls = [e for e in runtime if contains(scope, e, True)]
+                    for copy in copies:
+                        if not contains(update, copy):
+                            continue
+                        owners = [call for call in runtime if contains(update, call, True) and linked(call, copy)]
+                        if len(owners) == 1 and owners[0] in calls:
+                            matched.append(copy)
+                sizes = [e.get('args', {}).get('bytes') for e in matched]
+                complete = (len(scopes) == 1 and all(isinstance(n, (int, float)) for n in sizes)
+                            and sorted(sizes) == sorted(expected))
+                rows.append({'total_steps': record['update_index'], 'scope': name,
+                    'status': 'matched' if complete else 'unknown',
+                    'expected_nonempty_uploads': len(expected), 'expected_bytes': sum(expected),
+                    'matched_htod_events': len(matched),
+                    'matched_bytes': sum(sizes) if sizes and all(isinstance(n, (int, float)) for n in sizes) else None})
+        return {'complete': bool(rows) and all(r['status'] == 'matched' for r in rows),
+                'updates': rows, 'rule': 'sample/update + CPU scope containment, matching correlation or flow, input-derived byte sizes; no synchronization event required'}
 
 
 def cpu_batches(mixed, nonempty, action_dim, seed):

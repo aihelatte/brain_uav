@@ -3987,7 +3987,7 @@ def _run_diagnostic_level(
                             detail=update_details,
                         )
 
-                def perform_update(profile_sections: bool, transfer_diagnostic=None):
+                def perform_update(profile_sections: bool, transfer_diagnostic=None, submission_diagnostic=None):
                     nonlocal profiled_update_active
                     profiled_update_active = profile_sections
                     try:
@@ -4010,6 +4010,8 @@ def _run_diagnostic_level(
                                 profile_sections=profile_sections,
                                 **({'batch_transfer_diagnostic': transfer_diagnostic}
                                    if transfer_diagnostic is not None else {}),
+                                **({'gpu_compute_submission_diagnostic': submission_diagnostic}
+                                   if submission_diagnostic is not None else {}),
                                 **(
                                     {
                                         'diagnostic_timing_recorder': (
@@ -4033,7 +4035,9 @@ def _run_diagnostic_level(
                 if measured_phase:
                     if batch_preparation_diagnostic is not None:
                         batch_preparation_diagnostic.run(
-                            lambda transfer: perform_update(False, transfer),
+                            (lambda observer: perform_update(False, submission_diagnostic=observer))
+                            if getattr(batch_preparation_diagnostic, 'observes_submission', False)
+                            else (lambda transfer: perform_update(False, transfer)),
                             update_index=controlled_stage_step_offset + step_number, window=window)
                     else:
                         detailed_profiler.run(perform_update)
@@ -5237,16 +5241,19 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     environment_diagnostic = getattr(args, 'gpu_compute_environment_diagnostic', False)
     batch_updates = getattr(args, 'batch_preparation_updates', 0)
     batch_trace_updates = getattr(args, 'batch_preparation_trace_updates', 0)
-    batch_instrumented = bool(batch_updates or batch_trace_updates)
-    if batch_instrumented and args.non_blocking_batch_transfer:
+    submission_updates = getattr(args, 'gpu_compute_submission_trace_updates', 0)
+    batch_instrumented = bool(batch_updates or batch_trace_updates or submission_updates)
+    if (batch_updates or batch_trace_updates) and args.non_blocking_batch_transfer:
         raise ValueError('Nonblocking A/B must run separately from batch instrumentation/trace.')
+    if submission_updates and (not args.non_blocking_batch_transfer or batch_updates or batch_trace_updates):
+        raise ValueError('Submission trace requires real nonblocking, separate from blocking batch diagnosis.')
     if batch_instrumented:
         if (args.gpu_compute_worker != 'timing' or not args.gpu_td3_compute
                 or getattr(args, 'concurrent_window_dir', None) is None
                 or environment_diagnostic or getattr(args, 'cpu_deduplication_evidence', False)):
             raise ValueError('Batch preparation diagnosis requires isolated concurrent GPU compute timing.')
-        limit = batch_trace_updates or batch_updates
-        if batch_updates and batch_trace_updates or not 2 <= limit <= (8 if batch_trace_updates else 64):
+        limit = submission_updates or batch_trace_updates or batch_updates
+        if batch_updates and batch_trace_updates or not 2 <= limit <= (8 if batch_trace_updates or submission_updates else 64):
             raise ValueError('Select tensor-wall 2..64 OR trace 2..8 updates.')
     cpu_deduplication = getattr(args, 'cpu_deduplication', False)
     collect_deduplication = getattr(args, 'cpu_deduplication_evidence', False)
@@ -5369,9 +5376,11 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                     args.concurrent_worker_id, timeout=args.concurrent_timeout)
             batch_diagnostic = None
             if batch_instrumented:
-                from brain_uav.scripts.v2_batch_transfer_diagnostic import BatchPreparationDiagnostic
-                batch_diagnostic = BatchPreparationDiagnostic(
-                    updates=batch_trace_updates or batch_updates, trace=bool(batch_trace_updates),
+                from brain_uav.scripts.v2_batch_transfer_diagnostic import BatchPreparationDiagnostic, GPUComputeSubmissionDiagnostic
+                diagnostic_type = GPUComputeSubmissionDiagnostic if submission_updates else BatchPreparationDiagnostic
+                batch_diagnostic = diagnostic_type(
+                    updates=submission_updates or batch_trace_updates or batch_updates,
+                    **({} if submission_updates else {'trace': bool(batch_trace_updates)}),
                     output_dir=output, worker_id=args.concurrent_worker_id, model=args.model)
             result = _run_diagnostic_level(level='easy', pool=pool, prepared=prepared,
                 formal_config=config, bc_checkpoint=args.bc_checkpoint, model=args.model,
@@ -5538,6 +5547,8 @@ def build_parser() -> argparse.ArgumentParser:
         help='Concurrent worker only: instrument 2..64 steady updates; no speed acceptance.')
     batch_group.add_argument('--batch-preparation-trace-updates', type=int, default=0,
         help='Concurrent worker only: trace 2..8 steady updates; separate from tensor-wall/throughput runs.')
+    batch_group.add_argument('--gpu-compute-submission-trace-updates', type=int, default=0,
+        help='Concurrent nonblocking GPUCompute observer: 2..8 steady updates; no throughput acceptance.')
     parser.add_argument('--controlled-stage-step-offset', type=int, default=75000)
     parser.add_argument('--device', choices=DEVICE_CHOICES, default='auto')
     parser.add_argument('--seed', type=int, default=7)
@@ -5646,7 +5657,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
-    if (args.batch_preparation_updates or args.batch_preparation_trace_updates) and not (
+    if (args.batch_preparation_updates or args.batch_preparation_trace_updates or args.gpu_compute_submission_trace_updates) and not (
             args.gpu_compute_worker == 'timing' and args.gpu_td3_compute
             and args.concurrent_window_dir is not None):
         raise ValueError('Batch diagnosis requires concurrent GPU compute timing worker.')
