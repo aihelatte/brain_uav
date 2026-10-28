@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 
 from brain_uav.scripts import v2_concurrent_diagnostic as concurrent
 
@@ -244,6 +245,77 @@ def correctness_command(args, model, role, root, reference=None):
     return command
 
 
+def reuse_ann_reference(path, args, plan):
+    """Read-only preflight; the new MPS worker still validates its full contract."""
+    from brain_uav.scripts import v2_gpu_compute_diagnostic as d
+    root = Path(path).resolve()
+    detail = root/'other'/'ann_0'
+    report = concurrent.read_json(root/'review'/'summary.json')
+    result = concurrent.read_json(detail/'correctness.json')
+    recovery = concurrent.read_json(detail/'error_recovery_summary.json')
+    for item in (report,result):
+        if (item.get('passed') is not True or item.get('comparison') != 'ordinary_vs_mps'
+                or item.get('role') != 'ordinary'):
+            raise ValueError('Reused ANN ordinary report did not pass the required comparison.')
+        acceptance = item.get('acceptance',{})
+        if (acceptance.get('comparison') != 'ordinary_vs_mps' or not all(acceptance.get(key) is True
+                for key in ('semantic_passed','completed','recovery_required','recovery_completed','checkpoint_reload'))):
+            raise ValueError('Reused ANN ordinary acceptance evidence incomplete.')
+    if (report.get('model') != 'ann' or report.get('exit_code') != 0
+            or not all(result.get(key) is True for key in ('completed','load_rebuild_verified','recovery_completed'))
+            or not all(recovery.get(key) is True for key in ('passed','completed','recovery_completed'))
+            or set(result.get('manual_replay_evidence',{})) != {'actor','frozen_targets','critic_only'}
+            or any(value.get('cuda_graph_launch_count',0) < 1 for value in result['manual_replay_evidence'].values())):
+        raise ValueError('Reused ANN reference lacks complete lifecycle/Graph evidence.')
+    contract = result['inputs']
+    if (contract.get('version') != d.CONTRACT_VERSION or contract.get('model') != 'ann'
+            or contract.get('comparison') != 'ordinary_vs_mps'
+            or contract.get('config') != plan['models']['ann']['config']
+            or contract.get('schedule') != args.bc_schedule or contract.get('seed') != args.seed
+            or contract.get('checkpoint_sha256') != plan['models']['ann']['checkpoint_sha256']
+            or contract.get('full_pool_digest') != args.expected_pool_digest
+            or contract.get('pool_file_sha256') != concurrent._hash(args.validation_pool)
+            or contract.get('exception_gradient_lifecycle') != d.EXCEPTION_GRADIENTS
+            or contract.get('first_critic_loss_only') is not False or contract.get('error_recovery') is not True
+            or contract.get('trace_retained_gradient') is not False):
+        raise ValueError('Reused ANN reference configuration/contract mismatch.')
+    reference_path = detail/'reference.pt'
+    reference_args = SimpleNamespace(gpu_compute_reference=reference_path,gpu_compute_mps_comparison='mps')
+    reference = d._load_compute_reference(reference_args,contract)
+    contexts = reference['contexts']
+    count = len(contexts)
+    if (count != result.get('snapshot_count') or count != len(reference['snapshots'])
+            or count != len(result.get('checks',[])) or not count
+            or not all(check.get('passed') is True for check in result['checks'])
+            or 'initial' not in reference):
+        raise ValueError('Reused ANN reference snapshot/check sequence incomplete.')
+    failures = {i:context['failure'] for i,context in enumerate(contexts) if context.get('failure')}
+    if set(failures.values()) != set(d.EXCEPTION_GRADIENTS) or set(reference['error_states']) != set(failures):
+        raise ValueError('Reused ANN reference error-state sequence incomplete.')
+    files = [reference_path,root/'review'/'summary.json',detail/'correctness.json',detail/'error_recovery_summary.json']
+    for index in failures:
+        name = reference['error_states'][index]
+        if Path(name).name != name: raise ValueError('Error-state path must be a local relative filename.')
+        state = d._load_reference_error_state(reference_args,reference,index)
+        if any(not isinstance(state.get(phase,{}).get('values'),dict) for phase in ('before','after')):
+            raise ValueError('Reused ANN error-state payload incomplete.')
+        checks = result.get('error_states',{}).get(str(index),{})
+        if (checks.get('state_checks_completed') is not True or
+                any(checks.get(key,{}).get('passed') is not True for key in ('protected_state_exact','own_protected_state'))):
+            raise ValueError('Reused ANN error-state checks incomplete.')
+        check_path = detail/f'error_state_{index}_checks.json'
+        saved_checks = concurrent.read_json(check_path)
+        if (saved_checks.get('protected_state_exact') != checks['protected_state_exact']
+                or saved_checks.get('location',{}).get('index') != index):
+            raise ValueError('Reused ANN error-state check file mismatch.')
+        state_json = detail/f'error_state_{index}.json'
+        concurrent.read_json(state_json)
+        files.extend((detail/name,check_path,state_json))
+    return dict(reused=True,new_comparison_passed=False,model='ann',role='ordinary',
+        source=str(root),reference=str(reference_path),original_passed=True,
+        files_sha256={str(file):concurrent._hash(file) for file in files})
+
+
 def run_correctness_worker(args, model, role, root, *, reference=None, session=None):
     root = Path(root); (root/'review').mkdir(parents=True); (root/'other'/'control').mkdir(parents=True)
     control = root/'other'/'control'
@@ -276,6 +348,8 @@ def run_correctness_worker(args, model, role, root, *, reference=None, session=N
             report['passed'] = True
         except (Exception,KeyboardInterrupt) as exc:
             report['error'] = dict(type=type(exc).__name__,message=str(exc))
+            if (control/'last_stage.json').is_file():
+                report['last_stage'] = concurrent.read_json(control/'last_stage.json')
             concurrent.write_json(control/'abort.json',report['error'])
         finally:
             try:
@@ -301,10 +375,14 @@ def build_parser():
         help='With --launch, run only isolated MPS Graph capability/membership check; no eight-worker batches.')
     modes.add_argument('--correctness-only',action='store_true',
         help='Serial ANN/SNN ordinary GPUCompute reference then MPS numerical comparison; no timing.')
+    parser.add_argument('--reuse-ann-ordinary-reference',type=Path,
+        help='With --correctness-only, reuse a passed ANN ordinary worker directory (review/summary.json and other/ann_0).')
     return parser
 
 
 def validate(args):
+    if getattr(args,'reuse_ann_ordinary_reference',None) is not None and not getattr(args,'correctness_only',False):
+        raise ValueError('ANN ordinary reference reuse requires --correctness-only.')
     if (args.concurrency != [8] or args.repeats != 2 or args.measurement_seconds != 30
             or not args.non_blocking_batch_transfer or args.gpu_compute_non_blocking_coefficients
             or args.gpu_compute_lightweight_timing or args.gpu_compute_event_updates
@@ -331,6 +409,10 @@ def main(argv=None):
         plan['mps_comparison'].update(mode='correctness_only',comparison='ordinary_vs_mps',
             phases=['ann_ordinary_reference','ann_mps_compare','snn_ordinary_reference','snn_mps_compare'],
             rtol=1e-4,atol=1e-5,workers_serial=True)
+    reused = None
+    if getattr(args,'reuse_ann_ordinary_reference',None) is not None:
+        reused = reuse_ann_reference(args.reuse_ann_ordinary_reference,args,plan)
+        plan['mps_comparison']['reused_ann_ordinary'] = reused
     if not args.launch:
         print(json.dumps(dict(mode='plan_only',plan=plan),indent=2)); return 0
     root = args.output_dir.resolve(); root.mkdir(parents=True,exist_ok=False)
@@ -356,11 +438,16 @@ def main(argv=None):
             report.update(comparison='ordinary_vs_mps',correctness=[])
             for model in ('ann','snn'):
                 for role in ('ordinary','mps'):
+                    if model == 'ann' and role == 'ordinary' and reused is not None:
+                        report['correctness'].append(reused)
+                        concurrent.write_json(root/'review'/'ann_ordinary_reused.json',reused)
+                        continue
                     if mps_processes() or gpu_processes(): raise RuntimeError('Unexpected workload before correctness worker.')
                     if role == 'mps':
                         session = Session(root/'other'/(model+'_correctness_mps')); session.start()
                     worker_root = root/'other'/(model+'_'+role)
                     reference = root/'other'/(model+'_ordinary')/'other'/(model+'_0')/'reference.pt'
+                    if model == 'ann' and reused is not None: reference = Path(reused['reference'])
                     result = run_correctness_worker(args,model,role,worker_root,reference=reference if role=='mps' else None,session=session)
                     report['correctness'].append(result)
                     concurrent.write_json(root/'review'/(model+'_'+role+'.json'),result)

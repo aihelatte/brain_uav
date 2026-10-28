@@ -145,3 +145,29 @@ reference新增独立 `mps_reference` 来源契约及父进程普通CUDA接入�
 完整correctness.json、异常状态张量及加载证据。不会输出正式训练passed checkpoint。
 PID失败不发布release；MPS异常/超时先经私有服务terminate_client且明确返回0后才允许
 OS清理，否则保留错误/服务并阻断后续对照。无静默回退。
+
+### 超时定位与显式复用已完成 ANN 普通参照
+
+仅 ordinary_vs_mps worker 输出 `MPS_STAGE` 日志（Unix时间、单调时间、更新索引）：
+捕获、同步/PID门控、profiler调用前后、更新、快照、数值比较、异常恢复、checkpoint重建、
+报告写入。每条立即flush；`other/control/last_stage.json` 原子更新，父进程失败报告保留
+`last_stage`，详细日志仍在worker.log。阶段墙钟不是GPU计算时间。
+PID放行后启用faulthandler，每60秒向worker.log输出所有线程调用栈，正常/异常退出路径取消。
+父进程仍使用原120秒完成超时，不延长、不重试；栈只能定位阻塞调用，不能证明MPS根因。
+
+可显式传 `--reuse-ann-ordinary-reference <ANN普通worker根目录>`，仅correctness-only允许。
+预检读取原 `review/summary.json`、`other/ann_0/correctness.json`、恢复报告、reference及
+每个相对error_state文件；要求原普通CUDA通过、完整生命周期、原来源/PID契约、配置、
+BC哈希和固定池哈希匹配，并保存输入文件SHA256。新MPS worker仍严格核对完整reference契约。
+旧参照不复制、不重写、不再次生成；记录 `reused=true`、`original_passed=true`、
+`new_comparison_passed=false`，不得将复用记录当作新MPS比较通过。ANN MPS失败则仍阻断SNN。
+
+先定义上文完整函数，再执行以下草案（默认仅计划；本轮未执行服务器命令）：
+
+```bash
+uav_mps_compare --correctness-only \
+  --reuse-ann-ordinary-reference /home/zj/projects/my_project/outputs/v2_mps_compare_20261028_165610_917933931/other/run/other/ann_ordinary
+# 审查并同步代码后才显式启动；仍使用python -u、tee、立即PIPESTATUS、耗时/退出码：
+uav_mps_compare --correctness-only --launch \
+  --reuse-ann-ordinary-reference /home/zj/projects/my_project/outputs/v2_mps_compare_20261028_165610_917933931/other/run/other/ann_ordinary
+```

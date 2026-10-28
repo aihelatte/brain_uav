@@ -10,6 +10,8 @@ import random
 import subprocess
 import sys
 import traceback
+import time
+import faulthandler
 import numpy as np
 import torch
 
@@ -249,6 +251,31 @@ MPS_REFERENCE = dict(comparison='ordinary_vs_mps', source='ordinary', gpu_td3_co
                      non_blocking_batch_transfer=True, gpu_compute_non_blocking_coefficients=False)
 
 
+class _MPSProgress:
+    """Only ordinary_vs_mps: flushed stage evidence and bounded-time stack dump."""
+    def __init__(self, args):
+        self.root = Path(args.gpu_compute_correctness_control_dir) if getattr(args,'gpu_compute_mps_comparison',None) else None
+        self.armed = False
+
+    def stage(self, phase, index=None, **details):
+        if self.root is None: return
+        from brain_uav.scripts import v2_concurrent_diagnostic as c
+        record = dict(phase=phase,index=index,unix_time=time.time(),monotonic=time.monotonic(),**details)
+        print('MPS_STAGE '+json.dumps(record),file=sys.stderr,flush=True)
+        # The parent reads this bounded single record on timeout, before cleanup.
+        c.write_json(self.root/'last_stage.json',record)
+
+    def arm(self):
+        if self.root is not None:
+            faulthandler.dump_traceback_later(60,repeat=True,file=sys.stderr)
+            self.armed = True
+
+    def finish(self):
+        if self.armed:
+            faulthandler.cancel_dump_traceback_later()
+            self.armed = False
+
+
 def _validate_mps_comparison(args):
     role = getattr(args, 'gpu_compute_mps_comparison', None)
     control = getattr(args, 'gpu_compute_correctness_control_dir', None)
@@ -395,7 +422,9 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
         reference = _load_compute_reference(args, contract)
     engine = None
     trace_events = []
+    progress = _MPSProgress(args)
     try:
+        progress.stage('initialization')
         report['location']['phase'] = 'initialization'
         engine = p.build_v2_stage_engine(None,config,init_checkpoint=args.bc_checkpoint,
             rewards=prepared.reward_config,prepared_initialization=prepared,device=device,
@@ -440,6 +469,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
 
         def run_step(total,batch=None,noise=None,failure=None,*,recovery=False,trace=False):
             index = len(snapshots); collected.clear()
+            progress.stage('exception_recovery' if recovery else 'update_begin',index,steps=total,failure=failure)
             report['location'] = dict(phase='update',index=index,steps=total,failure=failure,
                 current_zones=None if batch is None else batch.obs.max_zone_count,
                 next_zones=None if batch is None else batch.next_obs.max_zone_count)
@@ -481,6 +511,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                 engine._require_finite_loss = old_loss
                 if args.gpu_td3_compute and engine._gpu_update_executor is not None: engine._gpu_update_executor.injections.zero_()
             if failure:
+                progress.stage('exception_snapshot',index)
                 after_error = error_state(engine)
                 expected_error = None
                 if reference is not None:
@@ -492,6 +523,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                 error_states[index] = Path(state_report['snapshot_path']).name
                 report.setdefault('error_states',{})[str(index)] = state_report
             actor_backward = (metric.actor_updated if metric is not None else failure == 'actor_gradient')
+            progress.stage('snapshot_begin',index)
             snap,evidence = snapshot(engine,metric)
             if engine.bc_reference_actor is not None:
                 flatten(engine.bc_reference_actor.state_dict(),'bc_reference',snap)
@@ -521,6 +553,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                             if isinstance(node.v,torch.Tensor): assert torch.count_nonzero(node.v) == 0
                             else: assert node.v == 0
             context = dict(snapshot_index=index,stage_steps=total,actor_backward=actor_backward,gradients=evidence,failure=failure)
+            progress.stage('numerical_comparison',index,reference=reference is not None)
             if reference is not None:
                 prior = reference['contexts'][index]
                 if any(context[name] != prior[name] for name in
@@ -590,6 +623,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                 passed=not recovery or reference is None or item['active_update']['passed']))
             if focus is not None:
                 focus.after_step(engine, index, snap)
+            progress.stage('update_complete',index,steps=total)
             return snap
 
         if focus is not None and focus.replaying:
@@ -613,10 +647,17 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                 executor.coefficients.copy_(torch.tensor([p.v2_bc_lambda(total,schedule=args.comparison_bc_schedule),
                     engine.spike_regularization.beta(total),pn,nc],device=device))
                 key = executor.key(upload,mode)
+                progress.stage('graph_capture_begin',len(snapshots),mode=mode)
                 if key not in executor.graphs: executor.capture_shape(key,upload)
+                progress.stage('graph_capture_complete',len(snapshots),mode=mode)
                 if mps_role and i == 0:
+                    progress.stage('synchronize_and_pid_gate',len(snapshots))
                     report['cuda_access_evidence'] = _mps_correctness_ready(args,device)
+                    progress.arm()
+                    progress.stage('pid_released',len(snapshots))
+                progress.stage('profiler_enter',len(snapshots),mode=mode)
                 evidence = engine._profile_cuda_graph_replay(lambda: run_step(total,fixed[i%len(fixed)],controlled))
+                progress.stage('profiler_exit',len(snapshots)-1,mode=mode)
                 report.setdefault('manual_replay_evidence',{})[mode] = evidence
                 if evidence['cuda_graph_launch_count'] < 1: raise AssertionError('No actual CUDA Graph launch: '+mode)
                 profiled_modes.add(mode)
@@ -638,6 +679,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
         for total in range(last+1,last+7): run_step(total)
         last += 6
         for failure in ('critic_loss','critic_gradient','actor_loss','actor_gradient'):
+            progress.stage('exception_recovery_sequence',len(snapshots),failure=failure)
             success = last+config.policy_delay-(last%config.policy_delay)
             tracing = contract['trace_retained_gradient'] and failure == 'critic_loss'
             run_step(success,fixed[0],trace=tracing)
@@ -702,6 +744,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
         # Supported load entry point must drop every old graph, then rebuild
         # from the same initial engine state; replay remains the CPU authority.
         if not contract['first_critic_loss_only']:
+            progress.stage('checkpoint_rebuild_begin',len(snapshots))
             report['location'] = {'phase':'checkpoint_load'}
             old_executor = engine._gpu_update_executor
             engine.set_target_noise(policy_noise=initial['algorithm_config']['policy_noise'],
@@ -713,6 +756,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             _prepare_loaded_bc_reference(engine,batches,compilation)
             run_step(last+config.policy_delay,fixed[3])
             report['load_rebuild_verified'] = True
+            progress.stage('checkpoint_rebuild_complete',len(snapshots)-1)
         else:
             report['load_rebuild_verified'] = None
             report['omitted_checks'] = ['remaining error injections','checkpoint load/rebuild','timing']
@@ -725,6 +769,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
         report.update(passed=True,completed=True,compilation=configured,
             effective=engine.local_optimization_metadata(),snapshot_count=len(snapshots),
             graph_evidence_scope='one actual prewarmed update per mode profiled; not every update individually profiled')
+        progress.stage('reference_save',len(snapshots),required=reference is None)
         if reference is None: torch.save(dict(contract=contract,initial=initial,snapshots=snapshots,contexts=contexts,error_states=error_states,
             **({'mps_reference': dict(MPS_REFERENCE), 'cuda_access_evidence': report['cuda_access_evidence']} if mps_role else {}),
             **({'coefficient_reference': dict(gpu_td3_compute=True, non_blocking_batch_transfer=True,
@@ -739,56 +784,66 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
         report['failure'] = report['error']
         raise
     finally:
-        report['acceptance'] = dict(semantic_passed=report['passed'],completed=report['completed'],
-            comparison='ordinary_vs_mps' if mps_role else 'baseline_reference_only' if reference is None else 'baseline_vs_compute',
-            raw_all_fields_equal=None if reference is None or not report['completed'] else
-                all(state.get(name,{'passed':True})['passed'] for state in report.get('error_states',{}).values()
-                    for name in ('cross_before','cross_after','cross_snapshot'))
-                and all(item.get('all_fields',{'passed':True})['passed'] for item in report.get('recovery_updates',[]))
-                and all(item['result']['passed'] for item in report.get('post_error_updates',[])),
-            scope='Exception lifecycle table; old gradients require presence/shape/dtype across paths; all numerical/nonfinite differences recorded; current gradients unchanged.',
-            recovery_required=contract['error_recovery'],recovery_completed=report.get('recovery_completed',False),
-            checkpoint_reload=report.get('load_rebuild_verified'))
-        if trace_events:
-            torch.save(trace_events,output/'retained_gradient_trace.pt')
-            report['retained_gradient_trace'] = retained_trace_summary(trace_events)
-        if contract['error_recovery'] or contract['trace_retained_gradient']:
-            compact = dict(passed=report['passed'],completed=report['completed'],trace_parameter=RETAINED_PARAMETER,
-                recovery_completed=report.get('recovery_completed',False),
-                trace=report.get('retained_gradient_trace'),
-                protected_state=[dict(index=index,passed=item.get('protected_state_exact',{}).get('passed'))
-                    for index,item in report.get('error_states',{}).items()],
-                recovery=[dict(index=item['index'],steps=item['stage_steps'],actor_backward=item['actor_backward'],
-                    after_exception=item['after_exception'],
-                    comparison=item['comparison'],
-                    all_fields_passed=item.get('all_fields',{}).get('passed'),
-                    active_update_passed=item.get('active_update',{}).get('passed'))
-                    for item in report.get('recovery_updates',[])],
-                first_failure=report.get('first_error_state_failure'),evidence='correctness.json')
-            compact['acceptance'] = report.get('acceptance')
-            compact['exception_checks'] = [dict(index=index,lifecycle=state['backward_lifecycle'],
-                current_gradients_passed=state.get('current_gradients',{}).get('passed'),
-                old_gradient_differences=len(state.get('effective_cross_after',{}).get('waived_fields',[])),
-                own_protection=state['own_protected_state']['passed'],
-                persistent_protection=state.get('protected_state_exact',{}).get('passed'),
-                recovery=state.get('recovery_acceptance')) for index,state in report.get('error_states',{}).items()]
-            compact['retained_residuals'] = [dict(index=index,
-                waived_field_count=len(state.get('effective_cross_after',{}).get('waived_fields',[])),
-                waived_fields_evidence='correctness.json:error_states.'+index+'.effective_cross_after.waived_fields',
-                compute_self_protection=state.get('own_protected_state',{}).get('passed') if args.gpu_td3_compute else None,
-                baseline_self_unchanged=state.get('own_before_after',{}).get('passed') if not args.gpu_td3_compute else None)
-                for index,state in report.get('error_states',{}).items()]
-            p._strict_json_write(output/'error_recovery_summary.json',compact)
-        if engine is not None: engine.invalidate_gpu_update()
-        if focus is None:
-            p._strict_json_write(output/'correctness.json',report)
-        else:
-            # Do not label a truncated investigation as full v8 acceptance.
-            p._strict_json_write(focus.root/'review'/(focus.worker+'_preparation.json'),
-                dict(completed=report['completed'], execution_passed=report['passed'],
-                    full_acceptance=False, scope=report.get('scope'), code=report.get('code'),
-                    compilation=locals().get('configured'), error=report.get('error'),
-                    selected_location=report['location']))
+        try:
+            report['acceptance'] = dict(semantic_passed=report['passed'],completed=report['completed'],
+                comparison='ordinary_vs_mps' if mps_role else 'baseline_reference_only' if reference is None else 'baseline_vs_compute',
+                raw_all_fields_equal=None if reference is None or not report['completed'] else
+                    all(state.get(name,{'passed':True})['passed'] for state in report.get('error_states',{}).values()
+                        for name in ('cross_before','cross_after','cross_snapshot'))
+                    and all(item.get('all_fields',{'passed':True})['passed'] for item in report.get('recovery_updates',[]))
+                    and all(item['result']['passed'] for item in report.get('post_error_updates',[])),
+                scope='Exception lifecycle table; old gradients require presence/shape/dtype across paths; all numerical/nonfinite differences recorded; current gradients unchanged.',
+                recovery_required=contract['error_recovery'],recovery_completed=report.get('recovery_completed',False),
+                checkpoint_reload=report.get('load_rebuild_verified'))
+            if trace_events:
+                torch.save(trace_events,output/'retained_gradient_trace.pt')
+                report['retained_gradient_trace'] = retained_trace_summary(trace_events)
+            if contract['error_recovery'] or contract['trace_retained_gradient']:
+                compact = dict(passed=report['passed'],completed=report['completed'],trace_parameter=RETAINED_PARAMETER,
+                    recovery_completed=report.get('recovery_completed',False),
+                    trace=report.get('retained_gradient_trace'),
+                    protected_state=[dict(index=index,passed=item.get('protected_state_exact',{}).get('passed'))
+                        for index,item in report.get('error_states',{}).items()],
+                    recovery=[dict(index=item['index'],steps=item['stage_steps'],actor_backward=item['actor_backward'],
+                        after_exception=item['after_exception'],
+                        comparison=item['comparison'],
+                        all_fields_passed=item.get('all_fields',{}).get('passed'),
+                        active_update_passed=item.get('active_update',{}).get('passed'))
+                        for item in report.get('recovery_updates',[])],
+                    first_failure=report.get('first_error_state_failure'),evidence='correctness.json')
+                compact['acceptance'] = report.get('acceptance')
+                compact['exception_checks'] = [dict(index=index,lifecycle=state['backward_lifecycle'],
+                    current_gradients_passed=state.get('current_gradients',{}).get('passed'),
+                    old_gradient_differences=len(state.get('effective_cross_after',{}).get('waived_fields',[])),
+                    own_protection=state['own_protected_state']['passed'],
+                    persistent_protection=state.get('protected_state_exact',{}).get('passed'),
+                    recovery=state.get('recovery_acceptance')) for index,state in report.get('error_states',{}).items()]
+                compact['retained_residuals'] = [dict(index=index,
+                    waived_field_count=len(state.get('effective_cross_after',{}).get('waived_fields',[])),
+                    waived_fields_evidence='correctness.json:error_states.'+index+'.effective_cross_after.waived_fields',
+                    compute_self_protection=state.get('own_protected_state',{}).get('passed') if args.gpu_td3_compute else None,
+                    baseline_self_unchanged=state.get('own_before_after',{}).get('passed') if not args.gpu_td3_compute else None)
+                    for index,state in report.get('error_states',{}).items()]
+                progress.stage('recovery_report_write_begin',len(locals().get('snapshots',[])))
+                p._strict_json_write(output/'error_recovery_summary.json',compact)
+                progress.stage('recovery_report_write_complete',len(locals().get('snapshots',[])))
+            if engine is not None:
+                progress.stage('executor_invalidate_begin',len(locals().get('snapshots',[])))
+                engine.invalidate_gpu_update()
+                progress.stage('executor_invalidate_complete',len(locals().get('snapshots',[])))
+            progress.stage('final_report_write_begin',len(locals().get('snapshots',[])))
+            if focus is None:
+                p._strict_json_write(output/'correctness.json',report)
+            else:
+                # Do not label a truncated investigation as full v8 acceptance.
+                p._strict_json_write(focus.root/'review'/(focus.worker+'_preparation.json'),
+                    dict(completed=report['completed'], execution_passed=report['passed'],
+                        full_acceptance=False, scope=report.get('scope'), code=report.get('code'),
+                        compilation=locals().get('configured'), error=report.get('error'),
+                        selected_location=report['location']))
+            progress.stage('final_report_write_complete',len(locals().get('snapshots',[])))
+        finally:
+            progress.finish()
     return report
 
 
