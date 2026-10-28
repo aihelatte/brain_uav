@@ -251,6 +251,30 @@ MPS_REFERENCE = dict(comparison='ordinary_vs_mps', source='ordinary', gpu_td3_co
                      non_blocking_batch_transfer=True, gpu_compute_non_blocking_coefficients=False)
 
 
+def _mps_graph_replay_evidence(callback, device):
+    """One real update; raw CPU runtime events only, with no aggregation/retry."""
+    torch.cuda.synchronize(device)
+    with torch.profiler.profile(
+        activities=(torch.profiler.ProfilerActivity.CPU,torch.profiler.ProfilerActivity.CUDA),
+        record_shapes=False,profile_memory=False,with_stack=False,
+    ) as replay_profile:
+        callback()
+    torch.cuda.synchronize(device)
+    results = replay_profile.profiler.kineto_results
+    if results is None:
+        raise RuntimeError('ordinary_vs_mps raw Kineto results unavailable.')
+    names = []
+    for event in results.events():
+        if event.device_type() != torch.autograd.DeviceType.CPU:
+            continue
+        name = event.name()
+        if 'cudagraphlaunch' in ''.join(character.lower() for character in name if character.isalnum()):
+            names.append(name)
+    if not names:
+        raise AssertionError('ordinary_vs_mps has no raw CPU cudaGraphLaunch evidence.')
+    return dict(cuda_graph_launch_count=len(names),event_names=sorted(set(names)))
+
+
 class _MPSProgress:
     """Only ordinary_vs_mps: flushed stage evidence and bounded-time stack dump."""
     def __init__(self, args):
@@ -656,7 +680,9 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                     progress.arm()
                     progress.stage('pid_released',len(snapshots))
                 progress.stage('profiler_enter',len(snapshots),mode=mode)
-                evidence = engine._profile_cuda_graph_replay(lambda: run_step(total,fixed[i%len(fixed)],controlled))
+                callback = lambda: run_step(total,fixed[i%len(fixed)],controlled)
+                evidence = (_mps_graph_replay_evidence(callback,device) if mps_role
+                    else engine._profile_cuda_graph_replay(callback))
                 progress.stage('profiler_exit',len(snapshots)-1,mode=mode)
                 report.setdefault('manual_replay_evidence',{})[mode] = evidence
                 if evidence['cuda_graph_launch_count'] < 1: raise AssertionError('No actual CUDA Graph launch: '+mode)

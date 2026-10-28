@@ -20,6 +20,66 @@ import test_v2_mps_diagnostic as fixtures
 
 
 class TestMPSCorrectness(unittest.TestCase):
+    def test_raw_graph_evidence_uses_cpu_names_without_aggregation_or_timing(self):
+        order=[]
+        class Event:
+            def __init__(self,name,device): self._name=name; self._device=device
+            def name(self): return self._name
+            def device_type(self): return self._device
+            def __getattr__(self,key): raise AssertionError('Unexpected event property: '+key)
+        cpu=torch.autograd.DeviceType.CPU; cuda=torch.autograd.DeviceType.CUDA
+        events=[Event('cudaGraphLaunch',cpu),Event('cudaGraphLaunch',cpu),
+                Event('cuda_graph_launch',cpu),Event('cudaGraphLaunch',cuda),Event('cudaMemcpy',cpu)]
+        raw=mock.Mock(spec=['events'])
+        raw.events.side_effect=lambda: order.append('raw_events') or events
+        # Mock context protocols explicitly; public event APIs must never be used.
+        profile=mock.MagicMock(spec=['profiler','__enter__','__exit__','key_averages','events'])
+        profile.profiler=SimpleNamespace(kineto_results=raw)
+        profile.__enter__.side_effect=lambda: order.append('enter') or profile
+        profile.__exit__.side_effect=lambda *a: order.append('exit') or False
+        profile.key_averages.side_effect=AssertionError('Aggregation forbidden')
+        profile.events.side_effect=AssertionError('Public events forbidden')
+        callback=mock.Mock(side_effect=lambda:order.append('callback'))
+        with mock.patch.object(torch.profiler,'profile',return_value=profile) as make_profile, \
+                mock.patch.object(torch.cuda,'synchronize',side_effect=lambda device:order.append('sync:'+device)):
+            result=d._mps_graph_replay_evidence(callback,'cuda:0')
+        self.assertEqual(result,dict(cuda_graph_launch_count=3,event_names=['cudaGraphLaunch','cuda_graph_launch']))
+        self.assertEqual(order,['sync:cuda:0','enter','callback','exit','sync:cuda:0','raw_events'])
+        callback.assert_called_once_with(); raw.events.assert_called_once_with()
+        profile.key_averages.assert_not_called(); profile.events.assert_not_called()
+        make_profile.assert_called_once_with(activities=(torch.profiler.ProfilerActivity.CPU,torch.profiler.ProfilerActivity.CUDA),
+            record_shapes=False,profile_memory=False,with_stack=False)
+
+    def test_raw_graph_evidence_missing_zero_and_errors_never_retry_update(self):
+        for case in ('missing_profiler','missing_kineto','none','missing_events','zero','gpu_only',
+                     'callback_error','exit_error','raw_error'):
+            with self.subTest(case=case):
+                raw=mock.Mock(spec=['events']); raw.events.return_value=[]
+                profile=mock.MagicMock(spec=['profiler','__enter__','__exit__','key_averages','events'])
+                profile.profiler=SimpleNamespace(kineto_results=raw)
+                profile.__enter__.return_value=profile; profile.__exit__.return_value=False
+                profile.key_averages.side_effect=AssertionError('Aggregation forbidden')
+                profile.events.side_effect=AssertionError('Public events forbidden')
+                if case=='missing_profiler': del profile.profiler
+                if case=='missing_kineto': profile.profiler=SimpleNamespace()
+                if case=='none': profile.profiler.kineto_results=None
+                if case=='missing_events': profile.profiler.kineto_results=SimpleNamespace()
+                if case=='gpu_only': raw.events.return_value=[SimpleNamespace(
+                    device_type=lambda:torch.autograd.DeviceType.CUDA,
+                    name=mock.Mock(side_effect=AssertionError('GPU name must not be read')))]
+                error=RuntimeError(case)
+                callback=mock.Mock(side_effect=error if case=='callback_error' else None)
+                if case=='exit_error': profile.__exit__.side_effect=error
+                if case=='raw_error': raw.events.side_effect=error
+                with mock.patch.object(torch.profiler,'profile',return_value=profile), \
+                        mock.patch.object(torch.cuda,'synchronize'):
+                    with self.assertRaises((AttributeError,RuntimeError,AssertionError)) as caught:
+                        d._mps_graph_replay_evidence(callback,'cuda')
+                callback.assert_called_once_with()
+                profile.key_averages.assert_not_called(); profile.events.assert_not_called()
+                if case.endswith('_error'): self.assertIs(caught.exception,error)
+                if case in ('callback_error','exit_error'): raw.events.assert_not_called()
+
     def args(self, root):
         args = arguments(root)
         args.concurrency=[8]; args.repeats=2; args.measurement_seconds=30.
