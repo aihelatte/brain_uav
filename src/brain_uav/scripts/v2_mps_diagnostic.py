@@ -150,6 +150,46 @@ def compact_batch(result, root):
     return compact
 
 
+def concurrency_model_summary(result):
+    """Reduce existing counters only; no new measurements or cross-parent sums."""
+    duration = result['common_window']['end']-result['common_window']['start']
+    models = {}
+    for model in ('ann','snn'):
+        workers = [worker for name,worker in result['workers'].items() if name.startswith(model+'_')]
+        steps = sum(worker['steps'] for worker in workers)
+        completed = sum(worker['window']['completed_steps_in_window'] for worker in workers)
+        updates = sum(worker['children_within_td3']['update_breakdown']['overall_weighted']['update_count'] for worker in workers)
+        parents = {key:1000*sum(worker['parent_wall_seconds'][key] for worker in workers)/steps
+                   for key in workers[0]['parent_wall_seconds']}
+        section_totals = {}
+        light_totals = {}
+        for worker in workers:
+            for name,section in worker['children_within_td3']['update_breakdown']['overall_weighted']['sections'].items():
+                section_totals[name] = section_totals.get(name,0.)+section['total_wall_seconds']
+            light = worker['execution'].get('gpu_compute_lightweight_timing')
+            if light:
+                for mode,values in light['by_mode'].items():
+                    row = light_totals.setdefault(mode,dict(count=0))
+                    for key,value in values.items(): row[key] = row.get(key,0)+value
+        models[model] = dict(worker_count=len(workers),measured_steps_including_tail=steps,
+            completed_steps_in_window=completed,window_steps_per_second=completed/duration,
+            full_step_ms_per_step_including_final_drain=1000*sum(worker['seconds_per_step_including_final_drain']*worker['steps'] for worker in workers)/steps,
+            parents_ms_per_step=parents,
+            replay_sample_ms_per_step=1000*sum(worker['children_within_td3']['replay_sample_wall_seconds'] for worker in workers)/steps,
+            full_td3_ms_per_step_including_final_wait=1000*sum(worker['final_completion']['td3_wall_including_final_window_wait_seconds'] for worker in workers)/steps,
+            final_wait_ms_per_step=1000*sum(worker['final_completion']['wait_seconds'] for worker in workers)/steps,
+            update_count=updates,
+            td3_children={name:dict(ms_per_step=1000*value/steps,ms_per_update=1000*value/updates if updates else None)
+                          for name,value in section_totals.items()},
+            lightweight_by_mode={mode:dict(count=row['count'],
+                ms_per_update={key:1000*value/row['count'] if row['count'] else None for key,value in row.items() if key!='count'},
+                ms_per_step={key:1000*value/steps for key,value in row.items() if key!='count'})
+                for mode,row in light_totals.items()} if light_totals else None,
+            lightweight_note='CPU submission/queue/wait; measurement-window samples only, tails excluded. None means not collected, not zero.')
+    return dict(models=models,batch_steps_per_second=result['batch_steps_per_second'],
+        note='Parent/child intervals overlap: replay sample, batch preparation and executor are within TD3; lightweight children overlap executor. Never add them to full TD3/step. Final wait is already in full step/TD3. Throughput excludes window tails; per-step walls retain original tail/final-drain accounting.')
+
+
 def stop_probe(process, session):
     if process.poll() is None:
         session.before_terminate(process)
@@ -375,6 +415,8 @@ def build_parser():
         help='With --launch, run only isolated MPS Graph capability/membership check; no eight-worker batches.')
     modes.add_argument('--correctness-only',action='store_true',
         help='Serial ANN/SNN ordinary GPUCompute reference then MPS numerical comparison; no timing.')
+    modes.add_argument('--mps-concurrency-only',action='store_true',
+        help='MPS only: --concurrency 2 8; each phase runs 2,8,8,2 workers, two 30s repeats per size.')
     parser.add_argument('--reuse-ann-ordinary-reference',type=Path,
         help='With --correctness-only, reuse a passed ANN ordinary worker directory (review/summary.json and other/ann_0).')
     return parser
@@ -383,12 +425,13 @@ def build_parser():
 def validate(args):
     if getattr(args,'reuse_ann_ordinary_reference',None) is not None and not getattr(args,'correctness_only',False):
         raise ValueError('ANN ordinary reference reuse requires --correctness-only.')
-    if (args.concurrency != [8] or args.repeats != 2 or args.measurement_seconds != 30
+    expected_concurrency = [2,8] if getattr(args,'mps_concurrency_only',False) else [8]
+    if (args.concurrency != expected_concurrency or args.repeats != 2 or args.measurement_seconds != 30
             or not args.non_blocking_batch_transfer or args.gpu_compute_non_blocking_coefficients
             or args.gpu_compute_lightweight_timing or args.gpu_compute_event_updates
             or args.batch_preparation_updates or args.batch_preparation_trace_updates
             or args.gpu_compute_submission_trace_updates):
-        raise ValueError('MPS driver requires 8 workers, 2 repeats, 30s, A-config nonblocking batch; instrumentation selected internally per phase.')
+        raise ValueError(f'MPS driver requires concurrency {expected_concurrency}, 2 repeats, 30s, A-config nonblocking batch; instrumentation selected internally per phase.')
     if any(k.startswith('CUDA_MPS_') for k in os.environ):
         raise ValueError('Inherited CUDA_MPS_* overrides are not allowed in controlled comparison.')
 
@@ -409,6 +452,10 @@ def main(argv=None):
         plan['mps_comparison'].update(mode='correctness_only',comparison='ordinary_vs_mps',
             phases=['ann_ordinary_reference','ann_mps_compare','snn_ordinary_reference','snn_mps_compare'],
             rtol=1e-4,atol=1e-5,workers_serial=True)
+    if getattr(args,'mps_concurrency_only',False):
+        plan['mps_comparison'].update(mode='mps_concurrency_only',conditions=['mps'],
+            concurrency_order_per_phase=[2,8,8,2],batches=8,
+            note='MPS scheduling size only; no ordinary CUDA or numerical correctness rerun. Lightweight is not pure throughput.')
     reused = None
     if getattr(args,'reuse_ann_ordinary_reference',None) is not None:
         reused = reuse_ann_reference(args.reuse_ann_ordinary_reference,args,plan)
@@ -455,6 +502,33 @@ def main(argv=None):
                     if session:
                         stopped = session.finish(); report['sessions'].append(stopped); session = None
                         if not stopped['stopped']: raise RuntimeError('Correctness MPS cleanup incomplete; stop.')
+            report['completed'] = True
+            return 0
+        if getattr(args,'mps_concurrency_only',False):
+            for phase in ('lightweight','throughput'):
+                for slot,count in enumerate((2,8,8,2)):
+                    if mps_processes() or gpu_processes(): raise RuntimeError('Unexpected workload before MPS concurrency batch.')
+                    repeat = slot//2
+                    name = f'{phase}_mps_{count}_{repeat}'
+                    session = Session(root/'other'/(name+'_service')); session.start()
+                    run_args = deepcopy(args)
+                    run_args.concurrency = [count]
+                    run_args.gpu_compute_lightweight_timing = phase == 'lightweight'
+                    batch_root = root/'other'/name
+                    result = concurrent.run_batch(run_args,count,repeat,batch_root,worker_env=session.env,
+                        access_check=session.verify,before_terminate=session.before_terminate,register_process=session.register)
+                    compact = compact_batch(result,batch_root)
+                    compact.update(phase=phase,condition='mps')
+                    if result['diagnostic_valid']:
+                        compact['by_model'] = concurrency_model_summary(result)
+                    # Preserve original per-worker configuration, validity and timing evidence.
+                    for worker_name,worker in result.get('workers',{}).items():
+                        compact['workers'][worker_name].update(worker)
+                    report['batches'].append(compact)
+                    if not result['diagnostic_valid'] or (phase=='throughput' and not result['valid_for_speed_comparison']):
+                        raise RuntimeError('MPS concurrency batch invalid; stop remaining measurements.')
+                    stopped = session.finish(); report['sessions'].append(stopped); session = None
+                    if not stopped['stopped']: raise RuntimeError('MPS concurrency service cleanup incomplete; stop.')
             report['completed'] = True
             return 0
         for phase in ('lightweight','throughput'):

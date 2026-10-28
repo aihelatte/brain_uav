@@ -309,6 +309,7 @@ class TestMPS(unittest.TestCase):
     def test_documented_command_uses_real_cli_and_defaults_plan_only(self):
         import shlex
         text=(Path(__file__).resolve().parents[1]/'docs/v2_mps_diagnostic.md').read_text(encoding='utf-8')
+        text=text.split('uav_mps_compare() {',1)[1]
         command=text.split('PYTHONPATH=src "$py" -u -m brain_uav.scripts.v2_mps_diagnostic',1)[1].split('2>&1 | tee',1)[0]
         argv=shlex.split(command.replace('\\\n',' ').replace('"$@"',''))
         args=m.build_parser().parse_args(argv)

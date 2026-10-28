@@ -75,6 +75,60 @@ NVIDIA legacy Volta+控制接口：
 `completed`是诊断执行状态，不是正式训练passed或加速结论。
 请分开审阅轻量定位与无额外插桩吞吐重复结果；改善未稳定或等待转移必须如实记录。
 
+## 仅 MPS 的 2/8 并发对照
+
+独立互斥模式 `--mps-concurrency-only --concurrency 2 8`，不启用时保持原八并发模式及
+capability-only / correctness-only 限制。新模式先复用Graph及安全终止能力探针，随后
+仅跑MPS，不重做普通CUDA或算法一致性检查。每阶段按2→8→8→2，重复编号0→0→1→1，
+lightweight阶段完成后才开始throughput；共8批，每批独立初始化、30秒共同窗口。
+2组为1 ANN+1 SNN，8组为4 ANN+4 SNN；每批创建本次私有Session，所有worker退出、服务
+安全关闭后才允许下一批。PID、超时、编译/捕获、场景覆盖或安全清理失败立即阻断后续。
+实际配置及CPU线程环境保持原样，系数非阻塞实验关闭，无新增计时插桩。
+
+`review/summary.json:batches[].by_model.models.ann/snn` 分别给出步数、共同窗口吞吐、
+完整单步（含最终等待）、父项ms/步、完整TD3（含最终等待）、replay采样、最终等待。
+`td3_children`保留原分项（含batch准备搬运及执行器）的ms/步和ms/更新；
+`lightweight_by_mode`按实际更新次数汇总系数上传、Graph提交、结果读取/完成等待。
+throughput不采轻量三项，字段为null，不是零耗时。每批workers同时保留原完整计时、
+场景、编译/捕获、执行路径、预热及有效性证据；详细产物留在other。
+
+均为CPU墙钟，含提交/排队/等待，不能称纯GPU时间。父子项重叠：replay采样、batch准备、
+执行器属于TD3；轻量三项属于执行器，不覆盖完整更新；完整TD3及单步已含最终等待。
+禁止重复相加。原尾步及最终回读仍计入各自墙钟口径，吞吐只计共同窗口内完成步骤；
+轻量三项另沿用窗口尾步剔除，比较时注意样本集合不同。lightweight始终为插桩定位，
+不能用于纯吞吐验收；throughput继续执行原严格有效性门槛。
+
+服务器完整命令草案（未执行），默认仅计划，明确传入`--launch`才启动：
+
+```bash
+uav_mps_concurrency() {
+  cd /home/zj/projects/my_project || return 1
+  local root py start rc
+  root="outputs/v2_mps_concurrency_$(date +%Y%m%d_%H%M%S_%N)"
+  py=/home/zj/envs/uav_torch/bin/python
+  mkdir -p "$root/review" || return 1
+  start=$(date +%s)
+  PYTHONPATH=src "$py" -u -m brain_uav.scripts.v2_mps_diagnostic \
+    --mps-concurrency-only --concurrency 2 8 --repeats 2 --measurement-seconds 30 \
+    --ann-bc-checkpoint outputs/v2_projected_head_round1/ann_20261012_102839/bc/bc_v2_ann_best.pt \
+    --snn-bc-checkpoint outputs/v2_projected_head_round1/snn_20261012_102848/bc/bc_v2_snn_best.pt \
+    --validation-pool outputs/v2_box085_round1_20261003_003948/validation_pools_600km_seed20260904/v2_validation_easy.json \
+    --expected-pool-digest 2e3199a60b8ff23f9cb8f8395d6f44bcb7d73abeddf2ff5a31f1c95c19332f4b \
+    --ann-actor-lr 1.55e-4 --snn-actor-lr 8.25e-4 --critic-lr 2.5e-4 --alpha 2.5 \
+    --bc-schedule smooth-mid --seed 7 --validation-seed 20260904 \
+    --batch-size 64 --replay-capacity 500000 --scenario-count 3 --snn-time-window 4 \
+    --controlled-stage-step-offset 75000 --warmup-steps 128 --steps-per-level 256 \
+    --ready-timeout 1800 --completion-timeout 120 --non-blocking-batch-transfer \
+    --output-dir "$root/other/run" "$@" 2>&1 | tee "$root/review/driver.log"
+  rc=${PIPESTATUS[0]}
+  printf 'exit_code=%s\nprocess_wall_seconds=%s\n' "$rc" "$(( $(date +%s)-start ))" | tee -a "$root/review/driver.log"
+  if [ -d "$root/other/run/review" ]; then cp -R -- "$root/other/run/review/." "$root/review/" || return 1; fi
+  return "$rc"
+}
+uav_mps_concurrency
+# 审查并同步代码后才显式运行：uav_mps_concurrency --launch
+```
+
 ## 服务器命令草案（未执行）
 
 以下函数无外层set -e/-u，不在交互shell末尾exit；管道后立即取真实Python退出码。
