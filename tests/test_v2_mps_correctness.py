@@ -90,6 +90,47 @@ class TestMPSCorrectness(unittest.TestCase):
                     with self.subTest(changes=changes),self.assertRaises(ValueError): d.run(parsed)
                     init.assert_not_called()
 
+    def test_public_main_rejects_partial_mps_arguments_before_any_dispatch(self):
+        for argv in (['--gpu-compute-mps-comparison','ordinary'],
+                     ['--gpu-compute-correctness-control-dir','control']):
+            with self.subTest(argv=argv), \
+                    mock.patch.object(p,'prepare_v2_stage_initialization') as init, \
+                    mock.patch.object(p,'resolve_training_device') as device, \
+                    mock.patch.object(d,'run') as run, \
+                    mock.patch.object(p,'run_v2_td3_timing_diagnostic') as timing:
+                with self.assertRaises(ValueError):
+                    p.main(['--model','ann','--output-dir','unused']+argv)
+                init.assert_not_called(); device.assert_not_called()
+                run.assert_not_called(); timing.assert_not_called()
+
+    def test_real_plan_matches_correctness_and_timing_worker_cpu_deduplication(self):
+        import json
+        with TemporaryDirectory() as tmp:
+            root=Path(tmp); args=self.args(root)
+            for model in ('ann','snn'): (root/f'{model}.pt').write_bytes(b'checkpoint fixture')
+            pool=SimpleNamespace(content_digest='digest',scenario_count=3,scenarios=[
+                dict(scenario_id=str(i),payload=dict(zones=[])) for i in range(3)])
+            for correctness_only in (True,False):
+                args.correctness_only=correctness_only
+                with self.subTest(correctness_only=correctness_only), \
+                        mock.patch.object(m,'build_parser') as parser, \
+                        mock.patch('brain_uav.trainers.v2_validation.load_v2_validation_pool',return_value=pool), \
+                        mock.patch.object(m,'Session') as session, \
+                        mock.patch.object(m,'run_correctness_worker') as worker_run, \
+                        mock.patch.object(c,'run_batch') as batch, \
+                        redirect_stdout(StringIO()) as output:
+                    parser.return_value.parse_args.return_value=args
+                    self.assertEqual(m.main([]),0)
+                    plan=json.loads(output.getvalue())['plan']
+                    session.assert_not_called(); worker_run.assert_not_called(); batch.assert_not_called()
+                for model in ('ann','snn'):
+                    for role in ('ordinary','mps'):
+                        command=(m.correctness_command(args,model,role,root/role,root/'reference.pt')
+                            if correctness_only else c.worker_command(args,model,model+'_0',root/role))
+                        worker=p.build_parser().parse_args(command[command.index('brain_uav.scripts.profile_v2_td3')+1:])
+                        self.assertEqual(plan['execution_requested']['cpu_deduplication'],worker.cpu_deduplication)
+                        self.assertEqual(worker.cpu_deduplication,not correctness_only)
+
     def test_worker_gate_synchronizes_then_waits_for_matching_release(self):
         with TemporaryDirectory() as tmp:
             root=Path(tmp); args=self.args(root)
@@ -171,7 +212,7 @@ class TestMPSCorrectness(unittest.TestCase):
                     runs.append((model,role))
                     return dict(passed=failure!='numeric',comparison='ordinary_vs_mps')
                 with mock.patch.object(m,'build_parser') as parser, \
-                        mock.patch.object(c,'build_plan',return_value={}), \
+                        mock.patch.object(c,'build_plan',return_value={'execution_requested':{'cpu_deduplication':True}}), \
                         mock.patch.object(m,'Session',return_value=session), \
                         mock.patch.object(m,'capability',return_value=dict(passed=True)), \
                         mock.patch.object(m,'mps_processes',return_value=[]), \
@@ -197,7 +238,7 @@ class TestMPSCorrectness(unittest.TestCase):
               '--bc-schedule','smooth-mid','--correctness-only']
         parsed=m.build_parser().parse_args(base)
         self.assertTrue(parsed.correctness_only); self.assertFalse(parsed.launch)
-        with mock.patch.object(c,'build_plan',return_value={}),mock.patch.object(m,'Session') as session, \
+        with mock.patch.object(c,'build_plan',return_value={'execution_requested':{'cpu_deduplication':True}}),mock.patch.object(m,'Session') as session, \
                 mock.patch.dict(os.environ,{},clear=True),redirect_stdout(StringIO()) as output:
             self.assertEqual(m.main(base+['--concurrency','8','--measurement-seconds','30','--repeats','2',
                                          '--non-blocking-batch-transfer']),0)

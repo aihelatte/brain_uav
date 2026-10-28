@@ -5728,6 +5728,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.gpu_compute_mps_comparison is not None or args.gpu_compute_correctness_control_dir is not None:
+        from brain_uav.scripts.v2_gpu_compute_diagnostic import _validate_mps_comparison
+        _validate_mps_comparison(args)
     if args.gpu_compute_event_updates and args.gpu_compute_worker != 'timing':
         raise ValueError('Event diagnosis requires the explicit GPUCompute timing worker.')
     if (args.gpu_compute_non_blocking_coefficients or args.gpu_compute_lightweight_timing

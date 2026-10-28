@@ -327,6 +327,7 @@ def main(argv=None):
         cleanup='terminate_client server_pid client_pid before OS termination; fail closed',
         caveat='No runtime capability, client attachment or speed claim until explicit launch succeeds.')
     if getattr(args,'correctness_only',False):
+        plan['execution_requested']['cpu_deduplication'] = False
         plan['mps_comparison'].update(mode='correctness_only',comparison='ordinary_vs_mps',
             phases=['ann_ordinary_reference','ann_mps_compare','snn_ordinary_reference','snn_mps_compare'],
             rtol=1e-4,atol=1e-5,workers_serial=True)
