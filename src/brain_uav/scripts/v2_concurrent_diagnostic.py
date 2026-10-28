@@ -302,7 +302,8 @@ def summarize_worker(summary, window, *, start_tolerance=.1):
         'server_load_before': run['server_load_before'], 'server_load_after': run['server_load_after']}
 
 
-def run_batch(args, count, repeat, root):
+def run_batch(args, count, repeat, root, *, worker_env=None, access_check=None, before_terminate=None,
+              register_process=None):
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=False)
     (root / 'review').mkdir()
@@ -319,12 +320,17 @@ def run_batch(args, count, repeat, root):
                 log = (root / 'review' / f'{name}.log').open('w', encoding='utf-8')
                 logs.append(log)
                 processes[name] = subprocess.Popen(worker_command(args, model, name, root),
-                    cwd=Path(__file__).resolve().parents[3], stdout=log, stderr=subprocess.STDOUT)
+                    cwd=Path(__file__).resolve().parents[3], stdout=log, stderr=subprocess.STDOUT,
+                    **({'env': worker_env} if worker_env is not None else {}))
+                if register_process is not None:
+                    register_process({name:processes[name]})
         ready = lambda name: (control / f'{name}.ready.json').is_file()
         wait_workers(processes, ready, timeout=args.ready_timeout)
         # An exited ready worker is still a failed participant.
         if any(p.poll() is not None for p in processes.values()):
             raise RuntimeError('A ready worker exited before window release.')
+        if access_check is not None:
+            report['cuda_access_evidence'] = access_check(processes)
         start = time.perf_counter() + args.start_delay
         window = {'start': start, 'end': start + args.measurement_seconds,
                   'clock': 'same-host time.perf_counter', 'published_unix_time': time.time()}
@@ -399,13 +405,15 @@ def run_batch(args, count, repeat, root):
         for name, process in processes.items():
             try:
                 if process.poll() is None:
+                    if before_terminate is not None:
+                        before_terminate(process)
                     process.terminate()
                     try:
                         process.wait(timeout=10)
                     except subprocess.TimeoutExpired:
                         process.kill()
                         process.wait(timeout=10)
-            except (OSError, subprocess.TimeoutExpired) as exc:
+            except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
                 report.setdefault('cleanup_errors', {})[name] = str(exc)
                 report['valid_for_speed_comparison'] = False
                 report['diagnostic_valid'] = False
