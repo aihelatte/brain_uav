@@ -1,5 +1,5 @@
 """CPU/mock only; no service, CUDA context, server access or real workers."""
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -136,7 +136,7 @@ class TestMPS(unittest.TestCase):
                 with mock.patch.object(m,'build_parser') as parser, \
                         mock.patch.object(c,'build_plan',return_value={}), \
                         mock.patch.object(m,'Session',return_value=session), \
-                        mock.patch.object(m,'capability',side_effect=(lambda *a: {'passed':True}) if pass_capability else RuntimeError('capability failed')), \
+                        mock.patch.object(m,'capability',side_effect=(lambda *a,**kw: {'passed':True}) if pass_capability else RuntimeError('capability failed')), \
                         mock.patch.object(m,'mps_processes',return_value=[]), \
                         mock.patch.object(m,'gpu_processes',return_value=set()), \
                         mock.patch.object(m,'command',return_value='mock GPU'), \
@@ -188,15 +188,19 @@ class TestMPS(unittest.TestCase):
                 self.assertTrue(session.finish()['stopped'])
                 control.assert_called_once_with('quit')
 
-    def test_capability_only_and_no_silent_fallback_on_unsupported_commands(self):
+    def test_start_uses_real_pid_query_without_legacy_help_and_capability_only(self):
         with TemporaryDirectory() as tmp:
             root=Path(tmp); session=self.session(root)
             (session.pipe/'nvidia-cuda-mps-control.pid').write_text('99')
             with mock.patch.object(m,'mps_processes',return_value=[]), \
                     mock.patch.object(m.Path,'is_file',return_value=True), \
-                    mock.patch.object(m,'command',return_value=''), \
-                    mock.patch.object(session,'control',return_value='get_server_list get_client_list'):
-                with self.assertRaisesRegex(RuntimeError,'terminate_client'): session.start()
+                    mock.patch.object(m.subprocess,'run',side_effect=lambda argv,**kw: SimpleNamespace(
+                        returncode=0,stdout='Unknown command "help"' if kw['input']=='help\n' else '',stderr='')) as run:
+                session.start()
+                self.assertEqual([call.kwargs['input'] for call in run.call_args_list],[None,'get_server_list\n'])
+                for response in ('Unknown command "get_server_list"','not a PID'):
+                    with mock.patch.object(session,'control',return_value=response):
+                        with self.assertRaises(RuntimeError): session.start()
             args=self.args(root); args.launch=True; args.capability_only=True
             owned=mock.Mock(); owned.finish.return_value=dict(stopped=True)
             with mock.patch.object(m,'build_parser') as parser, \
@@ -212,6 +216,82 @@ class TestMPS(unittest.TestCase):
                 parser.return_value.parse_args.return_value=args
                 self.assertEqual(m.main([]),0)
                 batch.assert_not_called()
+
+    def test_independent_termination_probe_requires_sync_pid_and_exact_zero(self):
+        for response in ('0','700','','unknown',m.subprocess.TimeoutExpired('control',30)):
+            with self.subTest(response=response),TemporaryDirectory() as tmp:
+                root=Path(tmp); session=self.session(root); session.started=True
+                process=mock.Mock(pid=12); alive=[True]
+                process.poll.side_effect=lambda: None if alive[0] else -15
+                process.wait.side_effect=lambda **kw: alive.__setitem__(0,False) or -15
+                def ready(processes,predicate,**kwargs):
+                    c.write_json(root/'termination'/'ready.json',dict(pid=12,graph_replays=8,synchronized=True))
+                    self.assertTrue(predicate('probe'))
+                def control(argv,**kw):
+                    self.assertEqual(kw['input'],'terminate_client 99 12\n')
+                    if isinstance(response,Exception): raise response
+                    return SimpleNamespace(returncode=0,stdout=response,stderr='')
+                with mock.patch.object(m.subprocess,'Popen',return_value=process), \
+                        mock.patch.object(c,'wait_workers',side_effect=ready), \
+                        mock.patch.object(session,'clients',return_value={12:99}), \
+                        mock.patch.object(m.subprocess,'run',side_effect=control) as run:
+                    if response=='0':
+                        result=m.capability(root/'termination',session,terminate_client=True)
+                        self.assertTrue(result['passed']); self.assertEqual(result['terminate_client_response'],'0')
+                        process.terminate.assert_called_once()
+                    else:
+                        with self.assertRaises((RuntimeError,m.subprocess.TimeoutExpired)):
+                            m.capability(root/'termination',session,terminate_client=True)
+                        process.terminate.assert_not_called(); process.kill.assert_not_called()
+                        with mock.patch.object(session,'control') as quit_control:
+                            self.assertFalse(session.finish()['stopped']); quit_control.assert_not_called()
+                    run.assert_called_once()  # Never retry unknown termination status.
+                self.assertFalse((root/'termination'/'release.json').exists())
+                self.assertEqual(c.read_json(root/'termination'/'summary.json')['passed'],response=='0')
+
+    def test_termination_probe_never_terminates_unverified_or_unsynchronized_child(self):
+        for failure in ('timeout','sync','pid','exited'):
+            with self.subTest(failure=failure),TemporaryDirectory() as tmp:
+                root=Path(tmp); session=self.session(root)
+                process=mock.Mock(pid=12); process.poll.return_value=None
+                if failure=='exited': process.poll.side_effect=[None,0,0]
+                def ready(*a,**kw):
+                    if failure=='timeout': raise TimeoutError('ready timeout')
+                    c.write_json(root/'termination'/'ready.json',dict(pid=12,graph_replays=8,synchronized=failure!='sync'))
+                with mock.patch.object(m.subprocess,'Popen',return_value=process), \
+                        mock.patch.object(c,'wait_workers',side_effect=ready), \
+                        mock.patch.object(session,'clients',return_value={13:99} if failure=='pid' else {12:99}), \
+                        mock.patch.object(session,'before_terminate') as terminate:
+                    with self.assertRaises((RuntimeError,TimeoutError)):
+                        m.capability(root/'termination',session,terminate_client=True)
+                    terminate.assert_not_called(); process.terminate.assert_not_called(); process.kill.assert_not_called()
+                result=c.read_json(root/'termination'/'summary.json')
+                self.assertFalse(result['passed'])
+                if failure=='exited': self.assertIn('exited before terminate_client',result['error'])
+                else: self.assertIn('no OS kill',result['cleanup_error'])
+
+    def test_termination_probe_failure_stops_driver_and_logs_error(self):
+        with TemporaryDirectory() as tmp:
+            root=Path(tmp); args=self.args(root); args.launch=True
+            session=mock.Mock(env={}); session.finish.return_value=dict(stopped=False,cleanup_error='service retained')
+            with mock.patch.object(m,'build_parser') as parser, \
+                    mock.patch.object(c,'build_plan',return_value={}), \
+                    mock.patch.object(m,'Session',return_value=session), \
+                    mock.patch.object(m,'capability',side_effect=[dict(passed=True),RuntimeError('terminate_client response 700')]) as probe, \
+                    mock.patch.object(m,'mps_processes',return_value=[]), \
+                    mock.patch.object(m,'gpu_processes',return_value=set()), \
+                    mock.patch.object(m,'command',return_value='GPU'), \
+                    mock.patch.object(m.sys,'platform','linux'), \
+                    mock.patch.object(c,'run_batch') as batch, \
+                    mock.patch.dict(m.os.environ,{},clear=True),redirect_stderr(StringIO()) as output:
+                parser.return_value.parse_args.return_value=args
+                self.assertEqual(m.main([]),1)
+                batch.assert_not_called()
+                self.assertTrue(probe.call_args.kwargs['terminate_client'])
+                self.assertIn('terminate_client response 700',output.getvalue())
+                self.assertIn('service retained',output.getvalue())
+            summary=c.read_json(args.output_dir/'review'/'summary.json')
+            self.assertFalse(summary['completed']); self.assertFalse(summary['capability_passed'])
 
     def test_access_failure_prevents_common_window_release(self):
         with TemporaryDirectory() as tmp:

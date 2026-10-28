@@ -69,10 +69,8 @@ class Session:
         command([CONTROL,'-d'],env=self.env)
         self.started = True
         self.daemon_pid = int((self.pipe/'nvidia-cuda-mps-control.pid').read_text().strip())
-        # Fail closed on an unsupported legacy interface; no forced-context fallback.
-        help_text = self.control('help')
-        for required in ('terminate_client','get_client_list','get_server_list'):
-            if required not in help_text: raise RuntimeError('MPS control lacks required command: '+required)
+        # Legacy drivers need not implement interactive help. Exercise the interface.
+        pid_list(self.control('get_server_list'))
 
     def clients(self):
         result = {}
@@ -158,12 +156,15 @@ def stop_probe(process, session):
         try: process.wait(timeout=10)
         except subprocess.TimeoutExpired:
             process.kill(); process.wait(timeout=10)
+        return True
+    return False
 
 
-def capability(root, session, timeout=60):
+def capability(root, session, timeout=60, *, terminate_client=False):
     root = Path(root); root.mkdir()
     log_path = root/'probe.log'
-    result = dict(passed=False)
+    result = dict(passed=False,termination_probe=terminate_client)
+    termination_attempted = False
     with log_path.open('w',encoding='utf-8') as log:
         process = subprocess.Popen([sys.executable,'-u','-m','brain_uav.scripts.v2_mps_diagnostic','--probe',str(root),str(timeout)],
             cwd=Path(__file__).resolve().parents[3],env=session.env,stdout=log,stderr=subprocess.STDOUT)
@@ -175,16 +176,29 @@ def capability(root, session, timeout=60):
             ready = concurrent.read_json(root/'ready.json')
             if ready != dict(pid=process.pid,graph_replays=8,synchronized=True):
                 raise RuntimeError('Probe CUDA Graph evidence mismatch.')
-            concurrent.write_json(root/'release.json',dict(verified=True))
-            rc = process.wait(timeout=timeout)
-            result['exit_code'] = rc
-            if rc: raise RuntimeError('MPS CUDA Graph capability failed.')
+            if terminate_client:
+                # Separate synchronized, PID-verified child remains waiting for us.
+                # Do not retry an ambiguous/failed termination in finally.
+                termination_attempted = True
+                if not stop_probe(process,session):
+                    raise RuntimeError('Probe exited before terminate_client could be tested.')
+                result['terminate_client_response'] = '0'
+            else:
+                concurrent.write_json(root/'release.json',dict(verified=True))
+                rc = process.wait(timeout=timeout)
+                result['exit_code'] = rc
+                if rc: raise RuntimeError('MPS CUDA Graph capability failed.')
             result['passed'] = True
         except BaseException as exc:
             result['error'] = f'{type(exc).__name__}: {exc}'
             raise
         finally:
-            try: stop_probe(process,session)
+            try:
+                if terminate_client:
+                    if not termination_attempted:
+                        raise RuntimeError('Termination probe not synchronized and verified; no OS kill; leave service intact.')
+                else:
+                    stop_probe(process,session)
             except Exception as exc:
                 result.update(passed=False,cleanup_error=str(exc))
             result['exit_code'] = process.poll()
@@ -242,7 +256,7 @@ def main(argv=None):
     validate(args)
     plan = concurrent.build_plan(args)
     plan['mps_comparison'] = dict(conditions=['ordinary','mps'],phases=['lightweight','throughput'],
-        capability_first=True,control=CONTROL,server=SERVER,thread_environment='unchanged',
+        capability_first=True,termination_probe=True,control=CONTROL,server=SERVER,thread_environment='unchanged',
         cleanup='terminate_client server_pid client_pid before OS termination; fail closed',
         caveat='No runtime capability, client attachment or speed claim until explicit launch succeeds.')
     if not args.launch:
@@ -259,6 +273,7 @@ def main(argv=None):
         session = Session(root/'other'/'capability_mps')
         session.start()
         report['capability'] = capability(root/'other'/'capability',session)
+        report['termination_capability'] = capability(root/'other'/'termination_capability',session,terminate_client=True)
         stopped = session.finish(); report['sessions'].append(stopped); session = None
         if not stopped['stopped']: raise RuntimeError('Capability service did not stop safely.')
         report['capability_passed'] = True
@@ -298,6 +313,11 @@ def main(argv=None):
         if session:
             stopped = session.finish(); report['sessions'].append(stopped)
             if not stopped['stopped']: report['completed'] = False
+        if 'error' in report:
+            print(f"MPS diagnostic failed: {report['error']['type']}: {report['error']['message']}",file=sys.stderr,flush=True)
+        for stopped in report['sessions']:
+            if 'cleanup_error' in stopped:
+                print(f"MPS cleanup failed: {stopped['cleanup_error']}",file=sys.stderr,flush=True)
         concurrent.write_json(root/'review'/'summary.json',report)
     return 0 if report['completed'] else 1
 

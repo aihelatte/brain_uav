@@ -17,10 +17,15 @@
   总8批，条件内并发、条件间串行，不自动重试失败。
 
 能力检查使用新建私有短路径 `/tmp/uav_mps_*` pipe 与本次输出下的独立日志目录，
-启动本次 control daemon。查询本地 control `help`，要求含 `get_server_list`、
-`get_client_list`、`terminate_client`；不支持则报错并停止，不切换其他接口或普通 CUDA。
+启动本次 control daemon，以真实 `get_server_list` 查询检查接口并严格解析PID列表；
+不查询交互 `help`（550.120实际返回rc=0、Unknown command），不以帮助文本判定能力。
 子进程执行少量真实 PyTorch CUDA Graph replay 并同步，然后保留上下文等待父进程核验。
 父进程通过 server/client列表核对 **Popen真实PID**，并核对 Graph就绪证据，才释放其同步正常退出。
+随后另起一个短客户端，复用同一Graph/同步就绪流程，保持等待父进程；仅核验本私有
+服务PID及同步证据后，实际执行 `terminate_client`。只有明确响应 `0` 才确认终止能力，
+再发送OS退出信号；不会释放该客户端继续调用CUDA。此探针不替代前一个正常退出检查。
+非零、空、未知响应或控制超时均失败，不重试凑通过，不发送OS信号；未同步或未核验时
+也不执行终止试验。保留服务/进程并阻断后续对照，供人工核查。
 完成能力检查后关闭本次服务，再进行普通条件，避免服务本身污染普通基线。
 
 每批ready之后、共同窗口发布之前，再核对所有8个客户端 PID：
@@ -60,7 +65,8 @@ NVIDIA legacy Volta+控制接口：
 `review/plan.json`：源码HEAD/工作区、池digest/输入hash、真实配置与编译组合。
 `review/summary.json`：能力门控、每批接入证据、worker退出码、无效原因、
 完整TD3/整步/batch/动作分项、已有CPU Graph提交及结果完成等待、整批共同窗口吞吐。
-`other/`：worker日志和明细、能力探针日志/就绪/退出码、MPS日志和控制命令响应。
+`other/`：worker日志和明细、Graph及独立终止能力探针日志/就绪/退出码、MPS日志和控制命令响应。
+顶层错误与服务清理错误同时打印到stderr，由命令中的tee写入driver.log。
 无 checkpoint、模型张量或大型trace。失败也保存summary，不把“分发成功”当完成。
 `completed`是诊断执行状态，不是正式训练passed或加速结论。
 请分开审阅轻量定位与无额外插桩吞吐重复结果；改善未稳定或等待转移必须如实记录。
