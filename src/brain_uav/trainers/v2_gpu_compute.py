@@ -307,11 +307,19 @@ class GPUCompute(GPUUpdate):
     def step_batch(self, batch, noise, total_steps, bc_lambda, *, recorder=None, submission_diagnostic=None):
         if getattr(self.e, '_pending_gpu_compute_transfer', None) is not None:
             raise RuntimeError('Prior GPU compute transfer failed to drain; source retained, no further updates allowed.')
+        observer = getattr(self.e, '_gpu_compute_event_diagnostic', None)
+        if observer is not None and observer.failed:
+            raise RuntimeError('Prior Event diagnostic failed; no further updates allowed.')
         sources = []
-        with (self.e._gpu_compute_source_lifetime(sources)
-              if self.e.gpu_compute_non_blocking_coefficients else nullcontext()):
-            return self._step_batch(batch, noise, total_steps, bc_lambda, recorder=recorder,
-                                    submission_diagnostic=submission_diagnostic, owned_sources=sources)
+        try:
+            with (self.e._gpu_compute_source_lifetime(sources)
+                  if self.e.gpu_compute_non_blocking_coefficients else nullcontext()):
+                return self._step_batch(batch, noise, total_steps, bc_lambda, recorder=recorder,
+                                        submission_diagnostic=submission_diagnostic, owned_sources=sources)
+        except BaseException as exc:
+            observer = getattr(self.e, '_gpu_compute_event_diagnostic', None)
+            if observer is not None: observer.fail(exc)
+            raise
 
     def _step_batch(self, batch, noise, total_steps, bc_lambda, *, recorder=None,
                     submission_diagnostic=None, owned_sources):
@@ -336,6 +344,9 @@ class GPUCompute(GPUUpdate):
             coefficient_seconds = perf_counter() - coefficient_started if coefficient_started is not None else None
         if key not in self.graphs: self.capture_shape(key,batch)
         graph,stable,fraction,output,presence,evidence = self.graphs[key]
+        event_observer = getattr(self.e, '_gpu_compute_event_diagnostic', None)
+        sample_events = event_observer is not None and event_observer.begin(
+            device=self.e.device,mode=mode,total_steps=total_steps,batch=batch,update_started=start)
         copy_started = perf_counter()
         with (submission_diagnostic.scope('graph_fixed_input_copy') if submission_diagnostic is not None else nullcontext()):
             floats, booleans = [], []
@@ -347,15 +358,28 @@ class GPUCompute(GPUUpdate):
         copy_elapsed = perf_counter()-copy_started
         self.copy_seconds += copy_elapsed
         replay_started = perf_counter()
+        event_error = None
         with (submission_diagnostic.scope('graph_replay_submit') if submission_diagnostic is not None else nullcontext()):
+            if sample_events: event_observer.mark(1)
             submit_started = perf_counter() if self.e.gpu_compute_lightweight_timing else None
-            graph.replay(); self.replays += 1
+            graph.replay()
             submit_seconds = perf_counter() - submit_started if submit_started is not None else None
+            if sample_events:
+                try: event_observer.mark(2)
+                except BaseException as exc:
+                    event_error = exc
+                    event_observer.fail(exc)
+            self.replays += 1
         self.mode_replays[mode] += 1
         with (submission_diagnostic.scope('result_read_and_completion') if submission_diagnostic is not None else nullcontext()):
             result_started = perf_counter() if self.e.gpu_compute_lightweight_timing else None
             values = output.cpu().tolist()  # sole terminal state/statistics barrier
             result_seconds = perf_counter() - result_started if result_started is not None else None
+        if sample_events and event_error is None:
+            try: event_observer.complete((coefficient_seconds,submit_seconds,result_seconds))
+            except BaseException as exc:
+                event_error = exc
+                event_observer.fail(exc)
         if self.e.gpu_compute_lightweight_timing:
             self.last_lightweight_timing = (mode, coefficient_seconds, submit_seconds, result_seconds)
         compute_elapsed = perf_counter()-replay_started
@@ -390,6 +414,8 @@ class GPUCompute(GPUUpdate):
         self.last_sections = dict(gpu_compute_input_copy=copy_elapsed,
                                   gpu_compute_to_result=compute_elapsed)
         self.ready_to_result_seconds += perf_counter()-start
+        if event_error is not None:
+            raise RuntimeError('GPUCompute Event diagnostic failed after original update cleanup.') from event_error
         return metric
 
     def invalidate(self):
@@ -440,4 +466,9 @@ class GPUCompute(GPUUpdate):
             result['lightweight_timing'] = {'requested': True, 'by_mode': self.lightweight_timing,
                 'note': 'CPU wall submission/queue/wait; three children do not cover full update. '
                     'No profiler/events/additional synchronization. Warmup and window tail excluded; do not add to parent TD3.'}
+        observer = getattr(self.e, '_gpu_compute_event_diagnostic', None)
+        if observer is not None:
+            result['event_diagnostic'] = observer.metadata()
+            result['lightweight_timing']['note'] = ('CPU wall with Event instrumentation; overlaps GPU timeline spans. '
+                'No profiler or additional synchronization; do not add/subtract overlapping CPU/GPU/parent times.')
         return result

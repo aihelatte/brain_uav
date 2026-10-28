@@ -3413,6 +3413,7 @@ def _run_diagnostic_level(
     batch_preparation_diagnostic=None,
     gpu_compute_non_blocking_coefficients: bool = False,
     gpu_compute_lightweight_timing: bool = False,
+    gpu_compute_event_diagnostic=None,
 ) -> dict[str, Any]:
     if batch_preparation_diagnostic is not None and (
             concurrent_window is None or not gpu_td3_compute or detailed_profiler_updates
@@ -3461,6 +3462,12 @@ def _run_diagnostic_level(
 
     )
     engine = components.engine
+    if gpu_compute_event_diagnostic is not None:
+        if not (gpu_td3_compute and non_blocking_batch_transfer and gpu_compute_lightweight_timing
+                and not gpu_compute_non_blocking_coefficients and concurrent_window is not None
+                and device.type == 'cuda'):
+            raise ValueError('Event observer requires concurrent CUDA A-config GPUCompute and lightweight timing.')
+        engine._gpu_compute_event_diagnostic = gpu_compute_event_diagnostic
     engine.actor.train()
     if type(cache_ellipsoid_segment_clearance) is not bool:
         raise TypeError('cache_ellipsoid_segment_clearance must be a bool.')
@@ -3834,6 +3841,8 @@ def _run_diagnostic_level(
                     engine.flush_update_statistics()
                 block_attribution.reset()
                 actual_warmup_steps = step_number
+                if gpu_compute_event_diagnostic is not None:
+                    gpu_compute_event_diagnostic.prime(device)
                 if device.type == 'cuda':
                     torch.cuda.synchronize(device)
                 loop_warmup_wall_seconds = perf_counter() - loop_warmup_started
@@ -3845,6 +3854,8 @@ def _run_diagnostic_level(
                     from brain_uav.scripts.v2_concurrent_diagnostic import inductor_capture_snapshot
                     concurrent_captures_before = inductor_capture_snapshot(device)
                     window = concurrent_window.ready()
+                    if gpu_compute_event_diagnostic is not None:
+                        gpu_compute_event_diagnostic.arm(window)
                 measured_started = perf_counter()
                 actor_updates_before = engine.actor_update_count
                 critic_updates_before = engine.critic_update_count
@@ -4037,6 +4048,8 @@ def _run_diagnostic_level(
                         profiled_update_active = False
 
                 if measured_phase:
+                    if gpu_compute_event_diagnostic is not None:
+                        gpu_compute_event_diagnostic.set_context(pool.scenarios[scenario_index]['scenario_id'])
                     if batch_preparation_diagnostic is not None:
                         batch_preparation_diagnostic.run(
                             (lambda observer: perform_update(False, submission_diagnostic=observer))
@@ -4081,6 +4094,8 @@ def _run_diagnostic_level(
                 measured_count += 1
                 coverage[scenario_index]['measured_steps'] += 1
                 completed_in_window = concurrent_window is None or perf_counter() <= window['end']
+                if gpu_compute_event_diagnostic is not None:
+                    gpu_compute_event_diagnostic.step_completed(completed_in_window)
                 if gpu_compute_lightweight_timing and engine._gpu_update_executor is not None:
                     engine._gpu_update_executor.record_lightweight_step(completed_in_window)
                 if concurrent_window is not None and completed_in_window:
@@ -4154,6 +4169,13 @@ def _run_diagnostic_level(
                 )
             compiled_path_profiler_metadata = compiled_path_profiler.finish()
     finally:
+        if gpu_compute_event_diagnostic is not None:
+            # Preserve a training exception even if diagnostic export itself fails.
+            import sys
+            active_exception = sys.exc_info()[0] is not None
+            try: gpu_compute_event_diagnostic.finish()
+            except Exception:
+                if not active_exception: raise
         if window_update_statistics:
             engine.flush_update_statistics()
         engine.replay.sample = original_sample
@@ -5249,6 +5271,14 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
     environment_diagnostic = getattr(args, 'gpu_compute_environment_diagnostic', False)
     batch_updates = getattr(args, 'batch_preparation_updates', 0)
     batch_trace_updates = getattr(args, 'batch_preparation_trace_updates', 0)
+    event_updates = getattr(args, 'gpu_compute_event_updates', 0)
+    if event_updates and (not 2 <= event_updates <= 32 or args.gpu_compute_worker != 'timing'
+            or not args.gpu_td3_compute or not args.non_blocking_batch_transfer
+            or args.gpu_compute_non_blocking_coefficients or not args.gpu_compute_lightweight_timing
+            or getattr(args,'concurrent_window_dir',None) is None
+            or getattr(args,'concurrent_worker_id',None) not in ('ann_0','snn_0') or batch_updates or batch_trace_updates
+            or getattr(args,'gpu_compute_submission_trace_updates',0)):
+        raise ValueError('Event diagnosis requires 2..32 concurrent A-config GPUCompute timing samples, lightweight CPU timing, no profiler.')
     if args.gpu_compute_non_blocking_coefficients and not (
             args.gpu_td3_compute and args.non_blocking_batch_transfer and (
                 args.gpu_compute_worker == 'timing' or (
@@ -5397,6 +5427,12 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 concurrent_window = WorkerWindow(args.concurrent_window_dir,
                     args.concurrent_worker_id, timeout=args.concurrent_timeout)
             batch_diagnostic = None
+            event_diagnostic = None
+            if event_updates:
+                from brain_uav.scripts.v2_gpu_compute_event_diagnostic import GPUComputeEventDiagnostic
+                event_diagnostic = GPUComputeEventDiagnostic(updates=event_updates,output_dir=output,
+                    worker_id=args.concurrent_worker_id,model=args.model,
+                    scene_ids=[r['scenario_id'] for r in pool.scenarios])
             if batch_instrumented:
                 from brain_uav.scripts.v2_batch_transfer_diagnostic import BatchPreparationDiagnostic, GPUComputeSubmissionDiagnostic
                 diagnostic_type = GPUComputeSubmissionDiagnostic if submission_updates else BatchPreparationDiagnostic
@@ -5429,6 +5465,7 @@ def run_local_optimization_comparison(args, *, formal_config: V2FormalTrainingCo
                 controlled_stage_step_offset=offset, bc_schedule=args.comparison_bc_schedule,
                 concurrent_window=concurrent_window,
                 **({'batch_preparation_diagnostic': batch_diagnostic} if batch_diagnostic is not None else {}),
+                **({'gpu_compute_event_diagnostic': event_diagnostic} if event_diagnostic is not None else {}),
                 **compilation)
             result['server_load_before'] = before
             result['server_load_after'] = load_snapshot()
@@ -5577,6 +5614,8 @@ def build_parser() -> argparse.ArgumentParser:
         help='Experimental direct CPU FP32 coefficient upload; requires GPUCompute + nonblocking batch.')
     parser.add_argument('--gpu-compute-lightweight-timing', action='store_true',
         help='CPU wall timing only: coefficient upload, replay call, original result barrier; no profiler.')
+    parser.add_argument('--gpu-compute-event-updates', type=int, default=0,
+        help='Concurrent A-config only: 2..32 current-stream Event samples; requires lightweight timing; not throughput evidence.')
     parser.add_argument('--gpu-compute-coefficient-comparison', action='store_true',
         help='Explicit correctness provenance: nonblocking batch, original vs direct coefficients.')
     parser.add_argument('--controlled-stage-step-offset', type=int, default=75000)
@@ -5687,6 +5726,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.gpu_compute_event_updates and args.gpu_compute_worker != 'timing':
+        raise ValueError('Event diagnosis requires the explicit GPUCompute timing worker.')
     if (args.gpu_compute_non_blocking_coefficients or args.gpu_compute_lightweight_timing
             or args.gpu_compute_coefficient_comparison) and not (
             args.gpu_compute_worker and args.gpu_td3_compute and args.non_blocking_batch_transfer):
