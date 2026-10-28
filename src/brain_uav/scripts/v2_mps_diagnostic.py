@@ -229,11 +229,78 @@ def probe(root, timeout):
     torch.cuda.synchronize()
 
 
+def correctness_command(args, model, role, root, reference=None):
+    """Reuse the timing worker's explicit algorithm/input configuration, not its loop."""
+    root = Path(root).resolve()
+    command = concurrent.worker_command(args,model,model+'_0',root)
+    for flag in ('--cpu-deduplication','--concurrent-window-dir','--concurrent-worker-id'):
+        index = command.index(flag)
+        del command[index:index+(1 if flag == '--cpu-deduplication' else 2)]
+    command[command.index('--gpu-compute-worker')+1] = 'correctness'
+    command += ['--gpu-compute-mps-comparison',role,
+        '--gpu-compute-correctness-control-dir',str(root/'other'/'control'),
+        '--correctness-updates','8','--gpu-compute-error-recovery']
+    command += ['--gpu-compute-write-reference'] if role == 'ordinary' else ['--gpu-compute-reference',str(reference)]
+    return command
+
+
+def run_correctness_worker(args, model, role, root, *, reference=None, session=None):
+    root = Path(root); (root/'review').mkdir(parents=True); (root/'other'/'control').mkdir(parents=True)
+    control = root/'other'/'control'
+    detail = root/'other'/(model+'_0')
+    report = dict(comparison='ordinary_vs_mps',model=model,role=role,passed=False,detail=str(detail))
+    environment = session.env if session else dict(os.environ,
+        CUDA_MPS_PIPE_DIRECTORY=tempfile.mkdtemp(prefix='uav_direct_'))
+    with (root/'review'/'worker.log').open('w',encoding='utf-8') as log:
+        process = subprocess.Popen(correctness_command(args,model,role,root,reference),
+            cwd=Path(__file__).resolve().parents[3],env=environment,stdout=log,stderr=subprocess.STDOUT)
+        if session: session.register({'correctness':process})
+        try:
+            concurrent.wait_workers({'correctness':process},lambda _: (control/'ready.json').exists(),timeout=args.ready_timeout)
+            if process.poll() is not None: raise RuntimeError('Correctness worker exited before PID check.')
+            ready = concurrent.read_json(control/'ready.json')
+            if ready != dict(pid=process.pid,role=role,synchronized=True,comparison='ordinary_vs_mps'):
+                raise RuntimeError('Correctness synchronization/PID evidence mismatch.')
+            access = session.verify({'correctness':process}) if session else ordinary_access({'correctness':process})
+            access.update(worker_pid=process.pid,verified_before_update=True,comparison='ordinary_vs_mps')
+            report['cuda_access_evidence'] = access
+            concurrent.write_json(control/'release.json',access)
+            concurrent.wait_workers({'correctness':process},lambda _: process.poll() == 0,timeout=args.completion_timeout)
+            result = concurrent.read_json(detail/'correctness.json')
+            report['acceptance'] = result.get('acceptance')
+            if (result.get('comparison') != 'ordinary_vs_mps' or not result.get('passed')
+                    or not result.get('completed') or not result.get('load_rebuild_verified')
+                    or not result.get('recovery_completed')
+                    or set(result.get('manual_replay_evidence',{})) != {'actor','frozen_targets','critic_only'}):
+                raise RuntimeError('ordinary_vs_mps numerical/lifecycle correctness failed; no timing.')
+            report['passed'] = True
+        except (Exception,KeyboardInterrupt) as exc:
+            report['error'] = dict(type=type(exc).__name__,message=str(exc))
+            concurrent.write_json(control/'abort.json',report['error'])
+        finally:
+            try:
+                if process.poll() is None:
+                    if session: stop_probe(process,session)
+                    else:
+                        process.terminate()
+                        try: process.wait(timeout=10)
+                        except subprocess.TimeoutExpired:
+                            process.kill(); process.wait(timeout=10)
+            except (OSError,subprocess.TimeoutExpired,RuntimeError) as exc:
+                report.update(passed=False,cleanup_error=str(exc))
+            report['exit_code'] = process.poll()
+            concurrent.write_json(root/'review'/'summary.json',report)
+    return report
+
+
 def build_parser():
     parser = concurrent.build_parser()
     parser.description = __doc__
-    parser.add_argument('--capability-only',action='store_true',
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--capability-only',action='store_true',
         help='With --launch, run only isolated MPS Graph capability/membership check; no eight-worker batches.')
+    modes.add_argument('--correctness-only',action='store_true',
+        help='Serial ANN/SNN ordinary GPUCompute reference then MPS numerical comparison; no timing.')
     return parser
 
 
@@ -259,6 +326,10 @@ def main(argv=None):
         capability_first=True,termination_probe=True,control=CONTROL,server=SERVER,thread_environment='unchanged',
         cleanup='terminate_client server_pid client_pid before OS termination; fail closed',
         caveat='No runtime capability, client attachment or speed claim until explicit launch succeeds.')
+    if getattr(args,'correctness_only',False):
+        plan['mps_comparison'].update(mode='correctness_only',comparison='ordinary_vs_mps',
+            phases=['ann_ordinary_reference','ann_mps_compare','snn_ordinary_reference','snn_mps_compare'],
+            rtol=1e-4,atol=1e-5,workers_serial=True)
     if not args.launch:
         print(json.dumps(dict(mode='plan_only',plan=plan),indent=2)); return 0
     root = args.output_dir.resolve(); root.mkdir(parents=True,exist_ok=False)
@@ -278,6 +349,24 @@ def main(argv=None):
         if not stopped['stopped']: raise RuntimeError('Capability service did not stop safely.')
         report['capability_passed'] = True
         if args.capability_only:
+            report['completed'] = True
+            return 0
+        if getattr(args,'correctness_only',False):
+            report.update(comparison='ordinary_vs_mps',correctness=[])
+            for model in ('ann','snn'):
+                for role in ('ordinary','mps'):
+                    if mps_processes() or gpu_processes(): raise RuntimeError('Unexpected workload before correctness worker.')
+                    if role == 'mps':
+                        session = Session(root/'other'/(model+'_correctness_mps')); session.start()
+                    worker_root = root/'other'/(model+'_'+role)
+                    reference = root/'other'/(model+'_ordinary')/'other'/(model+'_0')/'reference.pt'
+                    result = run_correctness_worker(args,model,role,worker_root,reference=reference if role=='mps' else None,session=session)
+                    report['correctness'].append(result)
+                    concurrent.write_json(root/'review'/(model+'_'+role+'.json'),result)
+                    if not result['passed']: raise RuntimeError(f'{model} {role} correctness failed: {result.get("error", result.get("cleanup_error"))}')
+                    if session:
+                        stopped = session.finish(); report['sessions'].append(stopped); session = None
+                        if not stopped['stopped']: raise RuntimeError('Correctness MPS cleanup incomplete; stop.')
             report['completed'] = True
             return 0
         for phase in ('lightweight','throughput'):

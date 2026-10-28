@@ -12,6 +12,10 @@
 
 - 默认无 `--launch`：只检查输入、输出计划，不启动 MPS/worker/CUDA。
 - `--launch --capability-only`：仅独立能力检查。
+- `--correctness-only`：独立一致性模式，仍默认只输出计划。
+- `--launch --correctness-only`：能力检查后，依次 ANN普通reference → ANN MPS比较 →
+  SNN普通reference → SNN MPS比较；每个worker独立进程、严格串行，不启动八并发或任何测速。
+  与 `--capability-only` 互斥；30秒/重复2次参数仅属于原测速模式，不用于一致性序列。
 - `--launch`：能力检查通过后才依次执行 lightweight普通、lightweight MPS、
   throughput普通、throughput MPS；每条件4 ANN+4 SNN、重复2次、共同窗口30秒。
   总8批，条件内并发、条件间串行，不自动重试失败。
@@ -108,3 +112,36 @@ uav_mps_compare
 
 本地只做CPU/mock测试及语法检查；未启动MPS、CUDA Graph或真实worker。
 尚不能确认服务器MPS支持、实际接入、清理命令行为或吞吐收益。
+
+## 普通 CUDA / MPS 实际参数更新一致性（ordinary_vs_mps）
+
+先定义上面的完整 `uav_mps_compare` 函数，再使用以下命令；每次调用仍创建独立时间戳
+目录，python -u / tee / PIPESTATUS / 耗时及非零返回均由该函数保留：
+
+```bash
+# 仅计划，不创建服务或worker：
+uav_mps_compare --correctness-only
+# 审查并同步代码后，显式运行一致性检查（本地未执行）：
+uav_mps_compare --correctness-only --launch
+```
+
+两侧均使用 GPUCompute、batch nonblocking=True、原系数上传=False实验开关和正式编译
+组合，复用同模型BC、固定池及digest、seed、学习率、BC日程与500k日程配置。
+此模式没有环境动作短循环，故不启用仅针对动作/环境的CPU去重插桩；不修改其正式默认值。
+初始化与首形状捕获完成后，首次受控更新前同步并写ready，父进程验证真实PID后才放行。
+普通reference保存online/target/BC/Adam共同初始状态，MPS严格加载该初始状态；固定batch与
+噪声、连续RNG、冻结/脉冲ramp、三种更新模式、异常恢复、checkpoint加载失效及重建
+均复用现有完整GPUCompute正确性序列，不新增公式或精度设置。
+
+reference新增独立 `mps_reference` 来源契约及父进程普通CUDA接入证据，报告标记
+`ordinary_vs_mps`。拒绝旧blocking reference、系数reference、缺失来源/PID证据或MPS
+来源reference；旧搬运/系数入口也拒绝该专用reference，不改变其白名单。
+保持rtol=1e-4、atol=1e-5及原精确字段；沿用现有异常梯度生命周期规则，原始未消费
+旧梯度差异仍保存在明细中，不新增豁免，也不提供ANN工程接受放行。失败即停止后续worker。
+普通/MPS同路径差异也必须满足原有门槛；不将“两个进程能运行”当成一致性通过。
+
+顶层 `review/summary.json` 与每侧小型JSON记录实际接入证据、退出码、acceptance及明细
+位置；`other/<model>_<role>/review/worker.log` 保存worker日志，`other/`内保存reference、
+完整correctness.json、异常状态张量及加载证据。不会输出正式训练passed checkpoint。
+PID失败不发布release；MPS异常/超时先经私有服务terminate_client且明确返回0后才允许
+OS清理，否则保留错误/服务并阻断后续对照。无静默回退。

@@ -5569,6 +5569,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--gpu-td3-worker', choices=('correctness', 'timing'), help=argparse.SUPPRESS)
     parser.add_argument('--gpu-td3-compute', action=argparse.BooleanOptionalAction, default=False, help='Explicit diagnostic path; never inherits formal auto defaults.')
     parser.add_argument('--gpu-compute-reference', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--gpu-compute-mps-comparison', choices=('ordinary','mps'), help=argparse.SUPPRESS)
+    parser.add_argument('--gpu-compute-correctness-control-dir', type=Path, help=argparse.SUPPRESS)
     parser.add_argument('--gpu-compute-write-reference', action='store_true',
         help='Correctness worker only: save a GPUCompute blocking reference for transfer A/B.')
     parser.add_argument('--gpu-compute-comparison', action='store_true', help='Isolated serial baseline/compute correctness then short A/B timing.')

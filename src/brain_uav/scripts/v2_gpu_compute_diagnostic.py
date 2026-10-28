@@ -245,11 +245,70 @@ def _load_reference_error_state(args, reference, index):
                       map_location='cpu', weights_only=False)
 
 
+MPS_REFERENCE = dict(comparison='ordinary_vs_mps', source='ordinary', gpu_td3_compute=True,
+                     non_blocking_batch_transfer=True, gpu_compute_non_blocking_coefficients=False)
+
+
+def _validate_mps_comparison(args):
+    role = getattr(args, 'gpu_compute_mps_comparison', None)
+    control = getattr(args, 'gpu_compute_correctness_control_dir', None)
+    if not role:
+        if control is not None: raise ValueError('Correctness control requires ordinary_vs_mps contract.')
+        return None
+    write = getattr(args, 'gpu_compute_write_reference', False)
+    reference = args.gpu_compute_reference
+    if (args.gpu_compute_worker != 'correctness' or not args.gpu_td3_compute
+            or not args.non_blocking_batch_transfer or control is None
+            or getattr(args, 'gpu_compute_coefficient_comparison', False)
+            or getattr(args, 'gpu_compute_non_blocking_coefficients', False)
+            or getattr(args, 'gpu_compute_lightweight_timing', False)
+            or getattr(args, 'gpu_compute_first_critic_loss_only', False)
+            or getattr(args, 'concurrent_window_dir', None) is not None
+            or (role == 'ordinary' and (not write or reference is not None))
+            or (role == 'mps' and (write or reference is None))):
+        raise ValueError('ordinary_vs_mps requires full correctness, nonblocking GPUCompute, original coefficients, PID gate, ordinary write / MPS read.')
+    return role
+
+
+def _mps_correctness_ready(args, device):
+    """After initialization/capture, before any controlled update; no timing window."""
+    import os
+    import time
+    from brain_uav.scripts import v2_concurrent_diagnostic as c
+    role = _validate_mps_comparison(args)
+    root = Path(args.gpu_compute_correctness_control_dir)
+    torch.cuda.synchronize(device)
+    c.write_json(root/'ready.json', dict(pid=os.getpid(),role=role,synchronized=True,
+                                       comparison='ordinary_vs_mps'))
+    deadline = time.monotonic() + args.concurrent_timeout
+    while True:
+        if (root/'abort.json').exists(): raise RuntimeError('MPS correctness parent aborted.')
+        if time.monotonic() >= deadline: raise TimeoutError('MPS correctness PID release timeout.')
+        if (root/'release.json').exists():
+            evidence = c.read_json(root/'release.json')
+            if (evidence.get('worker_pid') != os.getpid() or evidence.get('effective') != role
+                    or evidence.get('verified_before_update') is not True
+                    or evidence.get('comparison') != 'ordinary_vs_mps'):
+                raise ValueError('MPS correctness PID release evidence mismatch.')
+            return evidence
+        time.sleep(.01)
+
+
 def _load_compute_reference(args, contract):
     reference = torch.load(args.gpu_compute_reference, map_location='cpu', weights_only=False)
     if reference.get('contract') != contract:
         raise ValueError('Compute reference contract mismatch; rebuild baseline.')
-    if getattr(args, 'gpu_compute_coefficient_comparison', False):
+    if getattr(args, 'gpu_compute_mps_comparison', None):
+        access = reference.get('cuda_access_evidence', {})
+        if (reference.get('mps_reference') != MPS_REFERENCE or 'coefficient_reference' in reference
+                or reference.get('transfer_reference') != dict(gpu_td3_compute=True,non_blocking_batch_transfer=True)
+                or access.get('effective') != 'ordinary' or access.get('verified_before_update') is not True
+                or access.get('comparison') != 'ordinary_vs_mps' or not isinstance(access.get('worker_pid'),int)
+                or access.get('compute_pids') != [access.get('worker_pid')]):
+            raise ValueError('ordinary_vs_mps requires PID-verified ordinary GPUCompute nonblocking reference.')
+    elif 'mps_reference' in reference:
+        raise ValueError('ordinary_vs_mps reference cannot be used by transfer/coefficient comparisons.')
+    elif getattr(args, 'gpu_compute_coefficient_comparison', False):
         if reference.get('coefficient_reference') != {
                 'gpu_td3_compute': True, 'non_blocking_batch_transfer': True,
                 'gpu_compute_non_blocking_coefficients': False} or reference.get('transfer_reference') != {
@@ -322,6 +381,10 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
     contract['checkpoint_sha256'] = sha256(Path(args.bc_checkpoint).read_bytes()).hexdigest()
     contract['full_pool_digest'] = full_pool_digest
     contract['pool_file_sha256'] = sha256(Path(args.validation_pool).read_bytes()).hexdigest()
+    mps_role = _validate_mps_comparison(args)
+    if mps_role:
+        contract['comparison'] = 'ordinary_vs_mps'
+        report.update(comparison='ordinary_vs_mps',role=mps_role)
     report['inputs'] = contract
     report['code'] = {name:subprocess.run(command,capture_output=True,text=True,check=False).stdout.strip()
         for name,command in (('head',['git','rev-parse','HEAD']),('dirty',['git','status','--short']))}
@@ -551,6 +614,8 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
                     engine.spike_regularization.beta(total),pn,nc],device=device))
                 key = executor.key(upload,mode)
                 if key not in executor.graphs: executor.capture_shape(key,upload)
+                if mps_role and i == 0:
+                    report['cuda_access_evidence'] = _mps_correctness_ready(args,device)
                 evidence = engine._profile_cuda_graph_replay(lambda: run_step(total,fixed[i%len(fixed)],controlled))
                 report.setdefault('manual_replay_evidence',{})[mode] = evidence
                 if evidence['cuda_graph_launch_count'] < 1: raise AssertionError('No actual CUDA Graph launch: '+mode)
@@ -661,6 +726,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
             effective=engine.local_optimization_metadata(),snapshot_count=len(snapshots),
             graph_evidence_scope='one actual prewarmed update per mode profiled; not every update individually profiled')
         if reference is None: torch.save(dict(contract=contract,initial=initial,snapshots=snapshots,contexts=contexts,error_states=error_states,
+            **({'mps_reference': dict(MPS_REFERENCE), 'cuda_access_evidence': report['cuda_access_evidence']} if mps_role else {}),
             **({'coefficient_reference': dict(gpu_td3_compute=True, non_blocking_batch_transfer=True,
                 gpu_compute_non_blocking_coefficients=False)} if getattr(args, 'gpu_compute_coefficient_comparison', False) else {}),
             transfer_reference=dict(gpu_td3_compute=args.gpu_td3_compute,
@@ -674,7 +740,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
         raise
     finally:
         report['acceptance'] = dict(semantic_passed=report['passed'],completed=report['completed'],
-            comparison='baseline_reference_only' if reference is None else 'baseline_vs_compute',
+            comparison='ordinary_vs_mps' if mps_role else 'baseline_reference_only' if reference is None else 'baseline_vs_compute',
             raw_all_fields_equal=None if reference is None or not report['completed'] else
                 all(state.get(name,{'passed':True})['passed'] for state in report.get('error_states',{}).values()
                     for name in ('cross_before','cross_after','cross_snapshot'))
@@ -728,6 +794,7 @@ def correctness(args, *, prepared, config, pool, device, output, full_pool_diges
 
 def run(args):
     from brain_uav.scripts import profile_v2_td3 as p
+    mps_role = _validate_mps_comparison(args)
     coefficient_comparison = getattr(args, 'gpu_compute_coefficient_comparison', False)
     direct_coefficients = getattr(args, 'gpu_compute_non_blocking_coefficients', False)
     light_timing = getattr(args, 'gpu_compute_lightweight_timing', False)
@@ -746,12 +813,12 @@ def run(args):
         raise ValueError('Coefficient reference must use original coefficients and no input reference.')
     if getattr(args, 'gpu_compute_write_reference', False) and not (
             args.gpu_compute_worker == 'correctness' and args.gpu_td3_compute
-            and (not args.non_blocking_batch_transfer or coefficient_comparison)
+            and (not args.non_blocking_batch_transfer or coefficient_comparison or mps_role == 'ordinary')
             and args.gpu_compute_reference is None):
         raise ValueError('Writing transfer reference requires GPUCompute blocking correctness only.')
     if args.non_blocking_batch_transfer and not (args.gpu_compute_worker and args.gpu_td3_compute):
         raise ValueError('Nonblocking GPUCompute requires explicit compute worker; no serial baseline substitution.')
-    if args.non_blocking_batch_transfer and args.gpu_compute_worker == 'correctness' and args.gpu_compute_reference is None and not (coefficient_comparison and write_reference):
+    if args.non_blocking_batch_transfer and args.gpu_compute_worker == 'correctness' and args.gpu_compute_reference is None and not ((coefficient_comparison or mps_role == 'ordinary') and write_reference):
         raise ValueError('Nonblocking correctness requires a GPUCompute blocking reference file.')
     if (getattr(args,'cpu_deduplication',False) or getattr(args,'cpu_deduplication_evidence',False)) and not (args.gpu_compute_worker == 'timing'):
         raise ValueError('CPU deduplication requires --gpu-compute-worker timing --gpu-td3-compute.')
