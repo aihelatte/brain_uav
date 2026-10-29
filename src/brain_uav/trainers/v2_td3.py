@@ -383,6 +383,15 @@ class _OptionalUpdateDetailTimer:
             })
 
 
+def aggregate_v2_target_q(q1: torch.Tensor, q2: torch.Tensor, aggregation: str) -> torch.Tensor:
+    """Shared by eager, compiled/Graph updates and the offline intervention."""
+    if aggregation == 'min':
+        return torch.minimum(q1, q2)
+    if aggregation == 'mean':
+        return (q1 + q2) / 2
+    raise ValueError('target_q_aggregation must be min or mean.')
+
+
 class V2TD3UpdateEngine:
     """Independent V2 structured-observation update and validation engine.
 
@@ -407,6 +416,7 @@ class V2TD3UpdateEngine:
         action_low: np.ndarray | torch.Tensor,
         action_high: np.ndarray | torch.Tensor,
         *,
+        target_q_aggregation: str = 'min',
         actor_freeze_steps: int = 0,
         actor_grad_clip_norm: float | None = None,
         critic_grad_clip_norm: float | None = None,
@@ -556,6 +566,9 @@ class V2TD3UpdateEngine:
         critic_lr_value = _finite_float(critic_lr, name='critic_lr')
         if actor_lr_value <= 0.0 or critic_lr_value <= 0.0:
             raise ValueError('Learning rates must be greater than zero.')
+        if target_q_aggregation not in ('min', 'mean'):
+            raise ValueError('target_q_aggregation must be min or mean.')
+        self.target_q_aggregation = target_q_aggregation
         self.gamma = _finite_float(gamma, name='gamma')
         self.tau = _finite_float(tau, name='tau')
         if self.gamma < 0.0 or self.gamma > 1.0:
@@ -1481,7 +1494,7 @@ class V2TD3UpdateEngine:
             *encoder_arguments, next_action
         )
         target_q = reward + (
-            (1.0 - done) * self.gamma * torch.minimum(target_q1, target_q2)
+            (1.0 - done) * self.gamma * self._aggregate_target_q(target_q1, target_q2)
         )
         return next_action, target_q1, target_q2, target_q
 
@@ -3183,7 +3196,7 @@ class V2TD3UpdateEngine:
                     target_q = batch.reward + (
                         (1.0 - batch.done)
                         * self.gamma
-                        * torch.minimum(target_q1, target_q2)
+                        * self._aggregate_target_q(target_q1, target_q2)
                     )
 
         with update_timing.section('online_critic_forward_and_loss'):
@@ -3921,8 +3934,12 @@ class V2TD3UpdateEngine:
             return V2_SNN_TD3_CHECKPOINT_FORMAT, V2_SNN_TD3_CHECKPOINT_VERSION + extension
         return V2_TD3_CHECKPOINT_FORMAT, V2_TD3_CHECKPOINT_VERSION + extension
 
+    def _aggregate_target_q(self, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+        return aggregate_v2_target_q(q1, q2, self.target_q_aggregation)
+
     def _algorithm_config(self) -> dict[str, Any]:
         return {
+            'target_q_aggregation': self.target_q_aggregation,
             'gamma': self.gamma,
             'tau': self.tau,
             'policy_noise': self.policy_noise,
@@ -4114,6 +4131,7 @@ class V2TD3UpdateEngine:
         if 'algorithm_config' not in payload:
             raise ValueError('checkpoint is missing algorithm_config.')
         algorithm = dict(payload['algorithm_config'])
+        algorithm.setdefault('target_q_aggregation', 'min')
         if 'spike_regularization' not in algorithm and 'policy_head' not in payload['architecture']:
             algorithm['spike_regularization'] = V2SpikeRegularizationConfig().to_dict()
         if algorithm != self._algorithm_config():

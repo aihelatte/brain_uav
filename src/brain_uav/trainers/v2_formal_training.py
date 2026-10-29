@@ -269,6 +269,7 @@ class V2FormalTrainingConfig:
     actor_lr: float | None = None
     critic_lr: float | None = None
     gamma: float = 0.99
+    target_q_aggregation: str = 'min'
     tau: float = 0.005
     policy_delay: int = 2
     actor_grad_clip_norm: float | None = 1.0
@@ -288,6 +289,8 @@ class V2FormalTrainingConfig:
     validation_max_failures: int = 5
 
     def __post_init__(self) -> None:
+        if self.target_q_aggregation not in ('min', 'mean'):
+            raise ValueError('target_q_aggregation must be min or mean.')
         if self.spike_regularization is not None and not isinstance(self.spike_regularization, V2SpikeRegularizationConfig):
             raise TypeError('spike_regularization must be V2SpikeRegularizationConfig.')
         if self.stage not in V2_TD3_STAGES:
@@ -1246,6 +1249,7 @@ def build_v2_stage_engine(
         -expected_limit.numpy(),
         expected_limit.numpy(),
         actor_freeze_steps=config.actor_freeze_steps,
+        target_q_aggregation=config.target_q_aggregation,
         actor_grad_clip_norm=config.actor_grad_clip_norm,
         critic_grad_clip_norm=config.critic_grad_clip_norm,
         actor_rl_scale_alpha=config.actor_rl_scale_alpha,
@@ -1361,6 +1365,8 @@ class V2FormalStageTrainer:
         expected_high = -expected_low
         if engine.batch_size != config.batch_size:
             raise ValueError('engine batch_size must match formal config.')
+        if engine.target_q_aggregation != config.target_q_aggregation:
+            raise ValueError('engine target_q_aggregation must match formal config.')
         if not np.array_equal(engine.action_low.detach().cpu().numpy(), expected_low) or not np.array_equal(engine.action_high.detach().cpu().numpy(), expected_high):
             raise ValueError('engine action range must match ScenarioConfig.')
         radius = _nonnegative_float(uav_collision_radius, name='uav_collision_radius')
@@ -1782,6 +1788,30 @@ class V2FormalStageTrainer:
         return self.result
 
 
+def v2_initial_state_summary(engine: V2TD3UpdateEngine) -> dict[str, str]:
+    """Exact initial network/optimizer evidence, independent of device addresses."""
+    from hashlib import sha256
+    def digest(value):
+        h = sha256()
+        def visit(x):
+            if isinstance(x, torch.Tensor):
+                x = x.detach().cpu().contiguous()
+                h.update(str((x.dtype, tuple(x.shape))).encode())
+                h.update(x.numpy().tobytes())
+            elif isinstance(x, dict):
+                for key in sorted(x, key=str):
+                    h.update(str(key).encode()); visit(x[key])
+            elif isinstance(x, (tuple, list)):
+                for child in x: visit(child)
+            else:
+                h.update(repr(x).encode())
+        visit(value)
+        return h.hexdigest()
+    return {name: digest(getattr(engine, name).state_dict()) for name in (
+        'actor', 'critic1', 'critic2', 'actor_target', 'critic1_target', 'critic2_target',
+        'actor_optimizer', 'critic_optimizer')}
+
+
 def build_v2_formal_checkpoint(
     engine: V2TD3UpdateEngine,
     result: V2FormalTrainingResult,
@@ -1803,6 +1833,8 @@ def build_v2_formal_checkpoint(
     if not isinstance(scenario, ScenarioConfig) or not isinstance(rewards, RewardConfig):
         raise TypeError('scenario and rewards must use project config classes.')
     radius = _nonnegative_float(uav_collision_radius, name='uav_collision_radius')
+    if engine.target_q_aggregation != config.target_q_aggregation:
+        raise ValueError('Formal and engine target_q_aggregation configurations disagree.')
     if result.stage != config.stage:
         raise ValueError('result stage and config stage must match.')
     if result.status not in ('passed', 'failed'):
@@ -1880,6 +1912,8 @@ def build_v2_periodic_snapshot(
     if not isinstance(scenario, ScenarioConfig) or not isinstance(rewards, RewardConfig):
         raise TypeError('scenario and rewards must use project config classes.')
     steps = _nonnegative_int(stage_steps, name='stage_steps')
+    if engine.target_q_aggregation != config.target_q_aggregation:
+        raise ValueError('Formal and engine target_q_aggregation configurations disagree.')
     radius = _nonnegative_float(uav_collision_radius, name='uav_collision_radius')
     model_type = engine.model_type
     payload = {
@@ -1999,6 +2033,10 @@ def _validate_policy_training_snapshot_config(payload, model_type):
     if not isinstance(payload['formal_config'], dict):
         raise ValueError('V2 snapshot formal training configuration must be a dict.')
     formal = dict(payload['formal_config'])
+    formal.setdefault('target_q_aggregation', 'min')
+    mode = algorithm.get('target_q_aggregation', 'min')
+    if mode not in ('min', 'mean') or formal['target_q_aggregation'] != mode:
+        raise ValueError('Formal and engine target_q_aggregation configurations disagree.')
     payload['formal_config'] = formal
     if 'spike_regularization' not in formal:
         if 'spike_regularization' in algorithm or 'policy_head' in engine['architecture']:

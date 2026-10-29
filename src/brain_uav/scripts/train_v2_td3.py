@@ -32,6 +32,7 @@ from brain_uav.trainers.v2_formal_training import (
     save_v2_periodic_snapshot,
     validate_v2_prepared_stage_initialization,
     v2_bc_schedule_metadata,
+    v2_initial_state_summary,
 )
 from brain_uav.trainers.v2_validation import (
     V2_VALIDATION_POOL_VERSION,
@@ -72,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--max-failures-per-window', type=int, default=1)
     parser.add_argument('--validation-max-failures', type=int, default=5)
     parser.add_argument('--gamma', type=float, default=0.99)
+    parser.add_argument('--target-q-aggregation', choices=('min', 'mean'), default='min')
     parser.add_argument('--failure-sample-bias', type=float, default=1.0)
     parser.add_argument(
         '--actor-lr', type=float, default=None,
@@ -462,6 +464,7 @@ def run_v2_td3_stage(
     validation_pool: str | Path,
     seed: int = 7,
     gamma: float = 0.99,
+    target_q_aggregation: str = 'min',
     failure_sample_bias: float = 1.0,
     actor_lr: float | None = None,
     critic_lr: float | None = None,
@@ -564,6 +567,7 @@ def run_v2_td3_stage(
         max_failures_per_window=max_failures_per_window,
         validation_max_failures=validation_max_failures,
         gamma=gamma,
+        target_q_aggregation=target_q_aggregation,
         failure_sample_bias=failure_sample_bias,
         actor_lr=_resolve_v2_actor_lr(stage, model, actor_lr),
         critic_lr=critic_lr,
@@ -694,6 +698,7 @@ def run_v2_td3_stage(
         if reporting
         else None
     )
+    initial_state_summary = v2_initial_state_summary(components.engine)
     if reporter is not None:
         actor = components.engine.actor
         snn_metadata = (
@@ -707,6 +712,7 @@ def run_v2_td3_stage(
             else None
         )
         stage_report_payload = {
+            'initial_state_sha256': initial_state_summary,
             'requested_device': requested_device,
             'resolved_device': resolved_device,
             'initialization_source': dict(components.initialization_source),
@@ -894,6 +900,7 @@ def run_v2_td3_stage(
                 components.engine.replay.sampling_implementation
             ),
             'result': result.to_dict(),
+            'initial_state_sha256': initial_state_summary,
             'checkpoint': str(checkpoint_path),
             'report_directory': str(report_path) if reporter is not None else None,
             'compilation': compilation_metadata,
@@ -909,8 +916,12 @@ def run_v2_td3_stage(
         _write_strict_json(metrics_path, metrics_payload)
         if reporter is not None:
             reporter.finish_stage({**result.to_dict(),
+                                   'target_q_aggregation': config.target_q_aggregation,
+                                   'initial_state_sha256': initial_state_summary,
                                    'execution_configuration': execution_configuration})
         summary = {
+            'initial_state_sha256': initial_state_summary,
+            'target_q_aggregation': config.target_q_aggregation,
             'stage': stage,
             'model_type': model,
             'bc_schedule': bc_schedule_metadata,
@@ -967,6 +978,7 @@ def main(argv: list[str] | None = None) -> int:
         max_failures_per_window=args.max_failures_per_window,
         validation_max_failures=args.validation_max_failures,
         gamma=args.gamma,
+        target_q_aggregation=args.target_q_aggregation,
         failure_sample_bias=args.failure_sample_bias,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,
@@ -1005,6 +1017,7 @@ def main(argv: list[str] | None = None) -> int:
         max_failures_per_window=args.max_failures_per_window,
         validation_max_failures=args.validation_max_failures,
         gamma=args.gamma,
+        target_q_aggregation=args.target_q_aggregation,
         failure_sample_bias=args.failure_sample_bias,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,

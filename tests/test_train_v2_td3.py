@@ -81,6 +81,7 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                     output=Path('out.pt'), metrics_out=Path('metrics.json'), validation_pool=Path('pool.json'),
                     bc_schedule='smooth-mid', **extra)
 
+    @mock.patch('brain_uav.scripts.train_v2_td3.v2_initial_state_summary', new=lambda e: {'fixture': 'mock engine'})
     def test_report_finish_failure_preserves_core_td3_artifacts_and_closes_reporter(self):
         scenario = ScenarioConfig()
         rewards = RewardConfig()
@@ -638,7 +639,9 @@ class TestTrainV2TD3CLI(unittest.TestCase):
     def test_medium_stage_records_smooth_mid_strong_everywhere(self):
         self._check_medium_stage_schedule('smooth-mid-strong')
 
-    def _check_medium_stage_schedule(self, schedule):
+    @mock.patch('brain_uav.scripts.train_v2_td3.v2_initial_state_summary',
+                return_value={'fixture': 'medium stage mock engine'})
+    def _check_medium_stage_schedule(self, schedule, initial_summary):
         scenario = ScenarioConfig(target_distance=1_701.0)
         rewards = RewardConfig(progress_weight=3.25)
         actor = V2ANNPolicyActor(
@@ -785,6 +788,9 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 stage_end = json.loads((root / 'metrics_reports' / 'stage_end.json').read_text(encoding='utf-8'))
 
         resolver.assert_called_once_with('auto')
+        initial_summary.assert_called_once_with(components.engine)
+        for report in (stage_start, stage_end, summary, metrics_writer.call_args.args[1]):
+            self.assertEqual(report['initial_state_sha256'], initial_summary.return_value)
         self.assertEqual(initializer.call_args.kwargs['device'], 'cuda')
         self.assertIsNone(initializer.call_args.kwargs['scenario'])
         self.assertIsNone(initializer.call_args.kwargs['rewards'])

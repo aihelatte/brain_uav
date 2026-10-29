@@ -257,7 +257,7 @@ class GPUUpdate:
 
     @staticmethod
     def static_options(e):
-        values=(e.gamma,e.tau,e.actor_grad_clip_norm,e.critic_grad_clip_norm,e.actor_rl_scale_alpha,
+        values=(e.target_q_aggregation,e.gamma,e.tau,e.actor_grad_clip_norm,e.critic_grad_clip_norm,e.actor_rl_scale_alpha,
                 e.terminal_geo_regularization_enabled,e.terminal_geo_radius,e.terminal_geo_lambda,
                 e.spike_regularization.target_rate,e.actor.scales,
                 *(m.training for m in (e.actor,e.critic1,e.critic2,e.actor_target,e.critic1_target,e.critic2_target)))

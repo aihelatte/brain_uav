@@ -53,6 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--medium-max-stage-steps', type=int, default=None)
     parser.add_argument('--hard-max-stage-steps', type=int, default=None)
     parser.add_argument('--easy-gamma', type=float, default=0.99)
+    parser.add_argument('--target-q-aggregation', choices=('min', 'mean'), default='min')
     parser.add_argument('--medium-gamma', type=float, default=0.99)
     parser.add_argument('--hard-gamma', type=float, default=0.99)
     parser.add_argument('--easy-failure-sample-bias', type=float, default=1.0)
@@ -239,6 +240,7 @@ def run_v2_curriculum(
     hard_failure_sample_bias: float = 1.0,
     bc_schedule: str = 'default',
     rewards: RewardConfig | None = None,
+    target_q_aggregation: str = 'min',
     device: str = 'auto',
     stage_runner: Callable[..., dict[str, Any]] = run_v2_td3_stage,
     model: str = 'ann',
@@ -350,6 +352,7 @@ def run_v2_curriculum(
         raise FileNotFoundError(f'V2 BC checkpoint does not exist: {bc_path}')
     prepared_initialization = prepare_v2_stage_initialization(
         V2FormalTrainingConfig(stage='easy', seed=seed, noise_schedule=noise_schedule, spike_regularization=spike_regularization,
+                              target_q_aggregation=target_q_aggregation,
                               actor_rl_scale_alpha=actor_rl_scale_alpha),
         init_checkpoint=bc_path,
         device='cpu',
@@ -445,6 +448,7 @@ def run_v2_curriculum(
                 else hard_max_stage_steps
             ),
             gamma=stage_training_parameters[stage]['gamma'],
+            target_q_aggregation=target_q_aggregation,
             failure_sample_bias=(
                 stage_training_parameters[stage]['failure_sample_bias']
             ),
@@ -489,6 +493,7 @@ def run_v2_curriculum(
         initialization = Path(summary['checkpoint'])
     payload = {
         'format': f'v2_formal_{model}_td3_curriculum_summary',
+        'target_q_aggregation': target_q_aggregation,
         'format_version': 1,
         'model_type': model,
         'snn': snn_metadata,
@@ -576,6 +581,7 @@ def main(argv: list[str] | None = None) -> int:
         'resolved_device': resolved_device,
         'model_type': args.model,
         'snn_time_window': args.snn_time_window if args.model == 'snn' else None,
+        'target_q_aggregation': args.target_q_aggregation,
         'medium_trial_parameters': {
             'gamma': args.medium_gamma,
             'failure_sample_bias': args.medium_failure_sample_bias,
@@ -605,6 +611,7 @@ def main(argv: list[str] | None = None) -> int:
         hard_failure_sample_bias=args.hard_failure_sample_bias,
         bc_schedule=args.bc_schedule,
         device=args.device,
+        target_q_aggregation=args.target_q_aggregation,
         model=args.model,
         snn_time_window=args.snn_time_window,
         actor_projection_dim=args.actor_projection_dim,
