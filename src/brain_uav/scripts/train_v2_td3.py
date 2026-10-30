@@ -74,6 +74,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--validation-max-failures', type=int, default=5)
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--target-q-aggregation', choices=('min', 'mean'), default='min')
+    parser.add_argument('--mc-return-weight', type=float, default=0.0)
+    parser.add_argument('--mc-return-max-age-steps', type=int, default=100000)
     parser.add_argument('--failure-sample-bias', type=float, default=1.0)
     parser.add_argument(
         '--actor-lr', type=float, default=None,
@@ -465,6 +467,8 @@ def run_v2_td3_stage(
     seed: int = 7,
     gamma: float = 0.99,
     target_q_aggregation: str = 'min',
+    mc_return_weight: float = 0.0,
+    mc_return_max_age_steps: int = 100000,
     failure_sample_bias: float = 1.0,
     actor_lr: float | None = None,
     critic_lr: float | None = None,
@@ -568,6 +572,8 @@ def run_v2_td3_stage(
         validation_max_failures=validation_max_failures,
         gamma=gamma,
         target_q_aggregation=target_q_aggregation,
+        mc_return_weight=mc_return_weight,
+        mc_return_max_age_steps=mc_return_max_age_steps,
         failure_sample_bias=failure_sample_bias,
         actor_lr=_resolve_v2_actor_lr(stage, model, actor_lr),
         critic_lr=critic_lr,
@@ -819,6 +825,10 @@ def run_v2_td3_stage(
         cpu_deduplication=cpu_deduplication,
     )
     execution_configuration = trainer.execution_configuration
+    execution_configuration['mc_return'] = dict(requested=config.mc_return_weight > 0,
+        configured=config.mc_return_weight > 0, effective=False, observed_updates=0,
+        weight=config.mc_return_weight, max_age_steps=config.mc_return_max_age_steps,
+        reason='configured; update execution not yet observed' if config.mc_return_weight > 0 else 'disabled')
     execution_configuration['weight_snapshots'] = {
         'requested_steps': list(weight_snapshot_steps),
         'purpose': 'diagnostic_only_not_formal_passed_or_predecessor',
@@ -841,6 +851,9 @@ def run_v2_td3_stage(
     try:
         result = trainer.run()
         compilation_metadata['local_optimizations'] = components.engine.local_optimization_metadata()
+        execution_configuration['mc_return']['actual_execution'] = compilation_metadata['local_optimizations'].get('mc_return')
+        if config.mc_return_weight > 0:
+            execution_configuration['mc_return'].update(compilation_metadata['local_optimizations']['mc_return'])
         compute_resolution.update(phase='completed', actual_execution=compilation_metadata['local_optimizations'].get('gpu_td3_compute'))
         compute_resolution['effective'] = bool((compute_resolution['actual_execution'] or {}).get('effective', False))
         if compute_resolution['configured'] and not compute_resolution['effective']:
@@ -917,11 +930,15 @@ def run_v2_td3_stage(
         if reporter is not None:
             reporter.finish_stage({**result.to_dict(),
                                    'target_q_aggregation': config.target_q_aggregation,
+                                   'mc_return_weight': config.mc_return_weight,
+                                   'mc_return_max_age_steps': config.mc_return_max_age_steps,
                                    'initial_state_sha256': initial_state_summary,
                                    'execution_configuration': execution_configuration})
         summary = {
             'initial_state_sha256': initial_state_summary,
             'target_q_aggregation': config.target_q_aggregation,
+            'mc_return_weight': config.mc_return_weight,
+            'mc_return_max_age_steps': config.mc_return_max_age_steps,
             'stage': stage,
             'model_type': model,
             'bc_schedule': bc_schedule_metadata,
@@ -944,8 +961,12 @@ def run_v2_td3_stage(
         }
         return summary
     except BaseException as exc:
+        actual_execution = components.engine.local_optimization_metadata()
+        if config.mc_return_weight > 0:
+            execution_configuration['mc_return'].update(actual_execution['mc_return'])
+            execution_configuration['mc_return']['actual_execution'] = actual_execution['mc_return']
         compute_resolution.update(
-            phase='failed', actual_execution=components.engine.local_optimization_metadata().get('gpu_td3_compute'))
+            phase='failed', actual_execution=actual_execution.get('gpu_td3_compute'))
         compute_resolution['effective'] = bool((compute_resolution['actual_execution'] or {}).get('effective', False))
         compute_resolution['reason'] = type(exc).__name__ + ': ' + str(exc)
         _write_strict_json(metrics_path.with_name(metrics_path.stem + '_execution_error.json'), {
@@ -979,6 +1000,8 @@ def main(argv: list[str] | None = None) -> int:
         validation_max_failures=args.validation_max_failures,
         gamma=args.gamma,
         target_q_aggregation=args.target_q_aggregation,
+        mc_return_weight=args.mc_return_weight,
+        mc_return_max_age_steps=args.mc_return_max_age_steps,
         failure_sample_bias=args.failure_sample_bias,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,
@@ -1018,6 +1041,8 @@ def main(argv: list[str] | None = None) -> int:
         validation_max_failures=args.validation_max_failures,
         gamma=args.gamma,
         target_q_aggregation=args.target_q_aggregation,
+        mc_return_weight=args.mc_return_weight,
+        mc_return_max_age_steps=args.mc_return_max_age_steps,
         failure_sample_bias=args.failure_sample_bias,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,

@@ -270,6 +270,8 @@ class V2FormalTrainingConfig:
     critic_lr: float | None = None
     gamma: float = 0.99
     target_q_aggregation: str = 'min'
+    mc_return_weight: float = 0.0
+    mc_return_max_age_steps: int = 100000
     tau: float = 0.005
     policy_delay: int = 2
     actor_grad_clip_norm: float | None = 1.0
@@ -291,6 +293,11 @@ class V2FormalTrainingConfig:
     def __post_init__(self) -> None:
         if self.target_q_aggregation not in ('min', 'mean'):
             raise ValueError('target_q_aggregation must be min or mean.')
+        from .v2_mc_return import validate_mc_return_config
+        weight, age = validate_mc_return_config(self.mc_return_weight, self.mc_return_max_age_steps,
+                                                self.target_q_aggregation)
+        object.__setattr__(self, 'mc_return_weight', weight)
+        object.__setattr__(self, 'mc_return_max_age_steps', age)
         if self.spike_regularization is not None and not isinstance(self.spike_regularization, V2SpikeRegularizationConfig):
             raise TypeError('spike_regularization must be V2SpikeRegularizationConfig.')
         if self.stage not in V2_TD3_STAGES:
@@ -500,6 +507,7 @@ class _EpisodeTransition:
     done: bool
     near_goal: bool
     line_to_goal_safe: bool
+    collected_stage_step: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -1250,6 +1258,8 @@ def build_v2_stage_engine(
         expected_limit.numpy(),
         actor_freeze_steps=config.actor_freeze_steps,
         target_q_aggregation=config.target_q_aggregation,
+        mc_return_weight=config.mc_return_weight,
+        mc_return_max_age_steps=config.mc_return_max_age_steps,
         actor_grad_clip_norm=config.actor_grad_clip_norm,
         critic_grad_clip_norm=config.critic_grad_clip_norm,
         actor_rl_scale_alpha=config.actor_rl_scale_alpha,
@@ -1367,6 +1377,7 @@ class V2FormalStageTrainer:
             raise ValueError('engine batch_size must match formal config.')
         if engine.target_q_aggregation != config.target_q_aggregation:
             raise ValueError('engine target_q_aggregation must match formal config.')
+        _check_mc_engine_config(engine, config)
         if not np.array_equal(engine.action_low.detach().cpu().numpy(), expected_low) or not np.array_equal(engine.action_high.detach().cpu().numpy(), expected_high):
             raise ValueError('engine action range must match ScenarioConfig.')
         radius = _nonnegative_float(uav_collision_radius, name='uav_collision_radius')
@@ -1499,6 +1510,7 @@ class V2FormalStageTrainer:
                 success=False,
                 near_goal=near_goal,
                 line_to_goal_safe=line_safe,
+                **(dict(collected_stage_step=local_step_index + 1) if self.config.mc_return_weight > 0 else {}),
             )
             slot_refs.append(slot_ref)
             transitions.append(_EpisodeTransition(
@@ -1509,6 +1521,7 @@ class V2FormalStageTrainer:
                 done=done,
                 near_goal=near_goal,
                 line_to_goal_safe=line_safe,
+                collected_stage_step=local_step_index + 1,
             ))
             episode_return += float(reward)
             episode_length += 1
@@ -1550,9 +1563,14 @@ class V2FormalStageTrainer:
                 if outcome not in _OUTCOMES:
                     raise RuntimeError('Training environment returned an invalid terminal outcome.')
                 self.result.outcome_counts[outcome] += 1
+                returns = None
+                if self.config.mc_return_weight > 0:
+                    from .v2_mc_return import discounted_episode_returns
+                    returns = discounted_episode_returns([t.reward for t in transitions], self.engine.gamma)
+                    self.engine.replay.fill_episode_returns(slot_refs, returns)
                 if outcome == 'goal':
                     with self.engine.gpu_episode_submission():
-                        for transition in transitions:
+                        for transition_index, transition in enumerate(transitions):
                             self.engine.replay.add_success_transition(
                                 transition.observation,
                                 transition.action,
@@ -1561,6 +1579,8 @@ class V2FormalStageTrainer:
                                 transition.done,
                                 near_goal=transition.near_goal,
                                 line_to_goal_safe=transition.line_to_goal_safe,
+                                **(dict(collected_stage_step=transition.collected_stage_step,
+                                        mc_return=returns[transition_index]) if returns is not None else {}),
                             )
                         self.engine.replay.mark_success_slots(slot_refs, success=True)
                 else:
@@ -1640,6 +1660,11 @@ class V2FormalStageTrainer:
                     episode_record['snn_spike_rate_l2'] = snn_spike_diagnostics['spike_rate_l2']
                     episode_record['episode_terminal_spike_rate_l1'] = snn_spike_diagnostics['spike_rate_l1']
                     episode_record['episode_terminal_spike_rate_l2'] = snn_spike_diagnostics['spike_rate_l2']
+                if self.config.mc_return_weight > 0:
+                    for name in ('critic_td_loss', 'critic_mc_loss', 'critic_mc_weighted_loss',
+                                 'mc_valid_count', 'mc_valid_fraction'):
+                        episode_record[name] = mean([getattr(m, name) for m in update_metrics]) if update_metrics else None
+                    episode_record['critic_loss_definition'] = 'TD + mc_return_weight * MC; training behavior returns, not independent evaluation'
                 self.result.episodes.append(episode_record)
                 if self.reporter is not None:
                     reporting_record = dict(episode_record)
@@ -1788,6 +1813,12 @@ class V2FormalStageTrainer:
         return self.result
 
 
+def _check_mc_engine_config(engine, config):
+    if (engine.mc_return_weight != config.mc_return_weight or
+            engine.mc_return_max_age_steps != config.mc_return_max_age_steps):
+        raise ValueError('Formal and engine MC return configurations disagree.')
+
+
 def v2_initial_state_summary(engine: V2TD3UpdateEngine) -> dict[str, str]:
     """Exact initial network/optimizer evidence, independent of device addresses."""
     from hashlib import sha256
@@ -1835,6 +1866,7 @@ def build_v2_formal_checkpoint(
     radius = _nonnegative_float(uav_collision_radius, name='uav_collision_radius')
     if engine.target_q_aggregation != config.target_q_aggregation:
         raise ValueError('Formal and engine target_q_aggregation configurations disagree.')
+    _check_mc_engine_config(engine, config)
     if result.stage != config.stage:
         raise ValueError('result stage and config stage must match.')
     if result.status not in ('passed', 'failed'):
@@ -1914,6 +1946,7 @@ def build_v2_periodic_snapshot(
     steps = _nonnegative_int(stage_steps, name='stage_steps')
     if engine.target_q_aggregation != config.target_q_aggregation:
         raise ValueError('Formal and engine target_q_aggregation configurations disagree.')
+    _check_mc_engine_config(engine, config)
     radius = _nonnegative_float(uav_collision_radius, name='uav_collision_radius')
     model_type = engine.model_type
     payload = {
@@ -2034,6 +2067,13 @@ def _validate_policy_training_snapshot_config(payload, model_type):
         raise ValueError('V2 snapshot formal training configuration must be a dict.')
     formal = dict(payload['formal_config'])
     formal.setdefault('target_q_aggregation', 'min')
+    from .v2_mc_return import validate_mc_return_config
+    for key, default in (('mc_return_weight', 0.0), ('mc_return_max_age_steps', 100000)):
+        formal.setdefault(key, default)
+        if formal[key] != algorithm.get(key, default):
+            raise ValueError('Formal and engine MC return configurations disagree.')
+    validate_mc_return_config(algorithm.get('mc_return_weight', 0.0),
+        algorithm.get('mc_return_max_age_steps', 100000), algorithm.get('target_q_aggregation', 'min'))
     mode = algorithm.get('target_q_aggregation', 'min')
     if mode not in ('min', 'mean') or formal['target_q_aggregation'] != mode:
         raise ValueError('Formal and engine target_q_aggregation configurations disagree.')

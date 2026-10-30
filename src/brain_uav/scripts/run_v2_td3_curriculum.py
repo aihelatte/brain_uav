@@ -54,6 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--hard-max-stage-steps', type=int, default=None)
     parser.add_argument('--easy-gamma', type=float, default=0.99)
     parser.add_argument('--target-q-aggregation', choices=('min', 'mean'), default='min')
+    parser.add_argument('--mc-return-weight', type=float, default=0.0)
+    parser.add_argument('--mc-return-max-age-steps', type=int, default=100000)
     parser.add_argument('--medium-gamma', type=float, default=0.99)
     parser.add_argument('--hard-gamma', type=float, default=0.99)
     parser.add_argument('--easy-failure-sample-bias', type=float, default=1.0)
@@ -241,6 +243,8 @@ def run_v2_curriculum(
     bc_schedule: str = 'default',
     rewards: RewardConfig | None = None,
     target_q_aggregation: str = 'min',
+    mc_return_weight: float = 0.0,
+    mc_return_max_age_steps: int = 100000,
     device: str = 'auto',
     stage_runner: Callable[..., dict[str, Any]] = run_v2_td3_stage,
     model: str = 'ann',
@@ -353,6 +357,8 @@ def run_v2_curriculum(
     prepared_initialization = prepare_v2_stage_initialization(
         V2FormalTrainingConfig(stage='easy', seed=seed, noise_schedule=noise_schedule, spike_regularization=spike_regularization,
                               target_q_aggregation=target_q_aggregation,
+                              mc_return_weight=mc_return_weight,
+                              mc_return_max_age_steps=mc_return_max_age_steps,
                               actor_rl_scale_alpha=actor_rl_scale_alpha),
         init_checkpoint=bc_path,
         device='cpu',
@@ -449,6 +455,8 @@ def run_v2_curriculum(
             ),
             gamma=stage_training_parameters[stage]['gamma'],
             target_q_aggregation=target_q_aggregation,
+            mc_return_weight=mc_return_weight,
+            mc_return_max_age_steps=mc_return_max_age_steps,
             failure_sample_bias=(
                 stage_training_parameters[stage]['failure_sample_bias']
             ),
@@ -494,6 +502,8 @@ def run_v2_curriculum(
     payload = {
         'format': f'v2_formal_{model}_td3_curriculum_summary',
         'target_q_aggregation': target_q_aggregation,
+        'mc_return_weight': mc_return_weight,
+        'mc_return_max_age_steps': mc_return_max_age_steps,
         'format_version': 1,
         'model_type': model,
         'snn': snn_metadata,
@@ -582,6 +592,8 @@ def main(argv: list[str] | None = None) -> int:
         'model_type': args.model,
         'snn_time_window': args.snn_time_window if args.model == 'snn' else None,
         'target_q_aggregation': args.target_q_aggregation,
+        'mc_return_weight': args.mc_return_weight,
+        'mc_return_max_age_steps': args.mc_return_max_age_steps,
         'medium_trial_parameters': {
             'gamma': args.medium_gamma,
             'failure_sample_bias': args.medium_failure_sample_bias,
@@ -612,6 +624,8 @@ def main(argv: list[str] | None = None) -> int:
         bc_schedule=args.bc_schedule,
         device=args.device,
         target_q_aggregation=args.target_q_aggregation,
+        mc_return_weight=args.mc_return_weight,
+        mc_return_max_age_steps=args.mc_return_max_age_steps,
         model=args.model,
         snn_time_window=args.snn_time_window,
         actor_projection_dim=args.actor_projection_dim,

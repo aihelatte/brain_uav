@@ -141,6 +141,8 @@ class V2ReplayBatch:
     near_goal: torch.Tensor
     line_to_goal_safe: torch.Tensor
     sample_failure_fraction: float = 0.0
+    mc_return: torch.Tensor | None = None
+    mc_return_mask: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.obs, V2ObservationBatch):
@@ -186,6 +188,12 @@ class V2ReplayBatch:
             name='sample_failure_fraction',
         )
         object.__setattr__(self, 'sample_failure_fraction', failure_fraction)
+        if (self.mc_return is None) != (self.mc_return_mask is None):
+            raise ValueError('MC return and mask must be supplied together.')
+        for value in (self.mc_return, self.mc_return_mask):
+            if value is not None and (not isinstance(value, torch.Tensor) or
+                    value.shape != (batch_size, 1) or value.dtype != torch.float32 or value.device != device):
+                raise ValueError('MC tensors must be FP32 [B,1] on the replay batch device.')
 
     @property
     def batch_size(self) -> int:
@@ -205,6 +213,8 @@ class V2ReplayBatch:
             near_goal=self.near_goal.to(target, non_blocking=non_blocking),
             line_to_goal_safe=self.line_to_goal_safe.to(target, non_blocking=non_blocking),
             sample_failure_fraction=self.sample_failure_fraction,
+            mc_return=None if self.mc_return is None else self.mc_return.to(target, non_blocking=non_blocking),
+            mc_return_mask=None if self.mc_return_mask is None else self.mc_return_mask.to(target, non_blocking=non_blocking),
         )
 
 
@@ -340,6 +350,29 @@ class V2ReplayBuffer:
         )
         self.success_size = 0
         self.success_position = 0
+        self.mc_return_enabled = False
+
+    def enable_mc_returns(self) -> None:
+        if self.mc_return_enabled:
+            return
+        for prefix, size in (('', self.capacity), ('success_', self.success_capacity)):
+            setattr(self, prefix + 'mc_return', np.zeros(size, dtype=np.float32))
+            setattr(self, prefix + 'mc_valid', np.zeros(size, dtype=np.bool_))
+            setattr(self, prefix + 'collected_stage_step', np.zeros(size, dtype=np.int64))
+        self.mc_return_enabled = True
+
+    def fill_episode_returns(self, slot_refs, returns) -> None:
+        if not self.mc_return_enabled:
+            raise ValueError('MC return storage is not enabled.')
+        values = np.asarray(returns, dtype=np.float32)
+        if len(slot_refs) != len(values) or not np.isfinite(values).all():
+            raise ValueError('Invalid episode MC returns.')
+        for (index, write_id), value in zip(slot_refs, values):
+            if self.write_id[index] == write_id:
+                if self.collected_stage_step[index] <= 0:
+                    raise ValueError('MC transition is missing its original collection step.')
+                self.mc_return[index] = value
+                self.mc_valid[index] = True
 
     def __len__(self) -> int:
         return self.size
@@ -408,7 +441,10 @@ class V2ReplayBuffer:
         success: bool = False,
         near_goal: bool = False,
         line_to_goal_safe: bool = False,
+        collected_stage_step: int = 0,
     ) -> tuple[int, int]:
+        if self.mc_return_enabled:
+            collected_stage_step = _positive_int(collected_stage_step, name='collected_stage_step')
         action_array, reward_value = self._validate_transition(
             obs, action, reward, next_obs
         )
@@ -447,6 +483,10 @@ class V2ReplayBuffer:
         self.near_goal[index] = bool(near_goal)
         self.line_to_goal_safe[index] = bool(line_to_goal_safe)
         self.write_id[index] = write_id
+        if self.mc_return_enabled:
+            self.mc_return[index] = 0.
+            self.mc_valid[index] = False
+            self.collected_stage_step[index] = collected_stage_step
         if self.success[index]:
             self.success_count += 1
         if self.near_goal[index]:
@@ -522,7 +562,13 @@ class V2ReplayBuffer:
         done: bool,
         near_goal: bool = False,
         line_to_goal_safe: bool = False,
+        collected_stage_step: int = 0,
+        mc_return: float | None = None,
     ) -> None:
+        if self.mc_return_enabled:
+            collected_stage_step = _positive_int(collected_stage_step, name='collected_stage_step')
+            if mc_return is not None and not np.isfinite(np.float32(mc_return)):
+                raise ValueError('MC return must be finite FP32.')
         action_array, reward_value = self._validate_transition(
             obs, action, reward, next_obs
         )
@@ -552,6 +598,10 @@ class V2ReplayBuffer:
         self.success_done[index, 0] = float(bool(done))
         self.success_near_goal[index] = bool(near_goal)
         self.success_line_to_goal_safe[index] = bool(line_to_goal_safe)
+        if self.mc_return_enabled:
+            self.success_collected_stage_step[index] = collected_stage_step
+            self.success_mc_return[index] = 0. if mc_return is None else mc_return
+            self.success_mc_valid[index] = mc_return is not None
         self.success_position = (index + 1) % self.success_capacity
 
     def success_fraction(self) -> float:
@@ -649,6 +699,7 @@ class V2ReplayBuffer:
     def _sample_primary(self, batch_size: int) -> dict[str, np.ndarray]:
         indices = self._sample_primary_indices(batch_size)
         return {
+            **self._sample_mc_metadata('', indices),
             'ego': self.ego_features[indices].copy(),
             'goal': self.goal_features[indices].copy(),
             'zones': self.zone_features[indices].copy(),
@@ -675,6 +726,7 @@ class V2ReplayBuffer:
             replace=False,
         )
         return {
+            **self._sample_mc_metadata('success_', indices),
             'ego': self.success_ego_features[indices].copy(),
             'goal': self.success_goal_features[indices].copy(),
             'zones': self.success_zone_features[indices].copy(),
@@ -733,7 +785,18 @@ class V2ReplayBuffer:
             presence_mask=torch.from_numpy(mask),
         )
 
-    def sample(self, batch_size: int) -> V2ReplayBatch:
+    def _sample_mc_metadata(self, prefix, indices):
+        if not self.mc_return_enabled:
+            return {}
+        return {name: getattr(self, prefix + name)[indices].copy()
+                for name in ('mc_return', 'mc_valid', 'collected_stage_step')}
+
+    def sample(self, batch_size: int, *, current_stage_step=None, mc_return_max_age_steps=100000) -> V2ReplayBatch:
+        if current_stage_step is not None:
+            current_stage_step = _positive_int(current_stage_step, name='current_stage_step')
+            mc_return_max_age_steps = _positive_int(mc_return_max_age_steps, name='mc_return_max_age_steps')
+            if not self.mc_return_enabled:
+                raise ValueError('MC-enabled sampling requires MC return storage.')
         batch_size = _positive_int(batch_size, name='batch_size')
         if batch_size > self.size:
             raise ValueError(
@@ -753,6 +816,12 @@ class V2ReplayBuffer:
             else None
         )
         sample = self._merge_samples(primary, success)
+        mc_fields = {}
+        if current_stage_step is not None:
+            age = current_stage_step - sample['collected_stage_step']
+            valid = sample['mc_valid'] & (age >= 0) & (age <= mc_return_max_age_steps)
+            mc_fields = dict(mc_return=torch.from_numpy(sample['mc_return'].reshape(-1, 1)),
+                mc_return_mask=torch.from_numpy(valid.astype(np.float32).reshape(-1, 1)))
         obs = self._observation_batch(
             sample['ego'],
             sample['goal'],
@@ -775,4 +844,5 @@ class V2ReplayBuffer:
             near_goal=torch.from_numpy(sample['near_goal']),
             line_to_goal_safe=torch.from_numpy(sample['line_to_goal_safe']),
             sample_failure_fraction=float(np.mean(sample['failure'])),
+            **mc_fields,
         )

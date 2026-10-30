@@ -33,13 +33,16 @@ def preserving_clip(parameters, loss, error, loss_code, gradient_code, max_norm)
 def tensors(batch):
     return [getattr(o, n) for o in (batch.obs, batch.next_obs)
             for n in ('ego_features', 'goal_features', 'zone_features', 'presence_mask')] + [
-        getattr(batch, n) for n in ('action', 'reward', 'done', 'success', 'near_goal', 'line_to_goal_safe')]
+        getattr(batch, n) for n in ('action', 'reward', 'done', 'success', 'near_goal', 'line_to_goal_safe')] + (
+        [batch.mc_return, batch.mc_return_mask] if batch.mc_return is not None else [])
 
 
 def clone_batch(batch):
     values = [t.detach().clone() for t in tensors(batch)]
     return V2ReplayBatch(V2ObservationBatch(*values[:4]), values[8], values[9],
-        V2ObservationBatch(*values[4:8]), *values[10:], sample_failure_fraction=batch.sample_failure_fraction)
+        V2ObservationBatch(*values[4:8]), *values[10:14], sample_failure_fraction=batch.sample_failure_fraction,
+        mc_return=values[14] if len(values) > 14 else None,
+        mc_return_mask=values[15] if len(values) > 14 else None)
 
 
 class GPUCompute(GPUUpdate):
@@ -186,6 +189,8 @@ class GPUCompute(GPUUpdate):
                         raise RuntimeError('GPU compute Adam tensor binding changed; invalidate before mutation.')
 
     def key(self, batch, mode):
+        if self.e.mc_return_weight > 0 and (batch.mc_return is None or batch.mc_return_mask is None):
+            raise ValueError('MC-enabled GPUCompute requires return and mask inputs.')
         if batch.batch_size != self.e.batch_size:
             raise ValueError('GPU compute supports configured batch size only.')
         if max(batch.obs.max_zone_count, batch.next_obs.max_zone_count) > self.zone_limit:
@@ -409,6 +414,8 @@ class GPUCompute(GPUUpdate):
         e.update_count += 1; e.critic_update_count += 1
         e.critic_target_update_count += int(targets); e.actor_update_count += int(actor)
         e.last_total_steps = total_steps
+        if e.mc_return_weight > 0:
+            e._mc_return_update_count += 1
         metric = self.metrics(values[:-2],total_steps,bc_lambda,targets,actor)
         metric = replace(metric, sample_failure_fraction=batch.sample_failure_fraction)
         self.last_sections = dict(gpu_compute_input_copy=copy_elapsed,

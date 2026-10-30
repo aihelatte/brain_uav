@@ -257,7 +257,7 @@ class GPUUpdate:
 
     @staticmethod
     def static_options(e):
-        values=(e.target_q_aggregation,e.gamma,e.tau,e.actor_grad_clip_norm,e.critic_grad_clip_norm,e.actor_rl_scale_alpha,
+        values=(e.target_q_aggregation,e.mc_return_weight,e.mc_return_max_age_steps,e.gamma,e.tau,e.actor_grad_clip_norm,e.critic_grad_clip_norm,e.actor_rl_scale_alpha,
                 e.terminal_geo_regularization_enabled,e.terminal_geo_radius,e.terminal_geo_lambda,
                 e.spike_regularization.target_rate,e.actor.scales,
                 *(m.training for m in (e.actor,e.critic1,e.critic2,e.actor_target,e.critic1_target,e.critic2_target)))
@@ -330,7 +330,14 @@ class GPUUpdate:
             if p.grad is not None: p.grad.zero_()
         q1 = e.critic1._compute_full_forward_tensors(*current,value('action'))
         q2 = e.critic2._compute_full_forward_tensors(*current,value('action'))
-        loss = F.mse_loss(q1,target)+F.mse_loss(q2,target)
+        mc_stats = ()
+        if e.mc_return_weight > 0:
+            from .v2_mc_return import critic_loss_components
+            loss, td_loss, mc_loss, mc_count, mc_fraction = critic_loss_components(
+                q1, q2, target, e.mc_return_weight, value('mc_return'), value('mc_return_mask'))
+            mc_stats = (td_loss, mc_loss, mc_loss * e.mc_return_weight, mc_count, mc_fraction)
+        else:
+            loss = F.mse_loss(q1,target)+F.mse_loss(q2,target)
         for name,value_tensor in (('target.noise',noise),('target.action',next_action),
             ('target.q1',tq1),('target.q2',tq2),('target.td',target),
             ('critic.q1',q1),('critic.q2',q2),('critic.loss',loss)):
@@ -402,7 +409,7 @@ class GPUUpdate:
             return torch.stack((error.float(),loss,*terms,rate,actor_norm,
                 value('success').mean(),value('failure').mean(),value('near_goal').mean(),
                 q1.mean(),q1.std(unbiased=False),q1.abs().max(),target.mean(),td.mean(),
-                (td*failure).sum()/failure.sum().clamp_min(1.),critic_norm))
+                (td*failure).sum()/failure.sum().clamp_min(1.),critic_norm,*mc_stats))
 
     def persistent(self):
         return [p for m in self.models if m is not None for p in m.parameters()] + [x for a in self.adams for x in a.state_tensors()]
@@ -534,6 +541,8 @@ class GPUUpdate:
         # output: error, critic, eight actor terms, rate, norm, 3 fractions,
         # seven critic reductions and critic norm.
         m=V2TD3UpdateMetrics(critic_loss=critic,
+            **(dict(zip(('critic_td_loss', 'critic_mc_loss', 'critic_mc_weighted_loss',
+                         'mc_valid_count', 'mc_valid_fraction'), values[22:27])) if e.mc_return_weight > 0 else {}),
             actor_loss=values[2] if actor else 0.,rl_actor_loss=values[3] if actor else 0.,
             scaled_rl_actor_loss=values[4] if actor else 0.,actor_rl_scale=values[5] if actor else 1.,
             bc_loss=values[6] if actor else 0.,terminal_geo_loss=values[7] if actor else 0.,

@@ -639,9 +639,12 @@ class TestTrainV2TD3CLI(unittest.TestCase):
     def test_medium_stage_records_smooth_mid_strong_everywhere(self):
         self._check_medium_stage_schedule('smooth-mid-strong')
 
+    def test_medium_stage_records_mc_return_config_everywhere(self):
+        self._check_medium_stage_schedule('smooth-mid-strong', mc_return_weight=.1)
+
     @mock.patch('brain_uav.scripts.train_v2_td3.v2_initial_state_summary',
                 return_value={'fixture': 'medium stage mock engine'})
-    def _check_medium_stage_schedule(self, schedule, initial_summary):
+    def _check_medium_stage_schedule(self, schedule, initial_summary, *, mc_return_weight=0.):
         scenario = ScenarioConfig(target_distance=1_701.0)
         rewards = RewardConfig(progress_weight=3.25)
         actor = V2ANNPolicyActor(
@@ -675,7 +678,9 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 replay=SimpleNamespace(
                     sampling_implementation='fenwick_ppswor_v1'
                 ),
-                local_optimization_metadata=lambda: {},
+                local_optimization_metadata=lambda: {'mc_return': dict(requested=mc_return_weight > 0,
+                    configured=mc_return_weight > 0, effective=False, observed_updates=0,
+                    weight=mc_return_weight, max_age_steps=100000, reason='fixture: no updates executed')},
             ),
             scenario_generators={'easy': object()},
             selector=object(),
@@ -777,6 +782,9 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                     actor_lr=2e-4,
                     critic_lr=3e-4,
                     bc_schedule=schedule,
+                    target_q_aggregation='mean' if mc_return_weight else 'min',
+                    mc_return_weight=mc_return_weight,
+                    mc_return_max_age_steps=100000,
                     periodic_snapshot_interval_steps=100,
                     cpu_deduplication=True,
                 )
@@ -791,6 +799,12 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         initial_summary.assert_called_once_with(components.engine)
         for report in (stage_start, stage_end, summary, metrics_writer.call_args.args[1]):
             self.assertEqual(report['initial_state_sha256'], initial_summary.return_value)
+            self.assertEqual(report['execution_configuration']['mc_return']['weight'], mc_return_weight)
+            self.assertEqual(report['execution_configuration']['mc_return']['max_age_steps'], 100000)
+        for cfg in (builder.call_args.args[1], formal_checkpoint_builder.call_args.args[2],
+                    periodic_snapshot_builder.call_args.args[1]):
+            self.assertEqual(cfg.mc_return_weight, mc_return_weight)
+            self.assertEqual(cfg.mc_return_max_age_steps, 100000)
         self.assertEqual(initializer.call_args.kwargs['device'], 'cuda')
         self.assertIsNone(initializer.call_args.kwargs['scenario'])
         self.assertIsNone(initializer.call_args.kwargs['rewards'])

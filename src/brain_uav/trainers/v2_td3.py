@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from math import isfinite, pi
 import random
 from time import perf_counter
@@ -290,6 +290,12 @@ class V2TD3UpdateMetrics:
     spike_beta_eff: float | None = None
     weighted_spike_regularization: float | None = None
     sample_failure_fraction: float = 0.0
+    # critic_loss is the actual backward total; separate TD-only/MC quantities.
+    critic_td_loss: float | None = None
+    critic_mc_loss: float | None = None
+    critic_mc_weighted_loss: float | None = None
+    mc_valid_count: float | None = None
+    mc_valid_fraction: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,6 +423,8 @@ class V2TD3UpdateEngine:
         action_high: np.ndarray | torch.Tensor,
         *,
         target_q_aggregation: str = 'min',
+        mc_return_weight: float = 0.0,
+        mc_return_max_age_steps: int = 100000,
         actor_freeze_steps: int = 0,
         actor_grad_clip_norm: float | None = None,
         critic_grad_clip_norm: float | None = None,
@@ -441,6 +449,12 @@ class V2TD3UpdateEngine:
         gpu_compute_lightweight_timing: bool = False,
         spike_regularization: V2SpikeRegularizationConfig | None = None,
     ) -> None:
+        from .v2_mc_return import validate_mc_return_config
+        self.mc_return_weight, self.mc_return_max_age_steps = validate_mc_return_config(
+            mc_return_weight, mc_return_max_age_steps, target_q_aggregation)
+        if self.mc_return_weight > 0 and gpu_td3_update:
+            raise ValueError('MC return supervision does not support legacy gpu_td3_update.')
+        self._mc_return_update_count = 0
         actor_model_type = _actor_model_type(actor)
         self.spike_regularization = V2SpikeRegularizationConfig() if spike_regularization is None else spike_regularization
         if not isinstance(self.spike_regularization, V2SpikeRegularizationConfig):
@@ -569,6 +583,8 @@ class V2TD3UpdateEngine:
         if target_q_aggregation not in ('min', 'mean'):
             raise ValueError('target_q_aggregation must be min or mean.')
         self.target_q_aggregation = target_q_aggregation
+        if self.mc_return_weight > 0:
+            self.replay.enable_mc_returns()
         self.gamma = _finite_float(gamma, name='gamma')
         self.tau = _finite_float(tau, name='tau')
         if self.gamma < 0.0 or self.gamma > 1.0:
@@ -1356,6 +1372,8 @@ class V2TD3UpdateEngine:
         relation_pair_mask: torch.Tensor,
         action: torch.Tensor,
         target_q: torch.Tensor,
+        mc_return: torch.Tensor | None = None,
+        mc_return_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         encoder_arguments = (
             ego_features,
@@ -1372,9 +1390,12 @@ class V2TD3UpdateEngine:
         current_q2 = self.critic2._compute_full_forward_tensors(
             *encoder_arguments, action
         )
-        critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(
-            current_q2, target_q
-        )
+        if self.mc_return_weight > 0:
+            from .v2_mc_return import critic_loss_components
+            critic_loss = critic_loss_components(current_q1, current_q2, target_q,
+                self.mc_return_weight, mc_return, mc_return_mask)[0]
+        else:
+            critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
         return current_q1, current_q2, critic_loss
 
     def enable_critic_loss_compile(
@@ -2029,6 +2050,8 @@ class V2TD3UpdateEngine:
                     *encoder_arguments,
                     action,
                     target_q,
+                    **(dict(mc_return=target_q, mc_return_mask=torch.zeros_like(target_q))
+                       if self.mc_return_weight > 0 else {}),
                 )
                 critic_loss.backward()
                 self.critic_optimizer.zero_grad(set_to_none=True)
@@ -2344,6 +2367,8 @@ class V2TD3UpdateEngine:
                     *encoder_arguments,
                     action,
                     target_q,
+                    **(dict(mc_return=target_q, mc_return_mask=torch.zeros_like(target_q))
+                       if self.mc_return_weight > 0 else {}),
                 )
 
             return replay_critic_forward
@@ -2356,6 +2381,8 @@ class V2TD3UpdateEngine:
                 *encoder_arguments,
                 action,
                 target_q,
+                **(dict(mc_return=target_q, mc_return_mask=torch.zeros_like(target_q))
+                   if self.mc_return_weight > 0 else {}),
             )
 
             def replay_critic_backward() -> None:
@@ -2953,6 +2980,12 @@ class V2TD3UpdateEngine:
                 self._pending_gpu_compute_transfer = None
             raise
 
+    def _sample_training_batch(self, current_stage_step):
+        if self.mc_return_weight == 0:
+            return self.replay.sample(self.batch_size)
+        return self.replay.sample(self.batch_size, current_stage_step=current_stage_step,
+                                  mc_return_max_age_steps=self.mc_return_max_age_steps)
+
     def update_once(
         self,
         *,
@@ -3039,7 +3072,7 @@ class V2TD3UpdateEngine:
                     diagnostic_timing_recorder or diagnostic_profile_sections or block_attribution_recorder):
                 raise ValueError('GPU compute does not support legacy update instrumentation.')
             with update_timing.section('replay_sample'):
-                batch = self.replay.sample(self.batch_size)
+                batch = self._sample_training_batch(total_steps_value)
             with self._gpu_compute_source_lifetime(batch):
                 with (gpu_compute_submission_diagnostic.scope('batch_upload')
                       if gpu_compute_submission_diagnostic is not None else nullcontext()), update_timing.section('batch_preparation'):
@@ -3078,7 +3111,7 @@ class V2TD3UpdateEngine:
         self._mark_cuda_graph_step_begin()
 
         with update_timing.section('replay_sample'):
-            batch = self.replay.sample(self.batch_size)
+            batch = self._sample_training_batch(total_steps_value)
         with update_timing.section('batch_preparation'):
             # Own the copied CPU sample through this update's existing completion
             # barriers. Replay overwrites cannot mutate its independent arrays.
@@ -3236,6 +3269,8 @@ class V2TD3UpdateEngine:
                                 *critic_arguments,
                                 batch.action,
                                 target_q,
+                                **(dict(mc_return=batch.mc_return, mc_return_mask=batch.mc_return_mask)
+                                   if self.mc_return_weight > 0 else {}),
                             )
                         )
             else:
@@ -3251,9 +3286,12 @@ class V2TD3UpdateEngine:
                     shared_relations=current_shared_relations,
                     profile_sections=profile_sections,
                 )
-                critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(
-                    current_q2, target_q
-                )
+                if self.mc_return_weight > 0:
+                    from .v2_mc_return import critic_loss_components
+                    critic_loss = critic_loss_components(current_q1, current_q2, target_q,
+                        self.mc_return_weight, batch.mc_return, batch.mc_return_mask)[0]
+                else:
+                    critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
             self._require_finite_loss(
                 critic_loss,
                 component='critic',
@@ -3401,6 +3439,8 @@ class V2TD3UpdateEngine:
         self.update_count += 1
         self.critic_update_count += 1
         self.last_total_steps = total_steps_value
+        if self.mc_return_weight > 0:
+            self._mc_return_update_count += 1
         if actor_terms is None:
             statistic_values = self._read_update_statistics((
                 critic_loss,
@@ -3484,6 +3524,14 @@ class V2TD3UpdateEngine:
                 critic_failure_td_error_mean=statistic_values[14],
                 actor_grad_norm=statistic_values[15],
             )
+        if self.mc_return_weight > 0:
+            from .v2_mc_return import critic_loss_components
+            with torch.no_grad():
+                _, td, mc, count, fraction = critic_loss_components(current_q1, current_q2, target_q,
+                    self.mc_return_weight, batch.mc_return, batch.mc_return_mask)
+                extras = self._read_update_statistics((td, mc, mc * self.mc_return_weight, count, fraction))
+            metrics = replace(metrics, critic_td_loss=extras[0], critic_mc_loss=extras[1],
+                critic_mc_weighted_loss=extras[2], mc_valid_count=extras[3], mc_valid_fraction=extras[4])
         if defer_statistics:
             self._pending_update_metrics.append(metrics)
             if len(self._pending_update_metrics) >= 32:
@@ -3498,6 +3546,14 @@ class V2TD3UpdateEngine:
         metadata = {name: {'requested': getattr(self, name), 'effective': getattr(self, name),
                        'reason': 'explicit opt-in; device-independent path'}
                 for name in ('window_update_statistics', 'reuse_update_buffers')}
+        metadata['mc_return'] = dict(requested=self.mc_return_weight > 0,
+            configured=self.mc_return_weight > 0,
+            effective=self._mc_return_update_count > 0, observed_updates=self._mc_return_update_count,
+            weight=self.mc_return_weight,
+            max_age_steps=self.mc_return_max_age_steps,
+            reason=('disabled' if self.mc_return_weight == 0 else
+                    'configured; no completed update observed' if self._mc_return_update_count == 0 else
+                    'observed on original TD batch; completed exploratory behavior returns'))
         metadata['non_blocking_batch_transfer'] = {
             'requested': self.non_blocking_batch_transfer,
             'effective': self.non_blocking_batch_transfer and self.device.type == 'cuda',
@@ -3939,6 +3995,8 @@ class V2TD3UpdateEngine:
 
     def _algorithm_config(self) -> dict[str, Any]:
         return {
+            'mc_return_weight': self.mc_return_weight,
+            'mc_return_max_age_steps': self.mc_return_max_age_steps,
             'target_q_aggregation': self.target_q_aggregation,
             'gamma': self.gamma,
             'tau': self.tau,
@@ -4132,6 +4190,11 @@ class V2TD3UpdateEngine:
             raise ValueError('checkpoint is missing algorithm_config.')
         algorithm = dict(payload['algorithm_config'])
         algorithm.setdefault('target_q_aggregation', 'min')
+        algorithm.setdefault('mc_return_weight', 0.0)
+        algorithm.setdefault('mc_return_max_age_steps', 100000)
+        from .v2_mc_return import validate_mc_return_config
+        validate_mc_return_config(algorithm['mc_return_weight'], algorithm['mc_return_max_age_steps'],
+                                  algorithm['target_q_aggregation'])
         if 'spike_regularization' not in algorithm and 'policy_head' not in payload['architecture']:
             algorithm['spike_regularization'] = V2SpikeRegularizationConfig().to_dict()
         if algorithm != self._algorithm_config():
