@@ -216,6 +216,37 @@ class TestWD3ACC(unittest.TestCase):
                 self.assertEqual(d.main(args),0)
             self.assertFalse(path.exists())
 
+    def test_launcher_preflight_uses_path_inputs_before_cuda_probe(self):
+        import sys
+        launcher = Path(__file__).resolve().parents[1] / 'docs/v2_wd3_acc_launch.sh'
+        snippet = launcher.read_text(encoding='utf-8').split("<<'PREFLIGHT'\n", 1)[1].split('\nPREFLIGHT', 1)[0]
+        digest = '2e3199a60b8ff23f9cb8f8395d6f44bcb7d73abeddf2ff5a31f1c95c19332f4b'
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [root / name for name in ('pool.json', 'ann.pt', 'snn.pt')]
+            for path in paths:
+                path.write_bytes(b'preflight fixture')
+            def source(args):
+                self.assertIsInstance(args.checkpoint, Path)
+                self.assertIsInstance(args.validation_pool, Path)
+                self.assertEqual(d.file_sha256(args.checkpoint), d.file_sha256(paths[1]))
+            with mock.patch.object(sys, 'argv', ['-', *map(str, paths)]), \
+                    mock.patch('brain_uav.trainers.v2_validation.load_v2_validation_pool',
+                               return_value=SimpleNamespace(content_digest=digest)), \
+                    mock.patch.object(d, 'source_data', side_effect=source) as load, \
+                    mock.patch.object(torch.cuda, 'is_available', return_value=True) as available, \
+                    mock.patch.object(torch.cuda, 'get_device_name', return_value='mock CUDA'), \
+                    mock.patch.object(torch, 'ones') as ones, redirect_stdout(StringIO()):
+                ones.return_value.sum.return_value.item.return_value = 1
+                exec(compile(snippet, str(launcher), 'exec'), {})
+                self.assertEqual([call.args[0].model for call in load.call_args_list], ['ann', 'snn'])
+                self.assertEqual(load.call_count, 2)
+                load.side_effect = ValueError('source rejected')
+                available.reset_mock()
+                with self.assertRaisesRegex(ValueError, 'source rejected'):
+                    exec(compile(snippet, str(launcher), 'exec'), {})
+                available.assert_not_called()
+
     def test_collection_selection_unstratified_train_then_one_nine_and_no_flight(self):
         data,_=fixture(); scenes=scene_fixture(); data['pool']=SimpleNamespace(scenarios=scenes[40:])
         # Geometry-only proposals, with one validation duplicate rejected first.

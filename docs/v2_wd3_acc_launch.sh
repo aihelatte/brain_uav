@@ -31,9 +31,10 @@ HASHES
   test "$rc" -eq 0 || return "$rc"
   PYTHONPATH=src "$python_bin" -u -B - "$pool" "$ann_checkpoint" "$snn_checkpoint" <<'PREFLIGHT'
 import argparse, sys, torch
+from pathlib import Path
 from brain_uav.trainers.v2_validation import load_v2_validation_pool
 from brain_uav.scripts.diagnose_v2_wd3_acc import source_data
-pool_path, ann, snn = sys.argv[1:]
+pool_path, ann, snn = map(Path, sys.argv[1:])
 pool = load_v2_validation_pool(pool_path, expected_level='easy', expected_count=100,
                                expected_master_seed=20260904)
 if pool.content_digest != '2e3199a60b8ff23f9cb8f8395d6f44bcb7d73abeddf2ff5a31f1c95c19332f4b':
