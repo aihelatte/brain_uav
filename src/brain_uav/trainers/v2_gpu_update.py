@@ -263,6 +263,10 @@ class GPUUpdate:
                 *(m.training for m in (e.actor,e.critic1,e.critic2,e.actor_target,e.critic1_target,e.critic2_target)))
         if any(isinstance(value,torch.Tensor) for value in values):
             raise ValueError('GPU static configuration must not contain device tensor controls.')
+        config=getattr(e,'research_target_config',None)
+        if config is not None:
+            values += (tuple(sorted(config.items())),e._research_beta_tensor.data_ptr())
+        values += (bool(getattr(e,'online_research_statistics',False)),)
         return values
 
     def arguments(self, obs):
@@ -325,7 +329,8 @@ class GPUUpdate:
             noise = (self.noise*coefficients[2]).clamp(-coefficients[3],coefficients[3])
             next_action = torch.maximum(torch.minimum(next_action+noise,e.action_high),e.action_low)
             _, tq1, tq2, target = e._compute_target_critics_td_tensors(
-                *next_args,next_action,value('reward'),value('done'))
+                *next_args,next_action,value('reward'),value('done'),
+                **(dict(research_beta=coefficients[4]) if getattr(e,'research_target_config',None) is not None else {}))
         for p in self.critic_params:
             if p.grad is not None: p.grad.zero_()
         q1 = e.critic1._compute_full_forward_tensors(*current,value('action'))
@@ -337,7 +342,7 @@ class GPUUpdate:
                 q1, q2, target, e.mc_return_weight, value('mc_return'), value('mc_return_mask'))
             mc_stats = (td_loss, mc_loss, mc_loss * e.mc_return_weight, mc_count, mc_fraction)
         else:
-            loss = F.mse_loss(q1,target)+F.mse_loss(q2,target)
+            loss = e._twin_td_loss(q1,q2,target)
         for name,value_tensor in (('target.noise',noise),('target.action',next_action),
             ('target.q1',tq1),('target.q2',tq2),('target.td',target),
             ('critic.q1',q1),('critic.q2',q2),('critic.loss',loss)):
@@ -405,11 +410,17 @@ class GPUUpdate:
         with torch.no_grad():
             if self.bank_publication: self.publication = torch.stack((publish_critic, publish_actor))
             if self.diagnostic: self.tensor_evidence[mode]=evidence
-            td=(q1-target).abs(); failure=(value('success')<.5).float()
+            td=(q1-e._critic_target(target,0)).abs(); failure=(value('success')<.5).float()
+            research_stats=()
+            if getattr(e,'online_research_statistics',False):
+                research_stats=(q2.mean(),q2.std(unbiased=False),q2.abs().max(),target.min(),target.max(),
+                    (q2-e._critic_target(target,1)).abs().mean(),
+                    (q1-e._critic_target(target,0)).mean(),(q2-e._critic_target(target,1)).mean(),
+                    e._critic_target(target,0).mean(),e._critic_target(target,1).mean(),target.std(unbiased=False))
             return torch.stack((error.float(),loss,*terms,rate,actor_norm,
                 value('success').mean(),value('failure').mean(),value('near_goal').mean(),
                 q1.mean(),q1.std(unbiased=False),q1.abs().max(),target.mean(),td.mean(),
-                (td*failure).sum()/failure.sum().clamp_min(1.),critic_norm,*mc_stats))
+                (td*failure).sum()/failure.sum().clamp_min(1.),critic_norm,*mc_stats,*research_stats))
 
     def persistent(self):
         return [p for m in self.models if m is not None for p in m.parameters()] + [x for a in self.adams for x in a.state_tensors()]

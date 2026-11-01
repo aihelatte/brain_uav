@@ -72,6 +72,9 @@ def _optional_distance(value: float) -> float | None:
 def load_diagnostic_checkpoint(checkpoint, **expected):
     """Strict dispatch: snapshots remain non-terminal, never formal-passed."""
     raw = torch.load(checkpoint, map_location='cpu', weights_only=False)
+    if raw.get('format') == 'v2_online_wd3_acc_research_snapshot':
+        from brain_uav.trainers.v2_online_research import validate_snapshot
+        return validate_snapshot(raw, **expected)
     if raw.get('format') == V2_PERIODIC_SNAPSHOT_FORMAT:
         return load_v2_periodic_snapshot(raw, **expected)
     return load_v2_formal_checkpoint(raw, require_passed=False, **expected)

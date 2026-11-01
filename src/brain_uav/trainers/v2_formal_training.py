@@ -1341,6 +1341,7 @@ class V2FormalStageTrainer:
         weight_snapshot_sink: Callable[[int, int], None] | None = None,
         periodic_validation_sink: Callable[[int], None] | None = None,
         cpu_deduplication: bool = True,
+        online_research=None,
     ) -> None:
         if not isinstance(scenario, ScenarioConfig) or not isinstance(rewards, RewardConfig):
             raise TypeError('scenario and rewards must use project config classes.')
@@ -1386,6 +1387,11 @@ class V2FormalStageTrainer:
         if type(cpu_deduplication) is not bool:
             raise TypeError('cpu_deduplication must be a bool.')
         self.cpu_deduplication = cpu_deduplication
+        if online_research is not None:
+            from .v2_online_research import OnlineResearch
+            if not isinstance(online_research,OnlineResearch) or config.stage!='easy' or config.max_steps!=500000 or config.mc_return_weight!=0:
+                raise ValueError('Online research requires explicit easy/500k schedule/MC=0.')
+        self.online_research=online_research
         self.scenario = scenario
         self.rewards = rewards
         self.config = config
@@ -1447,6 +1453,8 @@ class V2FormalStageTrainer:
     def _new_episode(self) -> tuple[V2Observation, str]:
         level = self.selector.sample()
         payload = self.scenario_sources[level].generate()
+        if self.online_research is not None:
+            self.online_research.scene(payload,self.result.stage_steps)
         observation, _ = self.env.reset(options={'scenario': payload})
         self.result.curriculum_sample_counts[level] = self.result.curriculum_sample_counts.get(level, 0) + 1
         return observation, level
@@ -1476,7 +1484,7 @@ class V2FormalStageTrainer:
         slot_refs: list[tuple[int, int]] = []
         update_metrics: list[V2TD3UpdateMetrics] = []
         self.engine.actor.train()
-        while self.result.stage_steps < self.config.max_steps:
+        while self.result.stage_steps < (self.config.max_steps if self.online_research is None else self.online_research.hard_limit):
             local_step_index = self.result.stage_steps
             in_warmup = local_step_index < self.config.warmup_steps
             exploration_noise, policy_noise, noise_clip = self.config.noise_schedule.values(
@@ -1515,7 +1523,7 @@ class V2FormalStageTrainer:
             slot_refs.append(slot_ref)
             transitions.append(_EpisodeTransition(
                 observation=observation,
-                action=np.asarray(action, dtype=np.float32).copy(),
+                action=(self.env.prev_action.copy() if self.online_research is not None else np.asarray(action, dtype=np.float32).copy()),
                 reward=float(reward),
                 next_observation=next_observation,
                 done=done,
@@ -1546,6 +1554,8 @@ class V2FormalStageTrainer:
                         f'stage_steps={self.result.stage_steps}: {exc}'
                     ) from exc
                 update_metrics.append(metrics)
+                if self.online_research is not None:
+                    self.online_research.update(metrics,self.engine)
                 self.result.update_count += 1
             observation = next_observation
 
@@ -1585,6 +1595,9 @@ class V2FormalStageTrainer:
                         self.engine.replay.mark_success_slots(slot_refs, success=True)
                 else:
                     self.engine.replay.mark_failure_slots(slot_refs, failure=True)
+                if self.online_research is not None:
+                    self.online_research.episode(self,transitions)
+                    self.online_research.episode_metrics(update_metrics,self.result.stage_steps)
                 actor_updates = [value for value in update_metrics if value.actor_updated]
                 activity_updates = [value for value in actor_updates if value.actor_batch_spike_rate_l1 is not None]
                 episode_record = {
@@ -1733,7 +1746,7 @@ class V2FormalStageTrainer:
                     self.result.windows.append(window)
                     if self.reporter is not None:
                         self.reporter.record_window(window)
-                    if window['candidate']:
+                    if window['candidate'] and self.online_research is None:
                         if self.reporter is not None:
                             self.reporter.prepare_validation_candidate(
                                 self.controller.candidate_count,
@@ -1789,7 +1802,9 @@ class V2FormalStageTrainer:
                     if self.periodic_validation_sink is not None:
                         self.periodic_validation_sink(periodic_step)
                     self._next_periodic_step += self.periodic_snapshot_interval_steps
-                if self.result.stage_steps >= self.config.max_steps:
+                if self.online_research is not None:
+                    self.online_research.boundary(self)
+                if self.result.stage_steps >= (self.config.max_steps if self.online_research is None else self.online_research.hard_limit):
                     break
                 if self.reporter is not None:
                     self.reporter.begin_episode()
@@ -1803,13 +1818,16 @@ class V2FormalStageTrainer:
                 update_metrics = []
 
         self.engine.flush_update_statistics()
-        if not self.result.passed_validation:
+        if self.online_research is not None:
+            self.result.status = 'research_completed_budget'
+            self.result.stop_reason = 'research_hard_limit'
+        elif not self.result.passed_validation:
             self.result.status = 'failed'
             self.result.stop_reason = 'max_steps_without_validation'
         self.result.replay_size = len(self.engine.replay)
         self.result.replay_success_fraction = self.engine.replay.success_fraction()
         self.result.success_replay_size = self.engine.replay.success_size
-        self.result.candidate_validation_count = self.controller.candidate_count
+        self.result.candidate_validation_count = self.controller.candidate_count if self.online_research is None else 0
         return self.result
 
 
@@ -2063,6 +2081,8 @@ def load_v2_periodic_snapshot(
 def _validate_policy_training_snapshot_config(payload, model_type):
     engine = payload['engine_checkpoint']
     algorithm = engine['algorithm_config']
+    if 'online_research_target' in algorithm or 'online_research_beta' in engine:
+        raise ValueError('Online research targets require the explicit research snapshot diagnostic loader.')
     if not isinstance(payload['formal_config'], dict):
         raise ValueError('V2 snapshot formal training configuration must be a dict.')
     formal = dict(payload['formal_config'])

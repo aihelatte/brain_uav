@@ -116,7 +116,7 @@ class GPUCompute(GPUUpdate):
         self.ready_to_result_seconds = 0.
         self.captures = self.replays = self.handoffs = 0
         self.mode_replays = {'critic_only':0,'frozen_targets':0,'actor':0}
-        self.coefficients = torch.zeros(4, device=engine.device)
+        self.coefficients = torch.zeros(5 if getattr(engine,'research_target_config',None) is not None else 4, device=engine.device)
         self.noise = torch.zeros(engine.batch_size, engine.action_dim, device=engine.device)
         self.injections = torch.zeros(4, device=engine.device)
         if engine._gpu_update_stream is None:
@@ -338,13 +338,16 @@ class GPUCompute(GPUUpdate):
             self.noise.copy_(noise)
         with (submission_diagnostic.scope('coefficients_construct_and_upload') if submission_diagnostic is not None else nullcontext()):
             coefficient_started = perf_counter() if self.e.gpu_compute_lightweight_timing else None
+            research = getattr(self.e,'research_target_config',None) is not None
+            coefficient_values = [bc_lambda,self.e.spike_regularization.beta(total_steps),self.e.policy_noise,self.e.noise_clip]
+            if research: coefficient_values.append(self.e.research_beta)
             if self.e.gpu_compute_non_blocking_coefficients:
-                source = torch.tensor([bc_lambda,self.e.spike_regularization.beta(total_steps),self.e.policy_noise,self.e.noise_clip],dtype=torch.float32,device='cpu')
+                source = torch.tensor(coefficient_values,dtype=torch.float32,device='cpu')
                 owned_sources.append(source)
                 self.coefficients.copy_(source, non_blocking=True)
                 self.e._gpu_compute_coefficient_uploads = getattr(self.e, '_gpu_compute_coefficient_uploads', 0) + 1
             else:
-                self.coefficients.copy_(torch.tensor([bc_lambda,self.e.spike_regularization.beta(total_steps),self.e.policy_noise,self.e.noise_clip],device=self.e.device))
+                self.coefficients.copy_(torch.tensor(coefficient_values,device=self.e.device))
             self.e._gpu_compute_coefficient_submissions = getattr(self.e, '_gpu_compute_coefficient_submissions', 0) + 1
             coefficient_seconds = perf_counter() - coefficient_started if coefficient_started is not None else None
         if key not in self.graphs: self.capture_shape(key,batch)
@@ -417,6 +420,10 @@ class GPUCompute(GPUUpdate):
         if e.mc_return_weight > 0:
             e._mc_return_update_count += 1
         metric = self.metrics(values[:-2],total_steps,bc_lambda,targets,actor)
+        if getattr(e,'online_research_statistics',False):
+            e._online_research_last_statistics=dict(zip(('q2_mean','q2_std','q2_max_abs','target_min','target_max','q2_td_absolute_error',
+                'q1_minus_y_mean','q2_minus_y_mean','target1_mean','target2_mean','target_std'),values[22:33]))
+            e._online_research_last_statistics['critic_grad_norm']=values[21]
         metric = replace(metric, sample_failure_fraction=batch.sample_failure_fraction)
         self.last_sections = dict(gpu_compute_input_copy=copy_elapsed,
                                   gpu_compute_to_result=compute_elapsed)

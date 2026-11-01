@@ -389,6 +389,17 @@ class _OptionalUpdateDetailTimer:
             })
 
 
+def research_target_pair(q1, q2, method, weight):
+    """Research-only critic-specific targets, concatenated along the Q axis."""
+    low = torch.minimum(q1, q2)
+    if method == 'wd3':
+        value = weight * low + (1 - weight) * ((q1 + q2) / 2)
+        return torch.cat((value, value), dim=-1)
+    if method == 'acc':
+        return torch.cat((weight*q1+(1-weight)*low, weight*q2+(1-weight)*low), dim=-1)
+    raise ValueError('Unknown research target method.')
+
+
 def aggregate_v2_target_q(q1: torch.Tensor, q2: torch.Tensor, aggregation: str) -> torch.Tensor:
     """Shared by eager, compiled/Graph updates and the offline intervention."""
     if aggregation == 'min':
@@ -1395,7 +1406,7 @@ class V2TD3UpdateEngine:
             critic_loss = critic_loss_components(current_q1, current_q2, target_q,
                 self.mc_return_weight, mc_return, mc_return_mask)[0]
         else:
-            critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+            critic_loss = self._twin_td_loss(current_q1, current_q2, target_q)
         return current_q1, current_q2, critic_loss
 
     def enable_critic_loss_compile(
@@ -1462,6 +1473,7 @@ class V2TD3UpdateEngine:
         noise: torch.Tensor,
         reward: torch.Tensor,
         done: torch.Tensor,
+        research_beta: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         encoder_arguments = (
             ego_features,
@@ -1484,6 +1496,7 @@ class V2TD3UpdateEngine:
             next_action,
             reward,
             done,
+            research_beta,
         )
 
     def _compute_target_critics_td_tensors(
@@ -1498,6 +1511,7 @@ class V2TD3UpdateEngine:
         next_action: torch.Tensor,
         reward: torch.Tensor,
         done: torch.Tensor,
+        research_beta: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         encoder_arguments = (
             ego_features,
@@ -1515,7 +1529,7 @@ class V2TD3UpdateEngine:
             *encoder_arguments, next_action
         )
         target_q = reward + (
-            (1.0 - done) * self.gamma * self._aggregate_target_q(target_q1, target_q2)
+            (1.0 - done) * self.gamma * self._aggregate_target_q(target_q1, target_q2, research_beta)
         )
         return next_action, target_q1, target_q2, target_q
 
@@ -2041,7 +2055,7 @@ class V2TD3UpdateEngine:
                     device=self.device,
                 )
                 target_q = torch.zeros(
-                    (device_batch.batch_size, 1),
+                    (device_batch.batch_size, 2 if getattr(self,'research_target_config',None) is not None else 1),
                     dtype=torch.float32,
                     device=self.device,
                 )
@@ -2289,6 +2303,8 @@ class V2TD3UpdateEngine:
         batch: V2ObservationBatch,
         scope: str,
     ) -> Callable[[], None]:
+        if getattr(self,'research_target_config',None) is not None:
+            raise ValueError('Old update graph probes do not support research targets; use GPUCompute CUDA gate.')
         if scope in ('actor_forward', 'actor_backward', 'bc_reference', 'critic_guidance'):
             # These probes own an independent forward/backward, never a live
             # training graph. Build relations outside the measured scope.
@@ -3291,7 +3307,7 @@ class V2TD3UpdateEngine:
                     critic_loss = critic_loss_components(current_q1, current_q2, target_q,
                         self.mc_return_weight, batch.mc_return, batch.mc_return_mask)[0]
                 else:
-                    critic_loss = F.mse_loss(current_q1, target_q) + F.mse_loss(current_q2, target_q)
+                    critic_loss = self._twin_td_loss(current_q1, current_q2, target_q)
             self._require_finite_loss(
                 critic_loss,
                 component='critic',
@@ -3300,7 +3316,7 @@ class V2TD3UpdateEngine:
             with attribution.section('critic_equivalent_compute'):
                 with torch.no_grad():
                     current_q1_detached = current_q1.detach()
-                    td_error = (current_q1_detached - target_q.detach()).abs()
+                    td_error = (current_q1_detached - self._critic_target(target_q.detach(), 0)).abs()
                     failure_mask = (batch.success < 0.5).to(td_error.dtype)
                     diagnostic_q1_mean = current_q1_detached.mean()
                     diagnostic_q1_std = current_q1_detached.std(unbiased=False)
@@ -3990,7 +4006,41 @@ class V2TD3UpdateEngine:
             return V2_SNN_TD3_CHECKPOINT_FORMAT, V2_SNN_TD3_CHECKPOINT_VERSION + extension
         return V2_TD3_CHECKPOINT_FORMAT, V2_TD3_CHECKPOINT_VERSION + extension
 
-    def _aggregate_target_q(self, q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    def configure_research_targets(self, config):
+        """Explicit independent experiment only; configure before compilation/capture."""
+        from .v2_online_research import validate_target_config
+        config = validate_target_config(config)
+        if self.mc_return_weight != 0 or self.gpu_td3_update:
+            raise ValueError('Research targets require MC=0 and exclude old GPUUpdate.')
+        if any(value is not None for value in (self._gpu_update_executor,self._compiled_critic_loss,self._compiled_target_block,self._compiled_target_critic_td)):
+            raise ValueError('Configure research targets before compilation/capture.')
+        self.research_target_config = config
+        self.research_beta = config['initial_beta']
+        self._research_beta_tensor = torch.tensor(self.research_beta,device=self.device,dtype=torch.float32)
+
+    def set_research_beta(self, value):
+        value = float(value)
+        if not isfinite(value) or not 0 <= value <= 1:
+            raise ValueError('Research beta must be finite in [0,1].')
+        if getattr(self,'research_target_config',None) is None or self.research_target_config['method']!='acc':
+            raise ValueError('No ACC research target configured.')
+        if self.research_target_config['initial_beta']==1. and value!=1.:
+            raise ValueError('fixed-own beta must remain one.')
+        self._research_beta_tensor.fill_(value)
+        self.research_beta = value
+
+    def _critic_target(self, target, index):
+        return target[...,index:index+1] if getattr(self,'research_target_config',None) is not None else target
+
+    def _twin_td_loss(self, q1, q2, target):
+        return F.mse_loss(q1,self._critic_target(target,0)) + F.mse_loss(q2,self._critic_target(target,1))
+
+    def _aggregate_target_q(self, q1: torch.Tensor, q2: torch.Tensor, research_beta=None) -> torch.Tensor:
+        config = getattr(self,'research_target_config',None)
+        if config is not None:
+            weight = config['weight'] if config['method']=='wd3' else (
+                self._research_beta_tensor if research_beta is None else research_beta)
+            return research_target_pair(q1,q2,config['method'],weight)
         return aggregate_v2_target_q(q1, q2, self.target_q_aggregation)
 
     def _algorithm_config(self) -> dict[str, Any]:
@@ -4014,6 +4064,8 @@ class V2TD3UpdateEngine:
             'terminal_geo_radius': self.terminal_geo_radius,
             'terminal_geo_lambda': self.terminal_geo_lambda,
             'spike_regularization': self.spike_regularization.to_dict(),
+            **({'online_research_target': dict(self.research_target_config)}
+               if getattr(self, 'research_target_config', None) is not None else {}),
         }
 
     @staticmethod
@@ -4065,6 +4117,8 @@ class V2TD3UpdateEngine:
         }
         if self.model_type == 'snn':
             payload['model_type'] = 'snn'
+        if getattr(self,'research_target_config',None) is not None:
+            payload['online_research_beta'] = self.research_beta
         return payload
 
     @staticmethod
@@ -4199,6 +4253,12 @@ class V2TD3UpdateEngine:
             algorithm['spike_regularization'] = V2SpikeRegularizationConfig().to_dict()
         if algorithm != self._algorithm_config():
             raise ValueError('checkpoint algorithm_config is incompatible.')
+        if getattr(self,'research_target_config',None) is not None:
+            beta=payload.get('online_research_beta')
+            if type(beta) not in (int,float) or not isfinite(beta) or not 0<=beta<=1:
+                raise ValueError('Missing/invalid research beta.')
+            if (self.research_target_config['method']=='wd3' or self.research_target_config['initial_beta']==1.) and beta!=self.research_target_config['initial_beta']:
+                raise ValueError('Fixed research beta changed.')
 
         if 'bc_reference_present' not in payload:
             raise ValueError('checkpoint is missing bc_reference_present.')
@@ -4291,6 +4351,9 @@ class V2TD3UpdateEngine:
         self.actor_update_count = validated_counts['actor_update_count']
         self.last_total_steps = validated_counts['last_total_steps']
         self.bc_reference_actor = bc_reference_candidate
+        if getattr(self,'research_target_config',None) is not None:
+            self.research_beta=payload['online_research_beta']
+            self._research_beta_tensor.fill_(self.research_beta)
         self._validate_all_live_fixed_buffers()
         if self.bc_reference_actor is not None:
             self._validate_model_fixed_buffers(
