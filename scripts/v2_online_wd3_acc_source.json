@@ -105,9 +105,9 @@
     "src/brain_uav/utils/v2_operation_counts.py": "f0b10e355562702c48dc907061cd78c7abe4f3db0eb5bbef2b25230101510b06",
     "src/brain_uav/v2_curriculum.py": "32332ed6dae1bf65c8cee3c2e913e16f16473c1e97570ac8e66e3e444f3ad970",
     "scripts/online_v2_wd3_acc.sh": "3a32ab7ca0146eccc30b973f4ded578b37cb7faa408db21e898f6d5fd694ea9e",
-    "src/brain_uav/scripts/diagnose_v2_online_followup.py": "a3ddeb9615c7e8eca105711aacec6d3ecb68519089b9cb565a11c17b9b1f4b05"
+    "src/brain_uav/scripts/diagnose_v2_online_followup.py": "9993f151ee3a5a9968683d44a77f1b34c1a1376e72743971f10af4658647a5e5"
   },
   "source_hash_normalization": "CRLF-to-LF",
-  "HEAD": "f333a15c6fc5d972d113bb1c4f296de3a113a275",
-  "status": "M scripts/v2_online_wd3_acc_source.json\n M src/brain_uav/envs/v2_static_no_fly_env.py\n M tests/test_v2_static_no_fly_env.py\n?? AGENTS.md\n?? diagnostics/\n?? docs/superpowers/\n?? docs/v2_online_followup.md\n?? src/brain_uav/scripts/diagnose_v2_online_followup.py\n?? tests/test_diagnose_v2_online_followup.py"
+  "HEAD": "1d150934cfa2fb2b5fc3f5c9760f1f2c8acf4559",
+  "status": "M docs/v2_online_followup.md\n M scripts/v2_online_wd3_acc_source.json\n M src/brain_uav/envs/v2_static_no_fly_env.py\n M src/brain_uav/scripts/diagnose_v2_online_followup.py\n M tests/test_diagnose_v2_online_followup.py\n M tests/test_v2_static_no_fly_env.py\n?? AGENTS.md\n?? diagnostics/\n?? docs/superpowers/"
 }

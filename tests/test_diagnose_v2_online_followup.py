@@ -43,6 +43,102 @@ class TestFollowup(unittest.TestCase):
             args.updates_per_worker=201
             with self.assertRaises(ValueError):d.plan(args)
 
+    def test_real_bc_initialization_make_engine_modes_and_cpu_acc_update(self):
+        from dataclasses import replace
+        import test_v2_bc as bc_fixture
+        from brain_uav.models import V2ANNPolicyActor,V2SNNPolicyActor
+        from brain_uav.trainers import v2_bc as bc,v2_formal_training as formal
+        from brain_uav.observations import V2ObservationScales
+        from brain_uav.scripts import train_v2_td3 as entry
+        from test_v2_td3 import _observation
+        for model in ('ann','snn'):
+            with self.subTest(model=model),TemporaryDirectory() as root:
+                args=self.args(root,'acc-bank')
+                # Tiny synthetic serialized fixture; no BC optimizer, training or flight.
+                scenario_fixture=bc_fixture.make_scenario_payload
+                def payload_fixture(*a):
+                    value=scenario_fixture(*a)
+                    value['metadata']['requested_direct_path_blocker']=False
+                    return value
+                with patch.object(bc_fixture,'make_scenario_payload',side_effect=payload_fixture):
+                    cluster=bc.load_v2_bc_trajectory_cluster(bc_fixture.write_cluster(Path(root)/'cluster',zone_counts=(0,1)))
+                split=bc.split_v2_bc_scenarios(cluster,validation_fraction=.5,seed=7)
+                scenario=cluster.scenario_config
+                scales=V2ObservationScales(scenario.world_xy,scenario.world_z_min,scenario.world_z_max,scenario.gamma_max)
+                limit=torch.tensor([scenario.delta_gamma_max,scenario.delta_psi_max],dtype=torch.float32)
+                actor=(V2ANNPolicyActor(scales,2,8,limit) if model=='ann' else V2SNNPolicyActor(scales,2,8,limit,time_window=4))
+                state=deepcopy(actor.state_dict())
+                payload=(bc.build_v2_bc_checkpoint_payload if model=='ann' else bc.build_v2_snn_bc_checkpoint_payload)(
+                    checkpoint_kind='best',actor=actor,actor_state_dict=state,cluster=cluster,split=split,
+                    config=bc.V2BCTrainingConfig(1,2,.001,7,.5),
+                    result=bc.V2BCTrainingResult((0.,),(0.,),1,0.,state,state),finished_at='CPU fixture')
+                path=getattr(args,model+'_bc');torch.save(payload,path)
+                job=next(j for j in d.research.matrix() if j['model']==model and j['arm']=='acc_001')
+                config=replace(d.research.make_config(job),replay_capacity=16,batch_size=2)
+                prepared=formal.prepare_v2_stage_initialization(config,init_checkpoint=path,device='cpu',model_type=model,
+                    rewards=d.research.research_rewards())
+                self.assertFalse(prepared.bc_initialization.actor.training)
+                source=formal.build_v2_stage_engine(None,config,init_checkpoint=path,device='cpu',model_type=model,
+                    prepared_initialization=prepared).engine
+                self.assertFalse(source.actor.training)
+                source.configure_research_targets(target_config('acc_001'))
+                checkpoint=deepcopy(source.checkpoint_state_dict());source.load_checkpoint_state_dict(checkpoint)
+                self.assertFalse(source.actor.training)  # strict load does not repair eval
+                raw={'arm':'acc_001','snapshot':{'engine_checkpoint':checkpoint}}
+                data={'model':model,'device':torch.device('cpu'),'pool':SimpleNamespace(),
+                    'actor':deepcopy(prepared.bc_initialization.actor).eval().requires_grad_(False)}
+                build=formal.build_v2_stage_engine
+                def cpu_build(*a,**kw):
+                    self.assertTrue(kw['gpu_td3_compute'])
+                    kw.update(gpu_td3_compute=False,fused_adam=False)
+                    engine=build(*a,**kw)
+                    self.assertFalse(engine.engine.actor.training)
+                    return engine
+                def prewarm(engine,*a,**kw):
+                    self.assertFalse(engine.actor.training)
+                    self.assertIsNone(engine._gpu_update_executor)
+                    return {'warmup_batch_shapes':[]}
+                with patch.object(d.research,'make_config',return_value=config), \
+                        patch.object(formal,'build_v2_stage_engine',side_effect=cpu_build), \
+                        patch.object(entry,'_configure_stage_compilation',side_effect=prewarm) as warm, \
+                        patch.object(torch.cuda,'get_device_name',return_value='mock CPU'):
+                    engine,_,_,report=d.make_engine(args,data,raw)
+                warm.assert_called_once()
+                modes=report['model_modes']
+                self.assertFalse(modes['after_initialization']['actor']['training'])
+                self.assertFalse(modes['after_prewarm']['actor']['training'])
+                def assert_training():
+                    current=d.model_modes(engine)
+                    self.assertTrue(all(current[n]['training'] for n in ('actor','critic1','critic2')))
+                    for n in ('actor_target','critic1_target','critic2_target','bc_reference_actor'):
+                        self.assertFalse(current[n]['training']);self.assertTrue(current[n]['frozen'])
+                assert_training()
+                episode=[dict(observation=_observation(0,scales=engine.actor.scales),action=np.zeros(2,dtype=np.float32),
+                    reward=0.,step=i+1,done=i==1) for i in range(2)]
+                hook=OnlineResearch('acc_001',Path(root)/'hook')
+                d.bank_episode(hook,engine,episode,25000,predict_bank)
+                batch=d.replay_batch(engine,episode);update=engine.update_once
+                def checked_update(*a,**kw):
+                    assert_training();return update(*a,**kw)
+                with patch.object(engine.replay,'sample',return_value=batch), \
+                        patch.object(engine,'update_once',side_effect=checked_update) as call:
+                    engine.update_once(total_steps=25000,bc_lambda=0.)
+                call.assert_called_once();self.assertEqual(engine.update_count,1);assert_training()
+                if model=='snn':
+                    with patch.object(engine,'select_action',wraps=engine.select_action) as train, \
+                            patch.object(d.cal.base,'actor_action',wraps=d.cal.base.actor_action) as evaluate, \
+                            d.action_observer(engine,data) as observer:
+                        sequence=d.action_sequences(engine,data,[{'observation':episode[0]['observation']},
+                            {'observation':_observation(1,scales=engine.actor.scales)}],observer)
+                    self.assertEqual(train.call_count,4);self.assertEqual(evaluate.call_count,4)
+                    for row in sequence['sequence']:
+                        self.assertTrue(row['context']['train_context']['training'])
+                        self.assertFalse(row['context']['eval_context']['training'])
+                        self.assertTrue(row['context']['train_context']['inference'])
+                        self.assertFalse(row['context']['train_context']['grad'])
+                        self.assertTrue(row['context']['eval_context']['inference'])
+                        self.assertFalse(row['context']['eval_context']['grad'])
+
     def test_location_guard_protects_original_repo_and_history(self):
         with TemporaryDirectory() as root:
             args=self.args(root)

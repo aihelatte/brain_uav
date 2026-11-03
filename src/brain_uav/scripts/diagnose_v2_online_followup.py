@@ -147,6 +147,13 @@ def warmup_call_counts(engine):
             patch.object(engine,'_prepare_action_inference_cuda_graph_replay',counted_prepare):yield counts
 
 
+def model_modes(engine):
+    return {name:None if getattr(engine,name) is None else dict(
+        training=getattr(engine,name).training,
+        frozen=not any(p.requires_grad for p in getattr(engine,name).parameters()))
+        for name in ('actor','critic1','critic2','actor_target','critic1_target','critic2_target','bc_reference_actor')}
+
+
 def make_engine(args,data,raw,*,compile=True):
     from brain_uav.trainers.v2_formal_training import prepare_v2_stage_initialization,build_v2_stage_engine
     from brain_uav.scripts.train_v2_td3 import default_v2_cuda_graph_compilation,_configure_stage_compilation
@@ -162,6 +169,7 @@ def make_engine(args,data,raw,*,compile=True):
     algorithm=raw['snapshot']['engine_checkpoint']['algorithm_config']
     engine.set_target_noise(policy_noise=algorithm['policy_noise'],noise_clip=algorithm['noise_clip'])
     engine.load_checkpoint_state_dict(deepcopy(raw['snapshot']['engine_checkpoint']))
+    modes=dict(after_initialization=model_modes(engine))
     # Copies are created BEFORE any independent compilation; no live flag mutation.
     copies=deepcopy((engine.critic1,engine.critic2))
     for c in copies:c.requires_grad_(False)
@@ -176,11 +184,23 @@ def make_engine(args,data,raw,*,compile=True):
     calls['raw_actor_warmup_calls']=len(metadata.get('warmup_batch_shapes',[])) if compile else 0
     if engine.update_count!=before:raise RuntimeError('Unexpected state-changing compile warmup update.')
     if cal.state_hash(engine.checkpoint_state_dict())!=weights:raise RuntimeError('Compile prewarm changed network/target/Adam state.')
+    modes['after_prewarm']=model_modes(engine)
+    if engine._gpu_update_executor is not None and engine._gpu_update_executor.captures:
+        raise RuntimeError('Training mode must be set before first GPUCompute capture.')
+    # Formal entry compiles/warms first; V2FormalStageTrainer._run then sets train.
+    engine.actor.train()
+    modes['before_actions_and_updates']=model_modes(engine)
+    if not all(modes['before_actions_and_updates'][n]['training'] for n in ('actor','critic1','critic2')):
+        raise RuntimeError('Diagnostic online models must match formal training mode.')
+    for name in ('actor_target','critic1_target','critic2_target','bc_reference_actor'):
+        mode=modes['before_actions_and_updates'][name]
+        if mode is not None and (mode['training'] or not mode['frozen']):
+            raise RuntimeError('Diagnostic targets/BC must remain frozen and eval.')
     return engine,copies,config,dict(configuration=metadata,device=str(engine.device),
         gpu=torch.cuda.get_device_name(engine.device),seconds=compile_seconds,
         effective_formal_config=config.to_dict(),actual_algorithm=engine._algorithm_config(),prewarm_state_unchanged=True,
         state_changing_warmup_updates=engine.update_count-before,
-        pure_forward_host_calls=calls,compiler_internal_tracing_calls='unknown')
+        pure_forward_host_calls=calls,compiler_internal_tracing_calls='unknown',model_modes=modes)
 
 
 def common_observations(args,inputs,data,actual):
@@ -210,13 +230,14 @@ def action_observer(engine,data):
     """Observe returned tensor of the real call, without a second forward."""
     current={};original=engine._action_inference_tensor
     def train_tensor(batch):
+        training=engine.actor.training
         tensor=original(batch)
         current['train_raw']=tensor.detach().cpu().numpy()[0].copy()
-        current['train_context']=dict(inference=torch.is_inference_mode_enabled(),grad=torch.is_grad_enabled())
+        current['train_context']=dict(training=training,inference=torch.is_inference_mode_enabled(),grad=torch.is_grad_enabled())
         return tensor
     def evaluate_hook(module,args,tensor):
         current['eval_raw']=tensor.detach().cpu().numpy()[0].copy()
-        current['eval_context']=dict(inference=torch.is_inference_mode_enabled(),grad=torch.is_grad_enabled())
+        current['eval_context']=dict(training=module.training,inference=torch.is_inference_mode_enabled(),grad=torch.is_grad_enabled())
     handle=data['actor'].register_forward_hook(evaluate_hook)
     try:
         with ExitStack() as stack:
@@ -321,6 +342,7 @@ def inference(args,inputs,output):
         if cal.state_hash(engine.actor.state_dict())!=weights or cal.state_hash(data['actor'].state_dict())!=weights:
             raise RuntimeError('Inference path changed actor weights/buffers.')
         result=dict(arm=arm,requested=raw['requested_step'],actual=sidecar['actual_step'],records=records,sequence=sequence,
+            frozen_evaluation_mode=dict(training=data['actor'].training,frozen=not any(p.requires_grad for p in data['actor'].parameters())),
             compilation=compiled,closed_loop=loop,passed=all(v['passed'] for v in records) and sequence['passed'] and all(v['outcomes_equal'] for v in loop))
         _write_json(output/f'other/{arm}.json',result);results.append(result)
         inputs.check();engine.invalidate_gpu_update()
@@ -484,7 +506,7 @@ def bank_worker(args,inputs,output):
             engine.set_target_noise(policy_noise=pn,noise_clip=nc)
             captures=0 if engine._gpu_update_executor is None else engine._gpu_update_executor.captures
             _write_json(output/f'other/pre_update_{i}.json',dict(index=i,stage=stage,beta=engine.research_beta,
-                bank_rows=sum(map(len,hook.acc.episodes)),captures=captures))
+                bank_rows=sum(map(len,hook.acc.episodes)),captures=captures,model_modes=model_modes(engine)))
             update_started=time.perf_counter()
             with patch.object(engine.replay,'sample',return_value=batch),patch('torch.randn_like',new=lambda x:noise.to(x.device)):
                 if beta_trial:

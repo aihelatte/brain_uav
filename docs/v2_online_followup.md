@@ -23,6 +23,18 @@ GPUCompute使用手工Graph/raw计算。交替执行是否造成非法访问仍�
 
 ## snn-inference
 
+模式时序与正式入口一致：严格BC初始化/build/checkpoint load → 原编译及预热 →
+`actor.train()` → 动作或更新；在首次GPUCompute捕获之前完成，不在捕获后切换模式。
+双在线critic保持train并检查；targets和BC reference保持eval及冻结，不为隔离评分切换live模式。
+`compilation.model_modes`分别记录初始化后、预热后、动作/更新前七个模型的training/frozen状态；
+`pre_update_*.json`记录对应更新前模式。冻结评估actor仍独立eval，逐次真实前向记录
+training、inference、grad上下文，不把两条路径统一成相同模式。
+
+服务器旧snn-inference通过仅覆盖当时实际执行的模式，不能外推在线actor.train()情形；
+保留旧产物。本轮旧acc-bank首个ann/original被“GPU compute requires training online models”
+初始化保护拒绝，尚未完成受控更新，不是历史CUDA非法访问复现。
+修正后仍需补验SNN动作路径及未完成的ACC诊断，不重跑16组或500k训练。
+
 通过review sidecar的requested/actual/hash查找唯一快照，再严格校验研究格式和加载模型；
 不按文件名前缀任选。检查指定固定池加载对象的content_digest，保持原奖励/架构/环境校验。
 读取min的200k冻结评估manifest和20条完整episodes.jsonl，核对checkpoint和pool身份。
@@ -183,12 +195,16 @@ git diff --check
 ```
 
 本轮完整回归沿用`docs/v2_online_wd3_acc.md`里的原命令，在`python -m unittest`后追加
-`test_diagnose_v2_online_followup.TestFollowup`，原79项加4项及本轮父流程回归1项，共84项；诊断类单独18项。
+`test_diagnose_v2_online_followup.TestFollowup`，原84项加本轮初始化模式回归1项，共85项；诊断类单独19项。
+新回归用临时小型合法ANN/SNN BC best（仅序列化，无BC训练）和真实严格prepare/build/load，
+先确认actor为eval，再穿过真实make_engine；仅模拟CUDA开关/编译执行及设备信息。
+确认预热时仍eval、预热后train，真实CPU ACC更新入口核对在线train/targets和BC冻结eval；
+SNN继续调用真实select_action与actor_action进行A-A/A-B-A，确认两侧train/eval及前向上下文。
 新增CPU集成用例实际经过bank/controller、eager更新及同次recorder；Graph元数据仅为CPU mock，
 不作为CUDA证据。另测真实严格加载的ANN/SNN双向类型拒绝、新/旧beta与信息不足和总报告阻断。
 首次导入夹具类时意外收集了旧GPUCompute测试：课程CUDA ABI夹具、BC初始化reference参数夹具、
 环境诊断CLI旧断言三个无关用例出现失败（BC用例有ANN/SNN两个子项）。已改用模块导入，
-不顺手修复这些旧用例，也不将这84项针对性通过称作全仓通过。
+不顺手修复这些旧用例，也不将这85项针对性通过称作全仓通过。
 
 CPU/mock和极小合成更新只验证接线、公式/隔离/门控，**尚无真实CUDA复现、候选修复验收，
 也没有SNN动作协议结论**。编译器内部追踪次数和训练侧同次脉冲仍为缺失证据。
