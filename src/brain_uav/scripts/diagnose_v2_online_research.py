@@ -61,13 +61,15 @@ def grouped_statistics(rows,q,scenes):
 
 def evaluate(args,output):
     from brain_uav.scripts.run_v2_online_wd3_acc import REPO,POOL,DIGEST,identity
-    paths=dict(checkpoint=Path(args.checkpoint),pool=REPO/POOL)
+    paths=dict(checkpoint=Path(args.checkpoint),pool=getattr(args,'validation_pool',None) or REPO/POOL)
     hashes={k:file_sha256(p) for k,p in paths.items()};code=identity()
+    expected=getattr(args,'expected_pool_file_sha256',None)
+    if expected is not None and hashes['pool']!=expected:raise ValueError('Evaluation pool differs from worker/preflight.')
     data=cal.base.load_models(paths['checkpoint'],paths['pool'],'cuda')
     if data['checkpoint_hash']!=hashes['checkpoint'] or data['pool'].content_digest!=DIGEST: raise ValueError('Evaluation input mismatch.')
     selected=cal.base.select_scenarios(data['pool'])
     _write_json(output/'manifest.json',dict(diagnostic_only=True,formal_passed=False,
-        checkpoint_sha256=data['checkpoint_hash'],inputs=hashes,code=code,
+        checkpoint_sha256=data['checkpoint_hash'],inputs=hashes,input_paths={k:str(p) for k,p in paths.items()},code=code,
         research=data['checkpoint_payload'].get('diagnostic_research'),selection=selected,
         gamma=data['gamma'],pool_digest=DIGEST,backend='eager frozen cuda actor/critics, no exploration'))
     before=cal.state_hash([m.state_dict() for m in [data['actor'],*data['critics']]])

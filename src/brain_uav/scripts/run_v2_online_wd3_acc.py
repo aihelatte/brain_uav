@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 from dataclasses import asdict
+from copy import deepcopy
 from hashlib import sha256
 import json
 import os
@@ -17,7 +18,7 @@ import torch
 
 from brain_uav.trainers.v2_online_research import (
     ARMS, FORMAT, OnlineResearch, atomic_json, target_config, validate_snapshot,
-    training_identity,
+    training_identity, IsolatedScorer,
 )
 
 REPO=Path(__file__).resolve().parents[3]
@@ -49,6 +50,16 @@ def matrix():
         for model in ('ann','snn') for arm in ARMS]
 
 
+def selected_jobs(args):
+    if args.jobs is not None and len(args.jobs)!=len(set(args.jobs)):raise ValueError('Duplicate jobs.')
+    return [j for j in matrix() if args.jobs is None or j['id'] in args.jobs]
+
+
+def input_paths(args):
+    return dict(BC={m:(getattr(args,m+'_bc',None) or REPO/p).resolve() for m,(p,h) in BC.items()},
+        pool=(getattr(args,'validation_pool',None) or REPO/POOL).resolve())
+
+
 def identity():
     paths=sorted((REPO/'src').rglob('*.py'))+[REPO/'scripts/online_v2_wd3_acc.sh']
     # Git may convert CRLF to LF between Windows review and Linux execution.
@@ -61,7 +72,8 @@ def identity():
 def plan(args):
     from brain_uav.scripts.train_v2_td3 import default_v2_cuda_graph_compilation
     from brain_uav.envs.v2_scenario_generator import V2ScenarioGeneratorConfig
-    return dict(diagnostic_only=True,formal_passed=False,mode=args.mode,launch=args.launch,root=str(args.root),jobs=matrix(),
+    return dict(diagnostic_only=True,formal_passed=False,mode=args.mode,launch=args.launch,root=str(args.root),jobs=selected_jobs(args),
+        bank_scoring=args.bank_scoring,
         checkpoint=None if args.checkpoint is None else str(args.checkpoint),
         cuda_gate=dict(model=args.model,arm=args.job,updates_per_arm_per_path=25,
             max_actual_updates_per_model=400,rtol=1e-4,atol=1e-5,strict=True,new_exemptions=False,
@@ -73,8 +85,8 @@ def plan(args):
             EMA_rho=.05,C='mean_training_bank(G-(Q1+Q2)/2)',A='mean(abs(G-Qbar))',
             formula='EMA=A first, then .95*EMA+.05*A; S=max(1,EMA); beta=clip(beta+eta*clip(C/S,-1,1),0,1)',
             semantics='recent exploratory behavior returns, not unbiased current-policy calibration'),
-        inputs=dict(BC={m:dict(path=str(p),sha256=h) for m,(p,h) in BC.items()},
-            pool=str(POOL),pool_content_digest=DIGEST),
+        inputs=dict(BC={m:dict(path=str(input_paths(args)['BC'][m]),sha256=h) for m,(p,h) in BC.items()},
+            pool=str(input_paths(args)['pool']),pool_content_digest=DIGEST),
         confirmation=dict(plan_only=True,scenes=40,empty=8,nonempty=32,all_five_geometries=True,
             selection_seed=20261102,exclude='all training/calibration payload fingerprints plus old development pool',
             reporting=dict(macro='scene equal',subgroups='empty/nonempty, all five geometries, outcomes',
@@ -104,17 +116,19 @@ def preflight(args, *, cuda=True):
     if cuda and (not torch.cuda.is_available() or shutil.which('tmux') is None):
         raise RuntimeError('CUDA and tmux are required; no fallback or reduced concurrency.')
     result={}
-    for model,(relative,expected_hash) in BC.items():
-        path=REPO/relative
+    for model in sorted({j['model'] for j in selected_jobs(args)}):
+        relative,expected_hash=BC[model]
+        path=input_paths(args)['BC'][model]
         if sha256(path.read_bytes()).hexdigest()!=expected_hash: raise ValueError(f'{model} BC best SHA mismatch.')
-        job=next(j for j in matrix() if j['model']==model)
+        job=next(j for j in selected_jobs(args) if j['model']==model)
         config=make_config(job)
         prepared=prepare_v2_stage_initialization(config,init_checkpoint=path,device='cpu',model_type=model,rewards=research_rewards())
-        pool=load_v2_validation_pool(REPO/POOL,expected_level='easy',expected_count=100,
+        pool=load_v2_validation_pool(input_paths(args)['pool'],expected_level='easy',expected_count=100,
             expected_scenario=prepared.scenario_config,expected_uav_collision_radius=prepared.uav_collision_radius)
         if pool.content_digest!=DIGEST: raise ValueError('Fixed development pool digest mismatch.')
         from brain_uav.trainers.v2_validation import scenario_config_snapshot
-        result[model]=dict(path=str(path),sha256=expected_hash,pool_file_sha256=sha256((REPO/POOL).read_bytes()).hexdigest(),
+        result[model]=dict(path=str(path),sha256=expected_hash,pool_path=str(input_paths(args)['pool']),
+            pool_file_sha256=sha256(input_paths(args)['pool'].read_bytes()).hexdigest(),
             effective_formal_config=config.to_dict(),effective_reward_config=asdict(prepared.reward_config),
             effective_scenario_config=scenario_config_snapshot(prepared.scenario_config))
     return dict(inputs=result,source=source,source_manifest_sha256=sha256(Path(args.source_manifest).read_bytes()).hexdigest(),
@@ -162,13 +176,22 @@ def worker(args):
     try:
         manifest=json.loads((root/'manifest.json').read_text(encoding='utf-8'))
         if manifest['preflight']['source']['sha256']!=identity()['sha256']: raise ValueError('Worker source mismatch.')
-        config=make_config(job);bc=REPO/BC[job['model']][0]
-        if sha256(bc.read_bytes()).hexdigest()!=BC[job['model']][1]: raise ValueError('Worker BC identity mismatch.')
+        selection=manifest.get('plan',{}).get('jobs',matrix())
+        if job not in selection:raise ValueError('Worker not selected in manifest.')
+        scoring=manifest.get('plan',{}).get('bank_scoring','original')
+        if scoring not in ('original','isolated'):raise ValueError('Unknown bank scoring implementation.')
+        entry=manifest['preflight']['inputs'][job['model']]
+        config=make_config(job);bc=Path(entry.get('path',REPO/BC[job['model']][0]))
+        pool_path=Path(entry.get('pool_path',REPO/POOL))
+        summary.update(bank_scoring=scoring,selected_jobs=[j['id'] for j in selection],
+            actual_inputs=dict(BC=str(bc),pool=str(pool_path)),source=manifest['preflight']['source'])
+        if (sha256(bc.read_bytes()).hexdigest()!=BC[job['model']][1]
+                or entry.get('sha256',BC[job['model']][1])!=BC[job['model']][1]): raise ValueError('Worker BC identity mismatch.')
         prepared=prepare_v2_stage_initialization(config,init_checkpoint=bc,device='cuda',model_type=job['model'],rewards=research_rewards())
-        pool=load_v2_validation_pool(REPO/POOL,expected_level='easy',expected_count=100,
+        pool=load_v2_validation_pool(pool_path,expected_level='easy',expected_count=100,
             expected_scenario=prepared.scenario_config,expected_uav_collision_radius=prepared.uav_collision_radius)
         if pool.content_digest!=DIGEST: raise ValueError('Worker pool digest mismatch.')
-        pool_file_hash=sha256((REPO/POOL).read_bytes()).hexdigest()
+        pool_file_hash=sha256(pool_path.read_bytes()).hexdigest()
         if pool_file_hash!=manifest['preflight']['inputs'][job['model']]['pool_file_sha256']:
             raise ValueError('Worker pool file identity differs from preflight.')
         from brain_uav.scripts.diagnose_v2_wd3_acc import scene_key
@@ -184,6 +207,10 @@ def worker(args):
         from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
         initial['bc_reference_actor']=state_hash(engine.bc_reference_actor.state_dict())
         if job['target_config'] is not None: engine.configure_research_targets(job['target_config'])
+        if scoring=='isolated':
+            copies=deepcopy((engine.critic1,engine.critic2))
+            for critic in copies:critic.requires_grad_(False)
+            hook.bank_scorer=IsolatedScorer(copies)
         compilation=dict(defaults);compilation.pop('fused_adam');compilation.pop('reduce_update_stat_syncs')
         before_compile=time.perf_counter()
         compiled=_configure_stage_compilation(engine,pool,prepared,compile_critic_encoder=False,
@@ -193,7 +220,7 @@ def worker(args):
         after_compile['bc_reference_actor']=state_hash(engine.bc_reference_actor.state_dict())
         if initial!=after_compile:raise RuntimeError('Compilation/prewarm changed initial networks/Adam.')
         atomic_json(directory/'review/initialized.json',dict(job=job,initial_state_sha256=initial,
-            compilation=compiled,pid=os.getpid(),time=time.time()))
+            compilation=compiled,bank_scoring=scoring,pid=os.getpid(),time=time.time()))
         hook.status('initialized')
         gate_started=time.perf_counter()
         wait_for(root/'release.json',root,args.timeout)
@@ -203,7 +230,8 @@ def worker(args):
             scenario=prepared.scenario_config,rewards=prepared.reward_config,uav_collision_radius=prepared.uav_collision_radius,
             max_steps=500000,required_qualified_windows=config.consecutive_qualified_windows)
         reporter.start_stage(dict(research=True,formal_passed=False,job=job,initial_state_sha256=initial,
-            compilation=compiled,schedule_horizon_steps=500000))
+            compilation=compiled,bank_scoring=scoring,actual_inputs=summary['actual_inputs'],
+            selected_jobs=summary['selected_jobs'],schedule_horizon_steps=500000))
         saved=set();previous_snapshot_parameters=None
         def snapshot(requested,actual):
             nonlocal evaluation_seconds,previous_snapshot_parameters
@@ -233,7 +261,8 @@ def worker(args):
             before_evaluation=training_identity(engine,components.exploration_rng,components.selector)
             # Independent process owns all evaluation state/RNG/SNN resets.
             command=[sys.executable,'-u','-B','-m','brain_uav.scripts.run_v2_online_wd3_acc','evaluate',
-                '--checkpoint',str(path),'--root',str(directory/'other'/f'eval_{requested}_{actual}'),'--launch']
+                '--checkpoint',str(path),'--root',str(directory/'other'/f'eval_{requested}_{actual}'),
+                '--validation-pool',str(pool_path),'--expected-pool-file-sha256',pool_file_hash,'--launch']
             begin=time.perf_counter()
             subprocess.run(command,cwd=REPO,check=True)
             evaluation_elapsed=time.perf_counter()-begin
@@ -253,7 +282,7 @@ def worker(args):
         evaluation_during_training=evaluation_seconds;snapshot_during_training=hook.times.get('snapshot_seconds',0.)
         snapshot(400000,result.stage_steps)
         if (identity()['sha256']!=manifest['preflight']['source']['sha256'] or sha256(bc.read_bytes()).hexdigest()!=BC[job['model']][1]
-                or sha256((REPO/POOL).read_bytes()).hexdigest()!=pool_file_hash):
+                or sha256(pool_path.read_bytes()).hexdigest()!=pool_file_hash):
             raise RuntimeError('Research input/source changed during execution.')
         execution=engine.local_optimization_metadata()
         compute=execution['gpu_td3_compute']
@@ -266,7 +295,7 @@ def worker(args):
             initial_gate_wait_seconds=gate_seconds,training_loop_wall_inclusive_seconds=train_wall,
             training_wall_seconds=train_wall-hook.times['pause_seconds']-evaluation_during_training-snapshot_during_training-hook.times['acc_seconds']
                 -compute.get('capture_seconds',0.)-compute.get('initialization_seconds',0.),
-            actual_concurrency={j['id']:json.loads(p.read_text(encoding='utf-8')) if (p:=root/j['id']/'review/progress.json').exists() else None for j in matrix()},
+            actual_concurrency={j['id']:json.loads(p.read_text(encoding='utf-8')) if (p:=root/j['id']/'review/progress.json').exists() else None for j in selection},
             **hook.times,initial_state_sha256=initial,
             acc=None if hook.acc is None else {k:v for k,v in hook.acc.state().items() if k!='episodes'})
         hook.status('completed_budget',stage_steps=result.stage_steps)
@@ -292,12 +321,13 @@ def verify_initializations(root,jobs):
         summaries.append(value)
     for model in ('ann','snn'):
         selected=[v['initial_state_sha256'] for v in summaries if v['job']['model']==model]
-        if len(selected)!=8 or any(v!=selected[0] for v in selected): raise ValueError('Same-model initial state hashes differ.')
+        if selected and any(v!=selected[0] for v in selected): raise ValueError('Same-model initial state hashes differ.')
     return summaries
 
 
 def launch(args):
     if args.python!=PYTHON: raise ValueError('Use the declared server Python; no silent environment substitution.')
+    jobs=selected_jobs(args)
     args.root.mkdir(parents=True,exist_ok=False)
     started=[]
     try:
@@ -305,23 +335,25 @@ def launch(args):
         if tmux(args,'has-session','-t',args.session,check=False).returncode==0: raise FileExistsError('tmux session already exists.')
         manifest=dict(plan=plan(args),preflight=evidence,session=args.session,socket=args.socket,time=time.time())
         atomic_json(args.root/'manifest.json',manifest)
-        for index,job in enumerate(matrix()):
+        for index,job in enumerate(jobs):
             (args.root/job['id']/'review').mkdir(parents=True)
             command=shlex.join(['bash',str(REPO/'scripts/online_v2_wd3_acc.sh'),'--worker-run',str(args.root),job['id'],args.python,str(args.timeout)])
             if index==0: tmux(args,'new-session','-d','-s',args.session,'-n',job['id'],command)
             else: tmux(args,'new-window','-d','-t',args.session,'-n',job['id'],command)
             started.append(job['id'])
         atomic_json(args.root/'review_dispatch.json',dict(dispatched=started,not_dispatched=[],training_released=False))
-        for job in matrix(): wait_for(args.root/job['id']/'review/initialized.json',args.root,args.timeout)
-        initial=verify_initializations(args.root,matrix())
-        if len({v['pid'] for v in initial})!=16:raise ValueError('Workers must have sixteen independent live PIDs.')
+        for job in jobs: wait_for(args.root/job['id']/'review/initialized.json',args.root,args.timeout)
+        initial=verify_initializations(args.root,jobs)
+        if any(v.get('bank_scoring',args.bank_scoring)!=args.bank_scoring for v in initial):
+            raise ValueError('Worker bank scoring implementation differs from plan.')
+        if len({v['pid'] for v in initial})!=len(jobs):raise ValueError('Workers must have independent live PIDs.')
         for v in initial:os.kill(v['pid'],0)  # read-only existence probe before release
         if (args.root/'abort.json').exists():raise RuntimeError('Initialization aborted before release.')
         atomic_json(args.root/'release.json',dict(time=time.time(),initialization_checked=True,pids=[v['pid'] for v in initial]))
-        print('All 16 initialized and released; training is NOT completed.',flush=True)
+        print(f'All {len(jobs)} initialized and released; training is NOT completed.',flush=True)
     except BaseException as exc:
         atomic_json(args.root/'abort.json',dict(error=str(exc),started=started,
-            not_started=[j['id'] for j in matrix() if j['id'] not in started],training_released=False))
+            not_started=[j['id'] for j in jobs if j['id'] not in started],training_released=False))
         print(f'Batch blocked: {exc}; initialized jobs will exit before training. Logs: {args.root}',file=sys.stderr,flush=True)
         raise
 
@@ -335,6 +367,11 @@ def parser():
     p.add_argument('--model',choices=('ann','snn'),default='snn')
     p.add_argument('--job',choices=tuple(j['id'] for j in matrix()))
     p.add_argument('--jobs',nargs='+',choices=tuple(j['id'] for j in matrix()))
+    p.add_argument('--bank-scoring',choices=('original','isolated'),default='original')
+    p.add_argument('--ann-bc',type=Path)
+    p.add_argument('--snn-bc',type=Path)
+    p.add_argument('--validation-pool',type=Path)
+    p.add_argument('--expected-pool-file-sha256')
     p.add_argument('--session',default='uav_online_wd3_acc')
     p.add_argument('--socket')
     p.add_argument('--python',default=PYTHON)

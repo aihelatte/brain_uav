@@ -1,5 +1,72 @@
 # WD3 / ACC 在线研究（待审，未运行）
 
+## 四组ACC有限研究补跑（2026-11-03，接线待审）
+
+仅`ann_acc_001 ann_acc_010 snn_acc_001 snn_acc_010`，从各自BC best重新开始；
+旧失败权重不是精确恢复。500k日程、200k完整episode收尾/保存/冻结评估后原进程暂停、
+400k硬上限及显式继续令牌规则不变。新批次不自动继续，不重跑其余12组。
+`--jobs`现在也限定launch，计划、预检模型集合、派发、初始化摘要和统一放行共用同一集合。
+不传时仍为原16组。全部所选初始化完成、同模型摘要一致、独立PID存活后才放行。
+
+`--bank-scoring isolated`仅显式在线研究选择，默认仍original。复用
+`trainers.v2_online_research.IsolatedScorer`（独立诊断也导入此实现），编译前创建冻结eager
+critic副本，每次评分前严格同步live权重。无参数共享，不切live模式，不全局monkey patch。
+ACC公式、eta=.01/.1、完整bank、beta及更新频率、TD损失和更新次数不变；G仅供反馈。
+initialized/stage_start/summary记录评分实现、选中组、源码、输入及初始化摘要；原controls轨迹保留。
+
+只读核对已有产物：原SNN路径前6次完成、第7次缓存复用非法访问；候选24次更新、7图、
+24次重放、三种模式覆盖。前6次每次1463个状态张量逐值相同，controller通过；
+少数Q1评分仍超出原容差，`snn_prefix_comparison.json`的`prefix_strict_passed=false`保留。
+独立beta严格验收通过是已有证据。本次接线不代表长期稳定、完全数值等价或ACC效果通过。
+
+使用独立已审源码目录；绝不对有暂停进程的`/home/zj/projects/my_project`执行git pull、
+写入、tmux操作或继续令牌操作。外部BC/固定池只读、绝对路径，不复制、不生成、不用软链接。
+预检封存实际路径/raw SHA256，worker从manifest读取，评估子进程显式接收相同pool路径
+及文件hash并在加载前校验；pool加载器仍校验easy/100场/content_digest及场景契约。
+结束时重新核对源码/BC/pool。源码清单CRLF→LF，历史输入仍raw hash，旧历史清单不更新。
+
+以下命令**仅草案，本轮未执行**。默认打印计划，无目录/任务创建；审查后才显式加`--launch`。
+新会话/新socket/新批次均与旧实验隔离；shell入口保存各worker tee日志、退出码和耗时。
+
+```bash
+uav_acc_four() {
+  local code=/home/zj/diagnostics/my_project_acc_isolated_20261103
+  local old=/home/zj/projects/my_project
+  local py=/home/zj/envs/uav_torch/bin/python
+  local root="/home/zj/diagnostics/outputs/v2_acc_four_$(date +%Y%m%d_%H%M%S_%N)"
+  local rc start
+  cd -- "$code" || return 1
+  local cmd=("$py" -u -B -m brain_uav.scripts.run_v2_online_wd3_acc launch
+    --root "$root" --source-manifest "$code/scripts/v2_online_wd3_acc_source.json"
+    --jobs ann_acc_001 ann_acc_010 snn_acc_001 snn_acc_010 --bank-scoring isolated
+    --ann-bc "$old/outputs/v2_projected_head_round1/ann_20261012_102839/bc/bc_v2_ann_best.pt"
+    --snn-bc "$old/outputs/v2_projected_head_round1/snn_20261012_102848/bc/bc_v2_snn_best.pt"
+    --validation-pool "$old/outputs/v2_box085_round1_20261003_003948/validation_pools_600km_seed20260904/v2_validation_easy.json"
+    --session "acc_four_$(date +%Y%m%d_%H%M%S)" --socket acc_isolated_20261103)
+  if [[ "$1" != --launch ]]; then
+    PYTHONPATH=src "${cmd[@]}"
+    return $?
+  fi
+  mkdir -p -- "$(dirname -- "$root")" || return 1
+  start=$SECONDS
+  PYTHONPATH=src "${cmd[@]}" --launch 2>&1 | tee "$root.driver.log"
+  rc=${PIPESTATUS[0]}
+  printf 'exit_code=%s dispatch_wall_seconds=%s\n' "$rc" "$((SECONDS-start))" | tee -a "$root.driver.log"
+  return "$rc"
+}
+uav_acc_four
+# 审查后才运行：uav_acc_four --launch
+```
+
+派发成功不等于训练完成；200k会原地暂停。每worker的review含initialized/progress/summary/
+driver.log/process.json，other含controls、metrics_reports、研究快照及冻结评估。
+本地mock不证明Linux tmux、CUDA或四组长期稳定性。
+
+本轮本地回归沿用文末命令，额外加入`test_diagnose_v2_online_followup.TestFollowup`：
+共88项，87通过、1跳过（原只读BC/池夹具未挂载）。新增三项覆盖四组派发/初始化阻断、
+共享评分权重同步和live状态隔离、评估外部pool及原始hash检查；原worker集成用例同时
+验证manifest外部路径到评估命令及评分实现透传。Python AST、Bash -n、diff空白和清单均检查。
+
 实施计划：按附件锁定的16组合同，先验证逐支目标与ACC控制，再接真实eager/共享编译/GPUCompute，
 然后给原trainer增加默认空的研究hook（不复制训练循环），最后接独立研究快照、评估、
 tmux整批初始化门控、存活进程暂停及有界CUDA验收。旧固定actor工具不修改。

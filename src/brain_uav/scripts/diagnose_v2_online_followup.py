@@ -17,7 +17,7 @@ import torch
 from brain_uav.scripts import diagnose_v2_critic_calibration as cal
 from brain_uav.scripts import run_v2_online_wd3_acc as research
 from brain_uav.scripts.diagnose_v2_policy import file_sha256, _write_json
-from brain_uav.trainers.v2_online_research import OnlineResearch, predict_bank, training_identity, validate_snapshot
+from brain_uav.trainers.v2_online_research import OnlineResearch, IsolatedScorer, predict_bank, training_identity, validate_snapshot
 
 SNN_ARMS=('min','mean','fixed_own','wd3_045','wd3_015')
 RTOL,ATOL=1e-4,1e-5
@@ -355,21 +355,6 @@ def inference(args,inputs,output):
         coverage='32 fixed historical states, A-A/A-B-A; not a long-term protocol exclusion')
 
 
-class IsolatedScorer:
-    """Eager copies created pre-compile; never toggle live module state/addresses."""
-    def __init__(self,copies):
-        if any(c.zone_set_encoder.compiled_tensor_forward_enabled for c in copies):
-            raise ValueError('Isolated critics must be created before compilation.')
-        self.copies=copies
-
-    def __call__(self,engine,rows):
-        for live,copy in zip((engine.critic1,engine.critic2),self.copies):
-            if {p.data_ptr() for p in live.parameters()} & {p.data_ptr() for p in copy.parameters()}:
-                raise ValueError('Isolated scorer shares live parameter storage.')
-            copy.load_state_dict(live.state_dict(),strict=True)
-        return predict_bank(SimpleNamespace(critic1=self.copies[0],critic2=self.copies[1],device=engine.device),rows)
-
-
 def bank_episode(hook,engine,episode,stage,scorer):
     """Real OnlineResearch.episode -> complete_episode -> predict_bank -> adjust."""
     scores=[];started=time.perf_counter()
@@ -386,7 +371,7 @@ def bank_episode(hook,engine,episode,stage,scorer):
         collected_stage_step=stage-len(episode)+1+i,done=r['done']) for i,r in enumerate(episode)]
     trainer=SimpleNamespace(engine=engine,result=SimpleNamespace(stage_steps=stage))
     # Only dispatch the diagnostic scorer; the real hook and controller remain intact.
-    with patch('brain_uav.trainers.v2_online_research.predict_bank',side_effect=observed):hook.episode(trainer,rows)
+    with patch.object(hook,'bank_scorer',observed):hook.episode(trainer,rows)
     return dict(scores=scores,control=deepcopy(hook.acc.controls[-1]) if hook.acc.controls else None,
         beta=engine.research_beta,seconds=time.perf_counter()-started,
         synthetic_stage_steps=stage,source_episode_steps=[episode[0]['step'],episode[-1]['step']])

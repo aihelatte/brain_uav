@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import random
 import time
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -100,6 +101,21 @@ def predict_bank(engine, rows):
     return np.asarray(result)
 
 
+class IsolatedScorer:
+    """Eager copies created pre-compile; never toggle live module state/addresses."""
+    def __init__(self,copies):
+        if any(c.zone_set_encoder.compiled_tensor_forward_enabled for c in copies):
+            raise ValueError('Isolated critics must be created before compilation.')
+        self.copies=copies
+
+    def __call__(self,engine,rows):
+        for live,copy in zip((engine.critic1,engine.critic2),self.copies):
+            if {p.data_ptr() for p in live.parameters()} & {p.data_ptr() for p in copy.parameters()}:
+                raise ValueError('Isolated scorer shares live parameter storage.')
+            copy.load_state_dict(live.state_dict(),strict=True)
+        return predict_bank(SimpleNamespace(critic1=self.copies[0],critic2=self.copies[1],device=engine.device),rows)
+
+
 class OnlineResearch:
     """In-process pause keeps the trainer stack/replay/RNG/Adam/CUDA alive."""
     hard_limit=400000
@@ -112,6 +128,7 @@ class OnlineResearch:
         self.paused_once=False;self.times=dict(acc_seconds=0.,pause_seconds=0.,evaluation_seconds=0.)
         self.forbidden_scene_keys=set()
         self.update_statistics=[]
+        self.bank_scorer=None  # explicit research override; original path remains default
 
     def status(self,state,**extra):
         record=dict(state=state,pid=os.getpid(),arm=self.arm,time=time.time(),times=self.times,**extra)
@@ -124,7 +141,8 @@ class OnlineResearch:
         started=self.clock()
         rows=[dict(observation=t.observation,action=t.action.copy(),reward=t.reward,step=t.collected_stage_step,done=t.done) for t in transitions]
         self.acc.complete_episode(rows,trainer.result.stage_steps,'training')
-        record=self.acc.adjust(trainer.result.stage_steps,lambda bank:predict_bank(trainer.engine,bank))
+        record=self.acc.adjust(trainer.result.stage_steps,lambda bank:
+            (predict_bank if self.bank_scorer is None else self.bank_scorer)(trainer.engine,bank))
         if record is not None:
             trainer.engine.set_research_beta(self.acc.beta)
             path=self.directory/'other/controls.jsonl';path.parent.mkdir(parents=True,exist_ok=True)

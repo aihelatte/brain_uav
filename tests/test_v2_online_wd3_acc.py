@@ -12,6 +12,83 @@ from brain_uav.config import ScenarioConfig,RewardConfig
 
 
 class TestOnlineTargets(unittest.TestCase):
+    def test_four_acc_selection_plan_preflight_dispatch_and_release(self):
+        import json
+        from types import SimpleNamespace
+        from contextlib import redirect_stdout
+        from io import StringIO
+        from brain_uav.scripts import run_v2_online_wd3_acc as r
+        ids=['ann_acc_001','ann_acc_010','snn_acc_001','snn_acc_010']
+        for failure in (None,'mismatch','missing'):
+            with self.subTest(failure=failure),TemporaryDirectory() as tmp:
+                args=r.parser().parse_args(['launch','--root',str(Path(tmp)/'batch'),'--jobs',*ids,
+                    '--bank-scoring','isolated','--ann-bc',str(Path(tmp)/'ann.pt'),
+                    '--snn-bc',str(Path(tmp)/'snn.pt'),'--validation-pool',str(Path(tmp)/'pool.json')])
+                with patch.object(r,'launch',side_effect=AssertionError('plan must not launch')),redirect_stdout(StringIO()) as stream:
+                    argv=['launch','--root',str(args.root),'--jobs',*ids,'--bank-scoring','isolated']
+                    self.assertEqual(r.main(argv),0)
+                self.assertEqual([j['id'] for j in json.loads(stream.getvalue())['jobs']],ids)
+                jobs=r.selected_jobs(args);calls=[]
+                def preflight(actual):
+                    self.assertEqual(r.selected_jobs(actual),jobs)
+                    self.assertEqual(r.input_paths(actual)['pool'],args.validation_pool)
+                    return {}
+                def tmux(actual,*cmd,check=True):
+                    if cmd[0]=='has-session':return SimpleNamespace(returncode=1)
+                    job=jobs[len(calls)];calls.append(job['id'])
+                    initial={'all':job['model'] if failure!='mismatch' or len(calls)!=2 else 'wrong'}
+                    r.atomic_json(args.root/job['id']/'review/initialized.json',dict(job=job,pid=len(calls),initial_state_sha256=initial))
+                    return SimpleNamespace(returncode=0)
+                def wait(path,*a):
+                    if failure=='missing':raise TimeoutError('initialization incomplete')
+                with patch.object(r,'preflight',side_effect=preflight),patch.object(r,'tmux',side_effect=tmux), \
+                        patch.object(r,'wait_for',side_effect=wait),patch.object(r.os,'kill'):
+                    if failure:
+                        with self.assertRaises((ValueError,TimeoutError)):r.launch(args)
+                    else:r.launch(args)
+                self.assertEqual(calls,ids)
+                self.assertEqual((args.root/'release.json').exists(),failure is None)
+                self.assertEqual(sorted(p.name for p in args.root.iterdir() if p.is_dir()),sorted(ids))
+                self.assertEqual([j['id'] for j in json.loads((args.root/'manifest.json').read_text())['plan']['jobs']],ids)
+
+    def test_shared_isolated_scorer_sync_and_state_purity(self):
+        from brain_uav.trainers.v2_online_research import IsolatedScorer,predict_bank,training_identity
+        from brain_uav.scripts.diagnose_v2_online_followup import IsolatedScorer as diagnostic_scorer
+        from test_v2_td3 import _observation
+        self.assertIs(IsolatedScorer,diagnostic_scorer)
+        engine=f._engine(ScenarioConfig());copies=deepcopy((engine.critic1,engine.critic2))
+        for critic in copies:critic.requires_grad_(False)
+        scorer=IsolatedScorer(copies)
+        rows=[dict(observation=_observation(0,scales=engine.actor.scales),action=np.zeros(2,dtype=np.float32))]
+        for iteration in range(2):
+            with torch.no_grad():next(engine.critic1.parameters()).add_(.1)
+            before=training_identity(engine);modes=[m.training for m in (engine.actor,engine.critic1,engine.critic2)]
+            np.testing.assert_allclose(scorer(engine,rows),predict_bank(engine,rows),rtol=1e-4,atol=1e-5)
+            self.assertEqual(training_identity(engine),before)
+            self.assertEqual(modes,[m.training for m in (engine.actor,engine.critic1,engine.critic2)])
+            for live,copy in zip((engine.critic1,engine.critic2),copies):
+                self.assertFalse({p.data_ptr() for p in live.parameters()} & {p.data_ptr() for p in copy.parameters()})
+                for k,v in live.state_dict().items():self.assertTrue(torch.equal(v,copy.state_dict()[k]))
+
+    def test_external_pool_evaluation_checks_worker_hash_before_loading(self):
+        from types import SimpleNamespace
+        from brain_uav.scripts import diagnose_v2_online_research as diagnostic
+        from brain_uav.scripts import run_v2_online_wd3_acc as r
+        from hashlib import sha256
+        with TemporaryDirectory() as tmp:
+            root=Path(tmp);pool=root/'external.json';checkpoint=root/'snapshot.pt'
+            pool.write_bytes(b'pool');checkpoint.write_bytes(b'checkpoint')
+            expected=sha256(pool.read_bytes()).hexdigest()
+            args=r.parser().parse_args(['evaluate','--checkpoint',str(checkpoint),'--validation-pool',str(pool),
+                '--expected-pool-file-sha256',expected])
+            with patch.object(diagnostic.cal.base,'load_models',side_effect=RuntimeError('reached loader')) as load, \
+                    patch.object(r,'identity',return_value={}):
+                with self.assertRaisesRegex(RuntimeError,'reached loader'):diagnostic.evaluate(args,root)
+                self.assertEqual(load.call_args.args[1],pool)
+                load.reset_mock();pool.write_bytes(b'replacement')
+                with self.assertRaisesRegex(ValueError,'pool differs'):diagnostic.evaluate(args,root)
+                load.assert_not_called()
+
     def test_research_target_endpoints_and_done(self):
         self.assertTrue(hasattr(td, 'research_target_pair'))
         a=torch.tensor([[2.],[8.]]); b=torch.tensor([[6.],[4.]])
@@ -317,8 +394,10 @@ class TestOnlineTargets(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root=Path(directory);bc=root/'best.pt';bc.write_bytes(b'mock');pool=root/'pool.json';pool.write_bytes(b'pool')
             job='ann_wd3_045';(root/job/'review').mkdir(parents=True)
-            atomic_json(root/'manifest.json',{'preflight':{'source':r.identity(),
-                'inputs':{'ann':{'pool_file_sha256':__import__('hashlib').sha256(pool.read_bytes()).hexdigest()}}}})
+            selected=[j for j in r.matrix() if j['id']==job]
+            atomic_json(root/'manifest.json',{'plan':{'jobs':selected,'bank_scoring':'isolated'},'preflight':{'source':r.identity(),
+                'inputs':{'ann':{'path':str(bc),'pool_path':str(pool),
+                    'pool_file_sha256':__import__('hashlib').sha256(pool.read_bytes()).hexdigest()}}}})
             atomic_json(root/'release.json',{'mock_only':True})
             args=r.parser().parse_args(['worker','--root',str(root),'--job',job,'--launch'])
             with patch.object(r,'BC',{'ann':(bc,__import__('hashlib').sha256(bc.read_bytes()).hexdigest())}), \
@@ -339,9 +418,15 @@ class TestOnlineTargets(unittest.TestCase):
             self.assertTrue(compile_.call_args.kwargs['compile_actor_loss'])
             self.assertTrue(reporter.return_value.start_stage.called)
             self.assertEqual(evaluate.call_count,2)
+            for call in evaluate.call_args_list:
+                command=call.args[0]
+                self.assertEqual(command[command.index('--validation-pool')+1],str(pool))
+                self.assertEqual(command[command.index('--expected-pool-file-sha256')+1],__import__('hashlib').sha256(pool.read_bytes()).hexdigest())
+            self.assertIsNotNone(observed['online_research'].bank_scorer)
             self.assertEqual(observed['bc_schedule'],'smooth-mid-strong')
             result=json.loads((root/job/'review/summary.json').read_text())
             self.assertTrue(result['execution_completed']);self.assertFalse(result['formal_passed'])
+            self.assertEqual(result['bank_scoring'],'isolated');self.assertEqual(result['selected_jobs'],[job])
             self.assertEqual(json.loads((root/job/'review/progress.json').read_text())['state'],'completed_budget')
 
     def test_acc_tail_never_becomes_complete_g_bank(self):
