@@ -45,6 +45,7 @@
     "src/brain_uav/scripts/diagnose_v2_critic.py": "44519ac5829d807f29b3bd1beae03fed30f0f0f2aab440c4f8c815ad5622a0a0",
     "src/brain_uav/scripts/diagnose_v2_critic_calibration.py": "b502f2f0a2dd3c82648a3582e1213a53802723ad83c3dc2575b469f4c20190c3",
     "src/brain_uav/scripts/diagnose_v2_mc_return_cuda.py": "8139bae13dd3f74ba9bd5e6f47096d34536603ed9ab61de1312baa08e3cf3c2a",
+    "src/brain_uav/scripts/diagnose_v2_online_confirmation.py": "5b8facd75c957a958b0778f2b3233c77d04d9975fbf4576a995d897ca591c3a2",
     "src/brain_uav/scripts/diagnose_v2_online_followup.py": "6c00643cc148a26284b1e2928ffb4443589d28a929c99ed48159dabb349bc600",
     "src/brain_uav/scripts/diagnose_v2_online_research.py": "b51c691ae21b57acfa1765be7e67d300634b3f5ae1e62684564f91898f6e55bc",
     "src/brain_uav/scripts/diagnose_v2_policy.py": "bcee0867a7779be5fc765e3d019c54869d63e946ddf82680b34c250523f0dd44",
@@ -108,6 +109,6 @@
     "scripts/online_v2_wd3_acc.sh": "3a32ab7ca0146eccc30b973f4ded578b37cb7faa408db21e898f6d5fd694ea9e"
   },
   "source_hash_normalization": "CRLF-to-LF",
-  "HEAD": "000b977c5feb8c047c5c044075e2729bea292183",
-  "status": "M docs/v2_online_wd3_acc.md\n M scripts/v2_online_wd3_acc_source.json\n M src/brain_uav/envs/v2_static_no_fly_env.py\n M src/brain_uav/scripts/diagnose_v2_online_followup.py\n M src/brain_uav/scripts/diagnose_v2_online_research.py\n M src/brain_uav/scripts/run_v2_online_wd3_acc.py\n M src/brain_uav/trainers/v2_online_research.py\n M tests/test_v2_online_wd3_acc.py\n M tests/test_v2_static_no_fly_env.py\n?? AGENTS.md\n?? diagnostics/\n?? docs/superpowers/"
+  "HEAD": "48af1a72ab555c66b92d7b3c8c22ed3f7b38f183",
+  "status": "M scripts/v2_online_wd3_acc_source.json\n M src/brain_uav/envs/v2_static_no_fly_env.py\n M tests/test_v2_static_no_fly_env.py\n?? AGENTS.md\n?? diagnostics/\n?? docs/superpowers/\n?? docs/v2_online_confirmation.md\n?? src/brain_uav/scripts/diagnose_v2_online_confirmation.py\n?? tests/test_diagnose_v2_online_confirmation.py"
 }
