@@ -12,6 +12,102 @@ from brain_uav.config import ScenarioConfig,RewardConfig
 
 
 class TestOnlineTargets(unittest.TestCase):
+    def test_complete_seed_manifest_real_cpu_prepare_build(self):
+        from dataclasses import replace
+        import test_v2_bc as fixtures
+        from brain_uav.trainers import v2_bc as bc,v2_formal_training as formal
+        from brain_uav.models import V2ANNPolicyActor
+        from brain_uav.observations import V2ObservationScales
+        from brain_uav.scripts import run_v2_online_wd3_acc as r
+        from brain_uav.v2_curriculum import derive_v2_component_seed
+        with TemporaryDirectory() as tmp:
+            root=Path(tmp);original=fixtures.make_scenario_payload
+            def scenario_payload(*a):
+                value=original(*a);value['metadata']['requested_direct_path_blocker']=False
+                return value
+            with patch.object(fixtures,'make_scenario_payload',side_effect=scenario_payload):
+                cluster=bc.load_v2_bc_trajectory_cluster(fixtures.write_cluster(root/'cluster',zone_counts=(0,1)))
+            split=bc.split_v2_bc_scenarios(cluster,validation_fraction=.5,seed=7)
+            s=cluster.scenario_config
+            actor=V2ANNPolicyActor(V2ObservationScales(s.world_xy,s.world_z_min,s.world_z_max,s.gamma_max),
+                2,8,torch.tensor([s.delta_gamma_max,s.delta_psi_max],dtype=torch.float32))
+            state=deepcopy(actor.state_dict());path=root/'best.pt'
+            torch.save(bc.build_v2_bc_checkpoint_payload(checkpoint_kind='best',actor=actor,actor_state_dict=state,
+                cluster=cluster,split=split,config=bc.V2BCTrainingConfig(1,2,.001,7,.5),
+                result=bc.V2BCTrainingResult((0.,),(0.,),1,0.,state,state),finished_at='CPU fixture'),path)
+            for seed in (7,23):
+                config=replace(r.make_config(r.matrix(seed)[0]),replay_capacity=16,batch_size=2)
+                prepared=formal.prepare_v2_stage_initialization(config,init_checkpoint=path,device='cpu',model_type='ann',rewards=r.research_rewards())
+                components=formal.build_v2_stage_engine(None,config,init_checkpoint=path,device='cpu',model_type='ann',prepared_initialization=prepared)
+                r.validate_seed_manifest(config,components.seed_manifest)
+                for level in config.curriculum_mix:
+                    key=f'{level}_generator_seed'
+                    self.assertEqual(components.seed_manifest[key],derive_v2_component_seed(seed,config.stage,f'{level}_generator'))
+                    for corrupt in ('missing','changed'):
+                        bad=dict(components.seed_manifest)
+                        if corrupt=='missing':bad.pop(key)
+                        else:bad[key]+=1
+                        with self.subTest(seed=seed,level=level,corrupt=corrupt),self.assertRaises(ValueError):
+                            r.validate_seed_manifest(config,bad)
+                bad=dict(components.seed_manifest,unexpected_seed=1)
+                with self.assertRaises(ValueError):r.validate_seed_manifest(config,bad)
+
+    def test_seed_defaults_invalid_values_and_three_job_dispatch(self):
+        import json,shlex
+        from types import SimpleNamespace
+        from brain_uav.scripts import run_v2_online_wd3_acc as r
+        self.assertEqual(r.make_config(r.matrix()[0]).seed,23)
+        for bad in (-1,True,1.5):
+            with self.assertRaises(ValueError):r.matrix(bad)
+        with self.assertRaises(ValueError):r.main(['--seed','-1'])
+        ids=['snn_min','snn_fixed_own','snn_acc_001']
+        for failure in (None,'job','formal'):
+            with TemporaryDirectory() as temp:
+                args=r.parser().parse_args(['launch','--root',str(Path(temp)/'batch'),'--seed','7',
+                    '--jobs',*ids,'--bank-scoring','isolated'])
+                jobs=r.selected_jobs(args);calls=[]
+                self.assertTrue(all(j['seed']==7 and r.make_config(j).seed==7 for j in r.plan(args)['jobs']))
+                def tmux(args,*cmd,check=True):
+                    if cmd[0]=='has-session':return SimpleNamespace(returncode=1)
+                    job=deepcopy(jobs[len(calls)]);calls.append(shlex.split(cmd[-1]))
+                    self.assertEqual(calls[-1][-1],'7')
+                    formal=7
+                    if len(calls)==3:
+                        if failure=='job':job['seed']=23
+                        if failure=='formal':formal=23
+                    r.atomic_json(args.root/job['id']/'review/initialized.json',dict(job=job,formal_seed=formal,
+                        initial_state_sha256={'same':'snn'},pid=len(calls),bank_scoring='isolated'))
+                    return SimpleNamespace(returncode=0)
+                with patch.object(r,'preflight',return_value={}),patch.object(r,'tmux',side_effect=tmux),patch.object(r.os,'kill'):
+                    if failure:
+                        with self.assertRaises(ValueError):r.launch(args)
+                    else:r.launch(args)
+                self.assertEqual(len(calls),3);self.assertEqual((args.root/'release.json').exists(),failure is None)
+                manifest=json.loads((args.root/'manifest.json').read_text())
+                self.assertEqual([j['id'] for j in manifest['plan']['jobs']],ids)
+                for job in ids:
+                    args.job=job
+                    actual,selection,config=r.worker_job(args,manifest)
+                    self.assertEqual((actual['seed'],config.seed),(7,7))
+                args.seed=23
+                with self.assertRaises(ValueError):r.worker_job(args,manifest)
+                args.seed=7
+                with patch.object(r,'make_config',return_value=SimpleNamespace(seed=23)):
+                    with self.assertRaisesRegex(ValueError,'formal config'):r.worker_job(args,manifest)
+                for mode in ('continue','status'):
+                    with self.assertRaisesRegex(ValueError,'seed'):
+                        r.main([mode,'--root',str(args.root),'--seed','23','--jobs',*ids,'--launch'])
+                if failure is None:
+                    for job in ids:
+                        r.atomic_json(args.root/job/'review/progress.json',dict(state='paused_at_200k',pid=123,
+                            arm=job.split('_',1)[1],actual_step=200001))
+                    original_exists=Path.exists;original_read=Path.read_bytes
+                    with patch.object(r.os,'kill'), \
+                         patch.object(Path,'exists',lambda p:True if str(p).replace('\\','/').startswith('/proc/') else original_exists(p)), \
+                         patch.object(Path,'read_bytes',lambda p:b'run_v2_online_wd3_acc snn_min snn_fixed_own snn_acc_001' if str(p).replace('\\','/').startswith('/proc/') else original_read(p)):
+                        r.main(['continue','--root',str(args.root),'--seed','7','--jobs',*ids,'--launch'])
+                    self.assertTrue(all((args.root/j/'continue_to_400k.json').exists() for j in ids))
+
     def test_four_acc_selection_plan_preflight_dispatch_and_release(self):
         import json
         from types import SimpleNamespace
@@ -37,7 +133,7 @@ class TestOnlineTargets(unittest.TestCase):
                     if cmd[0]=='has-session':return SimpleNamespace(returncode=1)
                     job=jobs[len(calls)];calls.append(job['id'])
                     initial={'all':job['model'] if failure!='mismatch' or len(calls)!=2 else 'wrong'}
-                    r.atomic_json(args.root/job['id']/'review/initialized.json',dict(job=job,pid=len(calls),initial_state_sha256=initial))
+                    r.atomic_json(args.root/job['id']/'review/initialized.json',dict(formal_seed=job['seed'],job=job,pid=len(calls),initial_state_sha256=initial))
                     return SimpleNamespace(returncode=0)
                 def wait(path,*a):
                     if failure=='missing':raise TimeoutError('initialization incomplete')
@@ -243,9 +339,9 @@ class TestOnlineTargets(unittest.TestCase):
         from brain_uav.trainers.v2_online_research import atomic_json
         with TemporaryDirectory() as root:
             root=Path(root);jobs=r.matrix()
-            for job in jobs:atomic_json(root/job['id']/'review/initialized.json',dict(job=job,initial_state_sha256={'all':job['model']}))
+            for job in jobs:atomic_json(root/job['id']/'review/initialized.json',dict(formal_seed=job['seed'],job=job,initial_state_sha256={'all':job['model']}))
             self.assertEqual(len(r.verify_initializations(root,jobs)),16)
-            atomic_json(root/jobs[-1]['id']/'review/initialized.json',dict(job=jobs[-1],initial_state_sha256={'all':'wrong'}))
+            atomic_json(root/jobs[-1]['id']/'review/initialized.json',dict(formal_seed=jobs[-1]['seed'],job=jobs[-1],initial_state_sha256={'all':'wrong'}))
             with self.assertRaises(ValueError):r.verify_initializations(root,jobs)
 
     def test_real_shared_compute_matches_eager_all_three_modes_cpu(self):
@@ -325,7 +421,7 @@ class TestOnlineTargets(unittest.TestCase):
                     count=sum(c[0] in ('new-session','new-window') for c in calls)
                     if fail and count==5:raise subprocess.CalledProcessError(1,cmd)
                     job=r.matrix()[count-1]
-                    atomic_json(root/job['id']/'review/initialized.json',dict(job=job,pid=count,initial_state_sha256={'all':job['model']}))
+                    atomic_json(root/job['id']/'review/initialized.json',dict(formal_seed=job['seed'],job=job,pid=count,initial_state_sha256={'all':job['model']}))
                     return SimpleNamespace(returncode=0)
                 with patch.object(r,'preflight',return_value={}),patch.object(r,'tmux',side_effect=tmux),patch.object(r.os,'kill',return_value=None):
                     if fail:
@@ -380,10 +476,14 @@ class TestOnlineTargets(unittest.TestCase):
         from brain_uav.trainers.v2_formal_training import V2FormalTrainingConfig,V2FormalTrainingResult
         from brain_uav.trainers.v2_online_research import atomic_json
         scenario=ScenarioConfig();engine=f._engine(scenario)
-        cfg=V2FormalTrainingConfig(stage='easy',max_steps=500000,batch_size=2)
+        cfg=V2FormalTrainingConfig(stage='easy',seed=7,max_steps=500000,batch_size=2)
         prepared=SimpleNamespace(scenario_config=scenario,reward_config=r.research_rewards(),uav_collision_radius=0.)
+        from brain_uav.v2_curriculum import derive_v2_component_seed
         components=SimpleNamespace(engine=engine,scenario_generators={},selector=None,exploration_rng=None,
-            seed_manifest={'base_seed':23},initialization_source={'kind':'mock_only'})
+            seed_manifest={'base_seed':7,**{f'{k}_seed':derive_v2_component_seed(7,'easy',k)
+                for k in ('model','replay','curriculum','exploration')},
+                **{f'{level}_generator_seed':derive_v2_component_seed(7,'easy',f'{level}_generator')
+                    for level in cfg.curriculum_mix}},initialization_source={'kind':'mock_only'})
         observed={}
         class Trainer:
             def __init__(self,*a,**kw):observed.update(kw)
@@ -394,12 +494,12 @@ class TestOnlineTargets(unittest.TestCase):
         with TemporaryDirectory() as directory:
             root=Path(directory);bc=root/'best.pt';bc.write_bytes(b'mock');pool=root/'pool.json';pool.write_bytes(b'pool')
             job='ann_wd3_045';(root/job/'review').mkdir(parents=True)
-            selected=[j for j in r.matrix() if j['id']==job]
+            selected=[j for j in r.matrix(7) if j['id']==job]
             atomic_json(root/'manifest.json',{'plan':{'jobs':selected,'bank_scoring':'isolated'},'preflight':{'source':r.identity(),
                 'inputs':{'ann':{'path':str(bc),'pool_path':str(pool),
                     'pool_file_sha256':__import__('hashlib').sha256(pool.read_bytes()).hexdigest()}}}})
             atomic_json(root/'release.json',{'mock_only':True})
-            args=r.parser().parse_args(['worker','--root',str(root),'--job',job,'--launch'])
+            args=r.parser().parse_args(['worker','--root',str(root),'--job',job,'--seed','7','--launch'])
             with patch.object(r,'BC',{'ann':(bc,__import__('hashlib').sha256(bc.read_bytes()).hexdigest())}), \
                     patch.object(r,'POOL',pool), \
                     patch.object(r,'make_config',return_value=cfg), \
@@ -414,12 +514,14 @@ class TestOnlineTargets(unittest.TestCase):
                 # identity uses subprocess too; keep actual source evidence narrowly fixed here.
                 with patch.object(r,'identity',return_value=json.loads((root/'manifest.json').read_text())['preflight']['source']):r.worker(args)
             self.assertTrue(build.call_args.kwargs['gpu_td3_compute'])
+            self.assertEqual(build.call_args.args[1].seed,7)
             self.assertFalse(build.call_args.kwargs['non_blocking_batch_transfer'])
             self.assertTrue(compile_.call_args.kwargs['compile_actor_loss'])
             self.assertTrue(reporter.return_value.start_stage.called)
             self.assertEqual(evaluate.call_count,2)
             for call in evaluate.call_args_list:
                 command=call.args[0]
+                self.assertEqual(command[command.index('--seed')+1],'7')
                 self.assertEqual(command[command.index('--validation-pool')+1],str(pool))
                 self.assertEqual(command[command.index('--expected-pool-file-sha256')+1],__import__('hashlib').sha256(pool.read_bytes()).hexdigest())
             self.assertIsNotNone(observed['online_research'].bank_scorer)
@@ -428,6 +530,11 @@ class TestOnlineTargets(unittest.TestCase):
             self.assertTrue(result['execution_completed']);self.assertFalse(result['formal_passed'])
             self.assertEqual(result['bank_scoring'],'isolated');self.assertEqual(result['selected_jobs'],[job])
             self.assertEqual(json.loads((root/job/'review/progress.json').read_text())['state'],'completed_budget')
+            from brain_uav.trainers.v2_online_research import validate_snapshot
+            snapshot=torch.load(next((root/job/'other').glob('*.pt')),map_location='cpu',weights_only=False)
+            validate_snapshot(snapshot,expected_stage='easy',expected_model_type='ann')
+            self.assertEqual(snapshot['snapshot']['formal_config']['seed'],7)
+            self.assertEqual(snapshot['snapshot']['seed_manifest'],components.seed_manifest)
 
     def test_acc_tail_never_becomes_complete_g_bank(self):
         from brain_uav.trainers.v2_online_research import OnlineResearch,target_config

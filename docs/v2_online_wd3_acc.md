@@ -1,5 +1,76 @@
 # WD3 / ACC 在线研究（待审，未运行）
 
+## 新训练seed复验接线（2026-11-05，待审）
+
+`--seed`默认23，使用正式配置的非负整数校验。显式7贯通计划、预检、派发、
+shell worker、实际formal config及model/replay/curriculum/exploration派生种子。
+worker在统一放行前核对CLI、manifest、job、formal config和实际seed_manifest；
+清单严格包含base/model/replay/curriculum/exploration，以及curriculum_mix中每个level的
+`{level}_generator_seed=derive_v2_component_seed(seed,stage,f'{level}_generator')`，
+保持完整字典比较，缺失、篡改及额外字段均拒绝。
+父进程核对初始化报告的formal_seed。同模型同seed各臂初始摘要须相同；
+BC actor来自同一best，跨seed权重可能相同，不要求不同。
+status/continue读取原批次manifest并核对seed与所选组；seed7批次查询/继续须显式传7，
+不能用新seed混入旧23批次。旧23默认、作业ID及16组模式保留。
+算法、学习率、BC/脉冲/ACC、编译和GPUCompute配置均不变。
+
+以下仅为命令草案，不在原有暂停进程的仓库git pull。先把审查通过的代码打包，
+在独立目录解包（包须含源码清单，服务器应逐项核对规范化源码哈希）：
+
+```bash
+mkdir -p /home/zj/diagnostics/my_project_seed7_20261105 &&
+tar -xf /home/zj/diagnostics/reviewed_uav_seed7.tar -C /home/zj/diagnostics/my_project_seed7_20261105
+```
+
+三组并行启动，默认仅计划；审查授权后调用函数时加 `--launch`：
+
+```bash
+uav_seed7() {
+  local code=/home/zj/diagnostics/my_project_seed7_20261105
+  local old=/home/zj/projects/my_project
+  local root=/home/zj/diagnostics/outputs/v2_seed7_$(date +%Y%m%d_%H%M%S_%N)
+  local rc start
+  cd "$code" || return 1
+  local cmd=(/home/zj/envs/uav_torch/bin/python -u -B -m brain_uav.scripts.run_v2_online_wd3_acc
+    launch --root "$root" --seed 7 --jobs snn_min snn_fixed_own snn_acc_001
+    --bank-scoring isolated --session "seed7_$(date +%s)" --socket seed7_20261105
+    --source-manifest "$code/scripts/v2_online_wd3_acc_source.json"
+    --snn-bc "$old/outputs/v2_projected_head_round1/snn_20261012_102848/bc/bc_v2_snn_best.pt"
+    --validation-pool "$old/outputs/v2_box085_round1_20261003_003948/validation_pools_600km_seed20260904/v2_validation_easy.json")
+  if [ "${1:-}" != --launch ]; then
+    PYTHONPATH=src "${cmd[@]}"
+    return $?
+  fi
+  mkdir -p "$(dirname "$root")" || return 1
+  start=$(date +%s)
+  PYTHONPATH=src "${cmd[@]}" --launch 2>&1 | tee "$root.driver.log"
+  rc=${PIPESTATUS[0]}
+  printf 'exit_code=%s\nprocess_wall_seconds=%s\nroot=%s\n' "$rc" "$(( $(date +%s)-start ))" "$root" | tee -a "$root.driver.log"
+  return "$rc"
+}
+uav_seed7
+```
+
+从BC best重新开始，不恢复旧400k权重。500k日程，200k完整episode收尾、保存、
+评估后原进程暂停；不会自动继续。确认三组暂停后，在同一独立代码目录执行
+（把root替换为启动日志中的实际新批次，不能指向旧批次）：
+
+```bash
+cd /home/zj/diagnostics/my_project_seed7_20261105 &&
+PYTHONPATH=src /home/zj/envs/uav_torch/bin/python -u -B -m brain_uav.scripts.run_v2_online_wd3_acc continue \
+  --root /home/zj/diagnostics/outputs/REPLACE_WITH_ACTUAL_SEED7_BATCH \
+  --seed 7 --jobs snn_min snn_fixed_own snn_acc_001 --launch
+```
+
+继续仍要求原存活PID及暂停身份，400k硬停止，不进入medium。历史快照严格加载及
+旧六候选验收入口保持原样。本地CPU/mock检查不代表新seed CUDA或长期训练通过。
+本轮本地命令：`PYTHONPATH=src;tests python -m unittest test_v2_online_wd3_acc test_diagnose_v2_online_followup.TestFollowup -q`
+（PowerShell需先设置同名环境变量），45项运行、44通过、1项只读BC/池夹具未挂载跳过。
+新增真实CPU prepare/build回归：临时合法BC checkpoint，seed7/23清单通过；
+generator seed缺失或篡改、额外字段拒绝。不训练BC、不飞行，不以五字段mock代替构建器证据。
+覆盖seed7三组派发与统一放行、worker/config错配拒绝、实际派生种子检查、
+seed7快照严格加载/评估传参及原16组、子集、暂停/继续回归；未执行真实tmux或训练。
+
 ## 四组ACC有限研究补跑（2026-11-03，接线待审）
 
 仅`ann_acc_001 ann_acc_010 snn_acc_001 snn_acc_010`，从各自BC best重新开始；

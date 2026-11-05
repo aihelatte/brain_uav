@@ -32,8 +32,10 @@ BC={
         '7b2b266fdf32cdb8b4eb220ef26a45008717a0af1538f8d478019f37ddc9adbc')}
 
 
-def matrix():
-    return [dict(id=f'{model}_{arm}',model=model,arm=arm,seed=23,stage='easy',device='cuda',
+def matrix(seed=23):
+    from brain_uav.trainers.v2_formal_training import _nonnegative_int
+    seed=_nonnegative_int(seed,name='seed')
+    return [dict(id=f'{model}_{arm}',model=model,arm=arm,seed=seed,stage='easy',device='cuda',
         schedule_horizon_steps=500000,pause_requested_step=200000,hard_limit=400000,
         actor_lr=.000155 if model=='ann' else .000825,critic_lr=.0002 if model=='ann' else .001,
         alpha=2.5,gamma=.99,tau=.005,policy_delay=2,batch_size=64,warmup_steps=1280,
@@ -52,7 +54,27 @@ def matrix():
 
 def selected_jobs(args):
     if args.jobs is not None and len(args.jobs)!=len(set(args.jobs)):raise ValueError('Duplicate jobs.')
-    return [j for j in matrix() if args.jobs is None or j['id'] in args.jobs]
+    return [j for j in matrix(args.seed) if args.jobs is None or j['id'] in args.jobs]
+
+
+def worker_job(args,manifest):
+    job=next(j for j in matrix(args.seed) if j['id']==args.job)
+    selection=manifest['plan']['jobs']
+    if job not in selection or any(j['seed']!=args.seed for j in selection):
+        raise ValueError('CLI/manifest worker seed or configuration mismatch.')
+    config=make_config(job)
+    if config.seed!=args.seed:raise ValueError('Actual formal config seed mismatch.')
+    return job,selection,config
+
+
+def validate_seed_manifest(config, actual):
+    from brain_uav.v2_curriculum import derive_v2_component_seed
+    expected={'base_seed':config.seed,**{f'{k}_seed':derive_v2_component_seed(config.seed,config.stage,k)
+        for k in ('model','replay','curriculum','exploration')},
+        **{f'{level}_generator_seed':derive_v2_component_seed(config.seed,config.stage,f'{level}_generator')
+            for level in config.curriculum_mix}}
+    if dict(actual)!=expected:
+        raise ValueError('Actual component seed manifest differs from formal seed derivation.')
 
 
 def input_paths(args):
@@ -139,7 +161,7 @@ def preflight(args, *, cuda=True):
 def make_config(job):
     from brain_uav.trainers.v2_formal_training import V2FormalTrainingConfig
     from brain_uav.models.v2_policy_config import V2SpikeRegularizationConfig
-    return V2FormalTrainingConfig(stage='easy',seed=23,max_steps=500000,batch_size=64,
+    return V2FormalTrainingConfig(stage='easy',seed=job['seed'],max_steps=500000,batch_size=64,
         actor_lr=job['actor_lr'],critic_lr=job['critic_lr'],actor_rl_scale_alpha=2.5,
         failure_sample_bias=2.,target_q_aggregation=job['target_q_aggregation'],
         spike_regularization=V2SpikeRegularizationConfig(beta_max=job['spike_beta_max'],target_rate=.17,
@@ -167,7 +189,7 @@ def worker(args):
         build_v2_periodic_snapshot,V2FormalStageTrainer,v2_initial_state_summary)
     from brain_uav.trainers.v2_reporting import V2ExperimentReporter
     from brain_uav.trainers.v2_validation import load_v2_validation_pool
-    root=args.root.resolve(); job=next(j for j in matrix() if j['id']==args.job)
+    root=args.root.resolve(); job=next(j for j in matrix(args.seed) if j['id']==args.job)
     directory=root/args.job;directory.mkdir(parents=True,exist_ok=True)
     (directory/'review').mkdir(exist_ok=True);(directory/'other').mkdir(exist_ok=True)
     hook=OnlineResearch(job['arm'],directory)
@@ -176,12 +198,11 @@ def worker(args):
     try:
         manifest=json.loads((root/'manifest.json').read_text(encoding='utf-8'))
         if manifest['preflight']['source']['sha256']!=identity()['sha256']: raise ValueError('Worker source mismatch.')
-        selection=manifest.get('plan',{}).get('jobs',matrix())
-        if job not in selection:raise ValueError('Worker not selected in manifest.')
+        job,selection,config=worker_job(args,manifest)
         scoring=manifest.get('plan',{}).get('bank_scoring','original')
         if scoring not in ('original','isolated'):raise ValueError('Unknown bank scoring implementation.')
         entry=manifest['preflight']['inputs'][job['model']]
-        config=make_config(job);bc=Path(entry.get('path',REPO/BC[job['model']][0]))
+        bc=Path(entry.get('path',REPO/BC[job['model']][0]))
         pool_path=Path(entry.get('pool_path',REPO/POOL))
         summary.update(bank_scoring=scoring,selected_jobs=[j['id'] for j in selection],
             actual_inputs=dict(BC=str(bc),pool=str(pool_path)),source=manifest['preflight']['source'])
@@ -202,6 +223,7 @@ def worker(args):
             reduce_update_stat_syncs=defaults['reduce_update_stat_syncs'],gpu_td3_compute=True,
             non_blocking_batch_transfer=job['non_blocking_batch_transfer'])
         engine=components.engine
+        validate_seed_manifest(config,components.seed_manifest)
         engine.online_research_statistics=True
         initial=v2_initial_state_summary(engine)
         from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
@@ -220,7 +242,8 @@ def worker(args):
         after_compile['bc_reference_actor']=state_hash(engine.bc_reference_actor.state_dict())
         if initial!=after_compile:raise RuntimeError('Compilation/prewarm changed initial networks/Adam.')
         atomic_json(directory/'review/initialized.json',dict(job=job,initial_state_sha256=initial,
-            compilation=compiled,bank_scoring=scoring,pid=os.getpid(),time=time.time()))
+            compilation=compiled,bank_scoring=scoring,formal_seed=config.seed,seed_manifest=components.seed_manifest,
+            pid=os.getpid(),time=time.time()))
         hook.status('initialized')
         gate_started=time.perf_counter()
         wait_for(root/'release.json',root,args.timeout)
@@ -262,7 +285,7 @@ def worker(args):
             # Independent process owns all evaluation state/RNG/SNN resets.
             command=[sys.executable,'-u','-B','-m','brain_uav.scripts.run_v2_online_wd3_acc','evaluate',
                 '--checkpoint',str(path),'--root',str(directory/'other'/f'eval_{requested}_{actual}'),
-                '--validation-pool',str(pool_path),'--expected-pool-file-sha256',pool_file_hash,'--launch']
+                '--validation-pool',str(pool_path),'--expected-pool-file-sha256',pool_file_hash,'--seed',str(config.seed),'--launch']
             begin=time.perf_counter()
             subprocess.run(command,cwd=REPO,check=True)
             evaluation_elapsed=time.perf_counter()-begin
@@ -318,6 +341,7 @@ def verify_initializations(root,jobs):
     for job in jobs:
         value=json.loads((root/job['id']/'review/initialized.json').read_text(encoding='utf-8'))
         if value['job']!=job: raise ValueError('Worker configuration differs from plan.')
+        if value['formal_seed']!=job['seed']:raise ValueError('Initialized formal seed differs from plan.')
         summaries.append(value)
     for model in ('ann','snn'):
         selected=[v['initial_state_sha256'] for v in summaries if v['job']['model']==model]
@@ -337,7 +361,7 @@ def launch(args):
         atomic_json(args.root/'manifest.json',manifest)
         for index,job in enumerate(jobs):
             (args.root/job['id']/'review').mkdir(parents=True)
-            command=shlex.join(['bash',str(REPO/'scripts/online_v2_wd3_acc.sh'),'--worker-run',str(args.root),job['id'],args.python,str(args.timeout)])
+            command=shlex.join(['bash',str(REPO/'scripts/online_v2_wd3_acc.sh'),'--worker-run',str(args.root),job['id'],args.python,str(args.timeout),str(job['seed'])])
             if index==0: tmux(args,'new-session','-d','-s',args.session,'-n',job['id'],command)
             else: tmux(args,'new-window','-d','-t',args.session,'-n',job['id'],command)
             started.append(job['id'])
@@ -365,6 +389,7 @@ def parser():
     p.add_argument('--source-manifest',type=Path,default=REPO/'scripts/v2_online_wd3_acc_source.json')
     p.add_argument('--checkpoint',type=Path)
     p.add_argument('--model',choices=('ann','snn'),default='snn')
+    p.add_argument('--seed',type=int,default=23)
     p.add_argument('--job',choices=tuple(j['id'] for j in matrix()))
     p.add_argument('--jobs',nargs='+',choices=tuple(j['id'] for j in matrix()))
     p.add_argument('--bank-scoring',choices=('original','isolated'),default='original')
@@ -382,11 +407,18 @@ def parser():
 
 def main(argv=None):
     args=parser().parse_args(argv)
+    matrix(args.seed)  # Same seed validity rule as the formal configuration.
+    if args.mode in ('status','continue'):
+        jobs=json.loads((args.root/'manifest.json').read_text(encoding='utf-8'))['plan']['jobs']
+        if not jobs or any(j['seed']!=args.seed for j in jobs):
+            raise ValueError('Requested seed differs from existing batch identity.')
+        if args.jobs and not set(args.jobs)<={j['id'] for j in jobs}:
+            raise ValueError('Requested jobs are not in the existing batch.')
     if args.mode=='worker' and args.job is None:raise ValueError('worker requires an explicit --job.')
     if args.mode=='cuda-check' and args.job is not None and not args.job.startswith(args.model+'_'):
         raise ValueError('CUDA model/job mismatch.')
     if args.mode=='status':
-        values={j['id']:json.loads(p.read_text(encoding='utf-8')) if (p:=args.root/j['id']/'review/progress.json').exists() else 'not_initialized' for j in matrix()}
+        values={j['id']:json.loads(p.read_text(encoding='utf-8')) if (p:=args.root/j['id']/'review/progress.json').exists() else 'not_initialized' for j in jobs}
         for value in values.values():
             if isinstance(value,dict) and value['state'] in ('initialized','running','evaluating','paused_at_200k'):
                 try:os.kill(value['pid'],0)

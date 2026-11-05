@@ -66,7 +66,7 @@
     "src/brain_uav/scripts/run_full_experiment.py": "2784cde59c2415b8aad4c4d554e6e88d85768701cc6380d2db1c2282ea3253de",
     "src/brain_uav/scripts/run_full_pipeline.py": "a9ce6f2f23876be044c9954075129ecb02e8073e3e91d96dfd198ea7011f1a1d",
     "src/brain_uav/scripts/run_full_pipeline_candidates.py": "53c9bb5cb113a9bb4db3f3ff98e8e6385494860499eeec3ed00fe1b7f52ed23d",
-    "src/brain_uav/scripts/run_v2_online_wd3_acc.py": "0560ae342940c9509f0ad45a22aacf580e073374f2cdf9eee6f8d28652cb3151",
+    "src/brain_uav/scripts/run_v2_online_wd3_acc.py": "ea65dca306551d1901bae23fc0a7cebc45deb314a0b092dfa08bb1840cb74e78",
     "src/brain_uav/scripts/run_v2_td3_curriculum.py": "b311c13cf31fb6aeaf86968107efa955a9e749bdf38446d7f860834cbc5fc745",
     "src/brain_uav/scripts/test_baseline_planners.py": "22325101812e6494375dfe32f61a8768c22a734885f9c29c5d4b5b42fe194e14",
     "src/brain_uav/scripts/train_bc.py": "784b7c34269d7f9457e24aba22de291ff954be12cbddcd7fa3c76295dbdd0055",
@@ -106,9 +106,9 @@
     "src/brain_uav/utils/v1_spike_aware_thop.py": "6b3619cbe4c3c645bf739972af94721040858828c2204750aa4a69999bb06a6b",
     "src/brain_uav/utils/v2_operation_counts.py": "f0b10e355562702c48dc907061cd78c7abe4f3db0eb5bbef2b25230101510b06",
     "src/brain_uav/v2_curriculum.py": "32332ed6dae1bf65c8cee3c2e913e16f16473c1e97570ac8e66e3e444f3ad970",
-    "scripts/online_v2_wd3_acc.sh": "3a32ab7ca0146eccc30b973f4ded578b37cb7faa408db21e898f6d5fd694ea9e"
+    "scripts/online_v2_wd3_acc.sh": "2a1560d1f509a3e6351c017adfb2118e2cabdd649d5f27d9a9460ba4469231a8"
   },
   "source_hash_normalization": "CRLF-to-LF",
-  "HEAD": "48af1a72ab555c66b92d7b3c8c22ed3f7b38f183",
-  "status": "M scripts/v2_online_wd3_acc_source.json\n M src/brain_uav/envs/v2_static_no_fly_env.py\n M tests/test_v2_static_no_fly_env.py\n?? AGENTS.md\n?? diagnostics/\n?? docs/superpowers/\n?? docs/v2_online_confirmation.md\n?? src/brain_uav/scripts/diagnose_v2_online_confirmation.py\n?? tests/test_diagnose_v2_online_confirmation.py"
+  "HEAD": "1d80fae2abbd205a1605b8bfeee0d4695a1348a1",
+  "status": "M docs/v2_online_wd3_acc.md\n M scripts/online_v2_wd3_acc.sh\n M scripts/v2_online_wd3_acc_source.json\n M src/brain_uav/envs/v2_static_no_fly_env.py\n M src/brain_uav/scripts/run_v2_online_wd3_acc.py\n M tests/test_v2_online_wd3_acc.py\n M tests/test_v2_static_no_fly_env.py\n?? AGENTS.md\n?? diagnostics/\n?? docs/superpowers/"
 }
