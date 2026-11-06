@@ -262,9 +262,9 @@ def rankings(rows, sources):
     return result
 
 
-def bc_data(data, model, path):
+def bc_data(data, model, path, *, seed=23):
     from brain_uav.trainers.v2_formal_training import V2FormalTrainingConfig, prepare_v2_stage_initialization
-    p = prepare_v2_stage_initialization(V2FormalTrainingConfig(stage='easy', seed=23),
+    p = prepare_v2_stage_initialization(V2FormalTrainingConfig(stage='easy', seed=seed),
         init_checkpoint=path, device=data['device'], model_type=model)
     return dict(data, actor=p.bc_initialization.actor.to(data['device']).eval().requires_grad_(False))
 
@@ -292,8 +292,8 @@ def anchors(data, directory, supplied, inputs):
     return plans
 
 
-def probe(data, bc, plans, directory):
-    result, sealed = [], []
+def seal_probe_plans(data, bc, plans, directory):
+    sealed = []
     for index,p in enumerate(plans):
         env = cal.base.make_env(data)
         obs,_ = cal.base.reset_replay(env,p['scene'],p['prefix'],p['hash'])
@@ -303,6 +303,11 @@ def probe(data, bc, plans, directory):
         _write_json(directory/f'plan_{index:02d}.json',dict(prefix=p,sources=sources,
             actions=[a.tolist() for a in candidates_]))
         sealed.append((p,candidates_,sources))
+    return sealed
+
+
+def run_probe_branches(data, sealed, directory):
+    result = []
     for index,(p,candidates_,sources) in enumerate(sealed):
         env = cal.base.make_env(data)
         rows = []
@@ -319,6 +324,10 @@ def probe(data, bc, plans, directory):
         result.append(dict(scenario_id=p['scene']['scenario_id'],state_hash=p['hash'],
             sources=sources,rows=rows,rankings=rankings(rows,sources)))
     return result
+
+
+def probe(data, bc, plans, directory):
+    return run_probe_branches(data,seal_probe_plans(data,bc,plans,directory),directory)
 
 
 def parser():
@@ -508,6 +517,13 @@ def validate_bundle(out, result):
     excluded,evidence = exclusions(args,historical,tracked)
     if manifest['inputs'] != tracked.files or manifest['exclusions'] != evidence:
         raise ValueError('Required historical input inventory differs from seal.')
+    validate_evaluation_artifacts(out,result,get,required,manifest,args,tracked,locked,historical,excluded)
+
+
+def validate_evaluation_artifacts(out,result,get,required,manifest,args,tracked,locked,historical,excluded,
+        *,models=('ann','snn')):
+    """Shared JSON-only flight/probe evidence checks; input contracts stay in each entry."""
+    artifacts=result['artifacts']
     keys = get('other/excluded_scene_keys.json')
     if (keys != sorted(excluded) or manifest['excluded_unique']!=len(excluded)
             or manifest['excluded_keys'] != dict(path='other/excluded_scene_keys.json',
@@ -532,12 +548,12 @@ def validate_bundle(out, result):
         raise ValueError('Required input inventory missing/changed.')
     selected = cal.base.select_scenarios(historical)[:12]
     shared = get('review/probe_plan.json')
-    if set(shared) != {'ann','snn'}:
+    if set(shared) != set(models):
         raise ValueError('Missing model probe plan.')
     cfg = historical.scenario_config
     max_steps = cfg['max_steps']; limit = np.array([cfg['delta_gamma_max'],cfg['delta_psi_max']],dtype=np.float32)
     gamma = research.matrix()[0]['gamma']
-    for m in ('ann','snn'):
+    for m in models:
         anchor = get(f'other/BC_{m}/anchors.json'); identity = anchor['identity']
         if (identity['historical_pool'] != historical.content_digest or not identity['backend']
                 or len(identity['actor'])!=64 or identity['scenario_ids'] != [s['scenario_id'] for s in selected]
