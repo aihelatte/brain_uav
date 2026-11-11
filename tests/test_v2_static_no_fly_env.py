@@ -67,7 +67,7 @@ class TestV2StaticNoFlyTrajectoryEnv(unittest.TestCase):
         *,
         config=None,
         radius=0.0,
-        cache_ellipsoid_segment_clearance=False,
+        cache_ellipsoid_segment_clearance=True,
     ):
         env_type, _, _ = _v2_api()
         return env_type(
@@ -136,7 +136,7 @@ class TestV2StaticNoFlyTrajectoryEnv(unittest.TestCase):
                         atol=1e-7,
                     )
 
-    def test_ellipsoid_cache_is_default_off_and_rebuilt_with_each_scenario(self):
+    def test_ellipsoid_cache_is_default_on_and_rebuilt_with_each_scenario(self):
         first_payload = _scenario(
             [0.0, 0.0, 10.0, 0.0, 0.0],
             [30.0, 0.0, 10.0],
@@ -147,19 +147,24 @@ class TestV2StaticNoFlyTrajectoryEnv(unittest.TestCase):
             [30.0, 0.0, 10.0],
             [NoFlyZone('ellipse', Ellipsoid([15.0, 5.0, 10.0], 2.0, 1.0, 1.0))],
         )
-        default_env = self.make_env(first_payload)
-        default_observation, default_info = default_env.reset()
-        self.assertFalse(default_env.zones[0].shape.segment_clearance_cache_enabled)
-
-        env = self.make_env(
-            first_payload,
-            cache_ellipsoid_segment_clearance=True,
+        env_type, _, _ = _v2_api()
+        env = env_type(
+            scenario=_config(), rewards=RewardConfig(),
+            fixed_scenarios=[first_payload],
         )
         cached_observation, cached_info = env.reset()
-        np.testing.assert_array_equal(
-            cached_observation.zone_features, default_observation.zone_features
+        self.assertTrue(env.zones[0].shape.segment_clearance_cache_enabled)
+
+        uncached_env = self.make_env(
+            first_payload,
+            cache_ellipsoid_segment_clearance=False,
         )
-        self.assertEqual(cached_info['line_to_goal_safe'], default_info['line_to_goal_safe'])
+        uncached_observation, uncached_info = uncached_env.reset()
+        self.assertFalse(uncached_env.zones[0].shape.segment_clearance_cache_enabled)
+        np.testing.assert_array_equal(
+            cached_observation.zone_features, uncached_observation.zone_features
+        )
+        self.assertEqual(cached_info['line_to_goal_safe'], uncached_info['line_to_goal_safe'])
         self.assertFalse(cached_info['line_to_goal_safe'])
         first_shape = env.zones[0].shape
         self.assertTrue(first_shape.segment_clearance_cache_enabled)

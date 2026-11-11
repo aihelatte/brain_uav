@@ -113,7 +113,7 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         *,
         uav_collision_radius: float = 0.0,
         scenario_generator: V2ScenarioGenerator | None = None,
-        cache_ellipsoid_segment_clearance: bool = False,
+        cache_ellipsoid_segment_clearance: bool = True,
         cpu_deduplication: bool = False,
     ) -> None:
         if not isinstance(scenario, ScenarioConfig):

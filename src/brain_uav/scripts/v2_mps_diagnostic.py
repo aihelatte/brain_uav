@@ -208,7 +208,7 @@ def capability(root, session, timeout=60, *, terminate_client=False):
     termination_attempted = False
     with log_path.open('w',encoding='utf-8') as log:
         process = subprocess.Popen([sys.executable,'-u','-m','brain_uav.scripts.v2_mps_diagnostic','--probe',str(root),str(timeout)],
-            cwd=Path(__file__).resolve().parents[3],env=session.env,stdout=log,stderr=subprocess.STDOUT)
+            cwd=Path(__file__).resolve().parents[3],env=session.env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         session.register({'probe':process})
         try:
             concurrent.wait_workers({'probe':process},lambda _: (root/'ready.json').is_file(),timeout=timeout)

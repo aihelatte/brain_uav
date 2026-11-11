@@ -270,6 +270,7 @@ class V2FormalTrainingConfig:
     critic_lr: float | None = None
     gamma: float = 0.99
     target_q_aggregation: str = 'min'
+    acc_eta: float | None = None
     mc_return_weight: float = 0.0
     mc_return_max_age_steps: int = 100000
     tau: float = 0.005
@@ -291,6 +292,9 @@ class V2FormalTrainingConfig:
     validation_max_failures: int = 5
 
     def __post_init__(self) -> None:
+        if self.acc_eta is not None and (self.acc_eta!=.01 or self.stage!='easy' or self.gamma!=.99
+                or self.target_q_aggregation!='min' or self.mc_return_weight!=0):
+            raise ValueError('Formal ACC requires easy, eta=.01, gamma=.99, min backing and MC disabled.')
         if self.target_q_aggregation not in ('min', 'mean'):
             raise ValueError('target_q_aggregation must be min or mean.')
         from .v2_mc_return import validate_mc_return_config
@@ -384,6 +388,7 @@ class V2FormalTrainingConfig:
 
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
+        if self.acc_eta is None:values.pop('acc_eta')
         values['spike_regularization'] = (self.spike_regularization or V2SpikeRegularizationConfig()).to_dict()
         return _strict_json_copy(values)
 
@@ -1283,6 +1288,9 @@ def build_v2_stage_engine(
         gpu_compute_non_blocking_coefficients=gpu_compute_non_blocking_coefficients,
         gpu_compute_lightweight_timing=gpu_compute_lightweight_timing,
     )
+    if config.acc_eta is not None:
+        from .v2_formal_acc import FormalACC
+        FormalACC(engine,config)
     if previous_engine_payload is not None:
         engine.load_network_state_dicts(dict(previous_engine_payload))
     curriculum_seed = derive_v2_component_seed(config.seed, config.stage, 'curriculum')
@@ -1387,6 +1395,10 @@ class V2FormalStageTrainer:
         if type(cpu_deduplication) is not bool:
             raise TypeError('cpu_deduplication must be a bool.')
         self.cpu_deduplication = cpu_deduplication
+        if config.acc_eta is not None:
+            from .v2_formal_acc import FormalACC
+            if online_research is not None or not isinstance(getattr(engine,'formal_acc',None),FormalACC):
+                raise ValueError('Formal ACC requires its own feedback hook and normal formal control flow.')
         if online_research is not None:
             from .v2_online_research import OnlineResearch
             if not isinstance(online_research,OnlineResearch) or config.stage!='easy' or config.max_steps!=500000 or config.mc_return_weight!=0:
@@ -1523,7 +1535,7 @@ class V2FormalStageTrainer:
             slot_refs.append(slot_ref)
             transitions.append(_EpisodeTransition(
                 observation=observation,
-                action=(self.env.prev_action.copy() if self.online_research is not None else np.asarray(action, dtype=np.float32).copy()),
+                action=(self.env.prev_action.copy() if self.online_research is not None or self.config.acc_eta is not None else np.asarray(action, dtype=np.float32).copy()),
                 reward=float(reward),
                 next_observation=next_observation,
                 done=done,
@@ -1598,6 +1610,8 @@ class V2FormalStageTrainer:
                 if self.online_research is not None:
                     self.online_research.episode(self,transitions)
                     self.online_research.episode_metrics(update_metrics,self.result.stage_steps)
+                if self.config.acc_eta is not None:
+                    self.engine.formal_acc.episode(self,transitions)
                 actor_updates = [value for value in update_metrics if value.actor_updated]
                 activity_updates = [value for value in actor_updates if value.actor_batch_spike_rate_l1 is not None]
                 episode_record = {
@@ -1928,6 +1942,9 @@ def build_v2_formal_checkpoint(
     }
     if model_type == 'snn':
         payload['model_type'] = 'snn'
+    from .v2_formal_acc import save_state
+    state=save_state(engine,config)
+    if state is not None:payload['acc_state']=state
     return payload
 
 
@@ -1987,6 +2004,9 @@ def build_v2_periodic_snapshot(
     }
     if model_type == 'snn':
         payload['model_type'] = 'snn'
+    from .v2_formal_acc import save_state
+    state=save_state(engine,config)
+    if state is not None:payload['acc_state']=state
     return payload
 
 
@@ -2028,7 +2048,7 @@ def load_v2_periodic_snapshot(
     expected_fields = (
         _SNN_PERIODIC_SNAPSHOT_FIELDS if model_type == 'snn' else _PERIODIC_SNAPSHOT_FIELDS
     )
-    if set(payload) != expected_fields:
+    if set(payload) != expected_fields | ({'acc_state'} if payload.get('formal_config',{}).get('acc_eta') is not None else set()):
         raise ValueError('Periodic V2 snapshot has missing or unknown fields.')
     if expected_model_type is not None:
         if expected_model_type not in ('ann', 'snn'):
@@ -2081,10 +2101,10 @@ def load_v2_periodic_snapshot(
 def _validate_policy_training_snapshot_config(payload, model_type):
     engine = payload['engine_checkpoint']
     algorithm = engine['algorithm_config']
-    if 'online_research_target' in algorithm or 'online_research_beta' in engine:
-        raise ValueError('Online research targets require the explicit research snapshot diagnostic loader.')
     if not isinstance(payload['formal_config'], dict):
         raise ValueError('V2 snapshot formal training configuration must be a dict.')
+    from .v2_formal_acc import validate_state
+    validate_state(payload)
     formal = dict(payload['formal_config'])
     formal.setdefault('target_q_aggregation', 'min')
     from .v2_mc_return import validate_mc_return_config
@@ -2168,7 +2188,7 @@ def load_v2_formal_checkpoint(
                 'sampling configuration.'
             )
         raise ValueError('Formal V2 checkpoint format_version is incompatible.')
-    if set(payload) != expected_fields:
+    if set(payload) != expected_fields | ({'acc_state'} if payload.get('formal_config',{}).get('acc_eta') is not None else set()):
         raise ValueError('Formal V2 checkpoint has missing or unknown fields.')
     if model_type == 'snn' and payload.get('model_type') != 'snn':
         raise ValueError('Formal V2 SNN checkpoint model_type is invalid.')

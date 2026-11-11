@@ -59,6 +59,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--metrics-out', type=Path, required=True)
     parser.add_argument('--validation-pool', type=Path, required=True)
     parser.add_argument('--seed', type=int, default=7)
+    parser.add_argument('--acc-eta',type=float,choices=(.01,),default=None)
+    parser.add_argument('--non-blocking-batch-transfer',action='store_true')
     parser.add_argument('--target-noise-scale', type=float, default=1.0)
     parser.add_argument('--weight-snapshot-steps', type=int, nargs='+', default=(),
                         help='Diagnostic-only snapshots at episode boundaries; no validation.')
@@ -467,6 +469,7 @@ def run_v2_td3_stage(
     seed: int = 7,
     gamma: float = 0.99,
     target_q_aggregation: str = 'min',
+    acc_eta: float | None = None,
     mc_return_weight: float = 0.0,
     mc_return_max_age_steps: int = 100000,
     failure_sample_bias: float = 1.0,
@@ -516,6 +519,7 @@ def run_v2_td3_stage(
 
     gpu_td3_update: bool = False,
     gpu_td3_compute: bool | None = None,
+    non_blocking_batch_transfer: bool = False,
     cpu_deduplication: bool = True,
 
 
@@ -524,6 +528,9 @@ def run_v2_td3_stage(
     periodic_snapshot_interval_steps: int | None = None,
     target_noise_scale: float = 1.0,
     weight_snapshot_steps: tuple[int, ...] = (),
+    initialization_gate=None,
+    terminal_evaluation_sink=None,
+    formal_config: V2FormalTrainingConfig | None = None,
 ) -> dict[str, Any]:
     noise_schedule = V2NoiseSchedule().with_target_noise_scale(target_noise_scale)
     bc_schedule_metadata = v2_bc_schedule_metadata(
@@ -572,6 +579,7 @@ def run_v2_td3_stage(
         validation_max_failures=validation_max_failures,
         gamma=gamma,
         target_q_aggregation=target_q_aggregation,
+        acc_eta=acc_eta,
         mc_return_weight=mc_return_weight,
         mc_return_max_age_steps=mc_return_max_age_steps,
         failure_sample_bias=failure_sample_bias,
@@ -581,6 +589,9 @@ def run_v2_td3_stage(
         noise_schedule=noise_schedule,
         spike_regularization=V2SpikeRegularizationConfig() if spike_regularization is None else spike_regularization,
     )
+    if formal_config is not None:
+        if formal_config.to_dict()!=config.to_dict():raise ValueError('Explicit formal config differs from resolved single-stage parameters.')
+        config=formal_config
     if prepared_initialization is None:
         prepared_initialization = prepare_v2_stage_initialization(
             config,
@@ -668,9 +679,12 @@ def run_v2_td3_stage(
 
         gpu_td3_update=gpu_td3_update,
         gpu_td3_compute=gpu_td3_compute,
+        non_blocking_batch_transfer=non_blocking_batch_transfer,
 
 
     )
+    if acc_eta is not None:
+        components.engine.formal_acc.directory=report_path
     compilation_metadata = _configure_stage_compilation(
         components.engine,
         pool,
@@ -690,6 +704,9 @@ def run_v2_td3_stage(
         cuda_graph_updates=cuda_graph_updates,
         cuda_graph_actor_update=cuda_graph_actor_update,
     )
+    initial_state_summary = v2_initial_state_summary(components.engine)
+    if initialization_gate is not None:
+        initialization_gate(components.engine,config,components.seed_manifest,initial_state_summary,compilation_metadata)
     reporter = (
         V2ExperimentReporter(
             report_path,
@@ -704,7 +721,6 @@ def run_v2_td3_stage(
         if reporting
         else None
     )
-    initial_state_summary = v2_initial_state_summary(components.engine)
     if reporter is not None:
         actor = components.engine.actor
         snn_metadata = (
@@ -825,6 +841,11 @@ def run_v2_td3_stage(
         cpu_deduplication=cpu_deduplication,
     )
     execution_configuration = trainer.execution_configuration
+    execution_configuration['non_blocking_batch_transfer'] = dict(requested=non_blocking_batch_transfer,
+        configured=non_blocking_batch_transfer,actual_execution=None)
+    if acc_eta is not None:
+        execution_configuration['acc']=dict(method='acc',eta=acc_eta,scoring='isolated',beta_initial=.5,
+            bank_capacity=5000,complete_training_episodes_only=True)
     execution_configuration['mc_return'] = dict(requested=config.mc_return_weight > 0,
         configured=config.mc_return_weight > 0, effective=False, observed_updates=0,
         weight=config.mc_return_weight, max_age_steps=config.mc_return_max_age_steps,
@@ -851,6 +872,10 @@ def run_v2_td3_stage(
     try:
         result = trainer.run()
         compilation_metadata['local_optimizations'] = components.engine.local_optimization_metadata()
+        execution_configuration['non_blocking_batch_transfer']['actual_execution']=compilation_metadata['local_optimizations'].get('non_blocking_batch_transfer')
+        if acc_eta is not None:
+            acc=components.engine.formal_acc.controller
+            execution_configuration['acc'].update(beta=acc.beta,adjustments=len(acc.controls),bank_episodes=len(acc.episodes))
         execution_configuration['mc_return']['actual_execution'] = compilation_metadata['local_optimizations'].get('mc_return')
         if config.mc_return_weight > 0:
             execution_configuration['mc_return'].update(compilation_metadata['local_optimizations']['mc_return'])
@@ -884,6 +909,8 @@ def run_v2_td3_stage(
         if checkpoint_path.exists():
             raise FileExistsError(f'Formal V2 checkpoint already exists: {checkpoint_path}')
         save_v2_formal_checkpoint(checkpoint_path, checkpoint_payload)
+        if terminal_evaluation_sink is not None:
+            terminal_evaluation_sink(components.engine,pool,reward_config,result,checkpoint_path)
         actor = components.engine.actor
         metrics_payload = {
             'format': f'v2_formal_{model}_td3_metrics',
@@ -992,6 +1019,7 @@ def main(argv: list[str] | None = None) -> int:
         noise_schedule=V2NoiseSchedule().with_target_noise_scale(args.target_noise_scale),
         stage=args.stage,
         seed=args.seed,
+        acc_eta=args.acc_eta,
         max_steps=args.max_stage_steps,
         early_stop_min_steps=args.early_stop_min_steps,
         window_episode_count=args.window_episodes,
@@ -1032,6 +1060,8 @@ def main(argv: list[str] | None = None) -> int:
         metrics_out=args.metrics_out,
         validation_pool=args.validation_pool,
         seed=args.seed,
+        acc_eta=args.acc_eta,
+        non_blocking_batch_transfer=args.non_blocking_batch_transfer,
         device=args.device,
         max_stage_steps=args.max_stage_steps,
         early_stop_min_steps=args.early_stop_min_steps,

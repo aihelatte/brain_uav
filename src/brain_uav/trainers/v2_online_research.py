@@ -210,51 +210,7 @@ def validate_snapshot(raw, **expected):
         if raw['controller'] is not None: raise ValueError('Nonadaptive arm cannot have ACC state.')
         if beta!=(1. if raw['arm']=='fixed_own' else .5): raise ValueError('Fixed beta mismatch.')
     else:
-        state=raw['controller']
-        if (not isinstance(state,dict) or set(state)!={'eta','gamma','capacity','beta','ema','last_adjust','first_boundary','controls','boundary_fraction','episodes'}
-                or state['beta']!=beta or state['eta']!=(.01 if raw['arm']=='acc_001' else .1)
-                or state['gamma']!=.99 or state['capacity']!=5000):
-            raise ValueError('Controller/beta/arm mismatch.')
-        from brain_uav.scripts.diagnose_v2_critic_calibration import finite_tree
-        finite_tree(state)
-        previous_beta=.5;previous_step=None;previous_ema=None
-        for c in state['controls']:
-            step=c['stage_steps']
-            if step<25000 or step>raw['actual_step'] or (previous_step is not None and step-previous_step<1000):
-                raise ValueError('Invalid ACC update interval.')
-            ema=c['A'] if previous_ema is None else .95*previous_ema+.05*c['A']
-            scale=max(1.,ema);u=float(np.clip(c['C']/scale,-1,1))
-            if (c['beta_before']!=previous_beta or c['EMA']!=ema or c['S']!=scale or c['u']!=u
-                    or c['beta_after']!=float(np.clip(previous_beta+state['eta']*u,0,1))):
-                raise ValueError('ACC control trajectory algebra mismatch.')
-            previous_beta,previous_step,previous_ema=c['beta_after'],step,ema
-        if state['beta']!=previous_beta or state['last_adjust']!=previous_step or state['ema']!=previous_ema:
-            raise ValueError('ACC final state/trajectory mismatch.')
-        first=next((c['stage_steps'] for c in state['controls'] if c['beta_after'] in (0.,1.)),None)
-        fraction=sum(c['beta_after'] in (0.,1.) for c in state['controls'])/max(1,len(state['controls']))
-        if state['first_boundary']!=first or state['boundary_fraction']!=fraction:raise ValueError('ACC boundary evidence mismatch.')
-        episodes=state['episodes']
-        from .v2_mc_return import discounted_episode_returns
-        previous_end=None
-        for episode in episodes:
-            if not episode or not episode[-1]['done'] or any(r['done'] for r in episode[:-1]):raise ValueError('Invalid ACC bank episode.')
-            steps=[r['step'] for r in episode]
-            if (any(type(step) is not int for step in steps)
-                    or any(b!=a+1 for a,b in zip(steps,steps[1:]))
-                    or (previous_end is not None and steps[0]<=previous_end)):
-                raise ValueError('Invalid ACC bank episode chronology.')
-            previous_end=steps[-1]
-            # Same Python-float recurrence as bank creation; no storage rounding occurs.
-            returns=discounted_episode_returns([r['reward'] for r in episode],state['gamma'])
-            for r,g in zip(episode,returns):
-                if not 0<r['step']<=raw['actual_step'] or not np.isfinite([r['reward'],r['G']]).all():
-                    raise ValueError('Invalid ACC bank values/age.')
-                if (type(r['completed_step']) is not int or r['completed_step']!=steps[-1]
-                        or r['completed_step']>raw['actual_step'] or r['G']!=g):
-                    raise ValueError('ACC bank return/completion mismatch.')
-                if r['action'].dtype!=np.float32 or r['action'].shape!=(2,) or not np.isfinite(r['action']).all():
-                    raise ValueError('Invalid actual bank action.')
-        if len(episodes)>1 and sum(map(len,episodes))>5000:raise ValueError('ACC bank exceeds complete-episode capacity policy.')
+        validate_acc_controller(raw['controller'],beta,raw['actual_step'],.01 if raw['arm']=='acc_001' else .1)
     payload=deepcopy(raw['snapshot'])
     if payload.pop('research_only',None) is not True:raise ValueError('Missing explicit inner research snapshot identity.')
     algorithm=payload['engine_checkpoint']['algorithm_config']
@@ -270,6 +226,53 @@ def validate_snapshot(raw, **expected):
     validated=load_v2_periodic_snapshot(payload,**expected)
     validated['diagnostic_research']=dict(arm=raw['arm'],beta=beta,target_config=config)
     return validated
+
+
+def validate_acc_controller(state,beta,actual_step,eta):
+    if (not isinstance(state,dict) or set(state)!={'eta','gamma','capacity','beta','ema','last_adjust','first_boundary','controls','boundary_fraction','episodes'}
+            or state['beta']!=beta or state['eta']!=eta
+            or state['gamma']!=.99 or state['capacity']!=5000):
+        raise ValueError('Controller/beta/arm mismatch.')
+    from brain_uav.scripts.diagnose_v2_critic_calibration import finite_tree
+    finite_tree(state)
+    previous_beta=.5;previous_step=None;previous_ema=None
+    for c in state['controls']:
+        step=c['stage_steps']
+        if step<25000 or step>actual_step or (previous_step is not None and step-previous_step<1000):
+            raise ValueError('Invalid ACC update interval.')
+        ema=c['A'] if previous_ema is None else .95*previous_ema+.05*c['A']
+        scale=max(1.,ema);u=float(np.clip(c['C']/scale,-1,1))
+        if (c['beta_before']!=previous_beta or c['EMA']!=ema or c['S']!=scale or c['u']!=u
+                or c['beta_after']!=float(np.clip(previous_beta+state['eta']*u,0,1))):
+            raise ValueError('ACC control trajectory algebra mismatch.')
+        previous_beta,previous_step,previous_ema=c['beta_after'],step,ema
+    if state['beta']!=previous_beta or state['last_adjust']!=previous_step or state['ema']!=previous_ema:
+        raise ValueError('ACC final state/trajectory mismatch.')
+    first=next((c['stage_steps'] for c in state['controls'] if c['beta_after'] in (0.,1.)),None)
+    fraction=sum(c['beta_after'] in (0.,1.) for c in state['controls'])/max(1,len(state['controls']))
+    if state['first_boundary']!=first or state['boundary_fraction']!=fraction:raise ValueError('ACC boundary evidence mismatch.')
+    episodes=state['episodes']
+    from .v2_mc_return import discounted_episode_returns
+    previous_end=None
+    for episode in episodes:
+        if not episode or not episode[-1]['done'] or any(r['done'] for r in episode[:-1]):raise ValueError('Invalid ACC bank episode.')
+        steps=[r['step'] for r in episode]
+        if (any(type(step) is not int for step in steps)
+                or any(b!=a+1 for a,b in zip(steps,steps[1:]))
+                or (previous_end is not None and steps[0]<=previous_end)):
+            raise ValueError('Invalid ACC bank episode chronology.')
+        previous_end=steps[-1]
+        # Same Python-float recurrence as bank creation; no storage rounding occurs.
+        returns=discounted_episode_returns([r['reward'] for r in episode],state['gamma'])
+        for r,g in zip(episode,returns):
+            if not 0<r['step']<=actual_step or not np.isfinite([r['reward'],r['G']]).all():
+                raise ValueError('Invalid ACC bank values/age.')
+            if (type(r['completed_step']) is not int or r['completed_step']!=steps[-1]
+                    or r['completed_step']>actual_step or r['G']!=g):
+                raise ValueError('ACC bank return/completion mismatch.')
+            if r['action'].dtype!=np.float32 or r['action'].shape!=(2,) or not np.isfinite(r['action']).all():
+                raise ValueError('Invalid actual bank action.')
+    if len(episodes)>1 and sum(map(len,episodes))>5000:raise ValueError('ACC bank exceeds complete-episode capacity policy.')
 
 
 def training_identity(engine, exploration_rng=None, selector=None):
