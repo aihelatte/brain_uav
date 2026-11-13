@@ -1,0 +1,19 @@
+{
+  "name": "lr-final-20261113",
+  "baseline_commit": "8d6d9f6ec01f2af4354371a1735384aead6ddf42",
+  "baseline_config_sha256": "ba495168bc2f258b86703237d825a7eac136f02d6e33abc5b50fc5a24d8681eb",
+  "overrides": {
+    "ann": {
+      "actor_lr": {
+        "from": 0.000155,
+        "to": 0.00012
+      }
+    },
+    "snn": {
+      "critic_lr": {
+        "from": 0.001,
+        "to": 0.00025
+      }
+    }
+  }
+}

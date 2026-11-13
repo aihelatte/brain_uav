@@ -1,6 +1,6 @@
 """Four fresh-BC formal easy baselines; private MPS and fail-closed release."""
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict,replace
 from hashlib import sha256
 import json
 import math
@@ -20,6 +20,9 @@ REPO=provenance.REPO
 POOL_SHA='ebf605a59e1e88590d1fe8d7ab39eabb190e097085a20b8a4c38e5e890a4edcc'
 CONFIG=REPO/'scripts/v2_formal_easy_baseline_config.json'
 SOURCE_MANIFEST=REPO/'scripts/v2_formal_easy_baseline_source.json'
+LR_EXPERIMENT='lr-final-20261113'
+LR_CONFIG=REPO/'scripts/v2_formal_easy_lr_final_config.json'
+LR_SOURCE_MANIFEST=REPO/'scripts/v2_formal_easy_lr_final_source.json'
 
 
 class GateComplete(Exception):pass
@@ -28,9 +31,12 @@ class GateComplete(Exception):pass
 def file_hash(p):return sha256(Path(p).read_bytes()).hexdigest()
 
 
-def identity():
+def identity(experiment='baseline'):
     source=provenance.identity()
     source['sha256'][CONFIG.relative_to(REPO).as_posix()]=sha256(CONFIG.read_bytes().replace(b'\r\n',b'\n')).hexdigest()
+    if experiment==LR_EXPERIMENT:
+        source['sha256'][LR_CONFIG.relative_to(REPO).as_posix()]=sha256(LR_CONFIG.read_bytes().replace(b'\r\n',b'\n')).hexdigest()
+    elif experiment!='baseline':raise ValueError('Unknown formal easy experiment.')
     return source
 
 
@@ -39,7 +45,7 @@ def jobs():
         for m in ('ann','snn') for s in (7,23)]
 
 
-def resolved(job):
+def resolved(job,experiment='baseline'):
     from brain_uav.trainers.v2_formal_training import V2FormalTrainingConfig
     from brain_uav.models.v2_policy_config import V2SpikeRegularizationConfig
     source=json.loads(CONFIG.read_text(encoding='utf-8'))[job['model']]
@@ -71,6 +77,23 @@ def resolved(job):
             or old['spike_beta_max']!=config.spike_regularization.beta_max):raise ValueError('Historical method mismatch.')
     if source['resolved'][job['id']]!=result:
         raise ValueError('Resolved baseline configuration differs from the reviewed lock.')
+    if experiment==LR_EXPERIMENT:
+        candidate=json.loads(LR_CONFIG.read_text(encoding='utf-8'))
+        if (candidate['name']!=experiment or candidate['baseline_commit']!='8d6d9f6ec01f2af4354371a1735384aead6ddf42'
+                or candidate['baseline_config_sha256']!=sha256(CONFIG.read_bytes().replace(b'\r\n',b'\n')).hexdigest()
+                or set(candidate['overrides'])!={'ann','snn'}):
+            raise ValueError('Learning-rate candidate baseline identity mismatch.')
+        changes=candidate['overrides'][job['model']]
+        if set(changes)!=({'actor_lr'} if job['model']=='ann' else {'critic_lr'}):
+            raise ValueError('Only the reviewed per-model learning rate may change.')
+        for name,value in changes.items():
+            if (set(value)!={'from','to'} or getattr(config,name)!=value['from']
+                    or type(value['to']) not in (int,float) or not math.isfinite(value['to']) or value['to']<=0):
+                raise ValueError('Invalid explicit learning-rate difference.')
+        config=replace(config,**{name:value['to'] for name,value in changes.items()})
+        result.update(formal_config=config.to_dict(),experiment=experiment,
+            baseline_commit=candidate['baseline_commit'],learning_rate_changes=changes)
+    elif experiment!='baseline':raise ValueError('Unknown formal easy experiment.')
     return result,config
 
 
@@ -81,6 +104,7 @@ def parser():
     p.add_argument('--ann-bc',type=Path,required=True);p.add_argument('--snn-bc',type=Path,required=True)
     p.add_argument('--validation-pool',type=Path,required=True)
     p.add_argument('--source-manifest',type=Path,default=SOURCE_MANIFEST)
+    p.add_argument('--experiment',choices=('baseline',LR_EXPERIMENT),default='baseline')
     p.add_argument('--job',choices=[j['id'] for j in jobs()])
     p.add_argument('--timeout',type=float,default=1800.)
     p.add_argument('--launch',action='store_true')
@@ -91,7 +115,8 @@ def parser():
 
 
 def plan(a):
-    return dict(mode=a.mode,launch=a.launch,gate_only=a.gate_only,root=str(a.root),jobs=[resolved(j)[0] for j in jobs()],
+    return dict(mode=a.mode,launch=a.launch,gate_only=a.gate_only,root=str(a.root),experiment=a.experiment,
+        jobs=[resolved(j,a.experiment)[0] for j in jobs()],
         initialization_timeout=a.timeout,gate_timeout=a.gate_timeout if a.gate_only else None,
         gate_physical_update_budget_per_worker=128,
         formal_early_stop=True,research_pause=False,inputs=dict(ann_bc=str(a.ann_bc),snn_bc=str(a.snn_bc),pool=str(a.validation_pool)),
@@ -103,9 +128,10 @@ def inputs(a):
     from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
     if inspect.signature(V2StaticNoFlyTrajectoryEnv).parameters['cache_ellipsoid_segment_clearance'].default is not True:
         raise ValueError('Exact ellipsoid cache baseline default is not enabled.')
-    source=identity()
+    source=identity(a.experiment)
     if json.loads(a.source_manifest.read_text())['sha256']!=source['sha256']:raise ValueError('Actual source files differ from reviewed hashes.')
     paths={'ann_bc':a.ann_bc,'snn_bc':a.snn_bc,'pool':a.validation_pool,'config':CONFIG,'source_manifest':a.source_manifest}
+    if a.experiment==LR_EXPERIMENT:paths['experiment_config']=LR_CONFIG
     locked=json.loads(CONFIG.read_text())
     for model in ('ann','snn'):
         path=Path(locked[model]['stage_start_server'])
@@ -118,12 +144,12 @@ def inputs(a):
     from brain_uav.trainers.v2_validation import load_v2_validation_pool
     pool=load_v2_validation_pool(a.validation_pool,expected_level='easy',expected_count=100)
     if pool.content_digest!=provenance.DIGEST:raise ValueError('Fixed pool digest mismatch.')
-    return dict(source=source,paths={k:str(p.resolve()) for k,p in paths.items()},hashes=hashes,pool_digest=pool.content_digest)
+    return dict(source=source,experiment=a.experiment,paths={k:str(p.resolve()) for k,p in paths.items()},hashes=hashes,pool_digest=pool.content_digest)
 
 
 def check_inputs(evidence):
     if any(file_hash(p)!=evidence['hashes'][k] for k,p in evidence['paths'].items()):raise ValueError('Input changed during batch.')
-    if identity()['sha256']!=evidence['source']['sha256']:raise ValueError('Source changed during batch.')
+    if identity(evidence.get('experiment','baseline'))['sha256']!=evidence['source']['sha256']:raise ValueError('Source changed during batch.')
 
 
 def wait_ready(processes,root,timeout):
@@ -135,16 +161,16 @@ def wait_ready(processes,root,timeout):
         time.sleep(.1)
 
 
-def release(processes,root,session):
+def release(processes,root,session,experiment='baseline'):
     records={j:json.loads((root/j/'ready.json').read_text()) for j in processes}
     if set(records)!={j['id'] for j in jobs()} or len({p.pid for p in processes.values()})!=4:raise ValueError('Four unique worker PIDs required.')
     for job in jobs():
         r=records[job['id']]
-        if (r['pid']!=processes[job['id']].pid or r['job']!=job or r['resolved']!=resolved(job)[0]
+        if (r['pid']!=processes[job['id']].pid or r['job']!=job or r['resolved']!=resolved(job,experiment)[0]
                 or processes[job['id']].poll() is not None or r['synchronized'] is not True):
             raise ValueError('Worker identity/configuration/readiness mismatch.')
         from brain_uav.scripts.run_v2_online_wd3_acc import validate_seed_manifest
-        validate_seed_manifest(resolved(job)[1],r['seed_manifest'])
+        validate_seed_manifest(resolved(job,experiment)[1],r['seed_manifest'])
     access=session.verify(processes)
     if any(p.poll() is not None for p in processes.values()):
         raise RuntimeError('Worker exited during MPS membership verification.')
@@ -172,12 +198,12 @@ def worker(a):
     from brain_uav.trainers.v2_validation import scenario_config_from_snapshot,evaluate_v2_fixed_validation
     from brain_uav.scripts.train_v2_td3 import run_v2_td3_stage
     manifest=json.loads((a.root/'manifest.json').read_text());check_inputs(manifest['inputs'])
-    if manifest['plan']['gate_only']!=a.gate_only:
+    if manifest['plan']['gate_only']!=a.gate_only or manifest['plan'].get('experiment','baseline')!=a.experiment:
         raise ValueError('Worker mode differs from batch manifest.')
     for name,path in (('ann_bc',a.ann_bc),('snn_bc',a.snn_bc),('pool',a.validation_pool)):
         if str(path.resolve())!=manifest['inputs']['paths'][name]:
             raise ValueError('Worker input path differs from batch manifest.')
-    job=next(j for j in jobs() if j['id']==a.job);spec,cfg=resolved(job)
+    job=next(j for j in jobs() if j['id']==a.job);spec,cfg=resolved(job,a.experiment)
     directory=a.root/job['id'];directory.mkdir(exist_ok=False);started=time.perf_counter()
     status=dict(execution_completed=False,job=job,formal_passed=None,pid=os.getpid(),batch_id=manifest['batch_id'])
     def gate(engine,config,seeds,initial,compilation):
@@ -261,7 +287,7 @@ def gate_bindings(root,manifest):
         reports={name:json.loads((directory/name).read_text()) for name in
             ('cuda_gate.json','worker_summary.json','process.json','ready.json')}
         gate,worker,process,ready=[reports[k] for k in ('cuda_gate.json','worker_summary.json','process.json','ready.json')]
-        expected=dict(job=job,pid=ready['pid'],batch_id=manifest['batch_id'],resolved=resolved(job)[0],
+        expected=dict(job=job,pid=ready['pid'],batch_id=manifest['batch_id'],resolved=resolved(job,manifest['plan'].get('experiment','baseline'))[0],
             source_sha256=manifest['inputs']['source']['sha256'],input_hashes=manifest['inputs']['hashes'])
         if (gate.get('identity')!=expected or gate['strict_passed'] is not True or gate['execution_completed'] is not True
                 or worker['execution_completed'] is not True or worker['strict_passed'] is not True
@@ -278,6 +304,7 @@ def validate_gate(a,evidence):
     status=json.loads((root/'batch_summary.json').read_text())
     manifest=json.loads((root/'manifest.json').read_text())
     if (status['execution_completed'] is not True or manifest['plan']['gate_only'] is not True
+            or manifest['plan'].get('experiment','baseline')!=a.experiment
             or manifest['inputs']['hashes']!=evidence['hashes']
             or manifest['inputs'].get('paths')!=evidence.get('paths')
             or manifest['inputs']['source']['sha256']!=evidence['source']['sha256']):
@@ -298,6 +325,8 @@ def collect(a):
     staging=None
     try:
         manifest=json.loads((a.root/'manifest.json').read_text())
+        if manifest['plan'].get('experiment','baseline')!=a.experiment:
+            raise ValueError('Collect experiment differs from batch manifest.')
         evidence=manifest['inputs']
         check_inputs(evidence)
         pool=load_v2_validation_pool(evidence['paths']['pool'],expected_level='easy',expected_count=100)
@@ -309,7 +338,7 @@ def collect(a):
             records=[]
             for seed in (7,23):
                 job=next(j for j in jobs() if j['model']==model and j['seed']==seed)
-                spec,expected=resolved(job)
+                spec,expected=resolved(job,a.experiment)
                 directory=a.root/job['id']
                 status=json.loads((directory/'worker_summary.json').read_text())
                 process=json.loads((directory/'process.json').read_text())
@@ -448,7 +477,8 @@ def _launch(a):
             logs.append(log)
             command=[sys.executable,'-u','-B','-m','brain_uav.scripts.run_v2_formal_easy_baseline','worker',
                 '--root',str(a.root),'--ann-bc',str(a.ann_bc),'--snn-bc',str(a.snn_bc),'--validation-pool',str(a.validation_pool),
-                '--source-manifest',str(a.source_manifest),'--job',job['id'],'--timeout',str(a.timeout),'--launch']
+                '--source-manifest',str(a.source_manifest),'--experiment',a.experiment,
+                '--job',job['id'],'--timeout',str(a.timeout),'--launch']
             if a.gate_only:
                 command.append('--gate-only')
             worker_started[job['id']]=time.perf_counter()
@@ -457,7 +487,7 @@ def _launch(a):
             processes[job['id']]=process
             session.register(processes)
         wait_ready(processes,a.root,a.timeout)
-        release(processes,a.root,session)
+        release(processes,a.root,session,a.experiment)
         deadline=time.monotonic()+a.gate_timeout if a.gate_only else None
         pending=set(processes)
         while pending:
