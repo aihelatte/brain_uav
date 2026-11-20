@@ -337,6 +337,7 @@ def worker(a):
             max_stage_steps=500000,actor_lr=cfg.actor_lr,critic_lr=cfg.critic_lr,failure_sample_bias=2.,acc_eta=cfg.acc_eta,
             gamma=.99,target_q_aggregation='min',mc_return_weight=0.,bc_schedule='smooth-mid-strong',target_noise_scale=1.,
             actor_projection_dim=32,actor_hidden_dim=192,snn_time_window=4,actor_rl_scale_alpha=2.5,
+            terminal_geo_radius=cfg.terminal_geo_radius,terminal_geo_far_weight=cfg.terminal_geo_far_weight,
             spike_regularization=cfg.spike_regularization,formal_config=cfg,
             scenario=scenario_config_from_snapshot(spec['scenario_config']),rewards=reward_config_from_snapshot(spec['reward_config']),
             uav_collision_radius=0.,gpu_td3_compute=True,cpu_deduplication=True,non_blocking_batch_transfer=True,

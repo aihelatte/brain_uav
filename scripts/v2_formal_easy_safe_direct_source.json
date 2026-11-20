@@ -1,5 +1,5 @@
 {
-  "HEAD": "1b801d3c98b8d0bf9935edef60a044e205217ebb",
+  "HEAD": "6192a64438fdaa1ec5fb9224d329c578a9ceab1d",
   "sha256": {
     "scripts/online_v2_wd3_acc.sh": "2a1560d1f509a3e6351c017adfb2118e2cabdd649d5f27d9a9460ba4469231a8",
     "scripts/v2_formal_easy_baseline_config.json": "ba495168bc2f258b86703237d825a7eac136f02d6e33abc5b50fc5a24d8681eb",
@@ -71,14 +71,14 @@
     "src/brain_uav/scripts/run_full_experiment.py": "2784cde59c2415b8aad4c4d554e6e88d85768701cc6380d2db1c2282ea3253de",
     "src/brain_uav/scripts/run_full_pipeline.py": "a9ce6f2f23876be044c9954075129ecb02e8073e3e91d96dfd198ea7011f1a1d",
     "src/brain_uav/scripts/run_full_pipeline_candidates.py": "53c9bb5cb113a9bb4db3f3ff98e8e6385494860499eeec3ed00fe1b7f52ed23d",
-    "src/brain_uav/scripts/run_v2_formal_easy_baseline.py": "706e78cffbbedef75826c84f5a9da39d753def1994ccb682412b2ad264a49c32",
+    "src/brain_uav/scripts/run_v2_formal_easy_baseline.py": "865a004d847ad8e0ce2b3edc8350d5d3f4bc4c527d7c94b8884536ed97e2eed6",
     "src/brain_uav/scripts/run_v2_online_wd3_acc.py": "ea65dca306551d1901bae23fc0a7cebc45deb314a0b092dfa08bb1840cb74e78",
     "src/brain_uav/scripts/run_v2_td3_curriculum.py": "b311c13cf31fb6aeaf86968107efa955a9e749bdf38446d7f860834cbc5fc745",
     "src/brain_uav/scripts/test_baseline_planners.py": "22325101812e6494375dfe32f61a8768c22a734885f9c29c5d4b5b42fe194e14",
     "src/brain_uav/scripts/train_bc.py": "784b7c34269d7f9457e24aba22de291ff954be12cbddcd7fa3c76295dbdd0055",
     "src/brain_uav/scripts/train_td3.py": "10b05c19ad004f98b825c7cdd61da73ce76ed9ce4a5871a667ef87f049517830",
     "src/brain_uav/scripts/train_v2_bc.py": "0aec89a7207d70e33292b3def3a3d111c8e77b7cd83ebce66aec7fa955015fa9",
-    "src/brain_uav/scripts/train_v2_td3.py": "8fe679bbee731561d889834787dd133ddaf939901482c8daf3f4de70e6d565c8",
+    "src/brain_uav/scripts/train_v2_td3.py": "663c59fc49e38f2e83d08b268c1400a347ec822cbb759cd3befead9d5a9949f2",
     "src/brain_uav/scripts/v2_ann_common_state_diagnostic.py": "6d76cd483783a1ed09c1e13588efaf2558cb412bfacfe2f74531197840f48468",
     "src/brain_uav/scripts/v2_batch_transfer_diagnostic.py": "2f1be7029492719abc6a59726047392fb35d824051fb34f783211fcb18b80197",
     "src/brain_uav/scripts/v2_concurrent_diagnostic.py": "a4d078dfde7a1df900c8f246b427e0e2e1fea16138b6e4fe74d393a192131fbf",
@@ -117,5 +117,5 @@
     "src/brain_uav/v2_curriculum.py": "32332ed6dae1bf65c8cee3c2e913e16f16473c1e97570ac8e66e3e444f3ad970"
   },
   "source_hash_normalization": "CRLF-to-LF",
-  "status": "M src/brain_uav/config.py\n M src/brain_uav/envs/static_no_fly_env_runtime.py\n M src/brain_uav/envs/v2_static_no_fly_env.py\n M src/brain_uav/observations/v2_builder.py\n M src/brain_uav/scripts/run_v2_formal_easy_baseline.py\n M src/brain_uav/scripts/train_v2_td3.py\n M src/brain_uav/scripts/v2_formal_easy_cuda_gate.py\n M src/brain_uav/trainers/v2_formal_training.py\n M src/brain_uav/trainers/v2_gpu_update.py\n M src/brain_uav/trainers/v2_replay_buffer.py\n M src/brain_uav/trainers/v2_td3.py\n M src/brain_uav/trainers/v2_validation.py\n M tests/test_v2_formal_easy_lr_final.py\n?? AGENTS.md\n?? diagnostics/\n?? docs/superpowers/\n?? docs/v2_formal_easy_safe_direct.md\n?? scripts/v2_formal_easy_safe_direct_config.json\n?? src/brain_uav/scripts/v2_formal_easy_guidance.py\n?? tests/test_v2_formal_easy_guidance.py"
+  "status": "M scripts/v2_formal_easy_safe_direct_source.json\n M src/brain_uav/scripts/run_v2_formal_easy_baseline.py\n M src/brain_uav/scripts/train_v2_td3.py\n M tests/test_v2_formal_easy_guidance.py\n?? AGENTS.md\n?? diagnostics/\n?? docs/superpowers/"
 }

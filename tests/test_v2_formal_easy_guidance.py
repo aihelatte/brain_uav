@@ -1,4 +1,5 @@
 """CPU checks for the formal easy climb warning and safe-direct objective."""
+from contextlib import nullcontext
 from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
@@ -14,6 +15,7 @@ from brain_uav.config import RewardConfig
 from brain_uav.geometry import NoFlyZone, Sphere
 from brain_uav.models.v2_snn import V2SNNPolicyActor
 from brain_uav.scripts import run_v2_formal_easy_baseline as run
+from brain_uav.scripts import train_v2_td3 as single_stage
 from brain_uav.scripts import v2_formal_easy_guidance as reporting
 from brain_uav.trainers import v2_formal_training as formal
 from brain_uav.trainers.v2_td3 import _actor_loss_tensor_block
@@ -128,6 +130,50 @@ class Guidance(unittest.TestCase):
             self.assertFalse(root.exists())
             with self.assertRaisesRegex(ValueError, 'batch workers'):
                 run.release({}, root, None, run.GUIDANCE_EXPERIMENT, batch='seed11')
+
+    def test_worker_checks_guidance_in_real_single_stage_entry(self):
+        class ReachedInitialization(Exception):
+            pass
+
+        real_stage = single_stage.run_v2_td3_stage
+        for job in run.jobs(run.GUIDANCE_EXPERIMENT, 'seed11'):
+            for overrides in ({}, {'terminal_geo_radius': 250.}, {'terminal_geo_far_weight': 0.}):
+                with self.subTest(model=job['model'], overrides=overrides), TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    args = run.parser().parse_args([
+                        'worker', '--root', tmp, '--job', job['id'], '--batch', 'seed11',
+                        '--experiment', run.GUIDANCE_EXPERIMENT, '--ann-bc', str(root / 'ann.pt'),
+                        '--snn-bc', str(root / 'snn.pt'), '--validation-pool', str(root / 'pool.json'),
+                    ])
+                    paths = dict(ann_bc=str(args.ann_bc.resolve()), snn_bc=str(args.snn_bc.resolve()),
+                                 pool=str(args.validation_pool.resolve()))
+                    run.atomic_json(root / 'manifest.json', dict(
+                        plan=run.plan(args), inputs={'paths': paths}, batch_id='guidance-test',
+                    ))
+
+                    def stage_with_wrong_argument(**kwargs):
+                        return real_stage(**{**kwargs, **overrides})
+
+                    inject = (patch.object(single_stage, 'run_v2_td3_stage', side_effect=stage_with_wrong_argument)
+                              if overrides else nullcontext())
+                    # Stop after the real consistency check, before the checkpoint or CUDA is opened.
+                    with (patch.object(run, 'check_inputs'),
+                          patch.object(single_stage, 'resolve_training_device', return_value='cuda'),
+                          patch('brain_uav.trainers.v2_gpu_update.require_cuda_abi'),
+                          patch.object(single_stage, 'prepare_v2_stage_initialization',
+                                       side_effect=ReachedInitialization) as prepare,
+                          inject):
+                        if overrides:
+                            with self.assertRaisesRegex(ValueError, 'Explicit formal config differs'):
+                                run.worker(args)
+                            prepare.assert_not_called()
+                        else:
+                            with self.assertRaises(ReachedInitialization):
+                                run.worker(args)
+                            prepare.assert_called_once()
+                            config = prepare.call_args.args[0]
+                            self.assertEqual((config.terminal_geo_radius, config.terminal_geo_far_weight), (400., .5))
+                            self.assertEqual(prepare.call_args.kwargs['model_type'], job['model'])
 
     def test_ann_and_snn_formal_builder_trainer_replay_and_checkpoint(self):
         scenario = _config(world_xy=1250., world_z_max=600., goal_radius=410., max_steps=1)

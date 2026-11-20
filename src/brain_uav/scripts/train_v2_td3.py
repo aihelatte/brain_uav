@@ -496,6 +496,8 @@ def run_v2_td3_stage(
     actor_projection_dim: int | None = None,
     actor_hidden_dim: int | None = None,
     actor_rl_scale_alpha: float = 2.5,
+    terminal_geo_radius: float = 250.0,
+    terminal_geo_far_weight: float = 0.0,
     spike_regularization: V2SpikeRegularizationConfig | None = None,
     prepared_initialization: V2PreparedStageInitialization | None = None,
     reporting: bool = True,
@@ -586,6 +588,8 @@ def run_v2_td3_stage(
         actor_lr=_resolve_v2_actor_lr(stage, model, actor_lr),
         critic_lr=critic_lr,
         actor_rl_scale_alpha=actor_rl_scale_alpha,
+        terminal_geo_radius=terminal_geo_radius,
+        terminal_geo_far_weight=terminal_geo_far_weight,
         noise_schedule=noise_schedule,
         spike_regularization=V2SpikeRegularizationConfig() if spike_regularization is None else spike_regularization,
     )
