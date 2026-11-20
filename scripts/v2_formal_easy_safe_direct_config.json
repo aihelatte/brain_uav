@@ -1,0 +1,53 @@
+{
+  "name": "safe-direct-20261119",
+  "control": "safe-direct-control-seed11",
+  "baseline_commit": "8d6d9f6ec01f2af4354371a1735384aead6ddf42",
+  "baseline_config_sha256": "ba495168bc2f258b86703237d825a7eac136f02d6e33abc5b50fc5a24d8681eb",
+  "batches": {
+    "main": [
+      7,
+      23
+    ],
+    "seed11": [
+      11
+    ]
+  },
+  "overrides": {
+    "terminal_geo_radius": [
+      250,
+      400
+    ],
+    "terminal_geo_far_weight": [
+      0,
+      0.5
+    ],
+    "upper_boundary_directional_warning_distance": [
+      null,
+      120
+    ]
+  },
+  "historical_artifact_sha256": {
+    "manifest.json": "1670e59816efab4f74ddcc2ccbacbeefdc4e1f50dd095965568eda4032870c7f",
+    "batch_summary.json": "55b78ec19deae655f440de2bcbdc46ee0523416d41cce60eb9d56de6478f992c",
+    "ann_seed7/metrics_reports/episodes.jsonl": "ff1b431a99722cbc365551f318e5ecd8cd4ad0585ecd5fdc0b230e8ff203e2a4",
+    "ann_seed7/terminal_evaluation.json": "6efcd8692419638afa91cb3ddcc17f8994043f7df20c651263d6cf6e8d9a7309",
+    "ann_seed7/ready.json": "34d5480cb6449a18791d8a62e2d6c4243e5ce6ff37cfdaab7a21aeb97d351c04",
+    "ann_seed7/process.json": "b751364558778c79233963c31a993bdfb06f45695211bddea78b9b558fa5b67e",
+    "ann_seed7/worker_summary.json": "7f5e9a72a4c55b22a4e7fb066c89707d109daecb2cf934848ccd7e032d8776ad",
+    "ann_seed23/metrics_reports/episodes.jsonl": "1d884ed81de3ff013707db739b064d50946afa4b194d6284be5502824664ebd1",
+    "ann_seed23/terminal_evaluation.json": "aa1b93f4a856fca8d34750bef25bdc1bd058d8526bb5e83a57bc4b414e50ee20",
+    "ann_seed23/ready.json": "07e06e9799555e969a17ac91ec30605b954c4a47a18f131a8a9ca623108eb280",
+    "ann_seed23/process.json": "16c9e47dbdaf08a86510cf3d2ec4887221f40236cf3705d646856a1c1fdbb482",
+    "ann_seed23/worker_summary.json": "5b97f228247f583b1868d023255c64069c87a22db3664ff305e32a5038c5ee89",
+    "snn_seed7/metrics_reports/episodes.jsonl": "dd84e677e2a22090dd2d5d899e6421b0e99d034494844f1714f3d9751b605861",
+    "snn_seed7/terminal_evaluation.json": "a73ae321dc6f4b0339be7877d4fc8f6094edb932f961fe3cd32291d862f00be8",
+    "snn_seed7/ready.json": "90dc11b778e6b6ab791bb3abac4e2b170d2f29b81b4e88bd8c8c69f0036e7ed4",
+    "snn_seed7/process.json": "e764eae7be10bdeb4f70aa45728a986e7f88e29dab1c05cf968baf786f560bba",
+    "snn_seed7/worker_summary.json": "02cd5ef47d262bd3fc63a7480375ec684f55c0893159a1cb3fb859f2191f7127",
+    "snn_seed23/metrics_reports/episodes.jsonl": "9804d6947b769f1e5cf0c99c4ae341cc20f3d90e4049c818db02f082a7a41890",
+    "snn_seed23/terminal_evaluation.json": "bc3481c6d3b2f994aaf565a03fddfcb1d3819dc252b80f15125a5cdcdaebf816",
+    "snn_seed23/ready.json": "26168a7c50b6c4b9667dbb0995dc4127a43bbbd34bb1c6a400a0d10d58acc311",
+    "snn_seed23/process.json": "67ff18f6ac20125e7047465ccc38d45d1c23d1fe4e11be34b916c12be07a987d",
+    "snn_seed23/worker_summary.json": "119e7bc1b4e0ecbd1164e74db6fa6e5a2658380bdabbe0e2f2abdfe78f6e6a9b"
+  }
+}

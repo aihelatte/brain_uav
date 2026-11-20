@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import asdict, dataclass, fields, replace
-from math import isfinite, pi
+from math import isfinite
 import random
 from time import perf_counter
 from typing import Any, Callable, Iterator, Sequence
@@ -22,9 +22,7 @@ from brain_uav.models.v2_policy_config import V2SpikeRegularizationConfig, polic
 from brain_uav.models.zone_set_encoder import ZoneSetSharedRelations
 from brain_uav.observations import (
     EGO_FEATURE_DIM,
-    EGO_FEATURE_INDEX,
     GOAL_FEATURE_DIM,
-    GOAL_FEATURE_INDEX,
     ZONE_FEATURE_DIM,
     V2Observation,
     V2ObservationBatch,
@@ -34,10 +32,7 @@ from brain_uav.observations import (
 
 from .v2_replay_buffer import V2ReplayBatch, V2ReplayBuffer
 
-_GOAL_FORWARD_NORM_INDEX = int(GOAL_FEATURE_INDEX['goal_forward_norm'])
-_GOAL_RIGHT_NORM_INDEX = int(GOAL_FEATURE_INDEX['goal_right_norm'])
-_GOAL_UP_NORM_INDEX = int(GOAL_FEATURE_INDEX['goal_up_norm'])
-_GAMMA_FRACTION_INDEX = int(EGO_FEATURE_INDEX['gamma_fraction'])
+from brain_uav.observations.v2_builder import terminal_reference_action
 
 
 def _action_inference_ann_tensors(
@@ -92,6 +87,21 @@ def _empty_zone_batch(batch: V2ObservationBatch) -> V2ObservationBatch:
     )
 
 
+def _terminal_guidance_loss(actions, ego, goal, safe, low, high,
+                            horizontal_span, vertical_span, gamma_max, radius, far_weight):
+    reference, distance = terminal_reference_action(
+        ego, goal, horizontal_span, vertical_span, gamma_max, low, high, torch,
+    )
+    error = (actions - reference).square().mean(dim=-1)
+    safe = safe.squeeze(-1)
+    near = (safe == 1 if far_weight else (safe > .5) & (distance <= radius)).to(error.dtype)
+    near_loss = (error * near).sum() / near.sum().clamp_min(1.0)
+    if not far_weight:
+        return near_loss
+    far = (safe == 2).to(error.dtype)
+    return near_loss + far_weight * (error * far).sum() / far.sum().clamp_min(1.0)
+
+
 def _actor_loss_tensor_block(
     actor_actions: torch.Tensor,
     q_values: torch.Tensor,
@@ -113,6 +123,7 @@ def _actor_loss_tensor_block(
     spike_beta: torch.Tensor | None = None,
     spike_target: float = 0.17,
     return_spike_terms: bool = False,
+    far_weight: float = 0.0,
 ) -> tuple[torch.Tensor, ...]:
     rl_actor_loss = -q_values.mean()
     q_scale = q_values.detach().abs().mean().clamp(min=1.0)
@@ -122,39 +133,11 @@ def _actor_loss_tensor_block(
         actor_actions.sum() * 0.0 if reference_actions is None
         else F.mse_loss(actor_actions, reference_actions)
     )
-    if terminal_enabled:
-        goal_forward = goal_features[:, _GOAL_FORWARD_NORM_INDEX] * horizontal_span
-        goal_right = goal_features[:, _GOAL_RIGHT_NORM_INDEX] * horizontal_span
-        goal_up = goal_features[:, _GOAL_UP_NORM_INDEX] * vertical_span
-        goal_distance = torch.sqrt(
-            goal_forward.square() + goal_right.square() + goal_up.square()
-        )
-        gamma = ego_features[:, _GAMMA_FRACTION_INDEX] * gamma_max
-        target_gamma = torch.atan2(
-            goal_up, torch.sqrt(goal_forward.square() + goal_right.square()),
-        )
-        relative_target_psi = torch.atan2(goal_right, goal_forward)
-        delta_gamma = torch.maximum(
-            torch.minimum(target_gamma - gamma, action_high[0]), action_low[0],
-        )
-        delta_psi = torch.maximum(
-            torch.minimum(
-                torch.remainder(relative_target_psi + pi, 2.0 * pi) - pi,
-                action_high[1],
-            ),
-            action_low[1],
-        )
-        target_action = torch.stack((delta_gamma, delta_psi), dim=-1)
-        squared_error = (actor_actions - target_action).square().mean(dim=-1)
-        eligible = (
-            (line_to_goal_safe.squeeze(-1) > 0.5)
-            & (goal_distance <= terminal_radius)
-        ).to(squared_error.dtype)
-        terminal_geo_loss = (
-            (squared_error * eligible).sum() / eligible.sum().clamp_min(1.0)
-        )
-    else:
-        terminal_geo_loss = actor_actions.sum() * 0.0
+    terminal_geo_loss = (
+        _terminal_guidance_loss(actor_actions, ego_features, goal_features, line_to_goal_safe,
+            action_low, action_high, horizontal_span, vertical_span, gamma_max, terminal_radius, far_weight)
+        if terminal_enabled else actor_actions.sum() * 0.0
+    )
     actor_loss = (
         scaled_rl_actor_loss + bc_lambda * bc_loss
         + terminal_lambda * terminal_geo_loss
@@ -443,6 +426,7 @@ class V2TD3UpdateEngine:
         terminal_geo_regularization_enabled: bool = True,
         terminal_geo_radius: float = 250.0,
         terminal_geo_lambda: float = 3000.0,
+        terminal_geo_far_weight: float = 0.0,
         bc_reference_actor: V2PolicyActor | None = None,
         device: str | torch.device = 'cpu',
         fused_adam: bool = False,
@@ -633,6 +617,11 @@ class V2TD3UpdateEngine:
         self.terminal_geo_lambda = _finite_float(
             terminal_geo_lambda, name='terminal_geo_lambda'
         )
+        self.terminal_geo_far_weight = _finite_float(
+            terminal_geo_far_weight, name='terminal_geo_far_weight'
+        )
+        if not 0.0 <= self.terminal_geo_far_weight <= 1.0:
+            raise ValueError('Terminal geometry far weight must be in [0, 1].')
         if self.terminal_geo_radius < 0.0 or self.terminal_geo_lambda < 0.0:
             raise ValueError('Terminal geometry radius and lambda must be non-negative.')
         if self.terminal_geo_regularization_enabled and self.action_dim != 2:
@@ -772,6 +761,7 @@ class V2TD3UpdateEngine:
                         spike_rate=torch.full((), .3, device=self.device, requires_grad=True) if self.model_type == 'snn' else None,
                         spike_beta=torch.as_tensor(self.spike_regularization.beta_max, device=self.device) if self.model_type == 'snn' else None,
                         spike_target=self.spike_regularization.target_rate,
+                        far_weight=self.terminal_geo_far_weight,
                     )
                     total.backward()
                     if actions.grad is None or q_values.grad is None:
@@ -2489,6 +2479,7 @@ class V2TD3UpdateEngine:
                     spike_rate=torch.full((), .3, device=self.device, requires_grad=True) if self.model_type == 'snn' else None,
                     spike_beta=torch.as_tensor(self.spike_regularization.beta_max, device=self.device) if self.model_type == 'snn' else None,
                     spike_target=self.spike_regularization.target_rate,
+                    far_weight=self.terminal_geo_far_weight,
                 )
                 total.backward()
 
@@ -3837,6 +3828,7 @@ class V2TD3UpdateEngine:
                         spike_rate if isinstance(self.actor, V2SNNPolicyActor) else None,
                         self._actor_loss_coefficient_tensor('spike_beta', spike_beta, q_values) if self.model_type == 'snn' else None,
                         self.spike_regularization.target_rate,
+                        far_weight=self.terminal_geo_far_weight,
                     )
                 actor_loss, rl_actor_loss, scaled_rl_actor_loss, actor_rl_scale, bc_loss, terminal_geo_loss = outputs[:6]
         return _ActorLossTerms(
@@ -3874,56 +3866,12 @@ class V2TD3UpdateEngine:
     ) -> torch.Tensor:
         if not self.terminal_geo_regularization_enabled:
             return actor_actions.sum() * 0.0
-        goal_forward = (
-            observation.goal_features[
-                :, GOAL_FEATURE_INDEX['goal_forward_norm']
-            ]
-            * self.actor.scales.horizontal_span
+        return _terminal_guidance_loss(
+            actor_actions, observation.ego_features, observation.goal_features,
+            line_to_goal_safe, self.action_low, self.action_high,
+            self.actor.scales.horizontal_span, self.actor.scales.vertical_span,
+            self.actor.scales.gamma_max, self.terminal_geo_radius, self.terminal_geo_far_weight,
         )
-        goal_right = (
-            observation.goal_features[
-                :, GOAL_FEATURE_INDEX['goal_right_norm']
-            ]
-            * self.actor.scales.horizontal_span
-        )
-        goal_up = (
-            observation.goal_features[:, GOAL_FEATURE_INDEX['goal_up_norm']]
-            * self.actor.scales.vertical_span
-        )
-        goal_distance = torch.sqrt(
-            goal_forward.square() + goal_right.square() + goal_up.square()
-        )
-        gamma = (
-            observation.ego_features[:, EGO_FEATURE_INDEX['gamma_fraction']]
-            * self.actor.scales.gamma_max
-        )
-        target_gamma = torch.atan2(
-            goal_up,
-            torch.sqrt(goal_forward.square() + goal_right.square()),
-        )
-        relative_target_psi = torch.atan2(goal_right, goal_forward)
-        delta_gamma = torch.maximum(
-            torch.minimum(target_gamma - gamma, self.action_high[0]),
-            self.action_low[0],
-        )
-        delta_psi = torch.maximum(
-            torch.minimum(
-                self._wrap_angle_tensor(relative_target_psi),
-                self.action_high[1],
-            ),
-            self.action_low[1],
-        )
-        target_action = torch.stack((delta_gamma, delta_psi), dim=-1)
-        squared_error = (actor_actions - target_action).square().mean(dim=-1)
-        eligible = (
-            (line_to_goal_safe.squeeze(-1) > 0.5)
-            & (goal_distance <= self.terminal_geo_radius)
-        ).to(squared_error.dtype)
-        return (squared_error * eligible).sum() / eligible.sum().clamp_min(1.0)
-
-    @staticmethod
-    def _wrap_angle_tensor(value: torch.Tensor) -> torch.Tensor:
-        return torch.remainder(value + pi, 2.0 * pi) - pi
 
     def _soft_update(self, online: nn.Module, target: nn.Module) -> None:
         try:
@@ -4063,6 +4011,8 @@ class V2TD3UpdateEngine:
             ),
             'terminal_geo_radius': self.terminal_geo_radius,
             'terminal_geo_lambda': self.terminal_geo_lambda,
+            **({'terminal_geo_far_weight': self.terminal_geo_far_weight}
+               if self.terminal_geo_far_weight else {}),
             'spike_regularization': self.spike_regularization.to_dict(),
             **({'online_research_target': dict(self.research_target_config)}
                if getattr(self, 'research_target_config', None) is not None else {}),

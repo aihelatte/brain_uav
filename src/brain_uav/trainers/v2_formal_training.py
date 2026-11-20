@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from brain_uav.config import RewardConfig, ScenarioConfig, reward_config_from_snapshot
+from brain_uav.config import RewardConfig, ScenarioConfig, reward_config_from_snapshot, reward_config_snapshot
 from brain_uav.envs import V2ScenarioGenerator, V2StaticNoFlyTrajectoryEnv
 from brain_uav.models import V2ANNCritic, V2ANNPolicyActor, V2SNNPolicyActor
 from brain_uav.models.v2_policy_config import V2SpikeRegularizationConfig, projection_from_architecture
@@ -283,6 +283,7 @@ class V2FormalTrainingConfig:
     terminal_geo_radius: float = 250.0
     terminal_geo_lambda: float = 3000.0
     terminal_geo_safe_clearance: float = 40.0
+    terminal_geo_far_weight: float = 0.0
     near_goal_radius: float = 250.0
     noise_schedule: V2NoiseSchedule = field(default_factory=V2NoiseSchedule)
     window_episode_count: int = 15
@@ -345,6 +346,7 @@ class V2FormalTrainingConfig:
         terminal_radius = _nonnegative_float(self.terminal_geo_radius, name='terminal_geo_radius')
         terminal_lambda = _nonnegative_float(self.terminal_geo_lambda, name='terminal_geo_lambda')
         terminal_clearance = _nonnegative_float(self.terminal_geo_safe_clearance, name='terminal_geo_safe_clearance')
+        terminal_far_weight = _fraction(self.terminal_geo_far_weight, name='terminal_geo_far_weight')
         near_goal_radius = _nonnegative_float(self.near_goal_radius, name='near_goal_radius')
         if not isinstance(self.noise_schedule, V2NoiseSchedule):
             raise TypeError('noise_schedule must be a V2NoiseSchedule.')
@@ -379,6 +381,7 @@ class V2FormalTrainingConfig:
         object.__setattr__(self, 'terminal_geo_radius', terminal_radius)
         object.__setattr__(self, 'terminal_geo_lambda', terminal_lambda)
         object.__setattr__(self, 'terminal_geo_safe_clearance', terminal_clearance)
+        object.__setattr__(self, 'terminal_geo_far_weight', terminal_far_weight)
         object.__setattr__(self, 'near_goal_radius', near_goal_radius)
         object.__setattr__(self, 'window_episode_count', window_count)
         object.__setattr__(self, 'max_failures_per_window', max_window_failures)
@@ -389,6 +392,8 @@ class V2FormalTrainingConfig:
     def to_dict(self) -> dict[str, Any]:
         values = asdict(self)
         if self.acc_eta is None:values.pop('acc_eta')
+        if not self.terminal_geo_far_weight:
+            values.pop('terminal_geo_far_weight')
         values['spike_regularization'] = (self.spike_regularization or V2SpikeRegularizationConfig()).to_dict()
         return _strict_json_copy(values)
 
@@ -511,7 +516,7 @@ class _EpisodeTransition:
     next_observation: V2Observation
     done: bool
     near_goal: bool
-    line_to_goal_safe: bool
+    line_to_goal_safe: bool | int
     collected_stage_step: int = 0
 
 
@@ -732,8 +737,8 @@ def prepare_v2_stage_initialization(
         ):
             raise ValueError('Previous stage ScenarioConfig is incompatible.')
         if rewards is not None and (
-            _strict_json_copy(asdict(rewards))
-            != _strict_json_copy(asdict(effective_rewards))
+            _strict_json_copy(reward_config_snapshot(rewards))
+            != _strict_json_copy(reward_config_snapshot(effective_rewards))
         ):
             raise ValueError('Previous stage RewardConfig is incompatible.')
         if requested_radius is not None and requested_radius != effective_radius:
@@ -932,8 +937,8 @@ def validate_v2_prepared_stage_initialization(
         if not isinstance(rewards, RewardConfig):
             raise TypeError('rewards must be a RewardConfig when provided.')
         if (
-            _strict_json_copy(asdict(prepared.reward_config))
-            != _strict_json_copy(asdict(rewards))
+            _strict_json_copy(reward_config_snapshot(prepared.reward_config))
+            != _strict_json_copy(reward_config_snapshot(rewards))
         ):
             raise ValueError('prepared_initialization RewardConfig is incompatible.')
     if uav_collision_radius is not None:
@@ -1004,8 +1009,7 @@ def validate_v2_prepared_stage_initialization(
     if (
         wrapper.get('scenario_config')
         != scenario_config_snapshot(prepared.scenario_config)
-        or wrapper.get('reward_config')
-        != _strict_json_copy(asdict(prepared.reward_config))
+        or reward_config_from_snapshot(wrapper.get('reward_config')) != prepared.reward_config
         or wrapper.get('uav_collision_radius')
         != prepared.uav_collision_radius
     ):
@@ -1145,7 +1149,7 @@ def build_v2_stage_engine(
         if rewards is not None:
             if not isinstance(rewards, RewardConfig):
                 raise TypeError('rewards must be a RewardConfig when provided.')
-            if wrapper['reward_config'] != _strict_json_copy(asdict(rewards)):
+            if reward_config_from_snapshot(wrapper['reward_config']) != rewards:
                 raise ValueError('Previous stage RewardConfig is incompatible.')
         previous_engine_payload = wrapper['engine_checkpoint']
         (
@@ -1272,6 +1276,7 @@ def build_v2_stage_engine(
         terminal_geo_regularization_enabled=config.terminal_geo_regularization_enabled,
         terminal_geo_radius=config.terminal_geo_radius,
         terminal_geo_lambda=config.terminal_geo_lambda,
+        terminal_geo_far_weight=config.terminal_geo_far_weight,
         bc_reference_actor=bc_actor,
         device=device,
         fused_adam=fused_adam,
@@ -1504,10 +1509,16 @@ class V2FormalStageTrainer:
                 max_steps=self.config.max_steps,
             )
             self.engine.set_target_noise(policy_noise=policy_noise, noise_clip=noise_clip)
-            line_safe = self.env.line_to_goal_is_safe(
-                self.env.state[:3],
-                clearance=self.config.terminal_geo_safe_clearance,
-            )
+            if self.config.terminal_geo_far_weight:
+                line_safe = self.env.direct_guidance_band(
+                    observation, radius=self.config.terminal_geo_radius,
+                    clearance=self.config.terminal_geo_safe_clearance,
+                )
+            else:
+                line_safe = self.env.line_to_goal_is_safe(
+                    self.env.state[:3],
+                    clearance=self.config.terminal_geo_safe_clearance,
+                )
             action = self.engine.select_action(
                 observation,
                 exploration_noise=exploration_noise,
@@ -1928,7 +1939,7 @@ def build_v2_formal_checkpoint(
         'engine_checkpoint': engine.checkpoint_state_dict(),
         'formal_config': {**config.to_dict(), 'spike_regularization': engine.spike_regularization.to_dict()},
         'scenario_config': scenario_config_snapshot(scenario),
-        'reward_config': _strict_json_copy(asdict(rewards)),
+        'reward_config': _strict_json_copy(reward_config_snapshot(rewards)),
         'uav_collision_radius': radius,
         'seed_manifest': _strict_json_copy(seed_manifest),
         'bc_schedule': v2_bc_schedule_metadata(
@@ -1992,7 +2003,7 @@ def build_v2_periodic_snapshot(
         'engine_checkpoint': engine.checkpoint_state_dict(),
         'formal_config': {**config.to_dict(), 'spike_regularization': engine.spike_regularization.to_dict()},
         'scenario_config': scenario_config_snapshot(scenario),
-        'reward_config': _strict_json_copy(asdict(rewards)),
+        'reward_config': _strict_json_copy(reward_config_snapshot(rewards)),
         'uav_collision_radius': radius,
         'seed_manifest': _strict_json_copy(seed_manifest),
         'bc_schedule': v2_bc_schedule_metadata(
@@ -2088,7 +2099,7 @@ def load_v2_periodic_snapshot(
         restored_rewards.validate_scenario(scenario)
     except (TypeError, ValueError) as exc:
         raise ValueError('Periodic V2 snapshot RewardConfig is invalid.') from exc
-    payload['reward_config'] = _strict_json_copy(asdict(restored_rewards))
+    payload['reward_config'] = _strict_json_copy(reward_config_snapshot(restored_rewards))
     _nonnegative_float(payload['uav_collision_radius'], name='uav_collision_radius')
     if not isinstance(payload['seed_manifest'], dict) or not payload['seed_manifest']:
         raise ValueError('Periodic V2 snapshot seed_manifest is invalid.')
@@ -2107,6 +2118,12 @@ def _validate_policy_training_snapshot_config(payload, model_type):
     validate_state(payload)
     formal = dict(payload['formal_config'])
     formal.setdefault('target_q_aggregation', 'min')
+    if formal.get('terminal_geo_far_weight', 0.) != algorithm.get('terminal_geo_far_weight', 0.):
+        raise ValueError('Formal and engine terminal_geo_far_weight configurations disagree.')
+    if formal.get('terminal_geo_far_weight', 0.):
+        for key in ('terminal_geo_radius', 'terminal_geo_lambda', 'terminal_geo_regularization_enabled'):
+            if key not in algorithm or formal[key] != algorithm[key]:
+                raise ValueError(f'Formal and engine {key} configurations disagree.')
     from .v2_mc_return import validate_mc_return_config
     for key, default in (('mc_return_weight', 0.0), ('mc_return_max_age_steps', 100000)):
         formal.setdefault(key, default)
@@ -2235,7 +2252,7 @@ def load_v2_formal_checkpoint(
         restored_rewards.validate_scenario(scenario)
     except (TypeError, ValueError) as exc:
         raise ValueError('Formal V2 checkpoint RewardConfig is invalid.') from exc
-    payload['reward_config'] = _strict_json_copy(asdict(restored_rewards))
+    payload['reward_config'] = _strict_json_copy(reward_config_snapshot(restored_rewards))
     _nonnegative_float(payload['uav_collision_radius'], name='uav_collision_radius')
     if not isinstance(payload['seed_manifest'], dict) or not payload['seed_manifest']:
         raise ValueError('Formal V2 checkpoint seed_manifest is invalid.')

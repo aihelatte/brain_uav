@@ -558,25 +558,43 @@ def evaluate_v2_fixed_validation(
     reporter: V2ExperimentReporter | None = None,
     cpu_deduplication: bool = True,
 ) -> V2ValidationResult:
+    if not isinstance(pool, V2ValidationPool):
+        raise TypeError('pool must be a V2ValidationPool.')
+    return _evaluate_v2_scenarios(
+        actor, pool.scenarios, scenario_config_from_snapshot(pool.scenario_config),
+        pool.uav_collision_radius, rewards, curriculum_level=pool.curriculum_level,
+        max_failures=max_failures, device=device, reporter=reporter,
+        cpu_deduplication=cpu_deduplication,
+    )
+
+
+def evaluate_v2_diagnostic_scenarios(actor, records, scenario, collision_radius, rewards, *, device):
+    """Score fixed diagnostic records without adding any to the formal validation pool."""
+    return _evaluate_v2_scenarios(
+        actor, records, scenario, collision_radius, rewards, curriculum_level='easy',
+        max_failures=0, device=device, reporter=None, cpu_deduplication=True, measure_distance=True,
+    )
+
+
+def _evaluate_v2_scenarios(actor, records, scenario, collision_radius, rewards, *,
+                           curriculum_level, max_failures, device, reporter,
+                           cpu_deduplication, measure_distance=False):
     if type(cpu_deduplication) is not bool:
         raise TypeError('cpu_deduplication must be a bool.')
     if not isinstance(actor, (V2ANNPolicyActor, V2SNNPolicyActor)):
         raise TypeError('actor must be a V2ANNPolicyActor or V2SNNPolicyActor.')
-    if not isinstance(pool, V2ValidationPool):
-        raise TypeError('pool must be a V2ValidationPool.')
     if not isinstance(rewards, RewardConfig):
         raise TypeError('rewards must be a RewardConfig.')
     if reporter is not None and not isinstance(reporter, V2ExperimentReporter):
         raise TypeError('reporter must be a V2ExperimentReporter when provided.')
     maximum_failures = _nonnegative_int(max_failures, name='max_failures')
-    scenario = scenario_config_from_snapshot(pool.scenario_config)
     expected_scales = V2ObservationScales(
         scenario.world_xy,
         scenario.world_z_min,
         scenario.world_z_max,
         scenario.gamma_max,
     )
-    if actor.scales != expected_scales or actor.uav_radius != pool.uav_collision_radius:
+    if actor.scales != expected_scales or actor.uav_radius != collision_radius:
         raise ValueError('Actor observation architecture is incompatible with validation pool.')
     expected_limit = torch.tensor(
         [scenario.delta_gamma_max, scenario.delta_psi_max],
@@ -597,8 +615,8 @@ def evaluate_v2_fixed_validation(
     env = V2StaticNoFlyTrajectoryEnv(
         scenario,
         rewards,
-        fixed_scenarios=[record['payload'] for record in pool.scenarios],
-        uav_collision_radius=pool.uav_collision_radius,
+        fixed_scenarios=[record['payload'] for record in records],
+        uav_collision_radius=collision_radius,
         cpu_deduplication=cpu_deduplication,
     )
     was_training = actor.training
@@ -607,11 +625,11 @@ def evaluate_v2_fixed_validation(
     details: list[dict[str, Any]] = []
     if reporter is not None:
         reporter.begin_validation(
-            curriculum_level=pool.curriculum_level,
-            scenario_count=pool.scenario_count,
+            curriculum_level=curriculum_level,
+            scenario_count=len(records),
         )
     try:
-        for record in pool.scenarios:
+        for record in records:
             observation, _ = env.reset()
             episode_return = 0.0
             outcome = 'running'
@@ -645,6 +663,9 @@ def evaluate_v2_fixed_validation(
                 'episode_length': episode_length,
                 'episode_return': episode_return,
             }
+            if measure_distance:
+                points = np.asarray(env.trajectory, dtype=np.float64)
+                detail['flight_distance_m'] = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
             details.append(detail)
             if reporter is not None:
                 reporter.record_validation_scenario(
@@ -661,10 +682,10 @@ def evaluate_v2_fixed_validation(
     finally:
         actor.train(was_training)
     goal_count = counts['goal']
-    failure_count = pool.scenario_count - goal_count
+    failure_count = len(records) - goal_count
     result = V2ValidationResult(
-        curriculum_level=pool.curriculum_level,
-        scenario_count=pool.scenario_count,
+        curriculum_level=curriculum_level,
+        scenario_count=len(records),
         goal_count=goal_count,
         failure_count=failure_count,
         outcome_counts=counts,

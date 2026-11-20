@@ -258,7 +258,7 @@ class GPUUpdate:
     @staticmethod
     def static_options(e):
         values=(e.target_q_aggregation,e.mc_return_weight,e.mc_return_max_age_steps,e.gamma,e.tau,e.actor_grad_clip_norm,e.critic_grad_clip_norm,e.actor_rl_scale_alpha,
-                e.terminal_geo_regularization_enabled,e.terminal_geo_radius,e.terminal_geo_lambda,
+                e.terminal_geo_regularization_enabled,e.terminal_geo_radius,e.terminal_geo_lambda,e.terminal_geo_far_weight,
                 e.spike_regularization.target_rate,e.actor.scales,
                 *(m.training for m in (e.actor,e.critic1,e.critic2,e.actor_target,e.critic1_target,e.critic2_target)))
         if any(isinstance(value,torch.Tensor) for value in values):
@@ -389,7 +389,7 @@ class GPUUpdate:
                 e.actor.scales.horizontal_span,e.actor.scales.vertical_span,e.actor.scales.gamma_max,
                 e.terminal_geo_radius,e.terminal_geo_regularization_enabled,
                 rate if e.model_type=='snn' else None,coefficients[1],
-                e.spike_regularization.target_rate,return_spike_terms=True)
+                e.spike_regularization.target_rate,return_spike_terms=True,far_weight=e.terminal_geo_far_weight)
             actor_loss = torch.where(self.injections[2]!=0,torch.full_like(terms[0],float('nan')),terms[0])
             for name,tensor in zip(('actor_loss','rl_actor_loss','scaled_rl_actor_loss','actor_rl_scale','bc_loss','terminal_geo_loss'),terms[:6]):
                 record('actor.'+name,tensor)

@@ -1,6 +1,7 @@
 """Four reviewed LR candidates: CPU builders and mocked processes, never CUDA."""
 from copy import deepcopy
 from dataclasses import replace
+from hashlib import sha256
 import json
 from pathlib import Path
 import subprocess
@@ -135,7 +136,20 @@ class LRFinal(unittest.TestCase):
         self.assertEqual({p.relative_to(run.REPO).as_posix() for p in (run.REPO/'src').rglob('*.py')},
             {p for p in actual['sha256'] if p.startswith('src/')})
         self.assertIn(run.LR_CONFIG.relative_to(run.REPO).as_posix(),actual['sha256'])
-        self.assertEqual(json.loads(run.LR_SOURCE_MANIFEST.read_text())['sha256'],actual['sha256'])
+        historical = '1b801d3c98b8d0bf9935edef60a044e205217ebb'
+        tracked = subprocess.check_output(
+            ['git', '--no-optional-locks', 'ls-tree', '-r', '--name-only', historical, '--', 'src'],
+            cwd=run.REPO, text=True,
+        ).splitlines()
+        tracked = [path for path in tracked if path.endswith('.py')]
+        tracked += ['scripts/online_v2_wd3_acc.sh', 'scripts/v2_formal_easy_baseline_config.json',
+                    run.LR_CONFIG.relative_to(run.REPO).as_posix()]
+        expected = {}
+        for path in tracked:
+            data = subprocess.check_output(['git', '--no-optional-locks', 'show', f'{historical}:{path}'],
+                                           cwd=run.REPO)
+            expected[path] = sha256(data.replace(b'\r\n', b'\n')).hexdigest()
+        self.assertEqual(json.loads(run.LR_SOURCE_MANIFEST.read_text())['sha256'], expected)
         with TemporaryDirectory() as tmp:
             a=self.args(Path(tmp));a.source_manifest=run.SOURCE_MANIFEST
             with self.assertRaisesRegex(ValueError,'Actual source files'):run.inputs(a)

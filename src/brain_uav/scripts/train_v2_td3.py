@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, replace
+from dataclasses import replace
 import json
 from pathlib import Path
 from time import perf_counter
 from typing import Any
 
-from brain_uav.config import RewardConfig, ScenarioConfig
+from brain_uav.config import RewardConfig, ScenarioConfig, reward_config_snapshot
 from brain_uav.v2_curriculum import V2NoiseSchedule
 from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
 from brain_uav.models import V2SNNPolicyActor, require_v2_spikingjelly
@@ -928,7 +928,7 @@ def run_v2_td3_stage(
                 if parameter.requires_grad
             ),
             'scenario_config': scenario_config_snapshot(scenario_config),
-            'reward_config': asdict(reward_config),
+            'reward_config': reward_config_snapshot(reward_config),
             'formal_config': config.to_dict(),
             'bc_schedule': bc_schedule_metadata,
             'seed_manifest': dict(components.seed_manifest),

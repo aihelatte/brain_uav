@@ -290,7 +290,8 @@ class V2ReplayBuffer:
         self.success = np.zeros(self.capacity, dtype=np.bool_)
         self.failure = np.zeros(self.capacity, dtype=np.bool_)
         self.near_goal = np.zeros(self.capacity, dtype=np.bool_)
-        self.line_to_goal_safe = np.zeros(self.capacity, dtype=np.bool_)
+        # Zero is unsafe, one is legacy-safe or near, and two is far.
+        self.line_to_goal_safe = np.zeros(self.capacity, dtype=np.uint8)
         self.sample_weight = np.zeros(self.capacity, dtype=np.float64)
         self._sampling_weight_tree = _FenwickWeightTree(self.capacity)
         self.write_id = np.full(self.capacity, -1, dtype=np.int64)
@@ -345,9 +346,7 @@ class V2ReplayBuffer:
         self.success_near_goal = np.zeros(
             self.success_capacity, dtype=np.bool_
         )
-        self.success_line_to_goal_safe = np.zeros(
-            self.success_capacity, dtype=np.bool_
-        )
+        self.success_line_to_goal_safe = np.zeros(self.success_capacity, dtype=np.uint8)
         self.success_size = 0
         self.success_position = 0
         self.mc_return_enabled = False
@@ -440,7 +439,7 @@ class V2ReplayBuffer:
         done: bool,
         success: bool = False,
         near_goal: bool = False,
-        line_to_goal_safe: bool = False,
+        line_to_goal_safe: bool | int = False,
         collected_stage_step: int = 0,
     ) -> tuple[int, int]:
         if self.mc_return_enabled:
@@ -481,7 +480,7 @@ class V2ReplayBuffer:
         self.success[index] = bool(success)
         self.failure[index] = False
         self.near_goal[index] = bool(near_goal)
-        self.line_to_goal_safe[index] = bool(line_to_goal_safe)
+        self.line_to_goal_safe[index] = line_to_goal_safe
         self.write_id[index] = write_id
         if self.mc_return_enabled:
             self.mc_return[index] = 0.
@@ -561,7 +560,7 @@ class V2ReplayBuffer:
         next_obs: V2Observation,
         done: bool,
         near_goal: bool = False,
-        line_to_goal_safe: bool = False,
+        line_to_goal_safe: bool | int = False,
         collected_stage_step: int = 0,
         mc_return: float | None = None,
     ) -> None:
@@ -597,7 +596,7 @@ class V2ReplayBuffer:
         self.success_reward[index, 0] = reward_value
         self.success_done[index, 0] = float(bool(done))
         self.success_near_goal[index] = bool(near_goal)
-        self.success_line_to_goal_safe[index] = bool(line_to_goal_safe)
+        self.success_line_to_goal_safe[index] = line_to_goal_safe
         if self.mc_return_enabled:
             self.success_collected_stage_step[index] = collected_stage_step
             self.success_mc_return[index] = 0. if mc_return is None else mc_return

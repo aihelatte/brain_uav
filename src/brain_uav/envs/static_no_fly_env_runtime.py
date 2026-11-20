@@ -781,6 +781,9 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         self.last_curriculum_level = str(payload.get('curriculum_level', 'custom'))
 
     def _apply_action(self, action: np.ndarray) -> None:
+        self.state = self._predict_state(action)
+
+    def _predict_state(self, action: np.ndarray) -> np.ndarray:
         x, y, z, gamma, psi = self.state
         cfg = self.scenario
         gamma = float(np.clip(gamma + action[0], -cfg.gamma_max, cfg.gamma_max))
@@ -788,7 +791,7 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         x += cfg.speed * math.cos(gamma) * math.cos(psi) * cfg.dt
         y += cfg.speed * math.cos(gamma) * math.sin(psi) * cfg.dt
         z += cfg.speed * math.sin(gamma) * cfg.dt
-        self.state = np.array([x, y, z, gamma, psi], dtype=np.float32)
+        return np.array([x, y, z, gamma, psi], dtype=np.float32)
 
     def _get_obs(self) -> np.ndarray:
         own_state = self.state
@@ -1013,9 +1016,12 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         )
         warning_distance = max(self.scenario.boundary_warning_distance, 1e-6)
         penalties = []
-        for distance, outward_speed, denominator in faces:
+        for index, (distance, outward_speed, denominator) in enumerate(faces):
+            directional_distance = self.rewards.boundary_directional_warning_distance
+            if index == len(faces) - 1 and self.rewards.upper_boundary_directional_warning_distance is not None:
+                directional_distance = self.rewards.upper_boundary_directional_warning_distance
             old_ratio = min(1.0, max(0.0, (warning_distance - distance) / warning_distance))
-            h = min(1.0, max(0.0, 1.0 - distance / self.rewards.boundary_directional_warning_distance))
+            h = min(1.0, max(0.0, 1.0 - distance / directional_distance))
             u = min(1.0, max(0.0, outward_speed / denominator))
             penalties.append(self.rewards.boundary_soft_penalty_weight * old_ratio**2
                              + self.rewards.boundary_directional_penalty_weight * h**2 * u)

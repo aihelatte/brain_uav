@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from math import cos, isfinite, sin
+from math import cos, isfinite, pi, sin
 from typing import Any
 
 import numpy as np
@@ -118,6 +118,22 @@ def _validated_zone_surface_normals(
             'zone_surface_normals must contain one finite 3-vector for every zone.'
         )
     return normals.copy()
+
+
+def terminal_reference_action(ego, goal, horizontal_span, vertical_span, gamma_max,
+                              action_low, action_high, ops):
+    """Shared NumPy/Torch reference for the action preview and actor objective."""
+    forward = goal[..., GOAL_FEATURE_INDEX['goal_forward_norm']] * horizontal_span
+    right = goal[..., GOAL_FEATURE_INDEX['goal_right_norm']] * horizontal_span
+    up = goal[..., GOAL_FEATURE_INDEX['goal_up_norm']] * vertical_span
+    horizontal_squared = forward * forward + right * right
+    gamma = ego[..., EGO_FEATURE_INDEX['gamma_fraction']] * gamma_max
+    delta_gamma = ops.arctan2(up, ops.sqrt(horizontal_squared)) - gamma
+    delta_psi = ops.remainder(ops.arctan2(right, forward) + pi, 2 * pi) - pi
+    return ops.stack((
+        ops.maximum(ops.minimum(delta_gamma, action_high[0]), action_low[0]),
+        ops.maximum(ops.minimum(delta_psi, action_high[1]), action_low[1]),
+    ), -1), ops.sqrt(horizontal_squared + up * up)
 
 
 def build_v2_observation(

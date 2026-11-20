@@ -627,14 +627,9 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
             or self.last_goal_reached_by_segment
         ):
             return True, False, 'goal'
-        if position[2] <= cfg.world_z_min:
-            return True, False, 'ground'
-        if (
-            abs(position[0]) > cfg.world_xy
-            or abs(position[1]) > cfg.world_xy
-            or position[2] > cfg.world_z_max
-        ):
-            return True, False, 'boundary'
+        position_failure = self._position_failure(position)
+        if position_failure is not None:
+            return True, False, position_failure
         segment_start = position if previous_position is None else previous_position
         if any(
             zone.violates_segment(
@@ -648,6 +643,14 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
         if self.steps >= cfg.max_steps:
             return False, True, 'timeout'
         return False, False, 'running'
+
+    def _position_failure(self, position: np.ndarray) -> str | None:
+        cfg = self.scenario
+        if position[2] <= cfg.world_z_min:
+            return 'ground'
+        if abs(position[0]) > cfg.world_xy or abs(position[1]) > cfg.world_xy or position[2] > cfg.world_z_max:
+            return 'boundary'
+        return None
 
     def min_zone_clearance(self, position: Any | None = None) -> float:
         point = (
@@ -669,6 +672,27 @@ class V2StaticNoFlyTrajectoryEnv(StaticNoFlyTrajectoryEnv):
             if clearances is not None:
                 return self._minimum_zone_clearance(clearances)
         return self.min_zone_clearance(pos)
+
+    def direct_guidance_band(self, observation: V2Observation, *, radius: float, clearance: float) -> int:
+        """Classify the current state by the safe, clipped reference manoeuvre."""
+        from brain_uav.observations.v2_builder import terminal_reference_action
+
+        if not self.line_to_goal_is_safe(clearance=clearance):
+            return 0
+        scales = self.observation_scales
+        action, _ = terminal_reference_action(
+            observation.ego_features, observation.goal_features,
+            scales.horizontal_span, scales.vertical_span, scales.gamma_max,
+            self.action_space.low, self.action_space.high, np,
+        )
+        position = self._predict_state(np.asarray(action, dtype=np.float32))[:3]
+        # The flight box is convex, so endpoint bounds cover the whole segment.
+        if self._position_failure(self.state[:3]) or self._position_failure(position):
+            return 0
+        if any(zone.violates_segment(self.state[:3], position, uav_radius=self.uav_collision_radius)
+               for zone in self.zones):
+            return 0
+        return 1 if self._goal_distance(self.state[:3]) <= radius else 2
 
     def line_to_goal_is_safe(
         self,

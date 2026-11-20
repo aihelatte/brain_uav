@@ -141,6 +141,7 @@ class RewardConfig:
     boundary_directional_warning_enabled: bool = False
     boundary_directional_warning_distance: float = 60.0
     boundary_directional_penalty_weight: float = 90.0
+    upper_boundary_directional_warning_distance: float | None = None
 
     def __post_init__(self) -> None:
         for name in ('breakthrough_clearance_gate_enabled', 'descent_three_band_enabled',
@@ -165,6 +166,9 @@ class RewardConfig:
             raise ValueError('descent_transition_factor must be in [0, 1].')
         if self.boundary_directional_warning_distance <= 0:
             raise ValueError('boundary_directional_warning_distance must be positive.')
+        upper = self.upper_boundary_directional_warning_distance
+        if upper is not None and (type(upper) not in (int, float) or not isfinite(upper) or upper <= 0):
+            raise ValueError('Upper directional boundary warning distance must be finite and positive.')
         if self.boundary_directional_penalty_weight < 0:
             raise ValueError('boundary_directional_penalty_weight must be nonnegative.')
         try:
@@ -181,7 +185,8 @@ class RewardConfig:
 
     def validate_scenario(self, scenario: ScenarioConfig) -> None:
         if self.boundary_directional_warning_enabled and not (
-            self.boundary_directional_warning_distance > scenario.boundary_warning_distance
+            min(self.boundary_directional_warning_distance, self.upper_boundary_directional_warning_distance
+                or self.boundary_directional_warning_distance) > scenario.boundary_warning_distance
         ):
             raise ValueError('Directional boundary warning requires a distance above boundary_warning_distance.')
         if self.descent_three_band_enabled and not (
@@ -191,12 +196,19 @@ class RewardConfig:
             raise ValueError('Three-band descent requires world_z_min < low < high.')
 
 
+def reward_config_snapshot(config: RewardConfig) -> dict:
+    values = asdict(config)
+    if config.upper_boundary_directional_warning_distance is None:
+        values.pop('upper_boundary_directional_warning_distance')
+    return values
+
+
 def reward_config_from_snapshot(snapshot: dict) -> RewardConfig:
     """Only optional P1/P2/P3 reward fields may be absent in old artifacts."""
     added = ('breakthrough_clearance_gate_enabled', 'descent_three_band_enabled',
              'descent_low_height', 'descent_high_height', 'descent_transition_factor',
              'boundary_directional_warning_enabled', 'boundary_directional_warning_distance',
-             'boundary_directional_penalty_weight')
+             'boundary_directional_penalty_weight', 'upper_boundary_directional_warning_distance')
     names = {item.name for item in fields(RewardConfig)}
     if not isinstance(snapshot, dict) or set(snapshot) - names or (names - set(snapshot)) - set(added):
         raise ValueError('RewardConfig snapshot has missing or unknown fields.')

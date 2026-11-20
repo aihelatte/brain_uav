@@ -94,6 +94,8 @@ def _check(engine,config,pool,prepared,bc,model,report):
     batch=V2ReplayBatch(obs,torch.zeros(64,2),torch.linspace(-2,2,64).reshape(-1,1),deepcopy(obs),
         torch.arange(64).remainder(2).float().reshape(-1,1),torch.zeros(64,1),torch.zeros(64,1),torch.ones(64,1))
     noise=torch.randn(64,2,generator=torch.Generator().manual_seed(config.seed)).cuda()
+    if config.terminal_geo_far_weight:
+        report['guidance_fixture'] = 'alternating unsafe, near and far masks through actor updates'
     checks=[];public=0;physical=0;old_beta=None;load_invalidated=False
     report['checks']=checks
     original=GPUCompute.compute
@@ -105,6 +107,8 @@ def _check(engine,config,pool,prepared,bc,model,report):
         return original(self,*args,**kwargs)
     with patch.object(GPUCompute,'compute',counted):
         for index,step in enumerate(GATE_STEPS):
+            if config.terminal_geo_far_weight:
+                batch.line_to_goal_safe[:,0].copy_((torch.arange(64)+index).remainder(3))
             if config.acc_eta is not None and step in BETA_REFRESH_STEPS:
                 from types import SimpleNamespace
                 # Explicit complete synthetic diagnostic episode; never added to formal replay.
@@ -138,6 +142,22 @@ def _check(engine,config,pool,prepared,bc,model,report):
                     public+=1
                     report['public_updates']=public
                     e.update_once(total_steps=step,bc_lambda=v2_bc_lambda(step-1,schedule='smooth-mid-strong'),diagnostic_tensor_recorder=record)
+                if config.terminal_geo_far_weight and 'actor.action' in tensors:
+                    from brain_uav.observations.v2_builder import terminal_reference_action
+                    scales=e.actor.scales
+                    reference,_=terminal_reference_action(obs.ego_features,obs.goal_features,
+                        scales.horizontal_span,scales.vertical_span,scales.gamma_max,
+                        e.action_low.cpu(),e.action_high.cpu(),torch)
+                    error=(tensors['actor.action']-reference).square().mean(dim=-1)
+                    band=batch.line_to_goal_safe[:,0]
+                    near,far=error[band==1].mean(),error[band==2].mean()
+                    expected=near+config.terminal_geo_far_weight*far
+                    if not torch.allclose(tensors['actor.terminal_geo_loss'],expected,rtol=1e-4,atol=1e-5):
+                        raise AssertionError('Actor loss did not apply both guidance band means.')
+                    if e is engine:
+                        checks.append(dict(phase='guidance_bands',step=step,passed=True,
+                            near_count=int((band==1).sum()),far_count=int((band==2).sum()),
+                            near_mean=float(near),far_mean=float(far)))
                 snap,_=snapshot(e)
                 for name in ('actor','critic1','critic2'):
                     for parameter_name,p in getattr(e,name).named_parameters():
@@ -175,6 +195,8 @@ def _check(engine,config,pool,prepared,bc,model,report):
                             raise AssertionError('Loaded ACC beta/controller differs before rebuild update.')
                 if engine._gpu_update_executor is not None or old.graphs:raise AssertionError('Load did not invalidate graphs.')
                 load_invalidated=True
+    if config.terminal_geo_far_weight and not any(c['phase']=='guidance_bands' for c in checks):
+        raise AssertionError('Missing actual actor update with both guidance bands.')
     if not all(c['passed'] for c in checks):raise AssertionError('Controller gate failed.')
     if not load_invalidated or engine._gpu_update_executor is None or engine._gpu_update_executor.replays<=0:
         raise AssertionError('Missing actual rebuilt Graph replay evidence.')
