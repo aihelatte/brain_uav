@@ -29,6 +29,9 @@ GUIDANCE_CONTROL='safe-direct-control-seed11'
 GUIDANCE_CONFIG=REPO/'scripts/v2_formal_easy_safe_direct_config.json'
 GUIDANCE_SOURCE_MANIFEST=REPO/'scripts/v2_formal_easy_safe_direct_source.json'
 GUIDANCE_EXPERIMENTS=(GUIDANCE_EXPERIMENT,GUIDANCE_CONTROL)
+COURSE_EXPERIMENT='safe-direct-full-course-v1'
+COURSE_SEEDS=(7,11,23,41)
+COURSE_BATCHES=tuple(f'{stage}-{model}' for stage in ('easy','medium','hard') for model in ('ann','snn'))
 
 
 class GateComplete(Exception):pass
@@ -42,7 +45,7 @@ def source_hash(path):
 
 
 def experiment_config(experiment):
-    if experiment in GUIDANCE_EXPERIMENTS:
+    if experiment in (*GUIDANCE_EXPERIMENTS,COURSE_EXPERIMENT):
         return GUIDANCE_CONFIG
     return LR_CONFIG if experiment==LR_EXPERIMENT else None
 
@@ -59,18 +62,33 @@ def identity(experiment='baseline'):
 
 
 def jobs(experiment='baseline',batch=None):
+    allowed={
+        COURSE_EXPERIMENT:COURSE_BATCHES,
+        GUIDANCE_EXPERIMENT:(None,'main','seed11'),
+        GUIDANCE_CONTROL:(None,'seed11'),
+        'baseline':(None,),
+        LR_EXPERIMENT:(None,),
+    }
+    if batch not in allowed.get(experiment,()):
+        raise ValueError(f'Batch {batch!r} is invalid for experiment {experiment!r}.')
+    if experiment==COURSE_EXPERIMENT:
+        stage,model=batch.split('-')
+        return [dict(id=f'{model}_seed{seed}',model=model,stage=stage,seed=seed,
+                     method='min' if model=='ann' else 'acc',acc_eta=None if model=='ann' else .01)
+                for seed in COURSE_SEEDS]
     seeds=(7,23)
     if experiment==GUIDANCE_CONTROL or (experiment==GUIDANCE_EXPERIMENT and batch=='seed11'):
         seeds=(11,)
     elif experiment==GUIDANCE_EXPERIMENT and batch is None:
         seeds=(7,11,23)
-    elif experiment!=GUIDANCE_EXPERIMENT and batch is not None:
-        raise ValueError('Batch selection requires the safe-direct experiment.')
     return [dict(id=f'{m}_seed{s}',model=m,seed=s,method='min' if m=='ann' else 'acc',acc_eta=None if m=='ann' else .01)
         for m in ('ann','snn') for s in seeds]
 
 
 def resolved(job,experiment='baseline'):
+    if experiment==COURSE_EXPERIMENT:
+        from brain_uav.scripts.run_v2_formal_course import resolve_course_job
+        return resolve_course_job(job)
     from brain_uav.trainers.v2_formal_training import V2FormalTrainingConfig
     from brain_uav.models.v2_policy_config import V2SpikeRegularizationConfig
     source=json.loads(CONFIG.read_text(encoding='utf-8'))[job['model']]
@@ -155,9 +173,12 @@ def parser():
     p.add_argument('--ann-bc',type=Path,required=True);p.add_argument('--snn-bc',type=Path,required=True)
     p.add_argument('--validation-pool',type=Path,required=True)
     p.add_argument('--source-manifest',type=Path,default=SOURCE_MANIFEST)
-    p.add_argument('--experiment',choices=('baseline',LR_EXPERIMENT,*GUIDANCE_EXPERIMENTS),default='baseline')
-    p.add_argument('--batch',choices=('main','seed11'))
-    p.add_argument('--job',choices=[j['id'] for j in jobs(GUIDANCE_EXPERIMENT)])
+    p.add_argument('--experiment',choices=('baseline',LR_EXPERIMENT,*GUIDANCE_EXPERIMENTS,COURSE_EXPERIMENT),default='baseline')
+    p.add_argument('--batch',choices=('main','seed11',*COURSE_BATCHES))
+    p.add_argument('--job',choices=sorted({job['id'] for batch in COURSE_BATCHES for job in jobs(COURSE_EXPERIMENT,batch)}))
+    p.add_argument('--parent',type=Path)
+    p.add_argument('--parent-sha256')
+    p.add_argument('--pool-sha256')
     p.add_argument('--second-batch',type=Path)
     p.add_argument('--baseline-root',type=Path)
     p.add_argument('--control-root',type=Path)
@@ -171,10 +192,8 @@ def parser():
 
 def batch_jobs(a):
     batch=getattr(a,'batch',None)
-    if a.experiment in GUIDANCE_EXPERIMENTS and a.mode!='plan' and batch is None:
+    if batch is None and a.experiment in GUIDANCE_EXPERIMENTS and a.mode!='plan':
         raise ValueError('Select the explicit batch for a batch operation.')
-    if a.experiment==GUIDANCE_CONTROL and batch not in (None,'seed11'):
-        raise ValueError('The control batch only contains seed 11.')
     return jobs(a.experiment,batch)
 
 
@@ -204,13 +223,28 @@ def inputs(a):
         if file_hash(path)!=locked[model]['stage_start_sha256'] or json.loads(path.read_text())!=locked[model]['historical']:
             raise ValueError('Historical stage_start identity/configuration mismatch.')
         paths[model+'_stage_start']=path
+    course=a.experiment==COURSE_EXPERIMENT
+    stage=a.batch.split('-')[0] if course else 'easy'
+    if course and stage!='easy':
+        if a.parent is None or a.parent_sha256 is None:
+            raise ValueError('A course child batch requires the selected parent and SHA256.')
+        paths['parent']=a.parent
+    elif course and (a.parent is not None or a.parent_sha256 is not None):
+        raise ValueError('Course easy must start from the original BC.')
     hashes={k:file_hash(p) for k,p in paths.items()}
-    if any(hashes[m+'_bc']!=provenance.BC[m][1] for m in ('ann','snn')) or hashes['pool']!=POOL_SHA:
+    expected_pool=POOL_SHA if stage=='easy' else a.pool_sha256
+    if any(hashes[m+'_bc']!=provenance.BC[m][1] for m in ('ann','snn')) or hashes['pool']!=expected_pool:
         raise ValueError('BC best/fixed pool raw SHA256 mismatch.')
+    if course and hashes['pool']!=a.pool_sha256:
+        raise ValueError('Pool differs from the locked course.')
     from brain_uav.trainers.v2_validation import load_v2_validation_pool
-    pool=load_v2_validation_pool(a.validation_pool,expected_level='easy',expected_count=100)
-    if pool.content_digest!=provenance.DIGEST:raise ValueError('Fixed pool digest mismatch.')
-    return dict(source=source,experiment=a.experiment,paths={k:str(p.resolve()) for k,p in paths.items()},hashes=hashes,pool_digest=pool.content_digest)
+    pool=load_v2_validation_pool(a.validation_pool,expected_level=stage,expected_count=100)
+    if stage=='easy' and pool.content_digest!=provenance.DIGEST:raise ValueError('Fixed pool digest mismatch.')
+    evidence=dict(source=source,experiment=a.experiment,paths={k:str(p.resolve()) for k,p in paths.items()},hashes=hashes,pool_digest=pool.content_digest)
+    if course:
+        from brain_uav.scripts.run_v2_formal_course import parent_steps
+        evidence['global_steps_start']=parent_steps(stage,a.batch.split('-')[1],a.parent,a.parent_sha256,hashes)
+    return evidence
 
 
 def check_inputs(evidence):
@@ -232,6 +266,7 @@ def release(processes,root,session,experiment='baseline',*,batch=None):
     if set(processes)!={j['id'] for j in expected} or len({p.pid for p in processes.values()})!=len(expected):
         raise ValueError('Expected batch workers with unique PIDs.')
     records={j:json.loads((root/j/'ready.json').read_text()) for j in processes}
+    evidence=json.loads((root/'manifest.json').read_text())['inputs'] if experiment==COURSE_EXPERIMENT else None
     for job in expected:
         r=records[job['id']]
         if (r['pid']!=processes[job['id']].pid or r['job']!=job or r['resolved']!=resolved(job,experiment)[0]
@@ -239,6 +274,8 @@ def release(processes,root,session,experiment='baseline',*,batch=None):
             raise ValueError('Worker identity/configuration/readiness mismatch.')
         from brain_uav.scripts.run_v2_online_wd3_acc import validate_seed_manifest
         validate_seed_manifest(resolved(job,experiment)[1],r['seed_manifest'])
+        if evidence is not None and r['initialization']!=initialization_binding(job,evidence):
+            raise ValueError('Worker initialized with a different parent identity.')
     access=session.verify(processes)
     if any(p.poll() is not None for p in processes.values()):
         raise RuntimeError('Worker exited during MPS membership verification.')
@@ -260,12 +297,20 @@ def stop_owned(processes,session):
     if errors:raise RuntimeError('Cleanup blocked; service retained: '+'; '.join(errors))
 
 
+def initialization_binding(job,evidence):
+    key='parent' if job['stage']!='easy' else job['model']+'_bc'
+    return dict(path=evidence['paths'][key],sha256=evidence['hashes'][key],
+                global_steps_start=evidence['global_steps_start'])
+
+
 def worker(a):
+    expected=batch_jobs(a)
     import torch
     from brain_uav.config import reward_config_from_snapshot,reward_config_snapshot
     from brain_uav.trainers.v2_validation import scenario_config_from_snapshot,evaluate_v2_fixed_validation
     from brain_uav.scripts.train_v2_td3 import run_v2_td3_stage
-    manifest=json.loads((a.root/'manifest.json').read_text());check_inputs(manifest['inputs'])
+    manifest=json.loads((a.root/'manifest.json').read_text());evidence=manifest['inputs'];check_inputs(evidence)
+    course=a.experiment==COURSE_EXPERIMENT
     if (manifest['plan']['gate_only']!=a.gate_only
             or manifest['plan'].get('experiment','baseline')!=a.experiment
             or manifest['plan'].get('batch')!=getattr(a,'batch',None)):
@@ -273,12 +318,20 @@ def worker(a):
     for name,path in (('ann_bc',a.ann_bc),('snn_bc',a.snn_bc),('pool',a.validation_pool)):
         if str(path.resolve())!=manifest['inputs']['paths'][name]:
             raise ValueError('Worker input path differs from batch manifest.')
-    expected=batch_jobs(a)
     if a.job not in {job['id'] for job in expected}:
         raise ValueError('Worker job differs from the requested batch.')
     job=next(j for j in expected if j['id']==a.job);spec,cfg=resolved(job,a.experiment)
-    if a.experiment in GUIDANCE_EXPERIMENTS and manifest['plan']['jobs']!=[resolved(j,a.experiment)[0] for j in expected]:
+    if (course or a.experiment in GUIDANCE_EXPERIMENTS) and manifest['plan']['jobs']!=[resolved(j,a.experiment)[0] for j in expected]:
         raise ValueError('Worker manifest batch configuration differs.')
+    initialization=initialization_binding(job,evidence) if course else None
+    if course:
+        if a.pool_sha256!=evidence['hashes']['pool'] or (cfg.stage!='easy' and
+                (a.parent is None or str(a.parent.resolve())!=initialization['path']
+                 or a.parent_sha256!=initialization['sha256'])):
+            raise ValueError('Worker requested pool/parent differs from batch input.')
+        if cfg.stage=='easy' and (a.parent is not None or a.parent_sha256 is not None):
+            raise ValueError('Course easy worker must start from BC.')
+    checkpoint=Path(initialization['path']) if course else getattr(a,job['model']+'_bc')
     directory=a.root/job['id'];directory.mkdir(exist_ok=False);started=time.perf_counter()
     status=dict(execution_completed=False,job=job,formal_passed=None,pid=os.getpid(),batch_id=manifest['batch_id'])
     def gate(engine,config,seeds,initial,compilation):
@@ -294,9 +347,16 @@ def worker(a):
                 or engine.terminal_geo_far_weight!=config.terminal_geo_far_weight
                 or engine.terminal_geo_lambda!=config.terminal_geo_lambda):
             raise ValueError('Actual actor objective differs from the resolved guidance configuration.')
+        if course:
+            check_inputs(evidence)
+            hook=getattr(engine,'formal_acc',None)
+            if ((hook is None)!=(cfg.acc_eta is None)
+                    or (hook is not None and (hook.controller.beta!=.5 or hook.controller.episodes or hook.controller.controls))):
+                raise ValueError('Course stage did not initialize its own target method/controller.')
         torch.cuda.synchronize(engine.device)
         atomic_json(directory/'ready.json',dict(pid=os.getpid(),job=job,resolved=spec,seed_manifest=dict(seeds),
-            initial_state_sha256=initial,compilation=compilation,synchronized=True))
+            initial_state_sha256=initial,compilation=compilation,synchronized=True,
+            **({'initialization':initialization} if course else {})))
         deadline=time.monotonic()+a.timeout
         while not (a.root/'release.json').exists():
             if (a.root/'abort.json').exists():raise RuntimeError('Parent initialization aborted.')
@@ -309,11 +369,11 @@ def worker(a):
             from brain_uav.trainers.v2_formal_training import prepare_v2_stage_initialization
             from brain_uav.trainers.v2_validation import load_v2_validation_pool
             from brain_uav.scripts.v2_formal_easy_cuda_gate import check
-            bc=getattr(a,job['model']+'_bc')
-            prepared=prepare_v2_stage_initialization(config,init_checkpoint=bc,device='cuda',model_type=job['model'],
+            prepared=prepare_v2_stage_initialization(config,init_checkpoint=checkpoint,device='cuda',model_type=job['model'],
                 scenario=scenario_config_from_snapshot(spec['scenario_config']),rewards=reward_config_from_snapshot(spec['reward_config']))
-            pool=load_v2_validation_pool(a.validation_pool,expected_level='easy',expected_count=100)
-            gate_result=check(engine,config,pool,prepared,bc,job['model'],output=directory/'cuda_gate.json')
+            pool=load_v2_validation_pool(a.validation_pool,expected_level=cfg.stage,expected_count=100)
+            gate_result=check(engine,config,pool,prepared,checkpoint,job['model'],output=directory/'cuda_gate.json',
+                              bc_schedule=spec['bc_schedule'])
             gate_result['identity']=dict(job=job,pid=os.getpid(),batch_id=manifest['batch_id'],resolved=spec,
                 source_sha256=manifest['inputs']['source']['sha256'],input_hashes=manifest['inputs']['hashes'])
             atomic_json(directory/'cuda_gate.json',gate_result)
@@ -321,9 +381,9 @@ def worker(a):
             raise GateComplete()
     def evaluate(engine,pool,rewards,result,path):
         # Same worker, no bank feedback, no training exploration. Validator owns SNN resets.
-        value=evaluate_v2_fixed_validation(engine.actor,pool,rewards,max_failures=5,device='cuda',cpu_deduplication=True).to_dict()
+        value=evaluate_v2_fixed_validation(engine.actor,pool,rewards,max_failures=cfg.validation_max_failures,device='cuda',cpu_deduplication=True).to_dict()
         atomic_json(directory/'terminal_evaluation.json',dict(checkpoint=str(path),checkpoint_sha256=file_hash(path),
-            pool_sha256=POOL_SHA,pool_digest=pool.content_digest,reward_config=reward_config_snapshot(rewards),evaluation=value,
+            pool_sha256=evidence['hashes']['pool'] if course else POOL_SHA,pool_digest=pool.content_digest,reward_config=reward_config_snapshot(rewards),evaluation=value,
             formal_passed=result.passed_validation,actual_steps=result.stage_steps))
         if a.experiment==GUIDANCE_EXPERIMENT:
             from brain_uav.scripts.v2_formal_easy_guidance import diagnostic_evaluation
@@ -332,18 +392,20 @@ def worker(a):
             atomic_json(diagnostic_path,dict(checkpoint_sha256=file_hash(path),categories=diagnostic))
             status['diagnostic_sha256']=file_hash(diagnostic_path)
     try:
-        summary=run_v2_td3_stage(stage='easy',init_checkpoint=getattr(a,job['model']+'_bc'),output=directory/'model.pt',
+        summary=run_v2_td3_stage(stage=cfg.stage,init_checkpoint=checkpoint,output=directory/'model.pt',
             metrics_out=directory/'metrics.json',validation_pool=a.validation_pool,seed=job['seed'],device='cuda',model=job['model'],
-            max_stage_steps=500000,actor_lr=cfg.actor_lr,critic_lr=cfg.critic_lr,failure_sample_bias=2.,acc_eta=cfg.acc_eta,
-            gamma=.99,target_q_aggregation='min',mc_return_weight=0.,bc_schedule='smooth-mid-strong',target_noise_scale=1.,
+            max_stage_steps=cfg.max_steps,actor_lr=cfg.actor_lr,critic_lr=cfg.critic_lr,failure_sample_bias=cfg.failure_sample_bias,acc_eta=cfg.acc_eta,
+            gamma=.99,target_q_aggregation='min',mc_return_weight=0.,bc_schedule=spec['bc_schedule'],target_noise_scale=1.,
             actor_projection_dim=32,actor_hidden_dim=192,snn_time_window=4,actor_rl_scale_alpha=2.5,
             terminal_geo_radius=cfg.terminal_geo_radius,terminal_geo_far_weight=cfg.terminal_geo_far_weight,
             spike_regularization=cfg.spike_regularization,formal_config=cfg,
             scenario=scenario_config_from_snapshot(spec['scenario_config']),rewards=reward_config_from_snapshot(spec['reward_config']),
             uav_collision_radius=0.,gpu_td3_compute=True,cpu_deduplication=True,non_blocking_batch_transfer=True,
-            initialization_gate=gate,terminal_evaluation_sink=evaluate,**spec['compilation'])
+            initialization_gate=gate,terminal_evaluation_sink=evaluate,**spec['compilation'],
+            **({'global_steps_start':initialization['global_steps_start'],
+                'periodic_snapshot_interval_steps':spec['periodic_snapshot_interval_steps']} if course else {}))
         check_inputs(manifest['inputs']);status.update(execution_completed=True,formal_passed=summary['passed'],result=summary)
-        if a.experiment in GUIDANCE_EXPERIMENTS:
+        if course or a.experiment in GUIDANCE_EXPERIMENTS:
             status['terminal_evaluation_sha256']=file_hash(directory/'terminal_evaluation.json')
             status['episodes_sha256']=file_hash(directory/'metrics_reports'/'episodes.jsonl')
         execution=summary['execution_configuration']
@@ -374,8 +436,9 @@ def gate_bindings(root,manifest):
     plan_data=manifest['plan']
     experiment=plan_data.get('experiment','baseline')
     expected=jobs(experiment,plan_data.get('batch'))
-    if experiment in GUIDANCE_EXPERIMENTS and plan_data.get('jobs')!=[resolved(j,experiment)[0] for j in expected]:
+    if experiment in (*GUIDANCE_EXPERIMENTS,COURSE_EXPERIMENT) and plan_data.get('jobs')!=[resolved(j,experiment)[0] for j in expected]:
         raise ValueError('CUDA gate manifest jobs differ from the requested batch.')
+    pids=set()
     for job in expected:
         directory=root/job['id']
         reports={name:json.loads((directory/name).read_text()) for name in
@@ -386,9 +449,18 @@ def gate_bindings(root,manifest):
         if (gate.get('identity')!=expected or gate['strict_passed'] is not True or gate['execution_completed'] is not True
                 or worker['execution_completed'] is not True or worker['strict_passed'] is not True
                 or worker['job']!=job or worker['pid']!=ready['pid'] or worker['batch_id']!=manifest['batch_id']
-                or process['exit_code']!=0 or process['pid']!=ready['pid'] or ready['job']!=job):
+                or process['exit_code']!=0 or process['pid']!=ready['pid'] or ready['job']!=job
+                or (experiment==COURSE_EXPERIMENT and (ready['resolved']!=expected['resolved']
+                    or ready['synchronized'] is not True
+                    or ready['initialization']!=initialization_binding(job,manifest['inputs'])))):
             raise ValueError('CUDA gate worker/model/seed/PID/exit identity mismatch.')
+        if experiment==COURSE_EXPERIMENT:
+            provenance.validate_seed_manifest(resolved(job,experiment)[1],ready['seed_manifest'])
+            pids.add(ready['pid'])
         bindings[job['id']]={name:file_hash(directory/name) for name in reports}
+    if experiment==COURSE_EXPERIMENT and (len(pids)!=len(bindings)
+            or pids!=set(json.loads((root/'release.json').read_text())['pids'])):
+        raise ValueError('CUDA gate release PIDs differ from completed gate workers.')
     return bindings
 
 
@@ -398,10 +470,12 @@ def validate_gate(a,evidence):
     status=json.loads((root/'batch_summary.json').read_text())
     manifest=json.loads((root/'manifest.json').read_text())
     if (status['execution_completed'] is not True or manifest['plan']['gate_only'] is not True
+            or (a.experiment==COURSE_EXPERIMENT and status['mps_cleanup']['stopped'] is not True)
             or manifest['plan'].get('experiment','baseline')!=a.experiment
             or manifest['plan'].get('batch')!=getattr(a,'batch',None)
             or manifest['inputs']['hashes']!=evidence['hashes']
             or manifest['inputs'].get('paths')!=evidence.get('paths')
+            or manifest['inputs'].get('global_steps_start')!=evidence.get('global_steps_start')
             or manifest['inputs']['source']['sha256']!=evidence['source']['sha256']):
         raise ValueError('CUDA gate input/source/batch mismatch.')
     bindings=gate_bindings(root,manifest)
@@ -414,9 +488,11 @@ def validate_terminal(root,manifest,job,pool,*,recorded_root=None):
     from brain_uav.trainers.v2_formal_training import load_v2_formal_checkpoint,v2_bc_schedule_metadata
     evidence=manifest['inputs']
     experiment=manifest['plan'].get('experiment','baseline')
+    course=experiment==COURSE_EXPERIMENT
     model=job['model']
     scene_ids=[scene['scenario_id'] for scene in pool.scenarios]
     spec,expected=resolved(job,experiment)
+    initialization=initialization_binding(job,evidence) if course else None
     directory=root/job['id']
     status=json.loads((directory/'worker_summary.json').read_text())
     process=json.loads((directory/'process.json').read_text())
@@ -433,9 +509,10 @@ def validate_terminal(root,manifest,job,pool,*,recorded_root=None):
             or status['pid']!=ready['pid'] or process['pid']!=ready['pid']
             or status['execution_completed'] is not True or type(passed) is not bool or process['exit_code']!=0
             or status['formal_passed']!=passed or file_hash(path)!=evaluation['checkpoint_sha256']
-            or evaluation['pool_digest']!=provenance.DIGEST or evaluation['pool_sha256']!=POOL_SHA):
+            or evaluation['pool_digest']!=(pool.content_digest if course else provenance.DIGEST)
+            or evaluation['pool_sha256']!=(evidence['hashes']['pool'] if course else POOL_SHA)):
         raise ValueError('Terminal worker/evaluation identity incomplete.')
-    raw=load_v2_formal_checkpoint(path,expected_stage='easy',expected_model_type=model,require_passed=False)
+    raw=load_v2_formal_checkpoint(path,expected_stage=expected.stage,expected_model_type=model,require_passed=False)
     training=raw['training_result']
     worker_result=status['result']
     source=raw['initialization_source']
@@ -445,26 +522,40 @@ def validate_terminal(root,manifest,job,pool,*,recorded_root=None):
             or training['status']!=('passed' if passed else 'failed')
             or worker_result['steps']!=training['stage_steps'] or worker_result['stop_reason']!=stop
             or worker_result['passed']!=passed or Path(worker_result['checkpoint']).resolve()!=recorded_path.resolve()
-            or (not passed and training['stage_steps']!=500000)
+            or (not passed and training['stage_steps']!=expected.max_steps)
             or raw['scenario_config']!=spec['scenario_config'] or raw['reward_config']!=spec['reward_config']
             or evaluation['reward_config']!=spec['reward_config'] or raw['uav_collision_radius']!=0.
             or raw['validation_pool']['content_digest']!=pool.content_digest
-            or source['kind']!='v2_bc_best' or source['checkpoint_kind']!='best'
-            or Path(source['path']).resolve()!=Path(evidence['paths'][model+'_bc']).resolve()
-            or raw['bc_schedule']!=v2_bc_schedule_metadata('easy',schedule='smooth-mid-strong')):
+            or (expected.stage=='easy' and (source['kind']!='v2_bc_best' or source['checkpoint_kind']!='best'))
+            or Path(source['path']).resolve()!=Path(initialization['path'] if course else evidence['paths'][model+'_bc']).resolve()
+            or raw['bc_schedule']!=v2_bc_schedule_metadata(expected.stage,schedule=spec['bc_schedule'])):
         raise ValueError('Terminal configuration/BC/steps/stop identity mismatch.')
     scenes=evaluation['evaluation']['scenarios']
     if ([s['scenario_id'] for s in scenes]!=scene_ids or any(s['episode_length']<=0 for s in scenes)
             or evaluation['evaluation']['goal_count']!=sum(s['outcome']=='goal' for s in scenes)):
         raise ValueError('Terminal fixed-pool evaluation incomplete.')
-    if experiment in GUIDANCE_EXPERIMENTS:
+    if course or experiment in GUIDANCE_EXPERIMENTS:
         if ready['resolved']!=spec or ready['synchronized'] is not True:
             raise ValueError('Terminal initialized configuration differs from the requested job.')
         provenance.validate_seed_manifest(expected,ready['seed_manifest'])
+    if course:
+        provenance.validate_seed_manifest(expected,raw['seed_manifest'])
+        if (ready['initialization']!=initialization or file_hash(initialization['path'])!=initialization['sha256']
+                or training['global_steps_start']!=initialization['global_steps_start']
+                or training['global_steps_end']!=initialization['global_steps_start']+training['stage_steps']
+                or not 0<training['stage_steps']<=expected.max_steps
+                or raw['validation_pool']['scenario_count']!=100
+                or raw['validation_pool']['master_seed']!=pool.master_seed
+                or raw['validation_pool']['stage_seed']!=pool.stage_seed
+                or Path(raw['validation_pool']['path']).resolve()!=Path(evidence['paths']['pool'])
+                or status['terminal_evaluation_sha256']!=file_hash(directory/'terminal_evaluation.json')
+                or status['episodes_sha256']!=file_hash(directory/'metrics_reports'/'episodes.jsonl')):
+            raise ValueError('Course parent, history or validation provenance changed.')
     return dict(evaluation,checkpoint=str(path.resolve()),seed=job['seed'],execution_completed=True)
 
 
 def collect(a):
+    batch_jobs(a)
     if a.experiment in GUIDANCE_EXPERIMENTS:
         from brain_uav.scripts.v2_formal_easy_guidance import collect_guidance
         return collect_guidance(a)
@@ -555,11 +646,11 @@ def launch(a):
 
 def _launch(a):
     from brain_uav.scripts.v2_mps_diagnostic import Session,capability
+    expected=batch_jobs(a)
     if Path(sys.executable).resolve()!=Path(provenance.PYTHON).resolve():
         raise ValueError('Use the declared server Python.')
     if not a.gate_only and a.gate_report is None:
         raise ValueError('Formal launch requires --gate-report.')
-    expected=batch_jobs(a)
     evidence=inputs(a)
     gate_proof=None if a.gate_only else validate_gate(a,evidence)
     a.root.mkdir(parents=True,exist_ok=False)
@@ -585,6 +676,9 @@ def _launch(a):
         manifest=dict(plan=plan(a),inputs=evidence,gate_evidence=gate_proof,batch_id=uuid4().hex)
         atomic_json(a.root/'manifest.json',manifest)
         session=Session(a.root/'mps')
+        if a.experiment==COURSE_EXPERIMENT:
+            atomic_json(a.root/'mps'/'namespace.json',dict(batch_id=manifest['batch_id'],
+                pipe_directory=str(session.pipe),log_directory=str(session.root/'logs')))
         session.start()
         capability(a.root/'capability',session)
         capability(a.root/'termination_capability',session,terminate_client=True)
@@ -597,6 +691,10 @@ def _launch(a):
                 '--job',job['id'],'--timeout',str(a.timeout),'--launch']
             if getattr(a,'batch',None):
                 command.extend(('--batch',a.batch))
+            if a.experiment==COURSE_EXPERIMENT:
+                command.extend(('--pool-sha256',a.pool_sha256))
+                if a.parent is not None:
+                    command.extend(('--parent',str(a.parent),'--parent-sha256',a.parent_sha256))
             if a.gate_only:
                 command.append('--gate-only')
             worker_started[job['id']]=time.perf_counter()
@@ -627,7 +725,7 @@ def _launch(a):
         check_inputs(evidence)
         if a.gate_only:
             status['gate_bindings']=gate_bindings(a.root,manifest)
-        elif a.experiment in GUIDANCE_EXPERIMENTS:
+        elif a.experiment in (*GUIDANCE_EXPERIMENTS,COURSE_EXPERIMENT):
             status['formal_passed']={job['id']:json.loads(
                 (a.root/job['id']/'worker_summary.json').read_text())['formal_passed'] for job in expected}
         else:
@@ -638,7 +736,7 @@ def _launch(a):
         failure=exc
         status.update(execution_completed=False,error=f'{type(exc).__name__}: {exc}')
         report(a.root/'abort.json',status)
-        if not a.gate_only and a.experiment not in GUIDANCE_EXPERIMENTS and not (a.root/'selection_summary.json').exists():
+        if not a.gate_only and a.experiment not in (*GUIDANCE_EXPERIMENTS,COURSE_EXPERIMENT) and not (a.root/'selection_summary.json').exists():
             report(a.root/'selection_summary.json',dict(execution_completed=False,kind='incomplete',models={},error=status['error']))
     finally:
         if failure is not None and session is not None:
@@ -677,11 +775,16 @@ def _launch(a):
 
 
 def main(argv=None):
-    a=parser().parse_args(argv)
+    cli=parser()
+    a=cli.parse_args(argv)
+    try:
+        expected=batch_jobs(a)
+    except ValueError as exc:
+        cli.error(str(exc))
     if not math.isfinite(a.timeout) or a.timeout<=0:raise ValueError('Timeout must be finite and positive.')
     if not math.isfinite(a.gate_timeout) or a.gate_timeout<=0:raise ValueError('Gate timeout must be finite and positive.')
     if a.mode=='status':
-        print(json.dumps({j['id']:json.loads(p.read_text()) if (p:=a.root/j['id']/'worker_summary.json').exists() else 'not_finished' for j in batch_jobs(a)},indent=2));return 0
+        print(json.dumps({j['id']:json.loads(p.read_text()) if (p:=a.root/j['id']/'worker_summary.json').exists() else 'not_finished' for j in expected},indent=2));return 0
     if not a.launch:print(json.dumps(plan(a),indent=2));return 0
     if a.mode=='launch':launch(a)
     elif a.mode=='worker':

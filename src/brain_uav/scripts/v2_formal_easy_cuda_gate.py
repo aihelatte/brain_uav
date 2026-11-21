@@ -58,13 +58,13 @@ def checked_bank_score(engine,scorer,rows):
     return values
 
 
-def check(engine,config,pool,prepared,bc,model,*,output=None):
+def check(engine,config,pool,prepared,checkpoint,model,*,output=None,bc_schedule='smooth-mid-strong'):
     import time
     from brain_uav.trainers.v2_online_research import atomic_json
     report=dict(execution_completed=False,strict_passed=False,engineering_accepted=False)
     started=time.perf_counter()
     try:
-        report.update(_check(engine,config,pool,prepared,bc,model,report))
+        report.update(_check(engine,config,pool,prepared,checkpoint,model,report,bc_schedule=bc_schedule))
         return report
     except BaseException as exc:
         report.update(execution_completed=False,strict_passed=False,error=f'{type(exc).__name__}: {exc}')
@@ -74,7 +74,7 @@ def check(engine,config,pool,prepared,bc,model,*,output=None):
         if output is not None:atomic_json(output,report)
 
 
-def _check(engine,config,pool,prepared,bc,model,report):
+def _check(engine,config,pool,prepared,checkpoint,model,report,*,bc_schedule='smooth-mid-strong'):
     from brain_uav.scripts import diagnose_v2_mc_return_cuda as helper,profile_v2_td3 as profile
     from brain_uav.scripts.diagnose_v2_online_research import _append_update_evidence
     from brain_uav.scripts.v2_gpu_td3_diagnostic import flatten,snapshot
@@ -84,7 +84,7 @@ def _check(engine,config,pool,prepared,bc,model,report):
     from brain_uav.trainers.v2_replay_buffer import V2ReplayBatch
     from brain_uav.trainers.v2_gpu_compute import GPUCompute
     # Public builder gives independent objects/optimizer state, no formal trainer loop.
-    ref=build_v2_stage_engine(None,config,init_checkpoint=bc,device='cuda',model_type=model,
+    ref=build_v2_stage_engine(None,config,init_checkpoint=checkpoint,device='cuda',model_type=model,
         prepared_initialization=prepared,fused_adam=True,reduce_update_stat_syncs=True,
         gpu_td3_compute=False,non_blocking_batch_transfer=True).engine
     ref.load_checkpoint_state_dict(deepcopy(engine.checkpoint_state_dict()))
@@ -136,12 +136,12 @@ def _check(engine,config,pool,prepared,bc,model,report):
             for e in (ref,engine):
                 tensors=batch_evidence(batch)
                 def record(name,value):tensors[name]=value.detach().cpu().clone()
-                _,pn,nc=config.noise_schedule.values(step-1,max_steps=500000);e.set_target_noise(policy_noise=pn,noise_clip=nc)
+                _,pn,nc=config.noise_schedule.values(step-1,max_steps=config.max_steps);e.set_target_noise(policy_noise=pn,noise_clip=nc)
                 with patch.object(e.replay,'sample',return_value=batch),patch.object(torch,'randn_like',new=lambda x:noise.to(x.device)), \
                         (helper.eager_evidence(e,record) if e is ref else nullcontext()):
                     public+=1
                     report['public_updates']=public
-                    e.update_once(total_steps=step,bc_lambda=v2_bc_lambda(step-1,schedule='smooth-mid-strong'),diagnostic_tensor_recorder=record)
+                    e.update_once(total_steps=step,bc_lambda=v2_bc_lambda(step-1,schedule=bc_schedule),diagnostic_tensor_recorder=record)
                 if config.terminal_geo_far_weight and 'actor.action' in tensors:
                     from brain_uav.observations.v2_builder import terminal_reference_action
                     scales=e.actor.scales
@@ -186,7 +186,7 @@ def _check(engine,config,pool,prepared,bc,model,report):
                         payload=build_v2_periodic_snapshot(e,config,stage_steps=step,
                             scenario=prepared.scenario_config,rewards=prepared.reward_config,
                             uav_collision_radius=prepared.uav_collision_radius,seed_manifest={'base_seed':config.seed},
-                            initialization_source={'kind':'bounded_gate'},bc_schedule='smooth-mid-strong')
+                            initialization_source={'kind':'bounded_gate'},bc_schedule=bc_schedule)
                         restored=load_v2_periodic_snapshot(payload,expected_model_type=model)
                         load_state(e,config,restored)
                         from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash

@@ -1,4 +1,4 @@
-"""Explicit easy ACC feedback, independent of research pause/budget hooks."""
+"""Stage-local formal ACC feedback, independent of research pause/budget hooks."""
 from copy import deepcopy
 from pathlib import Path
 import json
@@ -6,12 +6,15 @@ import numpy as np
 import math
 import torch
 
+from brain_uav.v2_curriculum import V2_TD3_STAGES
 from .v2_online_research import ACCController, IsolatedScorer, target_config, validate_acc_controller
 
 
 class FormalACC:
     def __init__(self, engine, config, directory=None):
-        if config.acc_eta != .01 or config.stage != 'easy':raise ValueError('Only explicit easy ACC(.01) is supported.')
+        if config.acc_eta != .01 or config.stage not in V2_TD3_STAGES:
+            raise ValueError('Only explicit formal ACC(.01) is supported.')
+        self.stage=config.stage
         self.controller=ACCController(config.acc_eta,gamma=config.gamma)
         copies=deepcopy((engine.critic1,engine.critic2))
         for c in copies:c.requires_grad_(False)
@@ -38,7 +41,8 @@ def save_state(engine,config):
     if config.acc_eta is None:
         if hook is not None:raise ValueError('Unexpected formal ACC hook.')
         return None
-    if hook is None or hook.controller.beta!=engine.research_beta:raise ValueError('ACC hook/beta mismatch.')
+    if hook is None or hook.stage!=config.stage or hook.controller.beta!=engine.research_beta:
+        raise ValueError('ACC hook/stage/beta mismatch.')
     return dict(method='acc',scoring='isolated',controller=deepcopy(hook.controller.state()))
 
 
@@ -50,7 +54,7 @@ def validate_state(payload):
             raise ValueError('Online research/ACC targets require an explicit compatible formal contract.')
         return
     state=payload.get('acc_state')
-    if (eta!=.01 or formal['stage']!='easy' or formal['gamma']!=.99 or formal['mc_return_weight']!=0
+    if (eta!=.01 or formal['stage'] not in V2_TD3_STAGES or formal['gamma']!=.99 or formal['mc_return_weight']!=0
             or formal['target_q_aggregation']!='min' or not isinstance(state,dict)
             or set(state)!={'method','scoring','controller'} or state['method']!='acc' or state['scoring']!='isolated'
             or algorithm.get('online_research_target')!=target_config('acc_001')):
@@ -129,7 +133,7 @@ def load_state(engine,config,payload):
     for name in ('update_count','critic_update_count','critic_target_update_count','actor_update_count','last_total_steps'):
         if type(counts[name]) is not int or counts[name]<0:raise ValueError('Invalid ACC update counts.')
     hook=getattr(engine,'formal_acc',None)
-    if hook is not None and (not isinstance(hook,FormalACC) or hook.controller.eta!=config.acc_eta
+    if hook is not None and (not isinstance(hook,FormalACC) or hook.stage!=config.stage or hook.controller.eta!=config.acc_eta
             or hook.controller.gamma!=config.gamma or hook.controller.capacity!=5000):
         raise ValueError('Target ACC controller configuration mismatch.')
     if hook is None:

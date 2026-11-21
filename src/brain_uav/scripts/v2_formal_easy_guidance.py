@@ -68,8 +68,8 @@ def outcome(row):
     return row['outcome']
 
 
-def last_complete_episodes(path, actual_steps):
-    cutoff = max(0, actual_steps - 50000)
+def last_complete_episodes(path, actual_steps, *, by_end=False):
+    cutoff = actual_steps - 50000 if by_end else max(0, actual_steps - 50000)
     previous = success = count = 0
     with path.open(encoding='utf-8') as stream:
         for index, line in enumerate(stream, 1):
@@ -79,7 +79,8 @@ def last_complete_episodes(path, actual_steps):
                     or type(end) is not int or end != previous + length or end > actual_steps):
                 raise ValueError('Episode history is incomplete or inconsistent.')
             label = outcome(row)
-            if previous >= cutoff:
+            in_window = end > cutoff if by_end else previous >= cutoff
+            if in_window:
                 count += 1
                 success += label == 'goal'
             previous = end

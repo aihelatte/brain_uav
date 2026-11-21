@@ -293,9 +293,9 @@ class V2FormalTrainingConfig:
     validation_max_failures: int = 5
 
     def __post_init__(self) -> None:
-        if self.acc_eta is not None and (self.acc_eta!=.01 or self.stage!='easy' or self.gamma!=.99
+        if self.acc_eta is not None and (self.acc_eta!=.01 or self.gamma!=.99
                 or self.target_q_aggregation!='min' or self.mc_return_weight!=0):
-            raise ValueError('Formal ACC requires easy, eta=.01, gamma=.99, min backing and MC disabled.')
+            raise ValueError('Formal ACC requires eta=.01, gamma=.99, min backing and MC disabled.')
         if self.target_q_aggregation not in ('min', 'mean'):
             raise ValueError('target_q_aggregation must be min or mean.')
         from .v2_mc_return import validate_mc_return_config
