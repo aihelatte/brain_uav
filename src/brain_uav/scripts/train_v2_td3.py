@@ -9,6 +9,8 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any
 
+import numpy as np
+
 from brain_uav.config import RewardConfig, ScenarioConfig, reward_config_snapshot
 from brain_uav.v2_curriculum import V2NoiseSchedule
 from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
@@ -276,6 +278,7 @@ def _configure_stage_compilation(
     cuda_graph_action_inference: bool = False,
     cuda_graph_actor_update: bool = False,
     cuda_graph_updates: bool = False,
+    scenario_generators=None,
 ) -> dict[str, Any]:
     if cuda_graph_actor_update and not (
         cuda_graph_updates and compile_actors
@@ -408,6 +411,23 @@ def _configure_stage_compilation(
             zone_features=first.zone_features[:, :0, :],
             presence_mask=first.presence_mask[:, :0],
         ), *action_inference_batches)
+    if cuda_graph_action_inference and scenario_generators:
+        training_counts = {count for level, generator in scenario_generators.items()
+                           for count, probability in generator.config.zone_count_probabilities[level].items()
+                           if probability > 0}
+        missing = sorted(training_counts - {batch.max_zone_count for batch in action_inference_batches})
+        if missing:
+            template = max(observations, key=lambda obs: len(obs.zone_features))
+            # Exercise the real batch-one collation layout without sampling the
+            # curriculum or changing the validation-pool update warmup batches.
+            action_inference_batches += tuple(
+                collate_v2_observations([replace(
+                    template,
+                    zone_features=np.resize(template.zone_features, (count, template.zone_features.shape[1])),
+                    presence_mask=np.ones(count, dtype=np.bool_),
+                )]).to(engine.device)
+                for count in missing
+            )
     metadata['warmup_batch_shapes'] = [
         [batch.batch_size, int(batch.zone_features.shape[1])]
         for batch in warmup_batches
@@ -693,6 +713,7 @@ def run_v2_td3_stage(
         components.engine,
         pool,
         prepared_initialization,
+        scenario_generators=components.scenario_generators,
         compile_critic_encoder=compile_critic_encoder,
         compile_target_encoders=compile_target_encoders,
         compile_actors=compile_actors,

@@ -511,6 +511,106 @@ class ShortDiagnosticTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'No action capture or action workspace-clear candidate'):
                 diag.gap_reference(observe_args.out, original)
 
+    def test_warmup_diagnostic_verifies_startup_reuse_and_continues_to_1000(self):
+        from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
+        from brain_uav.trainers.v2_gpu_compute import clone_batch
+        from brain_uav.trainers.v2_replay_buffer import V2ReplayBatch
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            staged = root / 'staged' / 'ann_seed41' / 'step686_result.json'
+            raw_result = torch.tensor([1.])
+            metric = make_dataclass('Metric', [('critic_updated', bool)])(True)
+            after = {'training': 'after'}
+            formal.atomic_json(staged, dict(completed=True, metrics=dict(critic_updated=True),
+                result_sha256=state_hash(raw_result), post_state=after))
+            args = diag.parse_args(['--out', str(root / 'run'), '--warmup-staged-reference', str(root / 'staged')])
+            self.assertEqual(diag.describe(args)['stop_step'], 1000)
+            output = args.out / 'ann_seed41'
+            formal.atomic_json(output / 'ready.json', dict(compilation=dict(cuda_graph_action_inference_evidence={
+                'shapes': [{'batch_shape': [1, 1], 'verified': True, 'cuda_graph_launch_count': 1}]})))
+            obs = diag.V2ObservationBatch(torch.zeros(1, 6), torch.zeros(1, 4), torch.zeros(1, 2, 19),
+                                         torch.tensor([[True, False]]))
+            batch = V2ReplayBatch(obs, torch.zeros(1, 3), torch.zeros(1, 1), obs,
+                                  *(torch.zeros(1, 1) for _ in range(4)))
+            key = diag.COMPARE_KEY
+            graph = Mock()
+            entry = (graph, clone_batch(batch), torch.zeros(()), raw_result, ((), ()), {})
+            executor = SimpleNamespace(e=SimpleNamespace(last_total_steps=685, window_update_statistics=[]),
+                graphs={key: entry}, captures=1, replays=9, banks=[[[]], [[]]], persistent=lambda: [],
+                noise=torch.zeros(1), coefficients=torch.zeros(4), injections=torch.zeros(4))
+            engine = SimpleNamespace(device='cpu', select_action=lambda: torch.zeros(2), update_once=Mock(),
+                                     _action_inference_tensor=Mock())
+            trainer = SimpleNamespace(engine=engine, config=SimpleNamespace(max_steps=750000),
+                result=SimpleNamespace(stage_steps=685), _new_episode=Mock(),
+                env=SimpleNamespace(last_curriculum_level='easy', zones=[None]))
+            trace = diag.Trace(io.StringIO(), sync_window=False)
+            trace.synchronize = Mock()
+            state = {'training': 'before'}
+            legacy = diag.StepComparison(diag.parse_args(['--out', str(root / 'legacy'),
+                '--compare-686', 'graph']), root / 'legacy', {})
+            trace.step, trace.scene = 686, dict(level='easy', obstacles=1)
+            identity_path = root / 'legacy' / 'step686_before.json'
+            with patch.object(diag.StepComparison, 'state', side_effect=lambda *_: dict(state)):
+                legacy.capture(executor, key, 5)
+                legacy.select(executor, key, batch, trace)
+                legacy.before_replay(trace)
+                staged_identity = diag.read_json(identity_path)['identity']
+                with patch.object(diag, 'warmup_reference', return_value=(staged_identity, diag.read_json(staged))):
+                    comparison = diag.StepComparison(args, output, {})
+                trace.comparison = comparison
+                comparison.capture(executor, key, 5)
+                trace.gap.last_key = list(key)
+                trace.gap.training_completed(684, 5)
+                trace.gap.event(686, 'action_input', shapes={'zone_features': [1, 1, 19]})
+                trace.gap.event(686, 'action_graph_complete', branch='reuse', graph_id=4, function_id=2)
+
+                def update(*, total_steps, gpu_compute_submission_diagnostic):
+                    if total_steps == 686:
+                        comparison.select(executor, key, batch, trace)
+                        with trace.scope('graph_replay_submit'):
+                            executor.graphs[key][0].replay()
+                        state.update(after)
+                    return metric
+
+                def run(trainer):
+                    for step in range(686, 1001):
+                        engine.select_action()
+                        engine.update_once(total_steps=step)
+                        trainer.result.stage_steps = step
+                    engine.select_action()
+
+                engine.update_once = update
+                with (patch.object(diag.GraphGap, 'install'),
+                      patch.object(comparison, 'gap_state', return_value={}),
+                      self.assertRaises(diag.DiagnosticComplete)):
+                    diag.run_bounded(run, trainer, trace)
+            self.assertEqual(trainer.result.stage_steps, 1000)
+            graph.replay.assert_called_once_with()
+            self.assertIs(executor.graphs[key], entry)
+            result = diag.read_json(output / 'step686_result.json')
+            self.assertTrue(result['startup_action_graph_reused'])
+            self.assertTrue(all(result['comparison'].values()))
+            trace.gap.event(685, 'action_cuda_capture_end', graph_id=4, function_id=2)
+            with self.assertRaisesRegex(ValueError, 'did not reuse a startup-verified'):
+                comparison.verify_startup_graph_reuse(686)
+
+    def test_warmup_diagnostic_only_accepts_the_stage_entry_source_difference(self):
+        with TemporaryDirectory() as tmp:
+            seal = Path(tmp) / 'seal.json'
+            expected = {diag.WARMUP_SOURCE: 'old', 'other': 'original'}
+            formal.atomic_json(seal, {'sha256': expected})
+            historical = dict(paths={'source_manifest': str(seal)}, source={'sha256': expected})
+            amended = dict(expected, **{diag.WARMUP_SOURCE: 'new'})
+            for files in (amended, dict(amended, other='changed'), expected):
+                with self.subTest(files=files), patch.object(formal, 'identity', return_value={'sha256': files}):
+                    if files == amended:
+                        self.assertEqual(diag.fixed_warmup_inputs(historical)['source']['sha256'], amended)
+                        self.assertEqual(historical['source']['sha256'], expected)
+                    else:
+                        with self.assertRaisesRegex(ValueError, 'original source seal plus the stage-entry fix'):
+                            diag.fixed_warmup_inputs(historical)
+
     def test_real_worker_resolves_medium_and_marks_bounded_exit_without_artifact(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -579,6 +679,24 @@ class ShortDiagnosticTests(unittest.TestCase):
                 formal.atomic_json(root / 'summary.json', dict(summary, **bad))
                 with self.assertRaises(ValueError):
                     diag.require_single_result(root, binding)
+            staged = root / 'staged' / 'ann_seed41/step686_result.json'
+            formal.atomic_json(staged, {'completed': True})
+            warmup = dict(warmup_staged_reference=str(root / 'staged'), warmup_source_sha256='code',
+                          diagnostic_sha256='script')
+            formal.atomic_json(root / 'summary.json', dict(summary, **warmup))
+            result = dict(arm=diag.WARMUP_ARM, pid=41, completed=True, submitted=True, last_step=686,
+                          reference_matches=True, startup_action_graph_reused=True,
+                          staged_result_sha256=formal.file_hash(staged),
+                          comparison=dict(metrics_exact_match=True, post_state_exact_match=True,
+                                          result_sha256_exact_match=True))
+            result_path = root / 'ann_seed41/step686_result.json'
+            formal.atomic_json(result_path, result)
+            diag.require_single_result(root, binding, warmup=warmup)
+            with self.assertRaisesRegex(ValueError, 'without --warmup-staged-reference'):
+                diag.require_single_result(root, binding)
+            formal.atomic_json(result_path, dict(result, startup_action_graph_reused=False))
+            with self.assertRaisesRegex(ValueError, 'requires verified seed-41 replay'):
+                diag.require_single_result(root, binding, warmup=warmup)
 
     def test_release_single_seed_41(self):
         self.check_launch_release((41,))

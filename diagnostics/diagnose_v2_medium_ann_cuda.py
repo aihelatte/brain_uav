@@ -35,6 +35,8 @@ COMPARE_KEY = (2, 2, 'frozen_targets', 0, 0)
 FIRST_SAMPLE_ARM = 'first-sample-graph'
 RECAPTURE_ARMS = ('fresh-graph', FIRST_SAMPLE_ARM)
 GAP_ARMS = ('gap-observe', 'gap-bypass')
+WARMUP_ARM = 'warmup-verify'
+WARMUP_SOURCE = 'src/brain_uav/scripts/train_v2_td3.py'
 # The graph and staged server references predate the fresh-graph code.
 HISTORICAL_DIAGNOSTIC_SHA256 = 'f36bedd5c0d84f9ccc41215aef2988d8fbd6794f92c72a3faeec018635524f73'
 
@@ -55,6 +57,8 @@ def parse_args(argv=None):
     parser.add_argument('--graph-reference', type=Path, help='Cached graph output for staged or recapture modes.')
     parser.add_argument('--staged-reference', type=Path, help='Successful staged output for recapture modes.')
     parser.add_argument('--gap-reference', type=Path, help='Completed gap-observe evidence for gap-bypass.')
+    parser.add_argument('--warmup-staged-reference', type=Path,
+                        help='Historical staged result for the fixed-source 1,000-step diagnostic.')
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--worker', type=int, choices=ALL_SEEDS, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -68,6 +72,12 @@ def parse_args(argv=None):
         args.single_result = args.single_result.resolve()
     if args.compare_686 and (args.seeds != (41,) or args.sync_window):
         parser.error('--compare-686 uses seed 41 and adds no synchronization before step 686.')
+    if args.warmup_staged_reference is not None:
+        if args.compare_686 or args.sync_window:
+            parser.error('--warmup-staged-reference uses ordinary action inference and cached training graphs.')
+        args.warmup_staged_reference = args.warmup_staged_reference.resolve()
+        if args.out.is_relative_to(args.warmup_staged_reference) or args.warmup_staged_reference.is_relative_to(args.out):
+            parser.error('--out must be separate from --warmup-staged-reference.')
     for name, required in (('graph_reference', args.compare_686 in ('staged', *RECAPTURE_ARMS)),
                            ('staged_reference', args.compare_686 in RECAPTURE_ARMS),
                            ('gap_reference', args.compare_686 == 'gap-bypass')):
@@ -96,11 +106,16 @@ def describe(args):
         comparison['staged_reference'] = str(args.staged_reference)
     if args.gap_reference is not None:
         comparison['gap_reference'] = str(args.gap_reference)
+    warmup = {}
+    if args.warmup_staged_reference is not None:
+        warmup = dict(warmup_staged_reference=str(args.warmup_staged_reference),
+                      warmup_source_sha256=formal.source_hash(formal.REPO / WARMUP_SOURCE),
+                      diagnostic_sha256=formal.file_hash(Path(__file__)))
     return dict(diagnostic_only=True, base=BASE, batch=BATCH, seeds=list(args.seeds), formal_max_steps=750000,
                 stop_step=COMPARE_STEP if comparison else STOP_STEP,
                 trace_window=[COMPARE_STEP, COMPARE_STEP] if comparison else list(WINDOW),
                 sync_window=args.sync_window,
-                course_root=str(args.course_root), output=str(args.out), **comparison)
+                course_root=str(args.course_root), output=str(args.out), **(comparison | warmup))
 
 
 def source_args(root, source, *, job=None):
@@ -114,6 +129,16 @@ def source_args(root, source, *, job=None):
         argv.append(('--job', job))
     return formal.parser().parse_args(['worker' if job else 'launch', '--launch',
                                         *(str(item) for pair in argv for item in pair)])
+
+
+def fixed_warmup_inputs(evidence):
+    runtime = formal.identity(formal.COURSE_EXPERIMENT)
+    sealed = evidence['source']['sha256']
+    actual = runtime['sha256']
+    changed = {name for name in sealed.keys() | actual.keys() if sealed.get(name) != actual.get(name)}
+    if changed != {WARMUP_SOURCE} or read_json(Path(evidence['paths']['source_manifest']))['sha256'] != sealed:
+        raise ValueError(f'Warmup diagnostic requires the original source seal plus the stage-entry fix: {sorted(changed)}')
+    return dict(evidence, source=runtime)
 
 
 def load_original(args):
@@ -139,15 +164,16 @@ def load_original(args):
             or pool['path'] != identity['paths']['pool'] or pool['sha256'] != identity['hashes']['pool']
             or pool['content_digest'] != identity['pool_digest']):
         raise ValueError('Original committed medium ANN batch, parent, or pool differs.')
-    formal.check_inputs(identity)
+    formal.check_inputs(fixed_warmup_inputs(identity) if args.warmup_staged_reference else identity)
     parsed = source_args(train, source)
     parsed.gate_report = train.parent / 'gate'
     if formal.validate_gate(parsed, identity) != source['gate_evidence']:
         raise ValueError('Original medium ANN gate evidence differs.')
     # Recheck the existing input contract without opening a trainer or writing to the course.
-    actual = formal.inputs(parsed)
-    if any(actual[key] != identity[key] for key in ('paths', 'hashes', 'pool_digest', 'global_steps_start')):
-        raise ValueError('Original formal initialization evidence differs.')
+    if not args.warmup_staged_reference:
+        actual = formal.inputs(parsed)
+        if any(actual[key] != identity[key] for key in ('paths', 'hashes', 'pool_digest', 'global_steps_start')):
+            raise ValueError('Original formal initialization evidence differs.')
     load_v2_validation_pool(parsed.validation_pool, expected_level='medium', expected_count=100,
                             expected_master_seed=pool['master_seed'], expected_stage_seed=pool['stage_seed'])
     binding = dict(manifest=str(manifest_path), sha256=formal.file_hash(manifest_path),
@@ -156,7 +182,7 @@ def load_original(args):
     return source, wanted, binding
 
 
-def require_single_result(path, binding):
+def require_single_result(path, binding, *, warmup=None):
     summary = read_json(path / 'summary.json')
     worker = read_json(path / 'ann_seed41/worker_summary.json')
     process = summary.get('processes', {}).get('ann_seed41', {})
@@ -167,6 +193,23 @@ def require_single_result(path, binding):
             or summary.get('sync_window') is not False or worker.get('diagnostic_completed') is not True
             or worker.get('stage_steps') != STOP_STEP):
         raise ValueError('Four-seed run requires the completed asynchronous seed-41 diagnostic on these inputs.')
+    if warmup is None and {'warmup_staged_reference', 'warmup_source_sha256'} & summary.keys():
+        raise ValueError('Four-seed run without --warmup-staged-reference cannot reuse a warmup diagnostic.')
+    if warmup is not None:
+        report_path = path / 'ann_seed41/step686_result.json'
+        result = read_json(report_path)
+        comparison = result.get('comparison', {})
+        if (any(summary.get(key) != warmup[key] for key in
+                ('warmup_staged_reference', 'warmup_source_sha256', 'diagnostic_sha256'))
+                or result.get('arm') != WARMUP_ARM or result.get('pid') != worker['pid']
+                or result.get('last_step') != COMPARE_STEP or result.get('submitted') is not True
+                or result.get('completed') is not True or result.get('reference_matches') is not True
+                or result.get('startup_action_graph_reused') is not True
+                or any(comparison.get(key + '_exact_match') is not True
+                       for key in ('metrics', 'post_state', 'result_sha256'))
+                or result.get('staged_result_sha256') != formal.file_hash(
+                    Path(warmup['warmup_staged_reference']) / 'ann_seed41/step686_result.json')):
+            raise ValueError('Four-seed warmup run requires verified seed-41 replay and matching staged results.')
 
 
 def shapes(observation):
@@ -275,6 +318,10 @@ def comparison_references(args, original):
         raise ValueError('Recapture requires a cached replay synchronization failure and successful staged '
                          f'update with identical inputs and state: {args.graph_reference}, {args.staged_reference}')
     return {'graph': graph, 'staged': staged}
+
+
+def warmup_reference(path, original):
+    return read_comparison_reference(path, original, 'staged', HISTORICAL_DIAGNOSTIC_SHA256)
 
 
 def gap_reference(path, original):
@@ -426,10 +473,15 @@ class GraphGap:
 
 class StepComparison:
     def __init__(self, args, output, original):
-        self.arm, self.output, self.original = args.compare_686, output, original
-        self.references = comparison_references(args, original)
+        self.arm = WARMUP_ARM if args.warmup_staged_reference else args.compare_686
+        self.output, self.original = output, original
+        self.references = (dict(staged=warmup_reference(args.warmup_staged_reference, original))
+                           if self.arm == WARMUP_ARM else comparison_references(args, original))
+        self.staged_result_sha256 = (formal.file_hash(args.warmup_staged_reference / 'ann_seed41/step686_result.json')
+                                     if self.arm == WARMUP_ARM else None)
         self.gap = (GraphGap(gap_reference(args.gap_reference, original) if args.gap_reference else None)
-                    if self.arm in GAP_ARMS else None)
+                    if self.arm in (*GAP_ARMS, WARMUP_ARM) else None)
+        self.startup_graph_reused = False
         self.captured = None
         self.capture_step = None
         self.selected = None
@@ -534,6 +586,28 @@ class StepComparison:
             gradients={name: state_hash([p.grad for p in model.parameters()])
                        for name, model in zip(names, executor.models, strict=True) if model is not None})
 
+    def verify_startup_graph_reuse(self, step):
+        ready = read_json(self.output / 'ready.json')['compilation']
+        verified_shapes = {tuple(row['batch_shape']) for row in
+            ready['cuda_graph_action_inference_evidence']['shapes'] if row['verified'] and row['cuda_graph_launch_count'] > 0}
+        events = self.gap.events
+        shapes_at_step = [tuple(row['shapes']['zone_features'][:2]) for row in events
+                          if row['step'] == step and row['event'] == 'action_input']
+        calls = [row for row in events if row['step'] == step and row['event'] == 'action_graph_complete']
+        recorded_during_training = {(row['function_id'], row['graph_id']) for row in events
+                                     if row['event'] == 'action_cuda_capture_end' and 'function_id' in row}
+        self.startup_graph_reused = (
+            len(shapes_at_step) == 1 and shapes_at_step[0] in verified_shapes and bool(calls)
+            and all(row['branch'] == 'reuse' and
+                    (row['function_id'], row['graph_id']) not in recorded_during_training for row in calls)
+            and not any(row['step'] == step and row['event'] == 'action_cuda_capture_end' for row in events))
+        formal.atomic_json(self.output / 'step686_warmup.json', dict(
+            verified_shapes=sorted(verified_shapes), action_input_shapes=shapes_at_step, action_graph_calls=calls,
+            training_action_captures=[row for row in events if row['event'] == 'action_cuda_capture_end'],
+            startup_action_graph_reused=self.startup_graph_reused))
+        if not self.startup_graph_reused:
+            raise ValueError('Step 686 did not reuse a startup-verified action graph.')
+
     def before_replay(self, trace):
         from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
 
@@ -584,6 +658,9 @@ class StepComparison:
                 raise ValueError(f'Step 686 reference mismatch: {", ".join(mismatches)}.')
         if self.arm == 'fresh-graph':
             self.recapture(trace, identity)
+        elif self.arm == WARMUP_ARM:
+            with trace.scope('verify_startup_action_graph'):
+                self.verify_startup_graph_reuse(trace.step)
         elif not first_sample_arm and self.gap is None:
             self.submitted = True
 
@@ -661,6 +738,9 @@ class StepComparison:
             path = self.output / 'graph_gap.json'
             formal.atomic_json(path, self.gap.report())
             result['gap_sha256'] = formal.file_hash(path)
+        if self.arm == WARMUP_ARM:
+            result.update(startup_action_graph_reused=self.startup_graph_reused,
+                          staged_result_sha256=self.staged_result_sha256)
         if metric is not None:
             executor, _, _, entry = self.selected
             if self.arm == FIRST_SAMPLE_ARM:
@@ -670,21 +750,24 @@ class StepComparison:
             result.update(metrics=asdict(metric), post_state=self.state(executor, trace.trainer),
                           result_sha256=state_hash(output))
         if self.references and self.matched:
-            other = self.references['graph'][1]
-            result['graph_completed'] = other['completed']
-            result['graph_first_failure'] = other['first_failure']
-            reference_arm = 'staged' if self.arm in RECAPTURE_ARMS else 'graph'
+            if 'graph' in self.references:
+                other = self.references['graph'][1]
+                result['graph_completed'] = other['completed']
+                result['graph_first_failure'] = other['first_failure']
+            reference_arm = 'staged' if self.arm in (*RECAPTURE_ARMS, WARMUP_ARM) else 'graph'
             other = self.references[reference_arm][1]
             if metric is not None and other['completed']:
                 result['comparison'] = {key + '_exact_match': result[key] == other[key]
                                         for key in ('metrics', 'post_state', 'result_sha256')}
                 result[reference_arm + '_metrics'] = other['metrics']
-                if self.arm in RECAPTURE_ARMS:
+                if self.arm in (*RECAPTURE_ARMS, WARMUP_ARM):
                     result['comparison_details'] = {
                         group: {name: name in other[group] and value == other[group][name]
                                 for name, value in result[group].items()}
                         for group in ('metrics', 'post_state')}
         formal.atomic_json(self.output / 'step686_result.json', result)
+        if self.arm == WARMUP_ARM and metric is not None and not all(result['comparison'].values()):
+            raise ValueError('Step 686 output, metrics, or post-update training state differs from staged.')
 
 
 class Trace:
@@ -770,7 +853,7 @@ def run_bounded(run, trainer, trace):
         raise ValueError('The diagnostic requires the original 750000-step schedule.')
     trace.device = engine.device
     trace.trainer = trainer
-    stop_step = COMPARE_STEP if trace.comparison is not None else STOP_STEP
+    stop_step = (COMPARE_STEP if trace.comparison is not None and trace.comparison.arm != WARMUP_ARM else STOP_STEP)
     new_episode, select_action = trainer._new_episode, engine.select_action
     action_tensor, update = engine._action_inference_tensor, engine.update_once
     action_to, graph_key, capture = V2ObservationBatch.to, GPUCompute.key, GPUCompute.capture_shape
@@ -920,7 +1003,8 @@ def worker(args):
     spec = next(spec for spec in scratch['plan']['jobs'] if spec['job']['seed'] == args.worker)
     job = spec['job']['id']
     output = args.out / job
-    comparison = StepComparison(args, output, description['original']) if args.compare_686 else None
+    comparison = (StepComparison(args, output, description['original']) if args.compare_686
+                  or (args.warmup_staged_reference and args.worker == 41) else None)
     stop_step = description['stop_step']
     original_run, original_write = V2FormalStageTrainer.run, stage._write_strict_json
     write_json = formal.atomic_json
@@ -936,7 +1020,8 @@ def worker(args):
                 completed = True
                 raise
             except BaseException as exc:
-                if comparison is not None:
+                if comparison is not None and (comparison.arm != WARMUP_ARM or not
+                                                (output / 'step686_result.json').exists()):
                     if comparison.failure is None:
                         comparison.failure = dict(section='worker', phase='host_call',
                                                   error_type=type(exc).__name__, error=str(exc))
@@ -981,10 +1066,10 @@ def worker(args):
 
 def launch(args, original, wanted, binding):
     chosen = [job for job in wanted if job['seed'] in args.seeds]
-    evidence = original['inputs']
+    evidence = fixed_warmup_inputs(original['inputs']) if args.warmup_staged_reference else original['inputs']
     args.out.mkdir(parents=True, exist_ok=False)
     description = dict(describe(args), original=binding)
-    scratch = dict(original, batch_id=uuid4().hex,
+    scratch = dict(original, inputs=evidence, batch_id=uuid4().hex,
                    plan=dict(original['plan'], root=str(args.out),
                              jobs=[formal.resolved(job, formal.COURSE_EXPERIMENT)[0] for job in chosen]))
     formal.atomic_json(args.out / 'diagnostic.json', description)
@@ -1004,6 +1089,8 @@ def launch(args, original, wanted, binding):
         argv.extend(('--staged-reference', str(args.staged_reference)))
     if args.gap_reference is not None:
         argv.extend(('--gap-reference', str(args.gap_reference)))
+    if args.warmup_staged_reference is not None:
+        argv.extend(('--warmup-staged-reference', str(args.warmup_staged_reference)))
     status = dict(description, execution_completed=False)
     processes, session = {}, None
     failure = None
@@ -1106,8 +1193,12 @@ def main(argv=None):
         return worker(args)
     print(f'Diagnostic output: {args.out}', flush=True)
     original, jobs, binding = load_original(args)
+    warmup = None
+    if args.warmup_staged_reference is not None:
+        warmup_reference(args.warmup_staged_reference, binding)
+        warmup = describe(args)
     if args.single_result is not None:
-        require_single_result(args.single_result, binding)
+        require_single_result(args.single_result, binding, warmup=warmup)
     comparison_references(args, binding)
     if args.gap_reference is not None:
         gap_reference(args.gap_reference, binding)

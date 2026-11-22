@@ -475,6 +475,56 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         self.assertFalse(resolved['cuda_graph_updates'])
         self.assertTrue(resolved['compile_actors'])
 
+    def test_medium_action_graph_warmup_and_verification_include_easy_zone_count(self):
+        from copy import deepcopy
+        from brain_uav.envs.v2_scenario_generator import V2ScenarioGenerator
+        from brain_uav.scripts import train_v2_td3 as stage
+        from test_v2_bc import make_scenario_config, make_scenario_payload
+
+        scenario = make_scenario_config()
+        pool = SimpleNamespace(stage_seed=3, scenario_count=100, scenarios=[])
+        for count in (0, 2, 3):
+            payload = make_scenario_payload(count, count)
+            payload.pop('metadata')
+            pool.scenarios.append({'payload': payload})
+        prepared = SimpleNamespace(scenario_config=scenario, reward_config=RewardConfig(), uav_collision_radius=0.,
+            formal_checkpoint={'engine_checkpoint': {'algorithm_config': {}}})
+        engine = SimpleNamespace(batch_size=2, device=torch.device('cpu'), gpu_td3_update=False, gpu_td3_compute=False,
+            configure_compilation=mock.Mock(return_value={}), local_optimization_metadata=lambda: {},
+            warmup_actor_compile=mock.Mock(), warmup_action_inference_compile=mock.Mock(),
+            verify_action_inference_cuda_graph_capture=mock.Mock(return_value={'verified': True}))
+
+        class Initialized(Exception):
+            pass
+
+        def build(_scenario, config, **kwargs):
+            generators = {level: V2ScenarioGenerator(scenario, level, seed=3) for level in config.curriculum_mix}
+            engine.generators = generators
+            engine.generator_rng = {level: deepcopy(gen.rng.bit_generator.state) for level, gen in generators.items()}
+            return SimpleNamespace(engine=engine, scenario_generators=generators, seed_manifest={})
+
+        with (tempfile.TemporaryDirectory() as directory,
+              mock.patch.object(stage, 'load_v2_validation_pool', return_value=pool),
+              mock.patch.object(stage, 'validate_v2_prepared_stage_initialization'),
+              mock.patch.object(stage, 'build_v2_stage_engine', side_effect=build),
+              mock.patch.object(stage, 'v2_initial_state_summary', return_value={})):
+            with self.assertRaises(Initialized):
+                run_v2_td3_stage(stage='medium', device='cpu', init_checkpoint='easy.pt',
+                    output=Path(directory) / 'medium.pt', metrics_out=Path(directory) / 'metrics.json',
+                    validation_pool='medium.json', prepared_initialization=prepared, gpu_td3_compute=False,
+                    compile_actors=True, compile_action_inference=True, cuda_graph_action_inference=True,
+                    initialization_gate=mock.Mock(side_effect=Initialized))
+        for hook in (engine.warmup_action_inference_compile, engine.verify_action_inference_cuda_graph_capture):
+            batches, = hook.call_args.args
+            self.assertEqual({(batch.batch_size, batch.max_zone_count) for batch in batches},
+                             {(1, 0), (1, 1), (1, 2), (1, 3)})
+            single, = [batch for batch in batches if batch.max_zone_count == 1]
+            self.assertEqual(single.presence_mask.tolist(), [[True]])
+        batch_args, = engine.warmup_actor_compile.call_args.args
+        self.assertEqual([batch.max_zone_count for batch in batch_args], [0, 2, 3, 2])
+        self.assertEqual({level: gen.rng.bit_generator.state for level, gen in engine.generators.items()},
+                         engine.generator_rng)
+
     def test_formal_compile_setup_registers_and_warms_requested_full_paths(self):
         calls = []
         engine = SimpleNamespace(
