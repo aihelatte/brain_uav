@@ -32,6 +32,8 @@ WINDOW = (675, 700)
 ATTEMPT = Path('batches/medium-ann/attempt-000001')
 COMPARE_STEP = 686
 COMPARE_KEY = (2, 2, 'frozen_targets', 0, 0)
+# The graph and staged server references predate the fresh-graph code.
+HISTORICAL_DIAGNOSTIC_SHA256 = 'f36bedd5c0d84f9ccc41215aef2988d8fbd6794f92c72a3faeec018635524f73'
 
 
 class DiagnosticComplete(Exception):
@@ -45,9 +47,10 @@ def parse_args(argv=None):
     parser.add_argument('--seeds', type=int, nargs='+', default=[41])
     parser.add_argument('--single-result', type=Path, help='Completed async seed-41 output required for the four-seed run.')
     parser.add_argument('--sync-window', action='store_true', help='Synchronize between marked CUDA sections only in steps 675–700.')
-    parser.add_argument('--compare-686', choices=('graph', 'staged'),
-                        help='Stop at step 686 after the original graph or the same computation with barriers.')
-    parser.add_argument('--graph-reference', type=Path, help='Graph diagnostic output required for the staged arm.')
+    parser.add_argument('--compare-686', choices=('graph', 'staged', 'fresh-graph'),
+                        help='Stop at step 686 after cached replay, staged computation, or fresh capture and replay.')
+    parser.add_argument('--graph-reference', type=Path, help='Cached graph output for staged or fresh-graph.')
+    parser.add_argument('--staged-reference', type=Path, help='Successful staged output for fresh-graph.')
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--worker', type=int, choices=ALL_SEEDS, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -61,12 +64,17 @@ def parse_args(argv=None):
         args.single_result = args.single_result.resolve()
     if args.compare_686 and (args.seeds != (41,) or args.sync_window):
         parser.error('--compare-686 uses seed 41 and adds no synchronization before step 686.')
-    if (args.compare_686 == 'staged') != (args.graph_reference is not None):
-        parser.error('Only the staged arm requires --graph-reference.')
-    if args.graph_reference is not None:
-        args.graph_reference = args.graph_reference.resolve()
-        if args.out.is_relative_to(args.graph_reference) or args.graph_reference.is_relative_to(args.out):
-            parser.error('--out must be separate from --graph-reference.')
+    for name, required in (('graph_reference', args.compare_686 in ('staged', 'fresh-graph')),
+                           ('staged_reference', args.compare_686 == 'fresh-graph')):
+        path = getattr(args, name)
+        option = '--' + name.replace('_', '-')
+        if required != (path is not None):
+            parser.error(f'{option} is required for its comparison mode and forbidden in other modes.')
+        if path is not None:
+            path = path.resolve()
+            setattr(args, name, path)
+            if args.out.is_relative_to(path) or path.is_relative_to(args.out):
+                parser.error(f'--out must be separate from {option}.')
     if args.out.is_relative_to(args.course_root) or args.course_root.is_relative_to(args.out):
         parser.error('--out must be separate from the original course.')
     if args.worker is not None and (not args.run or args.worker not in args.seeds):
@@ -79,6 +87,8 @@ def describe(args):
                        diagnostic_sha256=formal.file_hash(Path(__file__)),
                        graph_reference=str(args.graph_reference) if args.graph_reference else None)
                   if args.compare_686 else {})
+    if args.staged_reference is not None:
+        comparison['staged_reference'] = str(args.staged_reference)
     return dict(diagnostic_only=True, base=BASE, batch=BATCH, seeds=list(args.seeds), formal_max_steps=750000,
                 stop_step=COMPARE_STEP if comparison else STOP_STEP,
                 trace_window=[COMPARE_STEP, COMPARE_STEP] if comparison else list(WINDOW),
@@ -213,40 +223,63 @@ def staged_compute(executor, key, entry, trace):
             return executor.compute(fixed, key[2])
 
 
-def graph_reference(path, original):
+def read_comparison_reference(path, original, arm, diagnostic_sha256):
     summary = read_json(path / 'summary.json')
     folder = path / 'ann_seed41'
     raw = (folder / 'step686_before.json').read_bytes()
     before = json.loads(raw)
     result = read_json(folder / 'step686_result.json')
-    if (summary.get('compare_686') != 'graph' or summary.get('seeds') != [41]
-            or summary.get('diagnostic_sha256') != formal.file_hash(Path(__file__))
+    if (summary.get('compare_686') != arm or summary.get('seeds') != [41]
+            or summary.get('diagnostic_sha256') != diagnostic_sha256
             or summary.get('original') != original or before['original'] != original
             or summary.get('mps_cleanup', {}).get('stopped') is not True
             or summary['processes']['ann_seed41']['pid'] != before['pid']
-            or result['pid'] != before['pid'] or before['arm'] != 'graph' or result['arm'] != 'graph'
+            or result['pid'] != before['pid'] or before['arm'] != arm or result['arm'] != arm
             or result['before_sha256'] != sha256(raw).hexdigest()
-            or not result['submitted'] or not before['addresses_match']
+            or result['last_step'] != COMPARE_STEP or not result['submitted'] or not before['addresses_match']
             or before['identity']['key'] != list(COMPARE_KEY)):
-        raise ValueError(f'Graph reference is incomplete or belongs to a different run: {path}')
+        raise ValueError(f'{arm} reference is incomplete or belongs to a different run: {path}')
+    if arm == 'staged' and (summary.get('execution_completed') is not True
+            or summary['processes']['ann_seed41']['exit_code'] != 0
+            or result['completed'] is not True or result['first_failure'] is not None
+            or result['reference_matches'] is not True or before['reference_matches'] is not True
+            or not {'metrics', 'post_state', 'result_sha256'} <= result.keys()):
+        raise ValueError(f'Staged reference did not complete a matching update: {path}')
     return before['identity'], result
+
+
+def comparison_references(args, original):
+    if args.graph_reference is None:
+        return {}
+    if args.compare_686 == 'staged':
+        return {'graph': read_comparison_reference(args.graph_reference, original, 'graph',
+                                                    formal.file_hash(Path(__file__)))}
+    graph = read_comparison_reference(args.graph_reference, original, 'graph', HISTORICAL_DIAGNOSTIC_SHA256)
+    staged = read_comparison_reference(args.staged_reference, original, 'staged', HISTORICAL_DIAGNOSTIC_SHA256)
+    failure = graph[1]['first_failure'] or {}
+    if (graph[1]['completed'] is not False or failure.get('section') != 'graph_replay_submit'
+            or failure.get('phase') != 'synchronize' or graph[0] != staged[0]):
+        raise ValueError('Fresh-graph requires a cached replay synchronization failure and successful staged '
+                         f'update with identical inputs and state: {args.graph_reference}, {args.staged_reference}')
+    return {'graph': graph, 'staged': staged}
 
 
 class StepComparison:
     def __init__(self, args, output, original):
         self.arm, self.output, self.original = args.compare_686, output, original
-        self.reference = graph_reference(args.graph_reference, original) if args.graph_reference else None
+        self.references = comparison_references(args, original)
         self.captured = None
         self.capture_step = None
         self.selected = None
         self.before_sha256 = None
         self.matched = None
         self.result = None
+        self.fresh_entry = None
         self.failure = None
         self.submitted = False
 
     def capture(self, executor, key, step):
-        if key == COMPARE_KEY:
+        if key == COMPARE_KEY and step < COMPARE_STEP:
             self.captured = graph_addresses(executor, key, executor.graphs[key])
             self.capture_step = step
 
@@ -257,18 +290,22 @@ class StepComparison:
             raise ValueError('The comparison requires the original updates through step 685.')
         entry = executor.graphs[key]
         self.selected = (executor, key, batch, entry)
-        if self.arm == 'staged':
+        if self.arm != 'graph':
             comparison = self
 
-            class StagedReplay:
+            class ComparisonReplay:
                 def replay(self):
-                    self.result = staged_compute(executor, key, entry, trace)
-                    comparison.result = self.result
+                    if comparison.arm == 'fresh-graph':
+                        comparison.fresh_entry[0].replay()
+                        comparison.submitted = True
+                        comparison.result = comparison.fresh_entry[3]
+                    else:
+                        comparison.result = staged_compute(executor, key, entry, trace)
 
                 def cpu(self):
-                    return self.result.cpu()
+                    return comparison.result.cpu()
 
-            replay = StagedReplay()
+            replay = ComparisonReplay()
             executor.graphs[key] = (replay, entry[1], entry[2], replay, *entry[4:])
 
     def restore_cache(self):
@@ -284,12 +321,20 @@ class StepComparison:
                     device_adam=state_hash([opt.state_tensors() for opt in executor.adams]),
                     gradient_banks=state_hash(executor.banks), published=list(executor.published))
 
+    @staticmethod
+    def fixed_inputs(executor, entry):
+        from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
+
+        return dict(fixed_sha256=state_hash(tensors(entry[1])), fraction_sha256=state_hash(entry[2]),
+                    noise_sha256=state_hash(executor.noise), coefficients_sha256=state_hash(executor.coefficients),
+                    injection_sha256=state_hash(executor.injections))
+
     def before_replay(self, trace):
         from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
 
         executor, key, batch, entry = self.selected
-        _, fixed, fraction, _, presence, _ = entry
-        # Complete the same copies and snapshot the same bytes in both arms.
+        _, fixed, _, _, presence, _ = entry
+        # Complete the original copies before taking the reference snapshot.
         with trace.scope('fixed_input_completion', sync=True):
             pass
         with trace.scope('comparison_before_replay'):
@@ -300,13 +345,11 @@ class StepComparison:
                 obs_shapes=shapes(fixed.obs), next_obs_shapes=shapes(fixed.next_obs),
                 obs_mask=fixed.obs.presence_mask.detach().cpu().tolist(),
                 next_obs_mask=fixed.next_obs.presence_mask.detach().cpu().tolist(),
-                sample_sha256=state_hash(tensors(batch)), fixed_sha256=state_hash(tensors(fixed)),
-                noise_sha256=state_hash(executor.noise), coefficients_sha256=state_hash(executor.coefficients),
-                fraction_sha256=state_hash(fraction), injection_sha256=state_hash(executor.injections),
+                sample_sha256=state_hash(tensors(batch)), **self.fixed_inputs(executor, entry),
                 state=self.state(executor, trace.trainer))
-            mismatches = ([name for name in identity if identity[name] != self.reference[0].get(name)]
-                          if self.reference else [])
-            self.matched = not mismatches if self.reference else None
+            mismatches = [name for name in identity
+                          if any(identity[name] != reference.get(name) for reference, _ in self.references.values())]
+            self.matched = not mismatches if self.references else None
             before = self.output / 'step686_before.json'
             formal.atomic_json(before, dict(arm=self.arm, pid=os.getpid(), original=self.original,
                 identity=identity, capture_addresses=self.captured, replay_addresses=addresses,
@@ -319,7 +362,36 @@ class StepComparison:
                 raise ValueError('Copied graph inputs differ from the sampled batch.')
             if mismatches:
                 raise ValueError(f'Step 686 reference mismatch: {", ".join(mismatches)}.')
-        self.submitted = True
+        if self.arm == 'fresh-graph':
+            self.recapture(trace, identity)
+        else:
+            self.submitted = True
+
+    def recapture(self, trace, identity):
+        executor, key, batch, old_entry = self.selected
+        with trace.scope('fresh_graph_recapture', sync=True):
+            # Hold the old entry alive while capturing into the same cache slot.
+            del executor.graphs[key]
+            with patch.object(executor, 'failure_fraction', executor.failure_fraction):
+                executor.capture_shape(key, batch)
+            self.fresh_entry = executor.graphs[key]
+        with trace.scope('fresh_graph_verify'):
+            after = self.state(executor, trace.trainer)
+            inputs = self.fixed_inputs(executor, self.fresh_entry)
+            state_matches = after == identity['state']
+            input_matches = {name: value == identity[name] for name, value in inputs.items()}
+            fresh_graph = self.fresh_entry[0] is not old_entry[0]
+            delta = executor.captures - identity['capture_count']
+            replay_count_matches = executor.replays == identity['prior_replays']
+            participation_matches = self.fresh_entry[4] == old_entry[4]
+            formal.atomic_json(self.output / 'step686_recapture.json', dict(
+                key=list(key), capture_count_before=identity['capture_count'], capture_count_after=executor.captures,
+                addresses=graph_addresses(executor, key, self.fresh_entry), fresh_graph=fresh_graph,
+                state_after_capture=after, state_matches=state_matches, input_matches=input_matches,
+                replay_count_matches=replay_count_matches, participation_matches=participation_matches))
+            if not (fresh_graph and delta == 1 and replay_count_matches and participation_matches
+                    and all(input_matches.values()) and state_matches):
+                raise ValueError('Fresh capture changed step 686 inputs or training state, or did not build one new graph.')
 
     def record(self, trace, *, metric=None):
         from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
@@ -330,14 +402,21 @@ class StepComparison:
             executor, _, _, entry = self.selected
             result.update(metrics=asdict(metric), post_state=self.state(executor, trace.trainer),
                           result_sha256=state_hash(entry[3] if self.arm == 'graph' else self.result))
-        if self.reference and self.matched:
-            other = self.reference[1]
+        if self.references and self.matched:
+            other = self.references['graph'][1]
             result['graph_completed'] = other['completed']
             result['graph_first_failure'] = other['first_failure']
+            reference_arm = 'staged' if self.arm == 'fresh-graph' else 'graph'
+            other = self.references[reference_arm][1]
             if metric is not None and other['completed']:
                 result['comparison'] = {key + '_exact_match': result[key] == other[key]
                                         for key in ('metrics', 'post_state', 'result_sha256')}
-                result['graph_metrics'] = other['metrics']
+                result[reference_arm + '_metrics'] = other['metrics']
+                if self.arm == 'fresh-graph':
+                    result['comparison_details'] = {
+                        group: {name: name in other[group] and value == other[group][name]
+                                for name, value in result[group].items()}
+                        for group in ('metrics', 'post_state')}
         formal.atomic_json(self.output / 'step686_result.json', result)
 
 
@@ -376,10 +455,10 @@ class Trace:
     def scope(self, name, *, sync=False):
         phase = 'before'
         comparison_replay = self.comparing and name == 'graph_replay_submit'
-        self.emit('begin', name)
         try:
             if comparison_replay:
                 self.comparison.before_replay(self)
+            self.emit('begin', name)
             phase = 'host_call'
             yield
             self.emit('host_return', name)
@@ -478,7 +557,8 @@ def run_bounded(run, trainer, trace):
         return key
 
     def traced_capture(executor, key, batch):
-        if not trace.active and trace.comparison is None:
+        if (not trace.active and trace.comparison is None
+                or trace.comparing and trace.comparison.arm == 'fresh-graph'):
             return capture(executor, key, batch)
         with trace.scope('update_graph_capture'):
             result = capture(executor, key, batch)
@@ -585,6 +665,8 @@ def launch(args, original, wanted, binding):
         argv.extend(('--compare-686', args.compare_686))
     if args.graph_reference is not None:
         argv.extend(('--graph-reference', str(args.graph_reference)))
+    if args.staged_reference is not None:
+        argv.extend(('--staged-reference', str(args.staged_reference)))
     status = dict(description, execution_completed=False)
     processes, session = {}, None
     failure = None
@@ -689,8 +771,7 @@ def main(argv=None):
     original, jobs, binding = load_original(args)
     if args.single_result is not None:
         require_single_result(args.single_result, binding)
-    if args.graph_reference is not None:
-        graph_reference(args.graph_reference, binding)
+    comparison_references(args, binding)
     return launch(args, original, jobs, binding)
 
 

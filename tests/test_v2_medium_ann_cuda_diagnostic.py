@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+from dataclasses import make_dataclass
 import importlib.util
 import io
 import json
@@ -6,6 +8,8 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+
+import torch
 
 from brain_uav.scripts import run_v2_formal_easy_baseline as formal
 from brain_uav.v2_curriculum import derive_v2_component_seed
@@ -72,6 +76,124 @@ class ShortDiagnosticTests(unittest.TestCase):
             self.assertEqual({row['step'] for row in rows}, {675, 700})
             self.assertEqual(trace.synchronize.call_count, 2 if synchronize else 0)
             self.assertEqual(sum(row['event'] == 'sync_done' for row in rows), 2 if synchronize else 0)
+
+    def test_fresh_graph_replays_new_entry_only_after_verification(self):
+        from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
+        from brain_uav.trainers.v2_gpu_compute import clone_batch
+        from brain_uav.trainers.v2_replay_buffer import V2ReplayBatch
+
+        obs = diag.V2ObservationBatch(torch.zeros(1, 6), torch.zeros(1, 4),
+                                     torch.zeros(1, 2, 19), torch.tensor([[True, False]]))
+        sample = V2ReplayBatch(obs, torch.zeros(1, 3), torch.zeros(1, 1), obs,
+                               *(torch.zeros(1, 1) for _ in range(4)),
+                               sample_failure_fraction=0.25)
+        key = diag.COMPARE_KEY
+        original = dict(batch_id='source')
+        for change in (None, 'state', 'reference', 'replay'):
+            with self.subTest(change=change), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                old, new = Mock(), Mock()
+                stable = clone_batch(sample)
+                fraction, result = torch.tensor(0.25), torch.tensor([4.0])
+                entry = (old, stable, fraction, torch.tensor([-1.0]), ((), ()), {})
+                fresh = (new, clone_batch(sample), fraction.clone(), result, ((), ()), {})
+                executor = SimpleNamespace(e=SimpleNamespace(last_total_steps=685, window_update_statistics=[]),
+                    graphs={key: entry}, captures=3, replays=42, banks=[[[]], [[]]],
+                    failure_fraction=fraction, noise=torch.zeros(1), coefficients=torch.zeros(4),
+                    injections=torch.zeros(4), persistent=lambda: [])
+                state = dict(training='before')
+                trace = diag.Trace(io.StringIO(), sync_window=False)
+                trace.synchronize = Mock()
+                trace.step = 685
+
+                def capture(actual_key, batch):
+                    self.assertEqual(actual_key, key)
+                    self.assertIs(batch, sample)
+                    self.assertNotIn(key, executor.graphs)
+                    executor.graphs[key] = fresh
+                    executor.captures += 1
+                    if change == 'state':
+                        state['training'] = 'advanced during capture'
+
+                executor.capture_shape = Mock(side_effect=capture)
+
+                def replay():
+                    state['training'] = 'after'
+                    if change == 'replay':
+                        trace.synchronize.side_effect = RuntimeError('illegal access')
+
+                new.replay.side_effect = replay
+                prior_failure = dict(section='graph_replay_submit', phase='synchronize')
+                output_hash = state_hash(result)
+                with patch.object(diag.StepComparison, 'state', side_effect=lambda *_: dict(state)):
+                    graph_args = diag.parse_args(['--out', str(root / 'graph'), '--compare-686', 'graph'])
+                    graph = diag.StepComparison(graph_args, graph_args.out, original)
+                    trace.comparison = graph
+                    graph.capture(executor, key, 42)
+                    trace.step = 686
+                    graph.select(executor, key, sample, trace)
+                    graph.before_replay(trace)
+                    graph.failure = prior_failure
+                    graph.record(trace)
+                    before = diag.read_json(graph_args.out / 'step686_before.json')
+                    staged_before = dict(before, arm='staged', reference_matches=True)
+                    staged_output = root / 'staged' / 'ann_seed41'
+                    formal.atomic_json(staged_output / 'step686_before.json', staged_before)
+                    formal.atomic_json(staged_output / 'step686_result.json', dict(
+                        arm='staged', pid=before['pid'], before_sha256=formal.file_hash(
+                            staged_output / 'step686_before.json'), completed=True, submitted=True, last_step=686,
+                        reference_matches=True, first_failure=None, metrics={}, post_state=dict(training='after'),
+                        result_sha256=output_hash))
+                    (graph_args.out / 'ann_seed41').mkdir()
+                    for path in graph_args.out.glob('step686_*.json'):
+                        path.rename(graph_args.out / 'ann_seed41' / path.name)
+                    for arm in ('graph', 'staged'):
+                        formal.atomic_json(root / arm / 'summary.json', dict(compare_686=arm,
+                            diagnostic_sha256='old-script', original=original, seeds=[41],
+                            mps_cleanup=dict(stopped=True), execution_completed=arm == 'staged',
+                            processes=dict(ann_seed41=dict(pid=before['pid'], exit_code=int(arm == 'graph')))))
+                    args = diag.parse_args(['--out', str(root / 'fresh'), '--compare-686', 'fresh-graph',
+                        '--graph-reference', str(root / 'graph'), '--staged-reference', str(root / 'staged')])
+                    with patch.object(diag, 'HISTORICAL_DIAGNOSTIC_SHA256', 'old-script'):
+                        comparison = diag.StepComparison(args, args.out, original)
+                    trace.comparison = comparison
+                    comparison.capture(executor, key, 42)
+                    comparison.select(executor, key, sample, trace)
+                    replay_proxy, _, _, readback, _, _ = executor.graphs[key]
+                    if change == 'reference':
+                        executor.noise.fill_(1)
+
+                    expectation = nullcontext()
+                    if change == 'replay':
+                        expectation = self.assertRaisesRegex(RuntimeError, 'illegal access')
+                    elif change:
+                        expectation = self.assertRaisesRegex(ValueError, 'changed|mismatch')
+                    with expectation:
+                        with trace.scope('graph_replay_submit'):
+                            replay_proxy.replay()
+                    old.replay.assert_not_called()
+                    self.assertEqual(executor.capture_shape.call_count, int(change != 'reference'))
+                    self.assertEqual(new.replay.call_count, int(change in (None, 'replay')))
+                    if change == 'replay':
+                        self.assertEqual((comparison.failure['section'], comparison.failure['phase']),
+                                         ('graph_replay_submit', 'synchronize'))
+                    if change is None:
+                        torch.testing.assert_close(readback.cpu(), result)
+                        comparison.record(trace, metric=make_dataclass('Metric', [])())
+                        report = diag.read_json(args.out / 'step686_result.json')
+                        self.assertTrue(all(report['comparison'].values()))
+                        recapture = diag.read_json(args.out / 'step686_recapture.json')
+                        self.assertEqual((recapture['capture_count_before'], recapture['capture_count_after']), (3, 4))
+                        self.assertTrue(recapture['state_matches'])
+                        self.assertNotEqual(recapture['addresses']['output'], before['replay_addresses']['output'])
+                        events = [json.loads(line) for line in trace.stream.getvalue().splitlines()]
+                        markers = [(row['section'], row['event']) for row in events]
+                        ordered = [markers.index(pair) for pair in (
+                            ('fresh_graph_recapture', 'begin'), ('fresh_graph_recapture', 'sync_done'),
+                            ('graph_replay_submit', 'host_return'), ('graph_replay_submit', 'sync_done'))]
+                        self.assertEqual(ordered, sorted(ordered))
+                    comparison.restore_cache()
+                    self.assertIs(executor.graphs[key], entry)
 
     def test_real_worker_resolves_medium_and_marks_bounded_exit_without_artifact(self):
         with TemporaryDirectory() as tmp:
