@@ -34,6 +34,7 @@ COMPARE_STEP = 686
 COMPARE_KEY = (2, 2, 'frozen_targets', 0, 0)
 FIRST_SAMPLE_ARM = 'first-sample-graph'
 RECAPTURE_ARMS = ('fresh-graph', FIRST_SAMPLE_ARM)
+GAP_ARMS = ('gap-observe', 'gap-bypass')
 # The graph and staged server references predate the fresh-graph code.
 HISTORICAL_DIAGNOSTIC_SHA256 = 'f36bedd5c0d84f9ccc41215aef2988d8fbd6794f92c72a3faeec018635524f73'
 
@@ -49,10 +50,11 @@ def parse_args(argv=None):
     parser.add_argument('--seeds', type=int, nargs='+', default=[41])
     parser.add_argument('--single-result', type=Path, help='Completed async seed-41 output required for the four-seed run.')
     parser.add_argument('--sync-window', action='store_true', help='Synchronize between marked CUDA sections only in steps 675–700.')
-    parser.add_argument('--compare-686', choices=('graph', 'staged', *RECAPTURE_ARMS),
+    parser.add_argument('--compare-686', choices=('graph', 'staged', *RECAPTURE_ARMS, *GAP_ARMS),
                         help='Stop at step 686 after cached replay, staged computation, or recapture and replay.')
     parser.add_argument('--graph-reference', type=Path, help='Cached graph output for staged or recapture modes.')
     parser.add_argument('--staged-reference', type=Path, help='Successful staged output for recapture modes.')
+    parser.add_argument('--gap-reference', type=Path, help='Completed gap-observe evidence for gap-bypass.')
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--worker', type=int, choices=ALL_SEEDS, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -67,7 +69,8 @@ def parse_args(argv=None):
     if args.compare_686 and (args.seeds != (41,) or args.sync_window):
         parser.error('--compare-686 uses seed 41 and adds no synchronization before step 686.')
     for name, required in (('graph_reference', args.compare_686 in ('staged', *RECAPTURE_ARMS)),
-                           ('staged_reference', args.compare_686 in RECAPTURE_ARMS)):
+                           ('staged_reference', args.compare_686 in RECAPTURE_ARMS),
+                           ('gap_reference', args.compare_686 == 'gap-bypass')):
         path = getattr(args, name)
         option = '--' + name.replace('_', '-')
         if required != (path is not None):
@@ -91,6 +94,8 @@ def describe(args):
                   if args.compare_686 else {})
     if args.staged_reference is not None:
         comparison['staged_reference'] = str(args.staged_reference)
+    if args.gap_reference is not None:
+        comparison['gap_reference'] = str(args.gap_reference)
     return dict(diagnostic_only=True, base=BASE, batch=BATCH, seeds=list(args.seeds), formal_max_steps=750000,
                 stop_step=COMPARE_STEP if comparison else STOP_STEP,
                 trace_window=[COMPARE_STEP, COMPARE_STEP] if comparison else list(WINDOW),
@@ -272,10 +277,159 @@ def comparison_references(args, original):
     return {'graph': graph, 'staged': staged}
 
 
+def gap_reference(path, original):
+    identity, result = read_comparison_reference(path, original, GAP_ARMS[0], formal.file_hash(Path(__file__)))
+    timeline_path = path / 'ann_seed41/graph_gap.json'
+    raw = timeline_path.read_bytes()
+    evidence = json.loads(raw)
+    failure = result['first_failure'] or {}
+    if (result.get('gap_sha256') != sha256(raw).hexdigest() or evidence['pid'] != result['pid']
+            or result['completed'] is not False or failure.get('section') != 'graph_replay_submit'
+            or failure.get('phase') != 'synchronize' or 'illegal memory access' not in failure.get('error', '').lower()
+            or evidence['last_successful_replay_step'] is None):
+        raise ValueError(f'Observation did not verify the old-graph illegal access and timeline: {path}')
+    if not evidence['action_candidates']:
+        raise ValueError(f'No action capture or action workspace-clear candidate in {timeline_path}; no bypass to run.')
+    return identity, evidence
+
+
+class GraphGap:
+    def __init__(self, reference=None):
+        self.reference = reference
+        self.candidate = reference[1]['action_candidates'][-1] if reference else None
+        self.bypassed = False
+        self.events = []
+        self.last_key = None
+        self.last_success = None
+        self.last_success_capture_step = None
+        self.start = 0
+        self.action_call = None
+        self.action_step = None
+        self.call_index = 0
+        self.runtime = None
+
+    def event(self, step, event, **details):
+        self.events.append(dict(step=step, event=event, **details))
+
+    def training_completed(self, step, capture_step):
+        self.event(step, 'training_update_complete', key=self.last_key)
+        if self.last_key == list(COMPARE_KEY) and step < COMPARE_STEP:
+            self.last_success = step
+            self.last_success_capture_step = capture_step
+            self.start = len(self.events) - 1
+
+    def report(self):
+        rows = self.events[self.start:]
+        # A workspace-clear call outside action inference remains visible in the
+        # timeline, with no corresponding action bypass.
+        evidence = {}
+        for row in rows:
+            if ((row.get('branch') in ('warmup', 'record') and row['event'] == 'cublas_workspace_clear'
+                    and row['phase'] == 'action')
+                    or (row.get('branch') == 'record' and row['event'] == 'action_cuda_capture_end')):
+                evidence[row['step'], row['call_index']] = row
+        candidates = []
+        for row in rows:
+            if row['event'] == 'action_graph_begin' and (row['step'], row['call_index']) in evidence:
+                direct = evidence[row['step'], row['call_index']]
+                candidates.append({name: direct[name] for name in
+                                   ('step', 'call_index', 'branch', 'function_id', 'graph_id')})
+        return dict(pid=os.getpid(), runtime=self.runtime, last_successful_replay_step=self.last_success,
+                    action_candidates=candidates, selected_candidate=self.candidate, bypassed=self.bypassed,
+                    events=rows)
+
+    def action_mismatches(self):
+        if self.reference is None:
+            return []
+        baseline = self.reference[1]
+        mismatches = [] if self.bypassed else ['action_bypass_not_reached']
+        if self.last_success != baseline['last_successful_replay_step']:
+            mismatches.append('last_successful_replay_step')
+        for event in ('action_input', 'action_result'):
+            expected = {row['step']: row for row in baseline['events'] if row['event'] == event}
+            actual = {row['step']: row for row in self.events[self.start:] if row['event'] == event}
+            mismatches.extend(f'{event}.{step}' for step in sorted(expected.keys() | actual.keys())
+                              if expected.get(step) != actual.get(step))
+        return mismatches
+
+    def install(self, trace, hooks, torch, manager):
+        cublas_name = '_cuda_clearCublasWorkspaces'
+        workspace_clear = getattr(torch._C, cublas_name, None)
+        branches = dict(run_eager='warmup', record_function='record', execute_node='reuse')
+        self.runtime = dict(torch=str(torch.__version__), cuda=torch.version.cuda,
+                            torch_git=torch.version.git_version,
+                            workspace_clear_hook=cublas_name if callable(workspace_clear) else None,
+                            action_graph_hooks=list(branches))
+        if self.reference and self.runtime != self.reference[1]['runtime']:
+            raise ValueError(f'PyTorch runtime differs from gap observation: {self.runtime}')
+
+        def branch_hook(original, branch):
+            def call(owner, *args, **kwargs):
+                if trace.phase != 'action':
+                    return original(owner, *args, **kwargs)
+                if self.action_step != trace.step:
+                    self.action_step, self.call_index = trace.step, 0
+                self.call_index += 1
+                node = args[0] if branch == 'reuse' else None
+                function_id = args[1] if node is None else node.wrapped_function.id
+                invocation = dict(call_index=self.call_index, branch=branch, function_id=function_id.id)
+                details = dict(invocation, graph_id=None if node is None else node.id.id)
+                previous, self.action_call = self.action_call, details
+                try:
+                    self.event(trace.step, 'action_graph_begin', **details)
+                    if (self.candidate and not self.bypassed and self.candidate['step'] == trace.step
+                            and all(self.candidate[name] == value for name, value in invocation.items())):
+                        # Inductor uses this same generated model for its own fallback.
+                        result = owner.ids_to_funcs[function_id].model(args[0])
+                        self.bypassed = True
+                        self.event(trace.step, 'action_graph_bypass', **details)
+                    else:
+                        result = original(owner, *args, **kwargs)
+                        self.event(trace.step, 'action_graph_complete', **details)
+                    return result
+                finally:
+                    self.action_call = previous
+            return call
+
+        for name, branch in branches.items():
+            hooks.enter_context(patch.object(manager, name, branch_hook(getattr(manager, name), branch)))
+
+        def node_id_hook(original, branch):
+            def call(owner, *args, **kwargs):
+                graph_id = original(owner, *args, **kwargs)
+                if self.action_call is not None and self.action_call['branch'] == branch:
+                    self.action_call['graph_id'] = graph_id.id
+                return graph_id
+            return call
+
+        for name, branch in (('new_warmup_node_id', 'warmup'), ('new_graph_id', 'record')):
+            hooks.enter_context(patch.object(manager, name, node_id_hook(getattr(manager, name), branch)))
+
+        def capture_hook(original, event):
+            def call(graph, *args, **kwargs):
+                result = original(graph, *args, **kwargs)
+                if trace.phase == 'action':
+                    self.event(trace.step, event, **(self.action_call or {}))
+                return result
+            return call
+
+        for name in ('capture_begin', 'capture_end'):
+            graph = torch.cuda.CUDAGraph
+            hooks.enter_context(patch.object(graph, name, capture_hook(getattr(graph, name), 'action_cuda_' + name)))
+
+        if callable(workspace_clear):
+            def clear(*args, **kwargs):
+                self.event(trace.step, 'cublas_workspace_clear', phase=trace.phase, **(self.action_call or {}))
+                return workspace_clear(*args, **kwargs)
+            hooks.enter_context(patch.object(torch._C, cublas_name, clear))
+
+
 class StepComparison:
     def __init__(self, args, output, original):
         self.arm, self.output, self.original = args.compare_686, output, original
         self.references = comparison_references(args, original)
+        self.gap = (GraphGap(gap_reference(args.gap_reference, original) if args.gap_reference else None)
+                    if self.arm in GAP_ARMS else None)
         self.captured = None
         self.capture_step = None
         self.selected = None
@@ -318,6 +472,8 @@ class StepComparison:
             raise ValueError('The comparison requires the original updates through step 685.')
         entry = executor.graphs[key]
         self.selected = (executor, key, batch, entry)
+        if self.gap is not None and self.gap.last_success_capture_step != self.capture_step:
+            raise ValueError('The original target graph has no verified successful replay before step 686.')
         if self.arm == FIRST_SAMPLE_ARM:
             if (self.first_sample_evidence is None or self.first_sample_evidence['capture_step'] != self.capture_step
                     or graph_addresses(executor, key, entry) != self.captured):
@@ -326,7 +482,7 @@ class StepComparison:
             # Keep the original entry alive in self.selected. A cache miss here
             # lets the formal update capture, copy and replay the replacement.
             del executor.graphs[key]
-        elif self.arm != 'graph':
+        elif self.arm in ('staged', 'fresh-graph'):
             comparison = self
 
             class ComparisonReplay:
@@ -345,7 +501,7 @@ class StepComparison:
             executor.graphs[key] = (replay, entry[1], entry[2], replay, *entry[4:])
 
     def restore_cache(self):
-        if self.selected is not None:
+        if self.selected is not None and self.gap is None:
             executor, key, _, entry = self.selected
             executor.graphs[key] = entry
 
@@ -364,6 +520,19 @@ class StepComparison:
         return dict(fixed_sha256=state_hash(tensors(entry[1])), fraction_sha256=state_hash(entry[2]),
                     noise_sha256=state_hash(executor.noise), coefficients_sha256=state_hash(executor.coefficients),
                     injection_sha256=state_hash(executor.injections))
+
+    @staticmethod
+    def gap_state(executor):
+        from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
+
+        names = ('actor', 'critic1', 'critic2', 'actor_target', 'critic1_target', 'critic2_target', 'bc_reference_actor')
+        return dict(
+            models={name: state_hash(model.state_dict()) for name, model in zip(names, executor.models, strict=True)
+                    if model is not None},
+            optimizers={name: state_hash(getattr(executor.e, f'{name}_optimizer').state_dict())
+                        for name in ('actor', 'critic')},
+            gradients={name: state_hash([p.grad for p in model.parameters()])
+                       for name, model in zip(names, executor.models, strict=True) if model is not None})
 
     def before_replay(self, trace):
         from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
@@ -389,6 +558,18 @@ class StepComparison:
             mismatches = [name for name in identity
                           if any(identity[name] != reference.get(name) for reference, _ in self.references.values())]
             self.matched = not mismatches if self.references else None
+            if self.gap is not None:
+                components = self.gap_state(executor)
+                if self.gap.reference is not None:
+                    reference = self.gap.reference[0]
+                    mismatches = [name for name, value in identity.items() if value != reference.get(name)]
+                    for group, current in components.items():
+                        expected = reference['gap_state'][group]
+                        mismatches.extend(f'{group}.{name}' for name in sorted(current.keys() | expected.keys())
+                                          if current.get(name) != expected.get(name))
+                    mismatches.extend(self.gap.action_mismatches())
+                    self.matched = not mismatches
+                identity['gap_state'] = components
             before = self.output / 'step686_before.json'
             formal.atomic_json(before, dict(arm=self.arm, pid=os.getpid(), original=self.original,
                 identity=identity, capture_addresses=captured, replay_addresses=addresses,
@@ -403,7 +584,7 @@ class StepComparison:
                 raise ValueError(f'Step 686 reference mismatch: {", ".join(mismatches)}.')
         if self.arm == 'fresh-graph':
             self.recapture(trace, identity)
-        elif not first_sample_arm:
+        elif not first_sample_arm and self.gap is None:
             self.submitted = True
 
     def recapture_first_sample(self, trace, capture):
@@ -476,12 +657,16 @@ class StepComparison:
         result = dict(arm=self.arm, pid=os.getpid(), before_sha256=self.before_sha256,
                       reference_matches=self.matched, submitted=self.submitted,
                       completed=metric is not None, first_failure=self.failure, last_step=trace.step)
+        if self.gap is not None:
+            path = self.output / 'graph_gap.json'
+            formal.atomic_json(path, self.gap.report())
+            result['gap_sha256'] = formal.file_hash(path)
         if metric is not None:
             executor, _, _, entry = self.selected
             if self.arm == FIRST_SAMPLE_ARM:
                 output = self.fresh_entry[3]
             else:
-                output = entry[3] if self.arm == 'graph' else self.result
+                output = entry[3] if self.arm == 'graph' or self.gap is not None else self.result
             result.update(metrics=asdict(metric), post_state=self.state(executor, trace.trainer),
                           result_sha256=state_hash(output))
         if self.references and self.matched:
@@ -518,6 +703,10 @@ class Trace:
         return self.comparison is not None and self.step == COMPARE_STEP
 
     @property
+    def gap(self):
+        return self.comparison.gap if self.comparison is not None else None
+
+    @property
     def active(self):
         if self.comparison is not None:
             return self.comparing
@@ -543,20 +732,31 @@ class Trace:
             if comparison_replay:
                 self.comparison.before_replay(self)
             self.emit('begin', name)
+            if self.gap is not None and name == 'graph_replay_submit':
+                self.gap.event(self.step, 'training_replay_begin', key=self.gap.last_key)
             phase = 'host_call'
             yield
-            if first_sample_arm and comparison_replay:
+            if (first_sample_arm or self.gap is not None) and comparison_replay:
                 self.comparison.submitted = True
+            if self.gap is not None:
+                if name == 'graph_replay_submit':
+                    self.gap.event(self.step, 'training_replay_submitted', key=self.gap.last_key)
+                elif name == 'result_read_and_completion':
+                    self.gap.event(self.step, 'training_readback_complete', key=self.gap.last_key)
             self.emit('host_return', name)
             if self.active and (self.sync_window or sync or comparison_replay or sync_copy):
                 phase = 'synchronize'
                 self.emit('sync_begin', name)
                 self.synchronize()
                 self.emit('sync_done', name)
+                if self.gap is not None and comparison_replay:
+                    self.gap.event(self.step, 'training_replay_sync_complete', key=self.gap.last_key)
         except BaseException as exc:
             detail = dict(section=name, phase=phase, error_type=type(exc).__name__, error=str(exc))
             if self.comparing and self.comparison.failure is None:
                 self.comparison.failure = detail
+                if self.gap is not None:
+                    self.gap.event(self.step, 'first_failure', **detail)
             self.emit('error', name, **{key: value for key, value in detail.items() if key != 'section'})
             raise
 
@@ -585,12 +785,21 @@ def run_bounded(run, trainer, trace):
 
     def bounded_reset(*args, **kwargs):
         stop_if_done()
-        return new_episode(*args, **kwargs)
+        if trace.gap is None:
+            return new_episode(*args, **kwargs)
+        trace.phase = 'episode_reset'
+        trace.step = trainer.result.stage_steps + 1
+        try:
+            observation, level = new_episode(*args, **kwargs)
+            trace.gap.event(trace.step, 'scenario_reset', level=level, obstacles=len(trainer.env.zones))
+            return observation, level
+        finally:
+            trace.phase = None
 
     def traced_select(*args, **kwargs):
         stop_if_done()
         trace.step = trainer.result.stage_steps + 1
-        if not trace.active:
+        if not trace.active and trace.gap is None:
             return select_action(*args, **kwargs)
         trace.scene = dict(level=trainer.env.last_curriculum_level, obstacles=len(trainer.env.zones))
         if trace.sync_window and trace.step == WINDOW[0]:
@@ -602,6 +811,8 @@ def run_bounded(run, trainer, trace):
             with trace.scope('action_inference_and_readback'):
                 result = select_action(*args, **kwargs)
                 trace.emit('host_return', 'action_result_readback')
+                if trace.gap is not None:
+                    trace.gap.event(trace.step, 'action_result', value=result.tolist())
                 return result
         finally:
             trace.phase = None
@@ -616,6 +827,8 @@ def run_bounded(run, trainer, trace):
     def traced_tensor(*args, **kwargs):
         if trace.phase != 'action':
             return action_tensor(*args, **kwargs)
+        if trace.gap is not None:
+            trace.gap.event(trace.step, 'action_input', shapes=shapes(args[0]))
         with trace.scope('action_forward'):
             result = action_tensor(*args, **kwargs)
         trace.emit('begin', 'action_result_readback')
@@ -623,25 +836,32 @@ def run_bounded(run, trainer, trace):
 
     def traced_update(**kwargs):
         nonlocal cpu_sample
-        if not trace.active:
+        if not trace.active and trace.gap is None:
             try:
                 return update(**kwargs)
             finally:
                 cpu_sample = None
         if kwargs['total_steps'] != trace.step:
             raise RuntimeError('Trace step differs from the actual update step.')
+        trace.phase = 'training_update'
         try:
             with trace.scope('update'):
                 metric = update(**kwargs, gpu_compute_submission_diagnostic=trace)
+            if trace.gap is not None:
+                trace.gap.training_completed(trace.step, trace.comparison.capture_step)
             if trace.comparing:
                 trace.comparison.record(trace, metric=metric)
             return metric
         finally:
+            trace.phase = None
             if trace.comparing:
                 trace.comparison.restore_cache()
 
     def traced_key(executor, batch, mode):
         key = graph_key(executor, batch, mode)
+        if trace.gap is not None:
+            trace.gap.last_key = list(key)
+            trace.gap.event(trace.step, 'training_graph_lookup', key=list(key), cache_hit=key in executor.graphs)
         if trace.active:
             trace.emit('lookup', 'update_graph', key=list(key), cache='reuse' if key in executor.graphs else 'new')
         if trace.comparing:
@@ -655,7 +875,11 @@ def run_bounded(run, trainer, trace):
                 or trace.comparing and trace.comparison.arm == 'fresh-graph'):
             return capture(executor, key, batch)
         with trace.scope('update_graph_capture'):
+            if trace.gap is not None:
+                trace.gap.event(trace.step, 'training_capture_begin', key=list(key))
             result = capture(executor, key, batch)
+            if trace.gap is not None:
+                trace.gap.event(trace.step, 'training_capture_complete', key=list(key))
         if trace.comparison is not None:
             trace.comparison.capture(executor, key, trace.step, cpu_sample)
         return result
@@ -668,6 +892,11 @@ def run_bounded(run, trainer, trace):
           patch.object(V2ObservationBatch, 'to', traced_action_to),
           patch.object(GPUCompute, 'key', traced_key),
           patch.object(GPUCompute, 'capture_shape', traced_capture)):
+        if trace.gap is not None:
+            import torch
+            from torch._inductor.cudagraph_trees import CUDAGraphTreeManager
+
+            trace.gap.install(trace, hooks, torch, CUDAGraphTreeManager)
         if first_sample_arm:
             sample_batch = engine._sample_training_batch
 
@@ -773,6 +1002,8 @@ def launch(args, original, wanted, binding):
         argv.extend(('--graph-reference', str(args.graph_reference)))
     if args.staged_reference is not None:
         argv.extend(('--staged-reference', str(args.staged_reference)))
+    if args.gap_reference is not None:
+        argv.extend(('--gap-reference', str(args.gap_reference)))
     status = dict(description, execution_completed=False)
     processes, session = {}, None
     failure = None
@@ -878,6 +1109,8 @@ def main(argv=None):
     if args.single_result is not None:
         require_single_result(args.single_result, binding)
     comparison_references(args, binding)
+    if args.gap_reference is not None:
+        gap_reference(args.gap_reference, binding)
     return launch(args, original, jobs, binding)
 
 

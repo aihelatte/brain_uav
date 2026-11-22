@@ -1,4 +1,5 @@
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
+from collections import namedtuple
 from dataclasses import make_dataclass
 import importlib.util
 import io
@@ -317,6 +318,198 @@ class ShortDiagnosticTests(unittest.TestCase):
                     ordered = [markers.index((section, 'sync_done')) for section in
                                ('first_sample_recapture', 'graph_fixed_input_copy', 'graph_replay_submit')]
                     self.assertEqual(ordered, sorted(ordered))
+
+    def test_gap_only_selects_first_warmup_when_second_has_no_clear(self):
+        self.check_gap_warmup_bypass(clears_on=1, function_ids=(4, 5))
+
+    def test_gap_bypasses_second_call_to_same_function(self):
+        self.check_gap_warmup_bypass(clears_on=2, function_ids=(4, 4))
+
+    def check_gap_warmup_bypass(self, clears_on, function_ids):
+        function_id_type = namedtuple('FunctionID', 'id')
+        ids = [function_id_type(value) for value in function_ids]
+        clear = Mock()
+        warmup = Mock()
+        compiled = Mock()
+        torch_stub = SimpleNamespace(__version__='2.5.1+cu124', version=SimpleNamespace(cuda='12.4',
+            git_version='stub'), _C=SimpleNamespace(_cuda_clearCublasWorkspaces=clear),
+            cuda=SimpleNamespace(CUDAGraph=type('Graph', (), dict(
+                capture_begin=lambda self: None, capture_end=lambda self: None))))
+
+        class Manager:
+            ids_to_funcs = {function_id: SimpleNamespace(model=compiled) for function_id in ids}
+
+            def __init__(self):
+                self.next_warmup_id = iter(range(81, 83))
+
+            def new_graph_id(self):
+                raise AssertionError('Expected warmup node ID')
+
+            def new_warmup_node_id(self):
+                return SimpleNamespace(id=next(self.next_warmup_id))
+
+            def run_eager(self, inputs, function_id):
+                self.new_warmup_node_id()
+                warmup(inputs[0])
+                if inputs[0] == clears_on:
+                    torch_stub._C._cuda_clearCublasWorkspaces()
+
+            def record_function(self, inputs, function_id):
+                raise AssertionError('Expected warmup')
+
+            def execute_node(self, node, inputs):
+                raise AssertionError('Expected warmup')
+
+        def run(gap):
+            trace = SimpleNamespace(step=685, phase='action')
+            with ExitStack() as hooks:
+                gap.install(trace, hooks, torch_stub, Manager)
+                manager = Manager()
+                for call, function_id in enumerate(ids, 1):
+                    manager.run_eager([call], function_id)
+            return gap.report()
+
+        observation = run(diag.GraphGap())
+        self.assertEqual(clear.call_count, 1)
+        warmup.reset_mock()
+        bypass = run(diag.GraphGap(({}, observation)))
+        compiled.assert_called_once_with([clears_on])
+        warmup.assert_called_once_with(3 - clears_on)
+        self.assertEqual(clear.call_count, 1)
+        self.assertEqual(observation['action_candidates'], [dict(step=685, call_index=clears_on, branch='warmup',
+            function_id=ids[clears_on - 1].id, graph_id=80 + clears_on)])
+        clear_event, = [row for row in observation['events'] if row['event'] == 'cublas_workspace_clear']
+        self.assertEqual(clear_event['call_index'], clears_on)
+        self.assertTrue(bypass['bypassed'])
+        bypass_event, = [row for row in bypass['events'] if row['event'] == 'action_graph_bypass']
+        self.assertEqual((bypass_event['call_index'], bypass_event['graph_id']), (clears_on, None))
+
+    def test_gap_observation_and_single_action_bypass_keep_old_training_graph(self):
+        from brain_uav.trainers.v2_gpu_compute import clone_batch
+        from brain_uav.trainers.v2_replay_buffer import V2ReplayBatch
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = dict(batch_id='course')
+            observe_args = diag.parse_args(['--out', str(root / 'observe'), '--compare-686', 'gap-observe'])
+            bypass_args = diag.parse_args(['--out', str(root / 'bypass'), '--compare-686', 'gap-bypass',
+                                          '--gap-reference', str(observe_args.out)])
+            obs = diag.V2ObservationBatch(torch.zeros(1, 6), torch.zeros(1, 4), torch.zeros(1, 2, 19),
+                                         torch.tensor([[True, False]]))
+            batch = V2ReplayBatch(obs, torch.zeros(1, 3), torch.zeros(1, 1), obs,
+                                  *(torch.zeros(1, 1) for _ in range(4)))
+            fixed = clone_batch(batch)
+            unchanged = Mock()
+            graph = Mock()
+            key = diag.COMPARE_KEY
+            entry = (graph, fixed, torch.zeros(()), torch.tensor([1.]), ((), ()), {})
+            executor = SimpleNamespace(e=SimpleNamespace(last_total_steps=685, window_update_statistics=[]),
+                graphs={key: entry}, captures=1, replays=9, banks=[[[]], [[]]], persistent=lambda: [],
+                noise=torch.zeros(1), coefficients=torch.zeros(4), injections=torch.zeros(4))
+            graph_id = SimpleNamespace(id=8)
+            function_id = namedtuple('FunctionID', 'id')(4)
+
+            class Graph:
+                capture_begin = lambda self: None
+                capture_end = lambda self: None
+
+            class Manager:
+                def new_graph_id(self):
+                    return graph_id
+
+                def new_warmup_node_id(self):
+                    return SimpleNamespace(id=-1)
+
+                def run_eager(self, inputs, function_id):
+                    return inputs[0]
+
+                def record_function(self, inputs, function_id):
+                    self.new_graph_id()
+                    torch_stub._C._cuda_clearCublasWorkspaces()
+                    gpu = Graph()
+                    gpu.capture_begin()
+                    gpu.capture_end()
+                    return inputs[0]
+
+                def execute_node(self, node, inputs):
+                    return inputs[0]
+
+            manager = Manager()
+            manager.ids_to_funcs = {function_id: SimpleNamespace(model=unchanged)}
+            unchanged.side_effect = lambda inputs: inputs[0]
+            clear = Mock()
+            torch_stub = SimpleNamespace(__version__='2.5.1+cu124', version=SimpleNamespace(cuda='12.4',
+                git_version='stub'), _C=SimpleNamespace(_cuda_clearCublasWorkspaces=clear),
+                cuda=SimpleNamespace(CUDAGraph=Graph))
+            model_state = {'models': {'actor': 'same'}, 'optimizers': {'critic': 'adam'}, 'gradients': {'critic': 'grad'}}
+
+            for args, mismatch in ((observe_args, False), (bypass_args, False), (bypass_args, True)):
+                with self.subTest(arm=args.compare_686, mismatch=mismatch), ExitStack() as hooks:
+                    output = args.out / 'ann_seed41'
+                    comparison = diag.StepComparison(args, output, original)
+                    trace = diag.Trace(io.StringIO(), sync_window=False, comparison=comparison)
+                    trace.synchronize = Mock()
+                    gap = trace.gap
+                    gap.install(trace, hooks, torch_stub, Manager)
+                    comparison.capture(executor, key, 2)
+                    gap.last_key = list(key)
+                    gap.training_completed(684, 2)
+                    gap.event(685, 'scenario_reset', level='medium', obstacles=2)
+                    trace.step, trace.phase = 685, 'action'
+                    gap.event(685, 'action_input', shapes=diag.shapes(obs))
+                    action = manager.record_function([0.5], function_id)
+                    gap.event(685, 'action_result', value=[action + int(mismatch)])
+                    trace.step = 686
+                    manager.execute_node(SimpleNamespace(id=graph_id,
+                        wrapped_function=SimpleNamespace(id=function_id)), [action])
+                    trace.phase = 'training_update'
+                    torch_stub._C._cuda_clearCublasWorkspaces()
+                    comparison.select(executor, key, batch, trace)
+                    self.assertIs(executor.graphs[key], entry)
+                    observed = args is observe_args
+                    if observed:
+                        trace.synchronize.side_effect = [None, RuntimeError('CUDA illegal memory access')]
+                    expected = (self.assertRaisesRegex(RuntimeError, 'illegal memory') if observed else
+                                self.assertRaisesRegex(ValueError, 'action_result.685') if mismatch else nullcontext())
+                    prior_replays = graph.replay.call_count
+                    with (patch.object(comparison, 'state', return_value={'training': 'unchanged'}),
+                          patch.object(comparison, 'gap_state', return_value=model_state), expected):
+                        with trace.scope('graph_replay_submit'):
+                            executor.graphs[key][0].replay()
+                    self.assertEqual(graph.replay.call_count - prior_replays, int(not mismatch))
+                    with patch.object(comparison, 'state', return_value={'training': 'after'}):
+                        comparison.record(trace, metric=None if observed or mismatch else make_dataclass('Metric', [])())
+                    evidence = diag.read_json(output / 'graph_gap.json')
+                    result = diag.read_json(output / 'step686_result.json')
+                    self.assertEqual(evidence['last_successful_replay_step'], 684)
+                    self.assertEqual(evidence['runtime']['torch'], '2.5.1+cu124')
+                    self.assertEqual(evidence['bypassed'], not observed)
+                    reused, = [row for row in evidence['events']
+                               if row.get('branch') == 'reuse' and row['event'] == 'action_graph_begin']
+                    self.assertEqual((reused['call_index'], reused['function_id'], reused['graph_id']), (1, 4, 8))
+                    if observed:
+                        self.assertEqual(evidence['action_candidates'], [dict(step=685, call_index=1,
+                            branch='record', function_id=4, graph_id=8)])
+                        capture, = [row for row in evidence['events'] if row['event'] == 'action_cuda_capture_end']
+                        self.assertEqual((capture['call_index'], capture['function_id'], capture['graph_id']), (1, 4, 8))
+                        formal.atomic_json(args.out / 'summary.json', dict(compare_686=args.compare_686,
+                            diagnostic_sha256=formal.file_hash(PATH), original=original, seeds=[41],
+                            mps_cleanup=dict(stopped=True), processes=dict(ann_seed41=dict(pid=result['pid']))))
+                    else:
+                        self.assertEqual(result['completed'], not mismatch)
+                        self.assertEqual(result['reference_matches'], not mismatch)
+                        self.assertEqual(evidence['action_candidates'], [])
+            self.assertEqual(clear.call_count, 4)
+            self.assertEqual(unchanged.call_count, 2)
+            baseline = observe_args.out / 'ann_seed41'
+            path = baseline / 'graph_gap.json'
+            evidence = diag.read_json(path)
+            evidence['action_candidates'] = []
+            formal.atomic_json(path, evidence)
+            path = baseline / 'step686_result.json'
+            formal.atomic_json(path, dict(diag.read_json(path), gap_sha256=formal.file_hash(baseline / 'graph_gap.json')))
+            with self.assertRaisesRegex(ValueError, 'No action capture or action workspace-clear candidate'):
+                diag.gap_reference(observe_args.out, original)
 
     def test_real_worker_resolves_medium_and_marks_bounded_exit_without_artifact(self):
         with TemporaryDirectory() as tmp:
