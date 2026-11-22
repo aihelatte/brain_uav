@@ -2,6 +2,8 @@
 
 import argparse
 from contextlib import ExitStack, contextmanager
+from dataclasses import asdict
+from hashlib import sha256
 import json
 import os
 from pathlib import Path
@@ -18,7 +20,7 @@ from brain_uav.scripts import train_v2_td3 as stage
 from brain_uav.scripts.v2_formal_easy_guidance import read_json
 from brain_uav.scripts.v2_mps_diagnostic import Session, capability
 from brain_uav.trainers.v2_formal_training import V2FormalStageTrainer
-from brain_uav.trainers.v2_gpu_compute import GPUCompute
+from brain_uav.trainers.v2_gpu_compute import GPUCompute, tensors
 
 
 BASE = 'e6bc9be6b1cd95ac5c23b370f373b7eb3050c6df'
@@ -28,6 +30,8 @@ ALL_SEEDS = (7, 11, 23, 41)
 STOP_STEP = 1000
 WINDOW = (675, 700)
 ATTEMPT = Path('batches/medium-ann/attempt-000001')
+COMPARE_STEP = 686
+COMPARE_KEY = (2, 2, 'frozen_targets', 0, 0)
 
 
 class DiagnosticComplete(Exception):
@@ -41,6 +45,9 @@ def parse_args(argv=None):
     parser.add_argument('--seeds', type=int, nargs='+', default=[41])
     parser.add_argument('--single-result', type=Path, help='Completed async seed-41 output required for the four-seed run.')
     parser.add_argument('--sync-window', action='store_true', help='Synchronize between marked CUDA sections only in steps 675–700.')
+    parser.add_argument('--compare-686', choices=('graph', 'staged'),
+                        help='Stop at step 686 after the original graph or the same computation with barriers.')
+    parser.add_argument('--graph-reference', type=Path, help='Graph diagnostic output required for the staged arm.')
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--worker', type=int, choices=ALL_SEEDS, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -52,6 +59,14 @@ def parse_args(argv=None):
         parser.error('The four-seed run requires --single-result from the async seed-41 run.')
     if args.single_result is not None:
         args.single_result = args.single_result.resolve()
+    if args.compare_686 and (args.seeds != (41,) or args.sync_window):
+        parser.error('--compare-686 uses seed 41 and adds no synchronization before step 686.')
+    if (args.compare_686 == 'staged') != (args.graph_reference is not None):
+        parser.error('Only the staged arm requires --graph-reference.')
+    if args.graph_reference is not None:
+        args.graph_reference = args.graph_reference.resolve()
+        if args.out.is_relative_to(args.graph_reference) or args.graph_reference.is_relative_to(args.out):
+            parser.error('--out must be separate from --graph-reference.')
     if args.out.is_relative_to(args.course_root) or args.course_root.is_relative_to(args.out):
         parser.error('--out must be separate from the original course.')
     if args.worker is not None and (not args.run or args.worker not in args.seeds):
@@ -60,9 +75,15 @@ def parse_args(argv=None):
 
 
 def describe(args):
+    comparison = (dict(compare_686=args.compare_686,
+                       diagnostic_sha256=formal.file_hash(Path(__file__)),
+                       graph_reference=str(args.graph_reference) if args.graph_reference else None)
+                  if args.compare_686 else {})
     return dict(diagnostic_only=True, base=BASE, batch=BATCH, seeds=list(args.seeds), formal_max_steps=750000,
-                stop_step=STOP_STEP, trace_window=list(WINDOW), sync_window=args.sync_window,
-                course_root=str(args.course_root), output=str(args.out))
+                stop_step=COMPARE_STEP if comparison else STOP_STEP,
+                trace_window=[COMPARE_STEP, COMPARE_STEP] if comparison else list(WINDOW),
+                sync_window=args.sync_window,
+                course_root=str(args.course_root), output=str(args.out), **comparison)
 
 
 def source_args(root, source, *, job=None):
@@ -136,17 +157,209 @@ def shapes(observation):
             ('ego_features', 'goal_features', 'zone_features', 'presence_mask')}
 
 
+def graph_addresses(executor, key, entry):
+    """Read CPU metadata from the real cache entry and its bound tensors."""
+    _, fixed, fraction, output, presence, _ = entry
+    names = tuple(shapes(fixed.obs))
+    inputs = [f'{side}.{name}' for side in ('obs', 'next_obs') for name in names]
+    inputs += ['action', 'reward', 'done', 'success', 'near_goal', 'line_to_goal_safe']
+    bound = dict(zip(inputs, tensors(fixed), strict=True), fraction=fraction, output=output,
+                 noise=executor.noise, coefficients=executor.coefficients, injections=executor.injections)
+    for group, bank in enumerate(key[3:]):
+        bound.update((f'grad[{group},{bank},{i}]', tensor)
+                     for i, tensor in enumerate(executor.banks[group][bank]) if presence[group][i])
+    bound.update((f'persistent[{i}]', tensor) for i, tensor in enumerate(executor.persistent()))
+    return {name: dict(address=hex(tensor.data_ptr()), storage=hex(tensor.untyped_storage().data_ptr()),
+                       shape=list(tensor.shape), stride=list(tensor.stride()),
+                       offset=tensor.storage_offset(), dtype=str(tensor.dtype))
+            for name, tensor in bound.items()}
+
+
+def staged_compute(executor, key, entry, trace):
+    """Run GPUCompute.compute itself, with fences at its existing call boundaries."""
+    import torch
+    from brain_uav.trainers import v2_gpu_update
+
+    _, fixed, fraction, _, presence, _ = entry
+    engine = executor.e
+    with ExitStack() as hooks:
+        def fence(owner, attribute, label):
+            original = getattr(owner, attribute)
+
+            def call(*args, **kwargs):
+                with trace.scope(label, sync=True):
+                    return original(*args, **kwargs)
+
+            hooks.enter_context(patch.object(owner, attribute, call))
+
+        fence(executor, 'arguments', 'relation_inputs')
+        fence(executor, 'actor_forward', 'target_actor_forward')
+        fence(engine, '_compute_target_critics_td_tensors', 'target_values')
+        fence(engine.critic1, '_compute_full_forward_tensors', 'critic1_forward')
+        fence(engine.critic2, '_compute_full_forward_tensors', 'critic2_forward')
+        fence(engine, '_twin_td_loss', 'critic_loss')
+        fence(torch.autograd, 'backward', 'critic_backward')
+        fence(executor, 'clip_gradients', 'critic_gradient_clip')
+        fence(executor.adams[1], 'step', 'critic_optimizer')
+        fence(v2_gpu_update, 'gated_targets', 'critic_target_update')
+        hooks.enter_context(patch.object(executor, 'failure_fraction', fraction))
+        # The graph writes its selected gradient banks directly. Bind those same
+        # buffers for eager autograd, and let the original step publish them.
+        for group, bank in enumerate(key[3:]):
+            for parameter, gradient, active in zip(executor.params[group],
+                    executor.banks[group][bank], presence[group], strict=True):
+                parameter.grad = gradient if active else None
+        with trace.scope('staged_compute_result', sync=True):
+            return executor.compute(fixed, key[2])
+
+
+def graph_reference(path, original):
+    summary = read_json(path / 'summary.json')
+    folder = path / 'ann_seed41'
+    raw = (folder / 'step686_before.json').read_bytes()
+    before = json.loads(raw)
+    result = read_json(folder / 'step686_result.json')
+    if (summary.get('compare_686') != 'graph' or summary.get('seeds') != [41]
+            or summary.get('diagnostic_sha256') != formal.file_hash(Path(__file__))
+            or summary.get('original') != original or before['original'] != original
+            or summary.get('mps_cleanup', {}).get('stopped') is not True
+            or summary['processes']['ann_seed41']['pid'] != before['pid']
+            or result['pid'] != before['pid'] or before['arm'] != 'graph' or result['arm'] != 'graph'
+            or result['before_sha256'] != sha256(raw).hexdigest()
+            or not result['submitted'] or not before['addresses_match']
+            or before['identity']['key'] != list(COMPARE_KEY)):
+        raise ValueError(f'Graph reference is incomplete or belongs to a different run: {path}')
+    return before['identity'], result
+
+
+class StepComparison:
+    def __init__(self, args, output, original):
+        self.arm, self.output, self.original = args.compare_686, output, original
+        self.reference = graph_reference(args.graph_reference, original) if args.graph_reference else None
+        self.captured = None
+        self.capture_step = None
+        self.selected = None
+        self.before_sha256 = None
+        self.matched = None
+        self.result = None
+        self.failure = None
+        self.submitted = False
+
+    def capture(self, executor, key, step):
+        if key == COMPARE_KEY:
+            self.captured = graph_addresses(executor, key, executor.graphs[key])
+            self.capture_step = step
+
+    def select(self, executor, key, batch, trace):
+        if key != COMPARE_KEY or key not in executor.graphs or self.captured is None:
+            raise ValueError(f'Step 686 requires a pre-existing capture of {COMPARE_KEY}; found {key}.')
+        if executor.e.last_total_steps != COMPARE_STEP - 1 or executor.e.window_update_statistics:
+            raise ValueError('The comparison requires the original updates through step 685.')
+        entry = executor.graphs[key]
+        self.selected = (executor, key, batch, entry)
+        if self.arm == 'staged':
+            comparison = self
+
+            class StagedReplay:
+                def replay(self):
+                    self.result = staged_compute(executor, key, entry, trace)
+                    comparison.result = self.result
+
+                def cpu(self):
+                    return self.result.cpu()
+
+            replay = StagedReplay()
+            executor.graphs[key] = (replay, entry[1], entry[2], replay, *entry[4:])
+
+    def restore_cache(self):
+        if self.selected is not None:
+            executor, key, _, entry = self.selected
+            executor.graphs[key] = entry
+
+    @staticmethod
+    def state(executor, trainer):
+        from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
+        from brain_uav.trainers.v2_online_research import training_identity
+        return dict(training=training_identity(executor.e, trainer.exploration_rng, trainer.selector),
+                    device_adam=state_hash([opt.state_tensors() for opt in executor.adams]),
+                    gradient_banks=state_hash(executor.banks), published=list(executor.published))
+
+    def before_replay(self, trace):
+        from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
+
+        executor, key, batch, entry = self.selected
+        _, fixed, fraction, _, presence, _ = entry
+        # Complete the same copies and snapshot the same bytes in both arms.
+        with trace.scope('fixed_input_completion', sync=True):
+            pass
+        with trace.scope('comparison_before_replay'):
+            addresses = graph_addresses(executor, key, entry)
+            identity = dict(key=list(key), capture_step=self.capture_step, capture_count=executor.captures,
+                prior_replays=executor.replays, graph_keys=[list(k) for k in executor.graphs],
+                participation=[list(group) for group in presence], scene=trace.scene,
+                obs_shapes=shapes(fixed.obs), next_obs_shapes=shapes(fixed.next_obs),
+                obs_mask=fixed.obs.presence_mask.detach().cpu().tolist(),
+                next_obs_mask=fixed.next_obs.presence_mask.detach().cpu().tolist(),
+                sample_sha256=state_hash(tensors(batch)), fixed_sha256=state_hash(tensors(fixed)),
+                noise_sha256=state_hash(executor.noise), coefficients_sha256=state_hash(executor.coefficients),
+                fraction_sha256=state_hash(fraction), injection_sha256=state_hash(executor.injections),
+                state=self.state(executor, trace.trainer))
+            mismatches = ([name for name in identity if identity[name] != self.reference[0].get(name)]
+                          if self.reference else [])
+            self.matched = not mismatches if self.reference else None
+            before = self.output / 'step686_before.json'
+            formal.atomic_json(before, dict(arm=self.arm, pid=os.getpid(), original=self.original,
+                identity=identity, capture_addresses=self.captured, replay_addresses=addresses,
+                addresses_match=(addresses == self.captured),
+                reference_matches=self.matched, reference_mismatches=mismatches))
+            self.before_sha256 = formal.file_hash(before)
+            if addresses != self.captured:
+                raise ValueError('Captured buffer addresses differ from the cached replay addresses.')
+            if identity['sample_sha256'] != identity['fixed_sha256']:
+                raise ValueError('Copied graph inputs differ from the sampled batch.')
+            if mismatches:
+                raise ValueError(f'Step 686 reference mismatch: {", ".join(mismatches)}.')
+        self.submitted = True
+
+    def record(self, trace, *, metric=None):
+        from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
+        result = dict(arm=self.arm, pid=os.getpid(), before_sha256=self.before_sha256,
+                      reference_matches=self.matched, submitted=self.submitted,
+                      completed=metric is not None, first_failure=self.failure, last_step=trace.step)
+        if metric is not None:
+            executor, _, _, entry = self.selected
+            result.update(metrics=asdict(metric), post_state=self.state(executor, trace.trainer),
+                          result_sha256=state_hash(entry[3] if self.arm == 'graph' else self.result))
+        if self.reference and self.matched:
+            other = self.reference[1]
+            result['graph_completed'] = other['completed']
+            result['graph_first_failure'] = other['first_failure']
+            if metric is not None and other['completed']:
+                result['comparison'] = {key + '_exact_match': result[key] == other[key]
+                                        for key in ('metrics', 'post_state', 'result_sha256')}
+                result['graph_metrics'] = other['metrics']
+        formal.atomic_json(self.output / 'step686_result.json', result)
+
+
 class Trace:
-    def __init__(self, stream, *, sync_window):
+    def __init__(self, stream, *, sync_window, comparison=None):
         self.stream = stream
         self.sync_window = sync_window
         self.step = 0
         self.device = None
         self.phase = None
         self.scene = {}
+        self.comparison = comparison
+        self.trainer = None
+
+    @property
+    def comparing(self):
+        return self.comparison is not None and self.step == COMPARE_STEP
 
     @property
     def active(self):
+        if self.comparison is not None:
+            return self.comparing
         return WINDOW[0] <= self.step <= WINDOW[1]
 
     def emit(self, event, section, **details):
@@ -160,17 +373,26 @@ class Trace:
         torch.cuda.synchronize(self.device)
 
     @contextmanager
-    def scope(self, name):
+    def scope(self, name, *, sync=False):
+        phase = 'before'
+        comparison_replay = self.comparing and name == 'graph_replay_submit'
         self.emit('begin', name)
         try:
+            if comparison_replay:
+                self.comparison.before_replay(self)
+            phase = 'host_call'
             yield
             self.emit('host_return', name)
-            if self.active and self.sync_window:
+            if self.active and (self.sync_window or sync or comparison_replay):
+                phase = 'synchronize'
                 self.emit('sync_begin', name)
                 self.synchronize()
                 self.emit('sync_done', name)
         except BaseException as exc:
-            self.emit('error', name, error_type=type(exc).__name__, error=str(exc))
+            detail = dict(section=name, phase=phase, error_type=type(exc).__name__, error=str(exc))
+            if self.comparing and self.comparison.failure is None:
+                self.comparison.failure = detail
+            self.emit('error', name, **{key: value for key, value in detail.items() if key != 'section'})
             raise
 
     def observe_batch(self, batch):
@@ -182,14 +404,16 @@ def run_bounded(run, trainer, trace):
     if trainer.config.max_steps != 750000:
         raise ValueError('The diagnostic requires the original 750000-step schedule.')
     trace.device = engine.device
+    trace.trainer = trainer
+    stop_step = COMPARE_STEP if trace.comparison is not None else STOP_STEP
     new_episode, select_action = trainer._new_episode, engine.select_action
     action_tensor, update = engine._action_inference_tensor, engine.update_once
     action_to, graph_key, capture = V2ObservationBatch.to, GPUCompute.key, GPUCompute.capture_shape
 
     def stop_if_done():
-        if trainer.result.stage_steps == STOP_STEP:
-            raise DiagnosticComplete(f'Completed {STOP_STEP} diagnostic steps.')
-        if trainer.result.stage_steps > STOP_STEP:
+        if trainer.result.stage_steps == stop_step:
+            raise DiagnosticComplete(f'Completed {stop_step} diagnostic steps.')
+        if trainer.result.stage_steps > stop_step:
             raise RuntimeError('Diagnostic exceeded the stop step.')
 
     def bounded_reset(*args, **kwargs):
@@ -235,20 +459,32 @@ def run_bounded(run, trainer, trace):
             return update(**kwargs)
         if kwargs['total_steps'] != trace.step:
             raise RuntimeError('Trace step differs from the actual update step.')
-        with trace.scope('update'):
-            return update(**kwargs, gpu_compute_submission_diagnostic=trace)
+        try:
+            with trace.scope('update'):
+                metric = update(**kwargs, gpu_compute_submission_diagnostic=trace)
+            if trace.comparing:
+                trace.comparison.record(trace, metric=metric)
+            return metric
+        finally:
+            if trace.comparing:
+                trace.comparison.restore_cache()
 
     def traced_key(executor, batch, mode):
         key = graph_key(executor, batch, mode)
         if trace.active:
             trace.emit('lookup', 'update_graph', key=list(key), cache='reuse' if key in executor.graphs else 'new')
+        if trace.comparing:
+            trace.comparison.select(executor, key, batch, trace)
         return key
 
     def traced_capture(executor, key, batch):
-        if not trace.active:
+        if not trace.active and trace.comparison is None:
             return capture(executor, key, batch)
         with trace.scope('update_graph_capture'):
-            return capture(executor, key, batch)
+            result = capture(executor, key, batch)
+        if trace.comparison is not None:
+            trace.comparison.capture(executor, key, trace.step)
+        return result
 
     with (patch.object(trainer, '_new_episode', bounded_reset),
           patch.object(engine, 'select_action', traced_select),
@@ -269,6 +505,8 @@ def worker(args):
     spec = next(spec for spec in scratch['plan']['jobs'] if spec['job']['seed'] == args.worker)
     job = spec['job']['id']
     output = args.out / job
+    comparison = StepComparison(args, output, description['original']) if args.compare_686 else None
+    stop_step = description['stop_step']
     original_run, original_write = V2FormalStageTrainer.run, stage._write_strict_json
     write_json = formal.atomic_json
     completed = False
@@ -276,10 +514,21 @@ def worker(args):
     def run(trainer):
         nonlocal completed
         with (output / 'cuda_trace.jsonl').open('x', encoding='utf-8', buffering=1) as events:
+            trace = Trace(events, sync_window=args.sync_window, comparison=comparison)
             try:
-                return run_bounded(original_run, trainer, Trace(events, sync_window=args.sync_window))
+                return run_bounded(original_run, trainer, trace)
             except DiagnosticComplete:
                 completed = True
+                raise
+            except BaseException as exc:
+                if comparison is not None:
+                    if comparison.failure is None:
+                        comparison.failure = dict(section='worker', phase='host_call',
+                                                  error_type=type(exc).__name__, error=str(exc))
+                    try:
+                        comparison.record(trace)
+                    except Exception as report_error:
+                        print(f'Could not write step686_result.json: {report_error}', file=sys.stderr, flush=True)
                 raise
 
     def stage_report(path, value):
@@ -293,7 +542,7 @@ def worker(args):
             if value.get('error', '').startswith(DiagnosticComplete.__name__ + ':'):
                 value = {key: item for key, item in value.items() if key != 'error'}
                 value.update(diagnostic_only=True, diagnostic_completed=True,
-                             execution_completed=True, stage_steps=STOP_STEP, formal_passed=None)
+                             execution_completed=True, stage_steps=stop_step, formal_passed=None)
         return write_json(path, value)
 
     def reject_checkpoint(*args, **kwargs):
@@ -309,7 +558,7 @@ def worker(args):
             formal.worker(source_args(args.out, scratch, job=job))
         except DiagnosticComplete:
             report = read_json(output / 'worker_summary.json')
-            if report.get('diagnostic_completed') is True and report['stage_steps'] == STOP_STEP:
+            if report.get('diagnostic_completed') is True and report['stage_steps'] == stop_step:
                 return 0
             raise
     raise RuntimeError('Worker exited without the bounded diagnostic stop.')
@@ -332,6 +581,10 @@ def launch(args, original, wanted, binding):
         argv.extend(('--single-result', str(args.single_result)))
     if args.sync_window:
         argv.append('--sync-window')
+    if args.compare_686:
+        argv.extend(('--compare-686', args.compare_686))
+    if args.graph_reference is not None:
+        argv.extend(('--graph-reference', str(args.graph_reference)))
     status = dict(description, execution_completed=False)
     processes, session = {}, None
     failure = None
@@ -387,7 +640,7 @@ def launch(args, original, wanted, binding):
                 time.sleep(.2)
             for name, process in processes.items():
                 report = read_json(args.out / name / 'worker_summary.json')
-                if (report.get('diagnostic_completed') is not True or report.get('stage_steps') != STOP_STEP
+                if (report.get('diagnostic_completed') is not True or report.get('stage_steps') != description['stop_step']
                         or report.get('pid') != process.pid or report.get('batch_id') != scratch['batch_id']):
                     raise ValueError(f'Incomplete diagnostic worker {name}.')
             formal.check_inputs(evidence)
@@ -436,6 +689,8 @@ def main(argv=None):
     original, jobs, binding = load_original(args)
     if args.single_result is not None:
         require_single_result(args.single_result, binding)
+    if args.graph_reference is not None:
+        graph_reference(args.graph_reference, binding)
     return launch(args, original, jobs, binding)
 
 
