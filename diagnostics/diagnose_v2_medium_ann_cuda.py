@@ -20,7 +20,7 @@ from brain_uav.scripts import train_v2_td3 as stage
 from brain_uav.scripts.v2_formal_easy_guidance import read_json
 from brain_uav.scripts.v2_mps_diagnostic import Session, capability
 from brain_uav.trainers.v2_formal_training import V2FormalStageTrainer
-from brain_uav.trainers.v2_gpu_compute import GPUCompute, tensors
+from brain_uav.trainers.v2_gpu_compute import GPUCompute, clone_batch, tensors
 
 
 BASE = 'e6bc9be6b1cd95ac5c23b370f373b7eb3050c6df'
@@ -32,6 +32,8 @@ WINDOW = (675, 700)
 ATTEMPT = Path('batches/medium-ann/attempt-000001')
 COMPARE_STEP = 686
 COMPARE_KEY = (2, 2, 'frozen_targets', 0, 0)
+FIRST_SAMPLE_ARM = 'first-sample-graph'
+RECAPTURE_ARMS = ('fresh-graph', FIRST_SAMPLE_ARM)
 # The graph and staged server references predate the fresh-graph code.
 HISTORICAL_DIAGNOSTIC_SHA256 = 'f36bedd5c0d84f9ccc41215aef2988d8fbd6794f92c72a3faeec018635524f73'
 
@@ -47,10 +49,10 @@ def parse_args(argv=None):
     parser.add_argument('--seeds', type=int, nargs='+', default=[41])
     parser.add_argument('--single-result', type=Path, help='Completed async seed-41 output required for the four-seed run.')
     parser.add_argument('--sync-window', action='store_true', help='Synchronize between marked CUDA sections only in steps 675–700.')
-    parser.add_argument('--compare-686', choices=('graph', 'staged', 'fresh-graph'),
-                        help='Stop at step 686 after cached replay, staged computation, or fresh capture and replay.')
-    parser.add_argument('--graph-reference', type=Path, help='Cached graph output for staged or fresh-graph.')
-    parser.add_argument('--staged-reference', type=Path, help='Successful staged output for fresh-graph.')
+    parser.add_argument('--compare-686', choices=('graph', 'staged', *RECAPTURE_ARMS),
+                        help='Stop at step 686 after cached replay, staged computation, or recapture and replay.')
+    parser.add_argument('--graph-reference', type=Path, help='Cached graph output for staged or recapture modes.')
+    parser.add_argument('--staged-reference', type=Path, help='Successful staged output for recapture modes.')
     parser.add_argument('--run', action='store_true')
     parser.add_argument('--worker', type=int, choices=ALL_SEEDS, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -64,8 +66,8 @@ def parse_args(argv=None):
         args.single_result = args.single_result.resolve()
     if args.compare_686 and (args.seeds != (41,) or args.sync_window):
         parser.error('--compare-686 uses seed 41 and adds no synchronization before step 686.')
-    for name, required in (('graph_reference', args.compare_686 in ('staged', 'fresh-graph')),
-                           ('staged_reference', args.compare_686 == 'fresh-graph')):
+    for name, required in (('graph_reference', args.compare_686 in ('staged', *RECAPTURE_ARMS)),
+                           ('staged_reference', args.compare_686 in RECAPTURE_ARMS)):
         path = getattr(args, name)
         option = '--' + name.replace('_', '-')
         if required != (path is not None):
@@ -167,6 +169,12 @@ def shapes(observation):
             ('ego_features', 'goal_features', 'zone_features', 'presence_mask')}
 
 
+def observation_evidence(batch):
+    return dict(obs_shapes=shapes(batch.obs), next_obs_shapes=shapes(batch.next_obs),
+                obs_mask=batch.obs.presence_mask.detach().cpu().tolist(),
+                next_obs_mask=batch.next_obs.presence_mask.detach().cpu().tolist())
+
+
 def graph_addresses(executor, key, entry):
     """Read CPU metadata from the real cache entry and its bound tensors."""
     _, fixed, fraction, output, presence, _ = entry
@@ -259,7 +267,7 @@ def comparison_references(args, original):
     failure = graph[1]['first_failure'] or {}
     if (graph[1]['completed'] is not False or failure.get('section') != 'graph_replay_submit'
             or failure.get('phase') != 'synchronize' or graph[0] != staged[0]):
-        raise ValueError('Fresh-graph requires a cached replay synchronization failure and successful staged '
+        raise ValueError('Recapture requires a cached replay synchronization failure and successful staged '
                          f'update with identical inputs and state: {args.graph_reference}, {args.staged_reference}')
     return {'graph': graph, 'staged': staged}
 
@@ -277,11 +285,31 @@ class StepComparison:
         self.fresh_entry = None
         self.failure = None
         self.submitted = False
+        self.first_sample = None
+        self.first_sample_evidence = None
+        self.cache_before = None
+        self.fresh_addresses = None
 
-    def capture(self, executor, key, step):
+    def capture(self, executor, key, step, cpu_sample=None):
         if key == COMPARE_KEY and step < COMPARE_STEP:
             self.captured = graph_addresses(executor, key, executor.graphs[key])
             self.capture_step = step
+            if self.arm == FIRST_SAMPLE_ARM and self.first_sample is None:
+                from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
+
+                if cpu_sample is None or any(t.device.type != 'cpu' for t in tensors(cpu_sample)):
+                    raise ValueError('First capture requires the original CPU replay sample.')
+                self.first_sample = clone_batch(cpu_sample)
+                self.first_sample_evidence = dict(
+                    key=list(key), capture_step=step, sample_sha256=state_hash(tensors(self.first_sample)),
+                    sample_failure_fraction=self.first_sample.sample_failure_fraction,
+                    **observation_evidence(self.first_sample))
+                formal.atomic_json(self.output / 'first_capture_sample.json', self.first_sample_evidence)
+
+    @staticmethod
+    def cache_identity(executor):
+        return dict(capture_count=executor.captures, prior_replays=executor.replays,
+                    graph_keys=[list(k) for k in executor.graphs])
 
     def select(self, executor, key, batch, trace):
         if key != COMPARE_KEY or key not in executor.graphs or self.captured is None:
@@ -290,7 +318,15 @@ class StepComparison:
             raise ValueError('The comparison requires the original updates through step 685.')
         entry = executor.graphs[key]
         self.selected = (executor, key, batch, entry)
-        if self.arm != 'graph':
+        if self.arm == FIRST_SAMPLE_ARM:
+            if (self.first_sample_evidence is None or self.first_sample_evidence['capture_step'] != self.capture_step
+                    or graph_addresses(executor, key, entry) != self.captured):
+                raise ValueError('Cannot verify the original cached entry and its first capture sample.')
+            self.cache_before = self.cache_identity(executor)
+            # Keep the original entry alive in self.selected. A cache miss here
+            # lets the formal update capture, copy and replay the replacement.
+            del executor.graphs[key]
+        elif self.arm != 'graph':
             comparison = self
 
             class ComparisonReplay:
@@ -333,18 +369,21 @@ class StepComparison:
         from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
 
         executor, key, batch, entry = self.selected
+        first_sample_arm = self.arm == FIRST_SAMPLE_ARM
+        captured = self.fresh_addresses if first_sample_arm else self.captured
+        cache = self.cache_before if first_sample_arm else self.cache_identity(executor)
+        if first_sample_arm:
+            entry = self.fresh_entry
+        else:
+            # The first-sample mode already fenced the formal fixed input copy.
+            with trace.scope('fixed_input_completion', sync=True):
+                pass
         _, fixed, _, _, presence, _ = entry
-        # Complete the original copies before taking the reference snapshot.
-        with trace.scope('fixed_input_completion', sync=True):
-            pass
         with trace.scope('comparison_before_replay'):
             addresses = graph_addresses(executor, key, entry)
-            identity = dict(key=list(key), capture_step=self.capture_step, capture_count=executor.captures,
-                prior_replays=executor.replays, graph_keys=[list(k) for k in executor.graphs],
+            identity = dict(key=list(key), capture_step=self.capture_step, **cache,
                 participation=[list(group) for group in presence], scene=trace.scene,
-                obs_shapes=shapes(fixed.obs), next_obs_shapes=shapes(fixed.next_obs),
-                obs_mask=fixed.obs.presence_mask.detach().cpu().tolist(),
-                next_obs_mask=fixed.next_obs.presence_mask.detach().cpu().tolist(),
+                **observation_evidence(fixed),
                 sample_sha256=state_hash(tensors(batch)), **self.fixed_inputs(executor, entry),
                 state=self.state(executor, trace.trainer))
             mismatches = [name for name in identity
@@ -352,11 +391,11 @@ class StepComparison:
             self.matched = not mismatches if self.references else None
             before = self.output / 'step686_before.json'
             formal.atomic_json(before, dict(arm=self.arm, pid=os.getpid(), original=self.original,
-                identity=identity, capture_addresses=self.captured, replay_addresses=addresses,
-                addresses_match=(addresses == self.captured),
+                identity=identity, capture_addresses=captured, replay_addresses=addresses,
+                addresses_match=(addresses == captured),
                 reference_matches=self.matched, reference_mismatches=mismatches))
             self.before_sha256 = formal.file_hash(before)
-            if addresses != self.captured:
+            if addresses != captured:
                 raise ValueError('Captured buffer addresses differ from the cached replay addresses.')
             if identity['sample_sha256'] != identity['fixed_sha256']:
                 raise ValueError('Copied graph inputs differ from the sampled batch.')
@@ -364,8 +403,47 @@ class StepComparison:
                 raise ValueError(f'Step 686 reference mismatch: {", ".join(mismatches)}.')
         if self.arm == 'fresh-graph':
             self.recapture(trace, identity)
-        else:
+        elif not first_sample_arm:
             self.submitted = True
+
+    def recapture_first_sample(self, trace, capture):
+        import torch
+        from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
+
+        executor, key, _, old_entry = self.selected
+        with trace.scope('first_sample_recapture_precheck'):
+            state = self.state(executor, trace.trainer)
+            reference = self.references['staged'][0]
+            if state != reference['state']:
+                raise ValueError('Pre-capture training state differs from staged.')
+        with trace.scope('first_sample_recapture', sync=True):
+            batch = self.first_sample.to(executor.e.device)
+            with patch.object(executor, 'failure_fraction', executor.failure_fraction):
+                capture(executor, key, batch)
+            self.fresh_entry = executor.graphs[key]
+        with trace.scope('first_sample_recapture_verify'):
+            entry = self.fresh_entry
+            self.fresh_addresses = graph_addresses(executor, key, entry)
+            after = self.state(executor, trace.trainer)
+            captured_sha256 = state_hash(tensors(entry[1]))
+            fraction_sha256 = state_hash(entry[2])
+            fraction_matches = fraction_sha256 == state_hash(torch.tensor(
+                self.first_sample.sample_failure_fraction, dtype=entry[2].dtype, device='cpu'))
+            checks = dict(state_matches=(after == state),
+                sample_matches=(captured_sha256 == self.first_sample_evidence['sample_sha256'] and fraction_matches),
+                new_capture=(entry[0] is not old_entry[0]
+                             and executor.captures == self.cache_before['capture_count'] + 1),
+                replay_count_matches=(executor.replays == self.cache_before['prior_replays']),
+                participation_matches=(entry[4] == old_entry[4]))
+            formal.atomic_json(self.output / 'step686_recapture.json', dict(key=list(key),
+                capture_step=self.capture_step, capture_count_before=self.cache_before['capture_count'],
+                capture_count_after=executor.captures, addresses=self.fresh_addresses,
+                capture_sample_sha256=captured_sha256, capture_fraction_sha256=fraction_sha256,
+                capture_sample_differs_from_replay=(captured_sha256 != reference['sample_sha256']
+                                                    or fraction_sha256 != reference['fraction_sha256']),
+                state_after_capture=after, **checks))
+            if not all(checks.values()):
+                raise ValueError('First-sample recapture failed verification.')
 
     def recapture(self, trace, identity):
         executor, key, batch, old_entry = self.selected
@@ -400,19 +478,23 @@ class StepComparison:
                       completed=metric is not None, first_failure=self.failure, last_step=trace.step)
         if metric is not None:
             executor, _, _, entry = self.selected
+            if self.arm == FIRST_SAMPLE_ARM:
+                output = self.fresh_entry[3]
+            else:
+                output = entry[3] if self.arm == 'graph' else self.result
             result.update(metrics=asdict(metric), post_state=self.state(executor, trace.trainer),
-                          result_sha256=state_hash(entry[3] if self.arm == 'graph' else self.result))
+                          result_sha256=state_hash(output))
         if self.references and self.matched:
             other = self.references['graph'][1]
             result['graph_completed'] = other['completed']
             result['graph_first_failure'] = other['first_failure']
-            reference_arm = 'staged' if self.arm == 'fresh-graph' else 'graph'
+            reference_arm = 'staged' if self.arm in RECAPTURE_ARMS else 'graph'
             other = self.references[reference_arm][1]
             if metric is not None and other['completed']:
                 result['comparison'] = {key + '_exact_match': result[key] == other[key]
                                         for key in ('metrics', 'post_state', 'result_sha256')}
                 result[reference_arm + '_metrics'] = other['metrics']
-                if self.arm == 'fresh-graph':
+                if self.arm in RECAPTURE_ARMS:
                     result['comparison_details'] = {
                         group: {name: name in other[group] and value == other[group][name]
                                 for name, value in result[group].items()}
@@ -455,14 +537,18 @@ class Trace:
     def scope(self, name, *, sync=False):
         phase = 'before'
         comparison_replay = self.comparing and name == 'graph_replay_submit'
+        first_sample_arm = self.comparing and self.comparison.arm == FIRST_SAMPLE_ARM
+        sync_copy = first_sample_arm and name == 'graph_fixed_input_copy'
         try:
             if comparison_replay:
                 self.comparison.before_replay(self)
             self.emit('begin', name)
             phase = 'host_call'
             yield
+            if first_sample_arm and comparison_replay:
+                self.comparison.submitted = True
             self.emit('host_return', name)
-            if self.active and (self.sync_window or sync or comparison_replay):
+            if self.active and (self.sync_window or sync or comparison_replay or sync_copy):
                 phase = 'synchronize'
                 self.emit('sync_begin', name)
                 self.synchronize()
@@ -488,6 +574,8 @@ def run_bounded(run, trainer, trace):
     new_episode, select_action = trainer._new_episode, engine.select_action
     action_tensor, update = engine._action_inference_tensor, engine.update_once
     action_to, graph_key, capture = V2ObservationBatch.to, GPUCompute.key, GPUCompute.capture_shape
+    first_sample_arm = trace.comparison is not None and trace.comparison.arm == FIRST_SAMPLE_ARM
+    cpu_sample = None
 
     def stop_if_done():
         if trainer.result.stage_steps == stop_step:
@@ -534,8 +622,12 @@ def run_bounded(run, trainer, trace):
         return result
 
     def traced_update(**kwargs):
+        nonlocal cpu_sample
         if not trace.active:
-            return update(**kwargs)
+            try:
+                return update(**kwargs)
+            finally:
+                cpu_sample = None
         if kwargs['total_steps'] != trace.step:
             raise RuntimeError('Trace step differs from the actual update step.')
         try:
@@ -557,22 +649,36 @@ def run_bounded(run, trainer, trace):
         return key
 
     def traced_capture(executor, key, batch):
+        if trace.comparing and first_sample_arm:
+            return trace.comparison.recapture_first_sample(trace, capture)
         if (not trace.active and trace.comparison is None
                 or trace.comparing and trace.comparison.arm == 'fresh-graph'):
             return capture(executor, key, batch)
         with trace.scope('update_graph_capture'):
             result = capture(executor, key, batch)
         if trace.comparison is not None:
-            trace.comparison.capture(executor, key, trace.step)
+            trace.comparison.capture(executor, key, trace.step, cpu_sample)
         return result
 
-    with (patch.object(trainer, '_new_episode', bounded_reset),
+    with (ExitStack() as hooks,
+          patch.object(trainer, '_new_episode', bounded_reset),
           patch.object(engine, 'select_action', traced_select),
           patch.object(engine, '_action_inference_tensor', traced_tensor),
           patch.object(engine, 'update_once', traced_update),
           patch.object(V2ObservationBatch, 'to', traced_action_to),
           patch.object(GPUCompute, 'key', traced_key),
           patch.object(GPUCompute, 'capture_shape', traced_capture)):
+        if first_sample_arm:
+            sample_batch = engine._sample_training_batch
+
+            def traced_sample(*args, **kwargs):
+                nonlocal cpu_sample
+                batch = sample_batch(*args, **kwargs)
+                if trace.comparison.first_sample is None and trace.step < COMPARE_STEP:
+                    cpu_sample = batch
+                return batch
+
+            hooks.enter_context(patch.object(engine, '_sample_training_batch', traced_sample))
         run(trainer)
     raise RuntimeError('Formal trainer returned before the diagnostic stop hook.')
 

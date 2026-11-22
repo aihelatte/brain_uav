@@ -195,6 +195,129 @@ class ShortDiagnosticTests(unittest.TestCase):
                     comparison.restore_cache()
                     self.assertIs(executor.graphs[key], entry)
 
+    def test_first_sample_graph_uses_formal_copy_between_capture_and_replay(self):
+        from brain_uav.scripts.diagnose_v2_critic_calibration import state_hash
+        from brain_uav.trainers.v2_gpu_compute import GPUCompute, clone_batch, tensors
+        from brain_uav.trainers.v2_replay_buffer import V2ReplayBatch
+
+        def sample(mask, value, fraction):
+            obs = diag.V2ObservationBatch(torch.full((1, 6), value), torch.zeros(1, 4),
+                                         torch.zeros(1, 2, 19), torch.tensor([mask]))
+            next_obs = diag.V2ObservationBatch(obs.ego_features, obs.goal_features, obs.zone_features,
+                                              torch.tensor([mask[::-1]]))
+            return V2ReplayBatch(obs, torch.full((1, 3), value), torch.zeros(1, 1), next_obs,
+                                 *(torch.zeros(1, 1) for _ in range(4)), sample_failure_fraction=fraction)
+
+        key = diag.COMPARE_KEY
+        metric_type = make_dataclass('Metric', [('sample_failure_fraction', float)])
+        for failure in (None, 'capture', 'copy', 'replay'):
+            with self.subTest(failure=failure), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                args = diag.parse_args(['--out', str(root / 'out'), '--compare-686', 'first-sample-graph',
+                    '--graph-reference', str(root / 'graph'), '--staged-reference', str(root / 'staged')])
+                first, real = sample([True, False], 1.0, 0.125), sample([False, True], 2.0, 0.75)
+                first_hash, real_hash = state_hash(tensors(first)), state_hash(tensors(real))
+                noise, result = torch.ones(1, 3), torch.tensor([0., 0., 0.])
+                e = SimpleNamespace(device=torch.device('cpu'), batch_size=1, policy_delay=2, actor_freeze_steps=900,
+                    last_total_steps=683, window_update_statistics=[], mc_return_weight=0, update_count=0,
+                    critic_update_count=0, critic_target_update_count=0, actor_update_count=0,
+                    gpu_compute_lightweight_timing=False, gpu_compute_non_blocking_coefficients=False,
+                    bc_reference_actor=None, spike_regularization=SimpleNamespace(beta=lambda _: 0.),
+                    policy_noise=0.2, noise_clip=0.5, _new_episode=Mock(), select_action=Mock(),
+                    _action_inference_tensor=Mock(), _sample_training_batch=Mock(side_effect=[first, real, real]))
+                gpu = object.__new__(GPUCompute)
+                vars(gpu).update(e=e, graphs={}, captures=0, replays=0, handoffs=0, copy_seconds=0.,
+                    compute_seconds=0., ready_to_result_seconds=0., mode_replays={'frozen_targets': 0, 'critic_only': 0},
+                    params=([], []), adams=(None, SimpleNamespace(params=[], states=[])), banks=[[[]], [[]]],
+                    published=[None, None], bound_device=e.device, zone_limit=2, noise=torch.zeros_like(noise),
+                    coefficients=torch.zeros(4), injections=torch.zeros(4), persistent=lambda: [],
+                    validate_binding=Mock(), metrics=lambda *_: metric_type(0.0))
+                trainer = SimpleNamespace(engine=e, config=SimpleNamespace(max_steps=750000),
+                    result=SimpleNamespace(stage_steps=683), _new_episode=e._new_episode,
+                    env=SimpleNamespace(last_curriculum_level='medium', zones=[None, None]))
+                trace = diag.Trace(io.StringIO(), sync_window=False)
+                trace.synchronize = Mock()
+                recaptured = Mock()
+
+                def capture(executor, actual_key, batch):
+                    def replay():
+                        if trace.step == 686:
+                            recaptured()
+                            self.assertEqual(state_hash(tensors(fixed)), real_hash)
+                            self.assertEqual(fraction.item(), 0.75)
+                            if failure == 'replay':
+                                trace.synchronize.side_effect = RuntimeError('illegal replay')
+
+                    if trace.step == 686:
+                        self.assertEqual(state_hash(tensors(batch)), first_hash)
+                        self.assertEqual(batch.sample_failure_fraction, 0.125)
+                        if failure == 'capture':
+                            raise RuntimeError('illegal capture')
+                        if failure == 'copy':
+                            trace.synchronize.side_effect = [None, RuntimeError('illegal copy')]
+                    fixed = clone_batch(batch)
+                    fraction = torch.tensor(batch.sample_failure_fraction)
+                    executor.failure_fraction = fraction
+                    executor.graphs[actual_key] = (SimpleNamespace(replay=replay), fixed, fraction, result, ((), ()), {})
+                    executor.captures += 1
+
+                def update(*, total_steps, gpu_compute_submission_diagnostic=None):
+                    batch = e._sample_training_batch(total_steps).to(e.device)
+                    return gpu._step_batch(batch, noise, total_steps, 0., owned_sources=[],
+                                           submission_diagnostic=gpu_compute_submission_diagnostic)
+
+                e.update_once = update
+                identity = dict(key=list(key), capture_step=684, capture_count=2, prior_replays=2,
+                    graph_keys=[list(key), [2, 2, 'critic_only', 0, 0]], participation=[[], []],
+                    scene=dict(level='medium', obstacles=2), obs_shapes=diag.shapes(real.obs),
+                    next_obs_shapes=diag.shapes(real.next_obs), obs_mask=[[False, True]],
+                    next_obs_mask=[[True, False]], sample_sha256=real_hash, fixed_sha256=real_hash,
+                    noise_sha256=state_hash(noise), fraction_sha256=state_hash(torch.tensor(0.75)),
+                    coefficients_sha256=state_hash(torch.tensor([0., 0., 0.2, 0.5])),
+                    injection_sha256=state_hash(torch.zeros(4)), state=dict(steps=685))
+                staged = dict(completed=True, first_failure=None, metrics=dict(sample_failure_fraction=0.75),
+                              post_state=dict(steps=686), result_sha256=state_hash(result))
+                refs = dict(graph=(identity, dict(completed=False, first_failure={})), staged=(identity, staged))
+
+                def run(trainer):
+                    for step in (684, 685, 686):
+                        e.select_action()
+                        e.update_once(total_steps=step)
+                        trainer.result.stage_steps = step
+                        if step == 684:
+                            first.obs.presence_mask.fill_(False)
+                            first.action.zero_()
+                    e.select_action()
+
+                expected = (self.assertRaisesRegex(RuntimeError, f'illegal {failure}') if failure else
+                            self.assertRaises(diag.DiagnosticComplete))
+                with (patch.object(diag, 'comparison_references', return_value=refs),
+                      patch.object(diag.StepComparison, 'state', side_effect=lambda *_: dict(steps=e.last_total_steps)),
+                      patch.object(GPUCompute, 'capture_shape', capture)):
+                    trace.comparison = diag.StepComparison(args, args.out, {})
+                    with expected:
+                        diag.run_bounded(run, trainer, trace)
+                self.assertEqual(recaptured.call_count, int(failure in (None, 'replay')))
+                initial = diag.read_json(args.out / 'first_capture_sample.json')
+                self.assertEqual((initial['capture_step'], initial['obs_mask'], initial['next_obs_mask']),
+                                 (684, [[True, False]], [[False, True]]))
+                if failure:
+                    first_failure = trace.comparison.failure
+                    locations = dict(capture=('first_sample_recapture', 'host_call'),
+                                     copy=('graph_fixed_input_copy', 'synchronize'),
+                                     replay=('graph_replay_submit', 'synchronize'))
+                    self.assertEqual((first_failure['section'], first_failure['phase']), locations[failure])
+                else:
+                    report = diag.read_json(args.out / 'step686_result.json')
+                    self.assertTrue(all(report['comparison'].values()))
+                    self.assertTrue(diag.read_json(args.out / 'step686_recapture.json')[
+                        'capture_sample_differs_from_replay'])
+                    markers = [(event['section'], event['event']) for event in
+                               map(json.loads, trace.stream.getvalue().splitlines())]
+                    ordered = [markers.index((section, 'sync_done')) for section in
+                               ('first_sample_recapture', 'graph_fixed_input_copy', 'graph_replay_submit')]
+                    self.assertEqual(ordered, sorted(ordered))
+
     def test_real_worker_resolves_medium_and_marks_bounded_exit_without_artifact(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
