@@ -903,6 +903,7 @@ class V2ExperimentReporter:
         self._periodic_validation_writer.append(dict(record))
         print(
             f"[V2 {self.model_type.upper()} {self.stage}] periodic validation "
+            f"scheduled_stage_steps={record.get('scheduled_stage_steps')} "
             f"stage_steps={record.get('stage_steps')} "
             f"outcomes={record.get('outcome_counts')} "
             f"passed={record.get('passed')}",

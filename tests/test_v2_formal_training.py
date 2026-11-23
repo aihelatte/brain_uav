@@ -735,8 +735,8 @@ class TestV2FormalTraining(unittest.TestCase):
             consecutive_qualified_windows=1,
             early_stop_min_steps=99,
         )
-        snapshot_calls: list[int] = []
-        validation_calls: list[int] = []
+        snapshot_calls: list[tuple[int, int]] = []
+        validation_calls: list[tuple[int, int]] = []
         trainer = V2FormalStageTrainer(
             scenario,
             RewardConfig(),
@@ -747,13 +747,13 @@ class TestV2FormalTraining(unittest.TestCase):
                 'candidate validation must not run: the window never completes'
             ),
             periodic_snapshot_interval_steps=2,
-            periodic_snapshot_sink=snapshot_calls.append,
-            periodic_validation_sink=validation_calls.append,
+            periodic_snapshot_sink=lambda scheduled, actual: snapshot_calls.append((scheduled, actual)),
+            periodic_validation_sink=lambda scheduled, actual: validation_calls.append((scheduled, actual)),
         )
         result = trainer.run()
         self.assertEqual(result.stage_steps, 6)
-        self.assertEqual(snapshot_calls, [2, 4, 6])
-        self.assertEqual(validation_calls, [2, 4, 6])
+        self.assertEqual(snapshot_calls, [(2, 2), (4, 4), (6, 6)])
+        self.assertEqual(validation_calls, [(2, 2), (4, 4), (6, 6)])
         self.assertEqual(trainer.controller.completed_windows, 0)
         self.assertEqual(trainer.controller.consecutive_qualified, 0)
         self.assertEqual(trainer.controller.candidate_count, 0)

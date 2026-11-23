@@ -37,7 +37,9 @@ SEEDS = batch_runner.COURSE_SEEDS
 VALIDATION_SEED = 20260904
 INDEPENDENT_SEED = 20261121
 SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_source.json'
-RESUME_SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_resume_source.json'
+MEDIUM_ANN_SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_resume_source.json'
+RESUME_SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_snapshot_resume_source.json'
+MEDIUM_ANN_HEAD = '144e5183628a28a29126e886fe16918aadd33c2d'
 HISTORICAL_HEAD = 'e6bc9be6b1cd95ac5c23b370f373b7eb3050c6df'
 PREDECESSOR = dict(medium='easy', hard='medium')
 PROC_ROOT = Path('/proc')
@@ -209,7 +211,7 @@ def collect_batch(args, pool, evidence, *, historical_source=None):
     manifest = read_json(root / 'manifest.json')
     status = read_json(root / 'batch_summary.json')
     if historical_source is not None:
-        check_historical_easy_inputs(args, evidence, historical_source)
+        check_historical_inputs(args, evidence, *historical_source)
     expected_gate = batch_runner.validate_gate(args, evidence)
     expected_plan = batch_runner.plan(args)
     expected_plan['initialization_timeout'] = manifest['plan']['initialization_timeout']
@@ -246,12 +248,12 @@ def collect_batch(args, pool, evidence, *, historical_source=None):
     return records
 
 
-def check_historical_easy_inputs(args, evidence, source):
-    """Verify e6bc9be inputs against the historical seal, without using live source identity."""
+def check_historical_inputs(args, evidence, source_manifest, head):
+    """Check historical inputs without comparing historical CUDA evidence to live sources."""
     paths = evidence['paths']
     hashes = evidence['hashes']
     sealed_files = dict(config=batch_runner.CONFIG, experiment_config=batch_runner.GUIDANCE_CONFIG,
-                        source_manifest=SOURCE_MANIFEST)
+                        source_manifest=source_manifest)
     expected_hashes = {key: batch_runner.source_hash(path) for key, path in sealed_files.items()}
     baseline = read_json(batch_runner.CONFIG)
     expected_paths = dict(pool=args.validation_pool)
@@ -261,15 +263,21 @@ def check_historical_easy_inputs(args, evidence, source):
         expected_hashes[model + '_bc'] = provenance.BC[model][1]
         expected_paths[model + '_stage_start'] = Path(baseline[model]['stage_start_server'])
         expected_hashes[model + '_stage_start'] = baseline[model]['stage_start_sha256']
+    if args.parent is not None:
+        expected_paths['parent'] = args.parent
+        expected_hashes['parent'] = args.parent_sha256
     gate_source = read_json(args.gate_report / 'manifest.json')['inputs']['source']
-    if (evidence['experiment'] != EXPERIMENT or evidence['global_steps_start'] != 0
-            or evidence['source']['HEAD'] != HISTORICAL_HEAD or gate_source['HEAD'] != HISTORICAL_HEAD
-            or evidence['source']['sha256'] != source or hashes != expected_hashes
-            or set(paths) != set(expected_hashes)):
-        raise ValueError(f'Historical easy source or input seal differs: {args.root / "manifest.json"}')
+    if (evidence['experiment'] != EXPERIMENT
+            or evidence['source']['HEAD'] != head or gate_source['HEAD'] != head
+            or evidence['source']['sha256'] != read_json(source_manifest)['sha256']
+            or hashes != expected_hashes or set(paths) != set(expected_hashes)):
+        raise ValueError(f'Historical {args.batch} source or input seal differs: {args.root / "manifest.json"}')
     for key, path in expected_paths.items():
         if Path(paths[key]) != path.resolve() or batch_runner.file_hash(path) != hashes[key]:
-            raise ValueError(f'Historical easy input path or SHA256 differs: {path}')
+            raise ValueError(f'Historical {args.batch} input path or SHA256 differs: {path}')
+    stage, model = args.batch.split('-')
+    if evidence['global_steps_start'] != parent_steps(stage, model, args.parent, args.parent_sha256, hashes):
+        raise ValueError(f'Historical {args.batch} parent step count differs: {args.root / "manifest.json"}')
 
 
 def promoted_selection(directory, candidates, winner):
@@ -286,57 +294,108 @@ def completed_attempts(directory):
             and read_json(path / 'train/batch_summary.json')['execution_completed'] is True]
 
 
-def import_easy(args, archive, bc):
-    source = read_json(SOURCE_MANIFEST)['sha256']
-    archive_course = archive / 'course.json'
-    if read_json(archive_course) != dict(experiment=EXPERIMENT, code=source, bc=bc,
-                                         plan=course_plan(archive)):
-        raise ValueError(f'Historical course differs from the e6bc9be seal: {archive_course}')
-    evidence, pools = prepare_pools(archive, None, read_only=True)
-    imported = {}
-    originals = {}
+def verify_historical_batch(args, archive, batch, pool_info, pool, source, parent=None):
+    directory = archive / 'batches' / batch
+    completed = completed_attempts(directory)
+    if len(completed) != 1:
+        raise ValueError(f'Expected one completed historical training attempt: {directory}')
+    attempt = completed[0]
+    training = batch_args(args, batch, attempt / 'train', pool_info, parent, gate_report=attempt / 'gate')
+    manifest = training.root / 'manifest.json'
+    evidence = read_json(manifest)['inputs']
+    candidates = collect_batch(training, pool, evidence, historical_source=source)
+    winner = select_winner(candidates)
+    selection = directory / 'selection.json'
+    label = 'easy' if batch.startswith('easy-') else batch
+    if read_json(selection) != promoted_selection(directory, candidates, winner):
+        raise ValueError(f'Historical {label} promotion differs from terminal candidate evidence: {selection}')
+    old_winner = directory / 'winner.pt'
+    if winner is not None:
+        if batch_runner.file_hash(old_winner) != winner['checkpoint_sha256']:
+            raise ValueError(f'Historical {label} winner SHA256 differs: {old_winner}')
+    elif old_winner.exists() or batch.startswith('easy-'):
+        raise ValueError(f'Unexpected historical winner status: {selection}')
+    receipt = dict(attempt=str(attempt), selection=str(selection), selection_sha256=batch_runner.file_hash(selection),
+        training_manifest_sha256=batch_runner.file_hash(manifest),
+        gate_manifest_sha256=batch_runner.file_hash(training.gate_report / 'manifest.json'),
+        winner=str(old_winner) if winner else None, winner_sha256=winner['checkpoint_sha256'] if winner else None)
+    return promoted_selection(args.root / 'batches' / batch, candidates, winner), receipt
+
+
+def remap_pools(evidence, root):
+    return {partition: {stage: {**info, 'path': str(root / 'pools' / partition / Path(info['path']).name)}
+                        for stage, info in levels.items()} for partition, levels in evidence.items()}
+
+
+def verify_course_record(root, source_manifest, bc, plan):
+    path = root / 'course.json'
+    if read_json(path) != dict(experiment=EXPERIMENT, code=read_json(source_manifest)['sha256'], bc=bc, plan=plan):
+        raise ValueError(f'Historical course differs from the reviewed seal: {path}')
+
+
+def import_completed(args, archive, bc, *, after_medium_ann):
+    if after_medium_ann:
+        preceding = archive
+        origin = Path(read_json(preceding / 'course.json')['plan']['resume_from']).resolve()
+        resume_root(args.root, origin)
+        resume_root(preceding, origin)
+        verify_course_record(preceding, MEDIUM_ANN_SOURCE_MANIFEST, bc, course_plan(preceding, origin))
+    else:
+        origin = archive
+    verify_course_record(origin, SOURCE_MANIFEST, bc, course_plan(origin))
+    evidence, pools = prepare_pools(origin, None, read_only=True)
+    imported, originals = {}, {}
     for model in MODELS:
         batch = f'easy-{model}'
-        directory = archive / 'batches' / batch
-        completed = completed_attempts(directory)
-        if len(completed) != 1:
-            raise ValueError(f'Expected one completed historical training attempt: {directory}')
-        attempt = completed[0]
-        training = batch_args(args, batch, attempt / 'train', evidence['validation']['easy'],
-                              None, gate_report=attempt / 'gate')
-        manifest = training.root / 'manifest.json'
-        old_inputs = read_json(manifest)['inputs']
-        candidates = collect_batch(training, pools['validation']['easy'], old_inputs,
-                                   historical_source=source)
-        winner = select_winner(candidates)
-        selection = directory / 'selection.json'
-        old_winner = directory / 'winner.pt'
-        if winner is None or read_json(selection) != promoted_selection(directory, candidates, winner):
-            raise ValueError(f'Historical easy promotion differs from terminal candidate evidence: {selection}')
-        if batch_runner.file_hash(old_winner) != winner['checkpoint_sha256']:
-            raise ValueError(f'Historical easy winner SHA256 differs: {old_winner}')
-        imported[model] = promoted_selection(args.root / 'batches' / batch, candidates, winner)
-        originals[model] = dict(attempt=str(attempt), selection=str(selection),
-            selection_sha256=batch_runner.file_hash(selection), training_manifest_sha256=batch_runner.file_hash(manifest),
-            gate_manifest_sha256=batch_runner.file_hash(training.gate_report / 'manifest.json'),
-            winner=str(old_winner), winner_sha256=winner['checkpoint_sha256'],
-            imported_winner=imported[model]['winner']['checkpoint'])
-    seal_json(args.root / 'resume_source.json', dict(root=str(archive), HEAD=HISTORICAL_HEAD,
-        course_sha256=batch_runner.file_hash(archive_course),
-        pool_seal_sha256=batch_runner.file_hash(archive / 'pools.json'), pools=evidence, easy=originals))
-    local_evidence = {}
+        imported[batch], receipt = verify_historical_batch(args, origin, batch, evidence['validation']['easy'],
+            pools['validation']['easy'], (SOURCE_MANIFEST, HISTORICAL_HEAD))
+        originals[model] = dict(receipt, imported_winner=imported[batch]['winner']['checkpoint'])
+    source = dict(root=str(origin), HEAD=HISTORICAL_HEAD, course_sha256=batch_runner.file_hash(origin / 'course.json'),
+        pool_seal_sha256=batch_runner.file_hash(origin / 'pools.json'), pools=evidence, easy=originals)
+    if after_medium_ann:
+        prior_pools, prior_objects = prepare_pools(preceding, None, read_only=True)
+        if prior_pools != remap_pools(evidence, preceding):
+            raise ValueError(f'Continued course pools differ from the original seal: {preceding / "pools.json"}')
+        prior_easy, prior_winners = {}, {}
+        for model in MODELS:
+            batch = f'easy-{model}'
+            directory = preceding / 'batches' / batch
+            old = imported[batch]
+            winner = {**old['winner'], 'checkpoint': str(directory / 'winner.pt')}
+            if (read_json(directory / 'selection.json') != {**old, 'winner': winner}
+                    or batch_runner.file_hash(winner['checkpoint']) != winner['checkpoint_sha256']):
+                raise ValueError(f'Previously imported {batch} differs from the original easy result: {directory}')
+            prior_easy[model] = dict(originals[model], imported_winner=winner['checkpoint'])
+            prior_winners[model] = winner
+        prior_receipt = preceding / 'resume_source.json'
+        if read_json(prior_receipt) != {**source, 'easy': prior_easy}:
+            raise ValueError(f'Previous continuation source receipt differs: {prior_receipt}')
+        imported['medium-ann'], receipt = verify_historical_batch(args, preceding, 'medium-ann',
+            prior_pools['validation']['medium'], prior_objects['validation']['medium'],
+            (MEDIUM_ANN_SOURCE_MANIFEST, MEDIUM_ANN_HEAD), parent=prior_winners['ann'])
+        for attempt in sorted((preceding / 'batches/medium-snn').glob('attempt-*')):
+            for phase in ('train', 'gate'):
+                require_stopped_phase(attempt / phase, 'medium-snn')
+        winner = imported['medium-ann']['winner']
+        source['medium-ann'] = dict(receipt, root=str(preceding), HEAD=MEDIUM_ANN_HEAD,
+            status=imported['medium-ann']['status'], imported_winner=winner['checkpoint'] if winner else None,
+            source_receipt_sha256=batch_runner.file_hash(prior_receipt),
+            course_sha256=batch_runner.file_hash(preceding / 'course.json'),
+            pool_seal_sha256=batch_runner.file_hash(preceding / 'pools.json'))
+    seal_json(args.root / 'resume_source.json', source)
+    local_evidence = remap_pools(evidence, args.root)
     for partition, levels in evidence.items():
-        local_evidence[partition] = {}
         for stage, info in levels.items():
-            source_path = Path(info['path'])
-            target = args.root / 'pools' / partition / source_path.name
-            seal_copy(source_path, target, info['sha256'])
-            local_evidence[partition][stage] = {**info, 'path': str(target)}
+            seal_copy(Path(info['path']), Path(local_evidence[partition][stage]['path']), info['sha256'])
     seal_json(args.root / 'pools.json', local_evidence)
-    for model, selection in imported.items():
-        target = Path(selection['winner']['checkpoint'])
-        seal_copy(Path(originals[model]['winner']), target, originals[model]['winner_sha256'])
-        seal_json(target.parent / 'selection.json', selection)
+    for batch, selection in imported.items():
+        directory = args.root / 'batches' / batch
+        receipt = source[batch] if batch == 'medium-ann' else originals[batch.split('-')[1]]
+        if selection['winner'] is not None:
+            seal_copy(Path(receipt['winner']), directory / 'winner.pt', receipt['winner_sha256'])
+        elif (directory / 'winner.pt').exists():
+            raise ValueError(f'Unexpected winner for an imported batch with no formal pass: {directory}')
+        seal_json(directory / 'selection.json', selection)
     return local_evidence, pools, imported
 
 
@@ -566,6 +625,7 @@ def run_course(args):
 def _run_locked(args):
     archive = resume_root(args.root, getattr(args, 'resume_from', None))
     identity = batch_runner.identity(EXPERIMENT)
+    after_medium_ann = getattr(args, 'resume_after_medium_ann', False)
     reviewed = read_json(args.source_manifest)['sha256']
     if archive is not None and reviewed != read_json(RESUME_SOURCE_MANIFEST)['sha256']:
         raise ValueError('Continuation requires the reviewed post-fix course source manifest.')
@@ -575,12 +635,12 @@ def _run_locked(args):
     if bc != {m: provenance.BC[m][1] for m in MODELS}:
         raise ValueError('Original BC best SHA256 mismatch.')
     seal_json(args.root / 'course.json', dict(experiment=EXPERIMENT,
-        code=identity['sha256'], bc=bc, plan=course_plan(args.root, archive)))
+        code=identity['sha256'], bc=bc, plan=course_plan(args.root, archive, after_medium_ann=after_medium_ann)))
     if archive is None:
         evidence, pools = prepare_pools(args.root, args.validation_pool_dir)
         imported = {}
     else:
-        evidence, pools, imported = import_easy(args, archive, bc)
+        evidence, pools, imported = import_completed(args, archive, bc, after_medium_ann=after_medium_ann)
     frozen_path = args.root / 'independent_inputs.json'
     if frozen_path.exists() or (args.root / 'independent').exists():
         return finish_independent(args.root, evidence, pools)
@@ -591,10 +651,11 @@ def _run_locked(args):
                 rows.extend(dict(model=model, stage=stage, seed=seed, status='blocked_by_no_formal_pass')
                             for seed in SEEDS)
                 continue
-            if stage == 'easy' and model in imported:
-                records, winner = imported[model]['candidates'], imported[model]['winner']
+            batch = f'{stage}-{model}'
+            if batch in imported:
+                records, winner = imported[batch]['candidates'], imported[batch]['winner']
             else:
-                records, winner = run_batch(args, f'{stage}-{model}', evidence['validation'][stage],
+                records, winner = run_batch(args, batch, evidence['validation'][stage],
                                             pools['validation'][stage], winners.get(model))
             if winner is None:
                 stopped[model] = stage
@@ -639,7 +700,7 @@ def finish_independent(root, evidence, pools):
     return 0
 
 
-def course_plan(root, archive=None):
+def course_plan(root, archive=None, *, after_medium_ann=False):
     batches = {}
     for batch in batch_runner.COURSE_BATCHES:
         entries = []
@@ -656,6 +717,9 @@ def course_plan(root, archive=None):
     if archive is not None:
         plan.update(resume_from=str(archive), reuse_batches=[f'easy-{model}' for model in MODELS],
                     first_training_batch='medium-ann')
+        if after_medium_ann:
+            plan['reuse_batches'].append('medium-ann')
+            plan['first_training_batch'] = 'medium-snn'
     return plan
 
 
@@ -692,7 +756,9 @@ def main(argv=None):
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--input-root', type=Path, default=Path('/home/zj/projects/my_project'))
     parser.add_argument('--validation-pool-dir', type=Path)
-    parser.add_argument('--resume-from', type=Path, help='Read completed e6bc9be easy results and pools here.')
+    parser.add_argument('--resume-from', type=Path, help='Read sealed results and pools from the previous course.')
+    parser.add_argument('--resume-after-medium-ann', action='store_true',
+                        help='Use the 144e518 continuation as the source and start at medium-snn.')
     parser.add_argument('--source-manifest', type=Path)
     parser.add_argument('--timeout', type=float, default=1800.)
     parser.add_argument('--gate-timeout', type=float, default=300.)
@@ -702,13 +768,15 @@ def main(argv=None):
         args.resume_from = resume_root(args.root, args.resume_from)
     except ValueError as error:
         parser.error(str(error))
+    if args.resume_after_medium_ann and args.resume_from is None:
+        parser.error('--resume-after-medium-ann requires --resume-from pointing to the 144e518 course.')
     if args.resume_from is not None and args.validation_pool_dir is not None:
         parser.error('--resume-from uses the six pools sealed by the historical course.')
     args.source_manifest = args.source_manifest or RESUME_SOURCE_MANIFEST
     if args.status:
         print(json.dumps(course_status(args.root), indent=2))
     elif not args.run:
-        print(json.dumps(course_plan(args.root, args.resume_from), indent=2))
+        print(json.dumps(course_plan(args.root, args.resume_from, after_medium_ann=args.resume_after_medium_ann), indent=2))
     else:
         if Path(sys.executable).resolve() != Path(provenance.PYTHON).resolve():
             parser.error('Use the declared server Python.')

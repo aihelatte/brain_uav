@@ -48,6 +48,12 @@ class FormalCourseTests(unittest.TestCase):
             self.assertEqual(plan['reuse_batches'], ['easy-ann', 'easy-snn'])
             self.assertEqual(plan['first_training_batch'], 'medium-ann')
             self.assertEqual(len(plan['batches']), 6)
+            with redirect_stdout(StringIO()) as output:
+                self.assertEqual(course.main(['--root', str(root), '--resume-from', str(old),
+                                             '--resume-after-medium-ann']), 0)
+            plan = json.loads(output.getvalue())
+            self.assertEqual(plan['reuse_batches'], ['easy-ann', 'easy-snn', 'medium-ann'])
+            self.assertEqual(plan['first_training_batch'], 'medium-snn')
             self.assertFalse(root.exists())
             with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
                 course.main(['--root', str(old / 'nested'), '--resume-from', str(old)])
@@ -153,6 +159,97 @@ class FormalCourseTests(unittest.TestCase):
                     launch.assert_not_called()
                 self.assertFalse((args.root / 'batches').exists())
 
+    def test_resume_preserves_medium_ann_selection_and_starts_fresh_snn_gate(self):
+        for medium_status in ('promoted', 'no_formal_pass', 'tampered'):
+            with self.subTest(status=medium_status), TemporaryDirectory() as tmp:
+                workspace = Path(tmp).resolve()
+                args, origin, pools, bc = self.historical_course_fixture(workspace)
+                prior = args.root
+                old_source = course.MEDIUM_ANN_SOURCE_MANIFEST
+                bc_hashes = {model: entry[1] for model, entry in bc.items()}
+                with self.mock_historical_inputs(pools, bc):
+                    course.import_completed(args, origin, bc_hashes, after_medium_ann=False)
+                batch.atomic_json(prior / 'course.json', dict(experiment=course.EXPERIMENT,
+                    code=course.read_json(old_source)['sha256'], bc=bc_hashes, plan=course.course_plan(prior, origin)))
+                parent = course.read_json(prior / 'batches/easy-ann/selection.json')['winner']
+                prior_pools = course.read_json(prior / 'pools.json')
+                winner_seed = None if medium_status == 'no_formal_pass' else 41
+                self.write_historical_batch_fixture(args, prior, prior_pools, bc, 'medium-ann', winner_seed,
+                                                    old_source, course.MEDIUM_ANN_HEAD, parent=parent)
+                selection_path = prior / 'batches/medium-ann/selection.json'
+                if medium_status == 'tampered':
+                    selection = course.read_json(selection_path)
+                    selection['winner']['seed'] = 7
+                    batch.atomic_json(selection_path, selection)
+                before = {path: batch.file_hash(path) for path in prior.rglob('*') if path.is_file()}
+                args.root = workspace / 'fix'
+                args.resume_from = prior
+                args.resume_after_medium_ann = True
+                launched = []
+                real_collect = course.collect_batch
+
+                def launch(namespace):
+                    launched.append((namespace.batch, namespace.gate_only))
+                    stage, model = namespace.batch.split('-')
+                    parent_name = f'{course.PREDECESSOR[stage]}-{model}'
+                    self.assertEqual(namespace.parent, args.root / 'batches' / parent_name / 'winner.pt')
+                    self.assertEqual(namespace.parent_sha256, batch.file_hash(namespace.parent))
+                    self.assertEqual(namespace.source_manifest, course.RESUME_SOURCE_MANIFEST)
+                    self.assertEqual([job['seed'] for job in batch.batch_jobs(namespace)], list(course.SEEDS))
+                    batch.atomic_json(namespace.root / 'batch_summary.json', dict(execution_completed=True,
+                                                                                 mps_cleanup=dict(stopped=True)))
+
+                def collect(namespace, pool, evidence, **kwargs):
+                    if kwargs:
+                        return real_collect(namespace, pool, evidence, **kwargs)
+                    stage, model = namespace.batch.split('-')
+                    records = []
+                    for seed in course.SEEDS:
+                        path = namespace.root / f'{seed}.pt'
+                        path.write_text(f'{stage} {model} {seed}', encoding='utf-8')
+                        records.append(dict(model=model, stage=stage, seed=seed, steps=160000, goal=100,
+                            collision=0, execution_completed=True, formal_passed=True, checkpoint=str(path),
+                            checkpoint_sha256=batch.file_hash(path), initialization=dict(sha256=namespace.parent_sha256),
+                            last_50k=dict(successes=1, count=1, success_rate=1.)))
+                    return records
+
+                def historical_parent_steps(stage, model, path, expected_hash, hashes):
+                    if stage == 'easy':
+                        return 0
+                    self.assertEqual((stage, model, path), ('medium', 'ann', Path(parent['checkpoint'])))
+                    self.assertEqual(expected_hash, hashes['parent'])
+                    return parent['steps']
+
+                with (self.mock_historical_inputs(pools, bc),
+                      patch.object(batch, 'launch', side_effect=launch),
+                      patch.object(batch, 'inputs', return_value={}),
+                      patch.object(course, 'collect_batch', side_effect=collect),
+                      patch.object(course, 'parent_steps', side_effect=historical_parent_steps),
+                      patch.object(course, 'evaluate_winners', return_value=[]) as evaluate):
+                    if medium_status == 'tampered':
+                        with self.assertRaisesRegex(ValueError, 'Historical medium-ann promotion differs'):
+                            course._run_locked(args)
+                        self.assertEqual(launched, [])
+                        evaluate.assert_not_called()
+                        continue
+                    self.assertEqual(course._run_locked(args), 0)
+                    if medium_status == 'promoted':
+                        evaluate.assert_called_once()
+                    else:
+                        evaluate.assert_not_called()
+                expected = ['medium-snn', 'hard-ann', 'hard-snn'] if winner_seed else ['medium-snn', 'hard-snn']
+                self.assertEqual(launched, [(name, gate_only) for name in expected for gate_only in (True, False)])
+                self.assertEqual(course.course_status(args.root)['medium-ann']['status'], medium_status)
+                receipt = course.read_json(args.root / 'resume_source.json')['medium-ann']
+                self.assertEqual(receipt['selection_sha256'], batch.file_hash(selection_path))
+                self.assertEqual(receipt['status'], medium_status)
+                self.assertEqual({path: batch.file_hash(path) for path in prior.rglob('*') if path.is_file()}, before)
+                with (args.root / 'training.csv').open(encoding='utf-8', newline='') as stream:
+                    rows = list(csv.DictReader(stream))
+                self.assertEqual(len(rows), 24)
+                self.assertEqual(sum(row['status'] == 'blocked_by_no_formal_pass' for row in rows),
+                                 0 if winner_seed else 4)
+
     def historical_course_fixture(self, workspace):
         archive = workspace / 'historical'
         args = SimpleNamespace(root=workspace / 'continued', resume_from=archive,
@@ -181,75 +278,85 @@ class FormalCourseTests(unittest.TestCase):
                 pools[partition][stage] = dict(path=str(path), sha256=batch.file_hash(path),
                     content_digest=digest, master_seed=master_seed, stage_seed=1)
         batch.atomic_json(archive / 'pools.json', pools)
-        baseline = course.read_json(batch.CONFIG)
         for model, winner_seed in (('ann', 23), ('snn', 11)):
-            name = f'easy-{model}'
-            directory = archive / 'batches' / name
-            attempt = directory / 'attempt-000001'
-            info = pools['validation']['easy']
-            gate, train = attempt / 'gate', attempt / 'train'
-            paths = dict(pool=Path(info['path']), config=batch.CONFIG, experiment_config=batch.GUIDANCE_CONFIG,
-                         source_manifest=course.SOURCE_MANIFEST)
-            hashes = {key: batch.source_hash(path) for key, path in paths.items() if key != 'pool'}
-            hashes['pool'] = info['sha256']
-            for kind, (relative, digest) in bc.items():
-                paths[kind + '_bc'] = args.input_root / relative
-                hashes[kind + '_bc'] = digest
-                paths[kind + '_stage_start'] = Path(baseline[kind]['stage_start_server']).resolve()
-                hashes[kind + '_stage_start'] = baseline[kind]['stage_start_sha256']
-            evidence = dict(source=source, paths={key: str(path) for key, path in paths.items()}, hashes=hashes,
-                experiment=course.EXPERIMENT, global_steps_start=0, pool_digest=info['content_digest'])
-            with patch.dict(batch.provenance.BC, bc):
-                gate_args = course.batch_args(args, name, gate, info, None, gate_only=True)
-                train_args = course.batch_args(args, name, train, info, None, gate_report=gate)
-            gate_manifest = gate / 'manifest.json'
-            gate_summary = gate / 'batch_summary.json'
-            batch.atomic_json(gate_manifest, dict(plan=batch.plan(gate_args), inputs=evidence, batch_id='gate'))
-            batch.atomic_json(gate_summary, dict(execution_completed=True, mps_cleanup=dict(stopped=True),
-                                                 gate_bindings=[]))
-            gate_evidence = dict(root=str(gate), batch_id='gate', bindings=[],
-                manifest_sha256=batch.file_hash(gate_manifest), summary_sha256=batch.file_hash(gate_summary))
-            batch.atomic_json(train / 'manifest.json', dict(plan=batch.plan(train_args), inputs=evidence,
-                                                           gate_evidence=gate_evidence))
-            records = []
-            pids = []
-            for job in batch.batch_jobs(train_args):
-                seed = job['seed']
-                worker = train / job['id']
-                init = dict(sha256=bc[model][1])
-                batch.atomic_json(worker / 'ready.json', dict(pid=seed, initialization=init))
-                pids.append(seed)
-                checkpoint = worker / 'model.pt'
-                checkpoint.write_text(f'easy {model} {seed}', encoding='utf-8')
-                scenarios = [dict(scenario_id=str(i), outcome='collision' if i == 0 and seed != winner_seed
-                                  else 'goal') for i in range(100)]
-                goal = 100 if seed == winner_seed else 99
-                counts = {outcome: 0 for outcome in course.OUTCOMES}
-                counts.update(goal=goal, collision=100-goal)
-                terminal = worker / 'terminal_evaluation.json'
-                batch.atomic_json(terminal, dict(actual_steps=160000, formal_passed=True, checkpoint=str(checkpoint),
-                    checkpoint_sha256=batch.file_hash(checkpoint), evaluation=dict(scenarios=scenarios, goal_count=goal)))
-                episodes = worker / 'metrics_reports' / 'episodes.jsonl'
-                episodes.parent.mkdir()
-                episodes.write_text(json.dumps(dict(episode=1, stage_steps=160000, episode_length=160000,
-                                                    outcome='goal')) + '\n', encoding='utf-8')
-                records.append(dict(model=model, stage='easy', seed=seed, steps=160000, execution_completed=True,
-                    formal_passed=True, checkpoint=str(checkpoint), checkpoint_sha256=batch.file_hash(checkpoint),
-                    terminal_evaluation=str(terminal), initialization=init, **counts,
-                    last_50k=dict(from_step_exclusive=110000, through_step=160000, count=1, successes=1, success_rate=1.)))
-            batch.atomic_json(train / 'batch_summary.json', dict(execution_completed=True, mps_cleanup=dict(stopped=True),
-                  formal_passed={job['id']: True for job in batch.batch_jobs(train_args)}))
-            batch.atomic_json(train / 'release.json', dict(pids=pids))
-            winner = course.select_winner(records)
-            (directory / 'winner.pt').write_bytes(Path(winner['checkpoint']).read_bytes())
-            batch.atomic_json(directory / 'selection.json', dict(status='promoted', candidates=records,
-                winner=dict(winner, checkpoint=str(directory / 'winner.pt'), candidate_checkpoint=winner['checkpoint'])))
+            self.write_historical_batch_fixture(args, archive, pools, bc, f'easy-{model}', winner_seed,
+                                                course.SOURCE_MANIFEST, course.HISTORICAL_HEAD)
         return args, archive, pools, bc
+
+    def write_historical_batch_fixture(self, args, archive, pools, bc, name, winner_seed,
+                                       source_manifest, head, parent=None):
+        stage, model = name.split('-')
+        baseline = course.read_json(batch.CONFIG)
+        source = dict(HEAD=head, sha256=course.read_json(source_manifest)['sha256'])
+        directory = archive / 'batches' / name
+        attempt = directory / 'attempt-000001'
+        info = pools['validation'][stage]
+        gate, train = attempt / 'gate', attempt / 'train'
+        paths = dict(pool=Path(info['path']), config=batch.CONFIG, experiment_config=batch.GUIDANCE_CONFIG,
+                     source_manifest=source_manifest)
+        hashes = {key: batch.source_hash(path) for key, path in paths.items() if key != 'pool'}
+        hashes['pool'] = info['sha256']
+        for kind, (relative, digest) in bc.items():
+            paths[kind + '_bc'] = args.input_root / relative
+            hashes[kind + '_bc'] = digest
+            paths[kind + '_stage_start'] = Path(baseline[kind]['stage_start_server']).resolve()
+            hashes[kind + '_stage_start'] = baseline[kind]['stage_start_sha256']
+        if parent is not None:
+            paths['parent'] = Path(parent['checkpoint'])
+            hashes['parent'] = parent['checkpoint_sha256']
+        start = 0 if parent is None else parent['steps']
+        evidence = dict(source=source, paths={key: str(path) for key, path in paths.items()}, hashes=hashes,
+            experiment=course.EXPERIMENT, global_steps_start=start, pool_digest=info['content_digest'])
+        with patch.dict(batch.provenance.BC, bc):
+            gate_args = course.batch_args(args, name, gate, info, parent, gate_only=True)
+            train_args = course.batch_args(args, name, train, info, parent, gate_report=gate)
+        gate_manifest = gate / 'manifest.json'
+        gate_summary = gate / 'batch_summary.json'
+        batch.atomic_json(gate_manifest, dict(plan=batch.plan(gate_args), inputs=evidence, batch_id='gate'))
+        batch.atomic_json(gate_summary, dict(execution_completed=True, mps_cleanup=dict(stopped=True),
+                                             gate_bindings=[]))
+        gate_evidence = dict(root=str(gate), batch_id='gate', bindings=[],
+            manifest_sha256=batch.file_hash(gate_manifest), summary_sha256=batch.file_hash(gate_summary))
+        batch.atomic_json(train / 'manifest.json', dict(plan=batch.plan(train_args), inputs=evidence,
+                                                       gate_evidence=gate_evidence))
+        records = []
+        pids = []
+        for job in batch.batch_jobs(train_args):
+            seed = job['seed']
+            worker = train / job['id']
+            init = (batch.initialization_binding(job, evidence) if parent is not None else dict(sha256=bc[model][1]))
+            batch.atomic_json(worker / 'ready.json', dict(pid=seed, initialization=init))
+            pids.append(seed)
+            passed = winner_seed is not None
+            checkpoint = worker / ('model.pt' if passed else 'model_failed.pt')
+            checkpoint.write_text(f'{stage} {model} {seed}', encoding='utf-8')
+            scenarios = [dict(scenario_id=str(i), outcome='collision' if i == 0 and seed != winner_seed
+                              else 'goal') for i in range(100)]
+            goal = 100 if seed == winner_seed else 99
+            counts = {outcome: 0 for outcome in course.OUTCOMES}
+            counts.update(goal=goal, collision=100-goal)
+            terminal = worker / 'terminal_evaluation.json'
+            batch.atomic_json(terminal, dict(actual_steps=160000, formal_passed=passed, checkpoint=str(checkpoint),
+                checkpoint_sha256=batch.file_hash(checkpoint), evaluation=dict(scenarios=scenarios, goal_count=goal)))
+            episodes = worker / 'metrics_reports' / 'episodes.jsonl'
+            episodes.parent.mkdir()
+            episodes.write_text(json.dumps(dict(episode=1, stage_steps=160000, episode_length=160000,
+                                                outcome='goal')) + '\n', encoding='utf-8')
+            records.append(dict(model=model, stage=stage, seed=seed, steps=160000, execution_completed=True,
+                formal_passed=passed, checkpoint=str(checkpoint), checkpoint_sha256=batch.file_hash(checkpoint),
+                terminal_evaluation=str(terminal), initialization=init, **counts,
+                last_50k=dict(from_step_exclusive=110000, through_step=160000, count=1, successes=1, success_rate=1.)))
+        batch.atomic_json(train / 'batch_summary.json', dict(execution_completed=True, mps_cleanup=dict(stopped=True),
+              formal_passed={job['id']: winner_seed is not None for job in batch.batch_jobs(train_args)}))
+        batch.atomic_json(train / 'release.json', dict(pids=pids))
+        winner = course.select_winner(records)
+        if winner is not None:
+            (directory / 'winner.pt').write_bytes(Path(winner['checkpoint']).read_bytes())
+        batch.atomic_json(directory / 'selection.json', course.promoted_selection(directory, records, winner))
 
     @staticmethod
     @contextmanager
     def mock_historical_inputs(pools, bc):
-        by_path = {Path(info['path']): info for levels in pools.values() for info in levels.values()}
         baseline = course.read_json(batch.CONFIG)
         stage_starts = {Path(value['stage_start_server']): value['stage_start_sha256']
                         for value in (baseline[model] for model in course.MODELS)}
@@ -257,7 +364,7 @@ class FormalCourseTests(unittest.TestCase):
 
         def load_pool(path, **kwargs):
             # Restoring the published copies still uses the original scenario identities.
-            info = by_path[path]
+            info = pools[path.parent.name][kwargs['expected_level']]
             return SimpleNamespace(scenarios=course.read_json(path)['scenarios'],
                 master_seed=info['master_seed'], stage_seed=info['stage_seed'], content_digest=info['content_digest'])
 
@@ -595,6 +702,61 @@ class FormalCourseTests(unittest.TestCase):
                 selection.write_text('changed selection', encoding='utf-8')
                 with self.assertRaisesRegex(ValueError, 'Frozen winner selection changed'):
                     course._run_locked(args)
+
+    def test_periodic_snapshot_and_evaluation_use_actual_acc_episode_end(self):
+        from brain_uav.config import ScenarioConfig
+        from brain_uav.trainers.v2_formal_training import V2FormalStageTrainer, load_v2_periodic_snapshot
+
+        threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        self.addCleanup(torch.set_num_threads, threads)
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scenario = ScenarioConfig(max_steps=2)
+
+            def unblocked_bc_scene(index, zone_count):
+                payload = make_scenario_payload(index, zone_count)
+                payload['metadata']['requested_direct_path_blocker'] = False
+                return payload
+
+            with patch('test_v2_bc.make_scenario_payload', side_effect=unblocked_bc_scene):
+                cluster = write_cluster(root / 'cluster', scenario_config=scenario, zone_counts=(0, 0, 0, 0))
+            train_v2_behavior_cloning(trajectory_cluster=cluster, output_dir=root / 'bc', epochs=1,
+                batch_size=2, validation_fraction=.25, model='snn', device='cpu')
+            pool = root / 'pool.json'
+            save_v2_validation_pool(pool, generate_v2_validation_pool(scenario, 'easy',
+                scenario_count=1, master_seed=123))
+            run = V2FormalStageTrainer.run
+
+            def run_near_snapshot(trainer):
+                trainer.result.stage_steps = 24999
+                return run(trainer)
+
+            with patch.object(V2FormalStageTrainer, 'run', run_near_snapshot):
+                single_stage.run_v2_td3_stage(stage='easy', model='snn', acc_eta=.01, device='cpu',
+                    init_checkpoint=root / 'bc' / 'bc_v2_snn_best.pt', output=root / 'model.pt',
+                    metrics_out=root / 'metrics.json', validation_pool=pool, validation_scenario_count=1,
+                    validation_max_failures=0, max_stage_steps=25001, global_steps_start=100, periodic_snapshot_interval_steps=25000)
+            saved = root / 'model_periodic' / 'step_000025000.pt'
+            payload = load_v2_periodic_snapshot(saved, expected_stage='easy', expected_model_type='snn')
+            self.assertEqual((payload['scheduled_stage_steps'], payload['stage_steps']), (25000, 25001))
+            controller = payload['acc_state']['controller']
+            self.assertEqual([row['stage_steps'] for row in controller['controls']], [25001])
+            self.assertEqual([row['step'] for row in controller['episodes'][0]], [25000, 25001])
+            record = json.loads((root / 'metrics_reports' / 'periodic_validation.jsonl').read_text(encoding='utf-8'))
+            self.assertEqual((record['scheduled_stage_steps'], record['stage_steps'], record['global_steps']),
+                             (25000, 25001, 25101))
+            old = payload.copy()
+            del old['scheduled_stage_steps']
+            legacy_file = root / 'legacy_periodic.pt'
+            torch.save(old, legacy_file)
+            self.assertEqual(load_v2_periodic_snapshot(legacy_file)['stage_steps'], 25001)
+            with self.assertRaisesRegex(ValueError, 'scheduled step exceeds'):
+                load_v2_periodic_snapshot(dict(payload, scheduled_stage_steps=25002))
+            controller['controls'][0]['stage_steps'] = 25002
+            controller['last_adjust'] = 25002
+            with self.assertRaisesRegex(ValueError, 'Invalid ACC update interval'):
+                load_v2_periodic_snapshot(payload)
 
     def test_real_workers_build_all_child_seeds_from_the_selected_actor(self):
         threads = torch.get_num_threads()

@@ -794,11 +794,12 @@ def run_v2_td3_stage(
         # section 6.1). Deliberately separate from `output_path`/`validate`
         # above: this never calls record_validation and is never accepted
         # as a stage predecessor by load_v2_formal_checkpoint.
-        def periodic_snapshot_sink(stage_steps: int) -> None:
+        def periodic_snapshot_sink(scheduled_step: int, stage_steps: int) -> None:
             payload = build_v2_periodic_snapshot(
                 components.engine,
                 config,
                 stage_steps=stage_steps,
+                scheduled_stage_steps=scheduled_step,
                 scenario=scenario_config,
                 rewards=reward_config,
                 uav_collision_radius=effective_uav_collision_radius,
@@ -807,15 +808,15 @@ def run_v2_td3_stage(
                 bc_final_drop_step=bc_final_drop_step,
                 bc_schedule=bc_schedule,
             )
-            snapshot_path = periodic_snapshot_dir / f'step_{stage_steps:09d}.pt'
+            snapshot_path = periodic_snapshot_dir / f'step_{scheduled_step:09d}.pt'
             save_v2_periodic_snapshot(snapshot_path, payload)
             print(
                 f"[V2 {model.upper()} {stage}] periodic snapshot "
-                f"stage_steps={stage_steps} path={snapshot_path}",
+                f"scheduled_stage_steps={scheduled_step} stage_steps={stage_steps} path={snapshot_path}",
                 flush=True,
             )
 
-        def periodic_validation_sink(stage_steps: int) -> None:
+        def periodic_validation_sink(scheduled_step: int, stage_steps: int) -> None:
             result = evaluate_v2_fixed_validation(
                 components.engine.actor,
                 pool,
@@ -827,6 +828,7 @@ def run_v2_td3_stage(
             )
             if reporter is not None:
                 record = dict(result.to_dict())
+                record['scheduled_stage_steps'] = scheduled_step
                 record['stage_steps'] = stage_steps
                 record['global_steps'] = global_steps_start + stage_steps
                 reporter.record_periodic_validation(record)

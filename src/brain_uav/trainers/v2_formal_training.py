@@ -1349,10 +1349,10 @@ class V2FormalStageTrainer:
         bc_final_drop_step: int = 300_000,
         bc_schedule: str = 'default',
         periodic_snapshot_interval_steps: int | None = None,
-        periodic_snapshot_sink: Callable[[int], None] | None = None,
+        periodic_snapshot_sink: Callable[[int, int], None] | None = None,
         weight_snapshot_steps: tuple[int, ...] = (),
         weight_snapshot_sink: Callable[[int, int], None] | None = None,
-        periodic_validation_sink: Callable[[int], None] | None = None,
+        periodic_validation_sink: Callable[[int, int], None] | None = None,
         cpu_deduplication: bool = True,
         online_research=None,
     ) -> None:
@@ -1823,9 +1823,9 @@ class V2FormalStageTrainer:
                 ):
                     periodic_step = self._next_periodic_step
                     if self.periodic_snapshot_sink is not None:
-                        self.periodic_snapshot_sink(periodic_step)
+                        self.periodic_snapshot_sink(periodic_step, self.result.stage_steps)
                     if self.periodic_validation_sink is not None:
-                        self.periodic_validation_sink(periodic_step)
+                        self.periodic_validation_sink(periodic_step, self.result.stage_steps)
                     self._next_periodic_step += self.periodic_snapshot_interval_steps
                 if self.online_research is not None:
                     self.online_research.boundary(self)
@@ -1971,6 +1971,7 @@ def build_v2_periodic_snapshot(
     initialization_source: Mapping[str, Any],
     bc_final_drop_step: int = 300_000,
     bc_schedule: str = 'default',
+    scheduled_stage_steps: int | None = None,
 ) -> dict[str, Any]:
     """Build one non-terminal, purely observational mid-stage snapshot (C1).
 
@@ -2013,6 +2014,8 @@ def build_v2_periodic_snapshot(
         ),
         'initialization_source': _strict_json_copy(initialization_source),
     }
+    if scheduled_stage_steps is not None:
+        payload['scheduled_stage_steps'] = scheduled_stage_steps
     if model_type == 'snn':
         payload['model_type'] = 'snn'
     from .v2_formal_acc import save_state
@@ -2059,7 +2062,7 @@ def load_v2_periodic_snapshot(
     expected_fields = (
         _SNN_PERIODIC_SNAPSHOT_FIELDS if model_type == 'snn' else _PERIODIC_SNAPSHOT_FIELDS
     )
-    if set(payload) != expected_fields | ({'acc_state'} if payload.get('formal_config',{}).get('acc_eta') is not None else set()):
+    if set(payload) - {'scheduled_stage_steps'} != expected_fields | ({'acc_state'} if payload.get('formal_config',{}).get('acc_eta') is not None else set()):
         raise ValueError('Periodic V2 snapshot has missing or unknown fields.')
     if expected_model_type is not None:
         if expected_model_type not in ('ann', 'snn'):
@@ -2071,7 +2074,11 @@ def load_v2_periodic_snapshot(
         raise ValueError('Periodic V2 snapshot stage is invalid.')
     if expected_stage is not None and stage != expected_stage:
         raise ValueError('Periodic V2 snapshot stage is incompatible.')
-    _nonnegative_int(payload['stage_steps'], name='stage_steps')
+    steps = _nonnegative_int(payload['stage_steps'], name='stage_steps')
+    if 'scheduled_stage_steps' in payload:
+        scheduled = _positive_int(payload['scheduled_stage_steps'], name='scheduled_stage_steps')
+        if scheduled > steps:
+            raise ValueError('Periodic V2 snapshot scheduled step exceeds the actual stage step.')
     engine_payload = payload['engine_checkpoint']
     expected_engine_format = (
         V2_TD3_CHECKPOINT_FORMAT if model_type == 'ann' else V2_SNN_TD3_CHECKPOINT_FORMAT

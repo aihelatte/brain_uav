@@ -73,7 +73,7 @@ cd "$checkout" && run_course
 
 ## 从 `v2_course_e6bc9be` 续跑
 
-续跑入口使用 `--resume-from`。旧目录固定为 `/home/zj/diagnostics/outputs/v2_course_e6bc9be`，新结果目录示例为 `/home/zj/diagnostics/outputs/v2_course_e6bc9be_resume_<时间戳>`。`5574972` 上的动作图预热修复及续跑入口由 `scripts/v2_formal_course_resume_source.json` 封存。历史 `scripts/v2_formal_course_source.json` 保留用于核对原课程，原 checkout 可沿用它。
+续跑入口使用 `--resume-from`。旧目录固定为 `/home/zj/diagnostics/outputs/v2_course_e6bc9be`，新结果目录示例为 `/home/zj/diagnostics/outputs/v2_course_e6bc9be_resume_<时间戳>`。`144e518` 的原续跑版本由 `scripts/v2_formal_course_resume_source.json` 封存。本 checkout 新训练使用 `scripts/v2_formal_course_snapshot_resume_source.json`。历史 `scripts/v2_formal_course_source.json` 保留用于核对原课程，原 checkout 可沿用它。
 
 启动前按 `e6bc9be` 的 `course.json`、原门控和训练清单、逐 seed 终态及回合记录复核两批 easy，重新核对晋级排名以及 `winner.pt` 和对应候选的 SHA256。`resume_source.json` 保存旧课程、旧池清单、原门控及训练清单、原选优记录和两个胜者的来源。新目录按原字节复制胜者和六份场景池。场景池核对字节哈希、内容摘要、种子与场景契约，沿用晋级和独立场景互斥检查。续跑读旧目录中的封存产物，并使用原 BC 和 `stage_start.json` 作为核验输入。
 
@@ -120,6 +120,43 @@ cd "$checkout" && resume_course
 ```
 
 续跑每次复核来源及新目录内的副本。已完成且核验通过的新批次沿用原收集与恢复流程。旧目录里若有失败的 `medium-ann`，它的日志留在旧目录，本次尝试从新目录的 `attempt-000001` 开始。
+
+## 从 `144e518` 的 medium ANN 完成处继续
+
+将 `prior` 设为实际使用 `144e518` 的续跑结果目录，即包含 `batches/medium-ann/selection.json` 的课程根目录。入口从该目录的 `course.json` 找到原 `e6bc9be` 课程，两个旧目录都只读。它核对三批共 12 个候选、旧门控及输入身份、场景池与选优记录。`medium-ann` 如有胜者，会复制到新目录供 hard ANN 使用。原结果若为 `no_formal_pass`，ANN 保持止步于 medium，SNN 继续。首个新批次为 `medium-snn`，使用 SNN easy 胜者，重新执行 CUDA 门控及 seed 7、11、23、41。原 `medium-snn` 如果有遗留进程，须先由既有只读检查确认已退出。
+
+新 `course.json` 和新门控使用 `scripts/v2_formal_course_snapshot_resume_source.json`。`resume_source.json` 同时记录两个旧阶段来源，包括 `medium-ann` 的原 `selection.json` 摘要与晋级状态。周期快照文件名仍用计划步数，内容和周期评估里的 `scheduled_stage_steps` 用于对齐索引，`stage_steps` 记录实际采集或评估步数，评估的 `global_steps` 同样对应实际步数。旧版可读快照仍可使用当前加载器。
+
+审查并推送后，把 `REVIEWED_COMMIT` 和 `prior` 填成实际值。中断后在同一个 checkout 和 `root` 上重跑 `resume_course`。
+
+```bash
+REVIEWED_COMMIT='填入审查后已推送的提交'
+prior='/home/zj/diagnostics/outputs/填入144e518续跑结果目录名'
+stamp=$(date +%Y%m%d_%H%M%S_%N)
+root="/home/zj/diagnostics/outputs/v2_course_snapshot_resume_$stamp"
+checkout="/home/zj/diagnostics/my_project_formal_course_snapshot_resume_$stamp"
+runner=(/home/zj/envs/uav_torch/bin/python -u -B -m brain_uav.scripts.run_v2_formal_course)
+resume_args=(--root "$root" --resume-from "$prior" --resume-after-medium-ann)
+resume_course() {
+  local start rc
+  start=$(date +%s)
+  printf 'Total result directory: %s\n' "$root"
+  if PYTHONPATH=src "${runner[@]}" "${resume_args[@]}" --run 2>&1 | tee -a "$root.driver.log"; then
+    rc=${PIPESTATUS[0]}
+  else
+    rc=${PIPESTATUS[0]}
+  fi
+  printf 'exit_code=%s\nprocess_wall_seconds=%s\n' "$rc" "$(( $(date +%s)-start ))" | tee -a "$root.driver.log"
+  return "$rc"
+}
+test -s "$prior/batches/medium-ann/selection.json" &&
+  git clone --single-branch --branch multi-nfz-training https://github.com/aihelatte/brain_uav.git "$checkout" &&
+  cd "$checkout" && git checkout --detach "$REVIEWED_COMMIT" &&
+  PYTHONPATH=src "${runner[@]}" "${resume_args[@]}" &&
+  resume_course
+```
+
+查看进度用 `PYTHONPATH=src "${runner[@]}" --root "$root" --status`。
 
 ## 结果目录
 

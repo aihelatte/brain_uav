@@ -810,12 +810,12 @@ class TestTrainV2TD3CLI(unittest.TestCase):
                 'brain_uav.scripts.train_v2_td3._write_strict_json'
             ) as metrics_writer:
                 def finish_training():
-                    trainer_type.call_args.kwargs['periodic_snapshot_sink'](10)
+                    trainer_type.call_args.kwargs['periodic_snapshot_sink'](10, 11)
                     with mock.patch('brain_uav.scripts.train_v2_td3.evaluate_v2_fixed_validation') as validate:
                         validate.return_value.to_dict.return_value = {}
                         trainer_type.call_args.kwargs['validation_runner'](actor)
                         self.assertTrue(validate.call_args.kwargs['cpu_deduplication'])
-                        trainer_type.call_args.kwargs['periodic_validation_sink'](10)
+                        trainer_type.call_args.kwargs['periodic_validation_sink'](10, 11)
                         self.assertTrue(validate.call_args.kwargs['cpu_deduplication'])
                     return result
 
