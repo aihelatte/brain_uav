@@ -71,6 +71,56 @@ find "$root/batches" -name '*.log' -print
 cd "$checkout" && run_course
 ```
 
+## 从 `v2_course_e6bc9be` 续跑
+
+续跑入口使用 `--resume-from`。旧目录固定为 `/home/zj/diagnostics/outputs/v2_course_e6bc9be`，新结果目录示例为 `/home/zj/diagnostics/outputs/v2_course_e6bc9be_resume_<时间戳>`。`5574972` 上的动作图预热修复及续跑入口由 `scripts/v2_formal_course_resume_source.json` 封存。历史 `scripts/v2_formal_course_source.json` 保留用于核对原课程，原 checkout 可沿用它。
+
+启动前按 `e6bc9be` 的 `course.json`、原门控和训练清单、逐 seed 终态及回合记录复核两批 easy，重新核对晋级排名以及 `winner.pt` 和对应候选的 SHA256。`resume_source.json` 保存旧课程、旧池清单、原门控及训练清单、原选优记录和两个胜者的来源。新目录按原字节复制胜者和六份场景池。场景池核对字节哈希、内容摘要、种子与场景契约，沿用晋级和独立场景互斥检查。续跑读旧目录中的封存产物，并使用原 BC 和 `stage_start.json` 作为核验输入。
+
+新目录的两批 `selection.json` 保留 8 个历史 easy 候选，最终 `training.csv` 仍保留这 8 行。`medium-ann` 首先运行新的正式 CUDA 门控，四个 seed 从导入的 ANN 胜者重新起跑。`medium-snn` 使用导入的 SNN 胜者。后续仍按原规则晋级 hard，两个模型均晋级后做独立评估。
+
+把 `REVIEWED_COMMIT` 填成续跑改动经审查后已推送的提交。第一段拉取到新 checkout，第二段输出计划并执行。`--resume-from` 的池来源是旧课程的封存目录。
+
+```bash
+REVIEWED_COMMIT='填入审查后已推送的续跑提交'
+stamp=$(date +%Y%m%d_%H%M%S_%N)
+old=/home/zj/diagnostics/outputs/v2_course_e6bc9be
+root="/home/zj/diagnostics/outputs/v2_course_e6bc9be_resume_$stamp"
+checkout="/home/zj/diagnostics/my_project_formal_course_resume_$stamp"
+git clone --single-branch --branch multi-nfz-training https://github.com/aihelatte/brain_uav.git "$checkout" &&
+  cd "$checkout" && git checkout --detach "$REVIEWED_COMMIT"
+```
+
+```bash
+runner=(/home/zj/envs/uav_torch/bin/python -u -B -m brain_uav.scripts.run_v2_formal_course)
+resume_course() {
+  local start rc
+  start=$(date +%s)
+  printf 'Total result directory: %s\n' "$root"
+  if PYTHONPATH=src "${runner[@]}" --root "$root" --resume-from "$old" --run 2>&1 | tee -a "$root.driver.log"; then
+    rc=${PIPESTATUS[0]}
+  else
+    rc=${PIPESTATUS[0]}
+  fi
+  printf 'exit_code=%s\nprocess_wall_seconds=%s\n' "$rc" "$(( $(date +%s)-start ))" | tee -a "$root.driver.log"
+  return "$rc"
+}
+cd "$checkout" &&
+  PYTHONPATH=src "${runner[@]}" --root "$root" --resume-from "$old" &&
+  resume_course
+```
+
+```bash
+# 查看进度
+cd "$checkout" && PYTHONPATH=src "${runner[@]}" --root "$root" --status
+tail -n 60 "$root.driver.log"
+
+# 中断后继续。新终端先恢复上次的 checkout、root、old、runner 和函数定义。
+cd "$checkout" && resume_course
+```
+
+续跑每次复核来源及新目录内的副本。已完成且核验通过的新批次沿用原收集与恢复流程。旧目录里若有失败的 `medium-ann`，它的日志留在旧目录，本次尝试从新目录的 `attempt-000001` 开始。
+
 ## 结果目录
 
 - `course.json` 保存 24 组实际解析配置和 BC 哈希。 `pools.json` 保存六份池的身份。

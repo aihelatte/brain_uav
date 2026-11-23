@@ -1,4 +1,7 @@
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+import csv
 from hashlib import sha256
+from io import StringIO
 import json
 import os
 from pathlib import Path
@@ -30,7 +33,254 @@ from test_v2_static_no_fly_env import _scenario
 class FormalCourseTests(unittest.TestCase):
     def test_course_source_manifest_covers_current_sources(self):
         self.assertEqual(batch.identity(course.EXPERIMENT)['sha256'],
-                         course.read_json(course.SOURCE_MANIFEST)['sha256'])
+                         course.read_json(course.RESUME_SOURCE_MANIFEST)['sha256'])
+        self.assertEqual(batch.source_hash(course.SOURCE_MANIFEST),
+                         '0065294ddba0e8593a025eaf6819fbf5e691f774e184529d560a8c597ffebce1')
+
+    def test_resume_plan_keeps_easy_in_course_and_starts_training_at_medium_ann(self):
+        with TemporaryDirectory() as tmp:
+            old = Path(tmp) / 'historical'
+            root = Path(tmp) / 'continuation'
+            with redirect_stdout(StringIO()) as output:
+                self.assertEqual(course.main(['--root', str(root), '--resume-from', str(old)]), 0)
+            plan = json.loads(output.getvalue())
+            self.assertEqual(plan['resume_from'], str(old.resolve()))
+            self.assertEqual(plan['reuse_batches'], ['easy-ann', 'easy-snn'])
+            self.assertEqual(plan['first_training_batch'], 'medium-ann')
+            self.assertEqual(len(plan['batches']), 6)
+            self.assertFalse(root.exists())
+            with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+                course.main(['--root', str(old / 'nested'), '--resume-from', str(old)])
+            self.assertFalse(old.exists())
+
+    def test_historical_easy_import_and_restart_use_formal_batch_path(self):
+        with TemporaryDirectory() as tmp:
+            fixture = self.historical_course_fixture(Path(tmp).resolve())
+            args, archive, archive_pools, old_bc = fixture
+            archived_files = {path: batch.file_hash(path) for path in archive.rglob('*') if path.is_file()}
+            launched = []
+            interrupted = False
+            child_batches = ('medium-ann', 'medium-snn', 'hard-ann', 'hard-snn')
+
+            def launch(namespace):
+                nonlocal interrupted
+                launched.append((namespace.batch, namespace.root.parent.name, namespace.root.name))
+                stage, model = namespace.batch.split('-')
+                parent_stage = course.PREDECESSOR[stage]
+                self.assertEqual(namespace.parent, args.root / 'batches' / f'{parent_stage}-{model}' / 'winner.pt')
+                self.assertEqual(namespace.parent_sha256, batch.file_hash(namespace.parent))
+                self.assertEqual(namespace.source_manifest, course.RESUME_SOURCE_MANIFEST)
+                self.assertEqual([job['seed'] for job in batch.batch_jobs(namespace)], list(course.SEEDS))
+                pool_info = archive_pools['validation'][stage]
+                self.assertEqual(namespace.validation_pool.parent, args.root / 'pools' / 'validation')
+                self.assertEqual(batch.file_hash(namespace.validation_pool), pool_info['sha256'])
+                failure = namespace.batch == 'medium-snn' and not namespace.gate_only and not interrupted
+                batch.atomic_json(namespace.root / 'batch_summary.json', dict(
+                    execution_completed=not failure, mps_cleanup=dict(stopped=True)))
+                if failure:
+                    interrupted = True
+                    raise RuntimeError('simulated interruption')
+
+            actual_collect = course.collect_batch
+
+            def collect(namespace, pool, evidence, **kwargs):
+                if namespace.batch.startswith('easy'):
+                    return actual_collect(namespace, pool, evidence, **kwargs)
+                stage, model = namespace.batch.split('-')
+                rows = []
+                for seed in course.SEEDS:
+                    path = namespace.root / f'{seed}.pt'
+                    path.write_text(f'{stage} {model} {seed}', encoding='utf-8')
+                    rows.append(dict(stage=stage, model=model, seed=seed, execution_completed=True,
+                        formal_passed=True, checkpoint=str(path), checkpoint_sha256=batch.file_hash(path),
+                        goal=100, collision=0, initialization=dict(sha256=namespace.parent_sha256),
+                        last_50k=dict(successes=1, count=1, success_rate=1.)))
+                return rows
+
+            with (self.mock_historical_inputs(archive_pools, old_bc),
+                  patch.object(batch, 'launch', side_effect=launch),
+                  patch.object(batch, 'inputs', return_value={}),
+                  patch.object(course, 'collect_batch', side_effect=collect),
+                  patch.object(course, 'evaluate_winners', return_value=[]) as evaluate):
+                with self.assertRaisesRegex(RuntimeError, 'simulated interruption'):
+                    course._run_locked(args)
+                evaluate.assert_not_called()
+                self.assertEqual(course._run_locked(args), 0)
+                evaluate.assert_called_once()
+                self.assertEqual(course._run_locked(args), 0)
+            expected_batches = [(child_batches[0], 'attempt-000001'), (child_batches[1], 'attempt-000001'),
+                (child_batches[1], 'attempt-000002'), (child_batches[2], 'attempt-000001'),
+                (child_batches[3], 'attempt-000001')]
+            self.assertEqual(launched, [(name, attempt, phase) for name, attempt in expected_batches
+                                        for phase in ('gate', 'train')])
+            receipt = course.read_json(args.root / 'resume_source.json')
+            self.assertEqual(receipt['root'], str(archive))
+            self.assertEqual(receipt['HEAD'], course.HISTORICAL_HEAD)
+            for model, seed in (('ann', 23), ('snn', 11)):
+                imported = args.root / 'batches' / f'easy-{model}'
+                selection = course.read_json(imported / 'selection.json')
+                self.assertEqual(selection['winner']['seed'], seed)
+                self.assertEqual((imported / 'winner.pt').read_text(), f'easy {model} {seed}')
+                self.assertEqual(batch.file_hash(imported / 'winner.pt'), receipt['easy'][model]['winner_sha256'])
+                self.assertFalse(list(imported.glob('attempt-*')))
+            with (args.root / 'training.csv').open(encoding='utf-8', newline='') as stream:
+                rows = list(csv.DictReader(stream))
+            self.assertEqual(len(rows), 24)
+            self.assertEqual([(row['model'], int(row['seed']), int(row['goal'])) for row in rows
+                              if row['stage'] == 'easy' and row['winner'] == 'True'],
+                             [('ann', 23, 100), ('snn', 11, 100)])
+            self.assertEqual({path: batch.file_hash(path) for path in archive.rglob('*') if path.is_file()},
+                             archived_files)
+
+    def test_historical_tampering_blocks_before_any_new_batch(self):
+        for corruption, message in (
+                ('winner', 'Historical easy winner SHA256'), ('pool', 'Locked pool changed'),
+                ('selection', 'Historical easy promotion differs')):
+            with self.subTest(corruption=corruption), TemporaryDirectory() as tmp:
+                args, archive, pools, old_bc = self.historical_course_fixture(Path(tmp).resolve())
+                if corruption == 'winner':
+                    (archive / 'batches' / 'easy-snn' / 'winner.pt').write_bytes(b'changed winner')
+                elif corruption == 'pool':
+                    Path(pools['independent']['hard']['path']).write_bytes(b'changed pool')
+                else:
+                    path = archive / 'batches' / 'easy-ann' / 'selection.json'
+                    selection = course.read_json(path)
+                    selection['candidates'][0]['goal'] -= 1
+                    batch.atomic_json(path, selection)
+                with (self.mock_historical_inputs(pools, old_bc), patch.object(batch, 'launch') as launch):
+                    with self.assertRaisesRegex(ValueError, message):
+                        course._run_locked(args)
+                    launch.assert_not_called()
+                self.assertFalse((args.root / 'batches').exists())
+
+    def historical_course_fixture(self, workspace):
+        archive = workspace / 'historical'
+        args = SimpleNamespace(root=workspace / 'continued', resume_from=archive,
+            input_root=workspace / 'inputs', source_manifest=course.RESUME_SOURCE_MANIFEST,
+            timeout=30., gate_timeout=10.)
+        bc = {}
+        for model in course.MODELS:
+            relative = Path(f'{model}.pt')
+            path = args.input_root / relative
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(f'BC {model}', encoding='utf-8')
+            bc[model] = (relative, batch.file_hash(path))
+        source = dict(HEAD=course.HISTORICAL_HEAD, sha256=course.read_json(course.SOURCE_MANIFEST)['sha256'])
+        batch.atomic_json(archive / 'course.json', dict(experiment=course.EXPERIMENT, code=source['sha256'],
+            bc={model: value[1] for model, value in bc.items()}, plan=course.course_plan(archive)))
+        pools = {}
+        for partition, master_seed in (('validation', course.VALIDATION_SEED), ('independent', course.INDEPENDENT_SEED)):
+            pools[partition] = {}
+            for stage in course.V2_TD3_STAGES:
+                path = archive / 'pools' / partition / f'v2_validation_{stage}.json'
+                payload = [dict(scenario_id=str(i), payload=dict(state=[0, 0, 10, 0, 0],
+                    goal=[master_seed, (1 + list(course.V2_TD3_STAGES).index(stage)) * 100 + i, 10], zones=[]))
+                    for i in range(100)]
+                batch.atomic_json(path, dict(scenarios=payload))
+                digest = f'{partition}-{stage}'
+                pools[partition][stage] = dict(path=str(path), sha256=batch.file_hash(path),
+                    content_digest=digest, master_seed=master_seed, stage_seed=1)
+        batch.atomic_json(archive / 'pools.json', pools)
+        baseline = course.read_json(batch.CONFIG)
+        for model, winner_seed in (('ann', 23), ('snn', 11)):
+            name = f'easy-{model}'
+            directory = archive / 'batches' / name
+            attempt = directory / 'attempt-000001'
+            info = pools['validation']['easy']
+            gate, train = attempt / 'gate', attempt / 'train'
+            paths = dict(pool=Path(info['path']), config=batch.CONFIG, experiment_config=batch.GUIDANCE_CONFIG,
+                         source_manifest=course.SOURCE_MANIFEST)
+            hashes = {key: batch.source_hash(path) for key, path in paths.items() if key != 'pool'}
+            hashes['pool'] = info['sha256']
+            for kind, (relative, digest) in bc.items():
+                paths[kind + '_bc'] = args.input_root / relative
+                hashes[kind + '_bc'] = digest
+                paths[kind + '_stage_start'] = Path(baseline[kind]['stage_start_server']).resolve()
+                hashes[kind + '_stage_start'] = baseline[kind]['stage_start_sha256']
+            evidence = dict(source=source, paths={key: str(path) for key, path in paths.items()}, hashes=hashes,
+                experiment=course.EXPERIMENT, global_steps_start=0, pool_digest=info['content_digest'])
+            with patch.dict(batch.provenance.BC, bc):
+                gate_args = course.batch_args(args, name, gate, info, None, gate_only=True)
+                train_args = course.batch_args(args, name, train, info, None, gate_report=gate)
+            gate_manifest = gate / 'manifest.json'
+            gate_summary = gate / 'batch_summary.json'
+            batch.atomic_json(gate_manifest, dict(plan=batch.plan(gate_args), inputs=evidence, batch_id='gate'))
+            batch.atomic_json(gate_summary, dict(execution_completed=True, mps_cleanup=dict(stopped=True),
+                                                 gate_bindings=[]))
+            gate_evidence = dict(root=str(gate), batch_id='gate', bindings=[],
+                manifest_sha256=batch.file_hash(gate_manifest), summary_sha256=batch.file_hash(gate_summary))
+            batch.atomic_json(train / 'manifest.json', dict(plan=batch.plan(train_args), inputs=evidence,
+                                                           gate_evidence=gate_evidence))
+            records = []
+            pids = []
+            for job in batch.batch_jobs(train_args):
+                seed = job['seed']
+                worker = train / job['id']
+                init = dict(sha256=bc[model][1])
+                batch.atomic_json(worker / 'ready.json', dict(pid=seed, initialization=init))
+                pids.append(seed)
+                checkpoint = worker / 'model.pt'
+                checkpoint.write_text(f'easy {model} {seed}', encoding='utf-8')
+                scenarios = [dict(scenario_id=str(i), outcome='collision' if i == 0 and seed != winner_seed
+                                  else 'goal') for i in range(100)]
+                goal = 100 if seed == winner_seed else 99
+                counts = {outcome: 0 for outcome in course.OUTCOMES}
+                counts.update(goal=goal, collision=100-goal)
+                terminal = worker / 'terminal_evaluation.json'
+                batch.atomic_json(terminal, dict(actual_steps=160000, formal_passed=True, checkpoint=str(checkpoint),
+                    checkpoint_sha256=batch.file_hash(checkpoint), evaluation=dict(scenarios=scenarios, goal_count=goal)))
+                episodes = worker / 'metrics_reports' / 'episodes.jsonl'
+                episodes.parent.mkdir()
+                episodes.write_text(json.dumps(dict(episode=1, stage_steps=160000, episode_length=160000,
+                                                    outcome='goal')) + '\n', encoding='utf-8')
+                records.append(dict(model=model, stage='easy', seed=seed, steps=160000, execution_completed=True,
+                    formal_passed=True, checkpoint=str(checkpoint), checkpoint_sha256=batch.file_hash(checkpoint),
+                    terminal_evaluation=str(terminal), initialization=init, **counts,
+                    last_50k=dict(from_step_exclusive=110000, through_step=160000, count=1, successes=1, success_rate=1.)))
+            batch.atomic_json(train / 'batch_summary.json', dict(execution_completed=True, mps_cleanup=dict(stopped=True),
+                  formal_passed={job['id']: True for job in batch.batch_jobs(train_args)}))
+            batch.atomic_json(train / 'release.json', dict(pids=pids))
+            winner = course.select_winner(records)
+            (directory / 'winner.pt').write_bytes(Path(winner['checkpoint']).read_bytes())
+            batch.atomic_json(directory / 'selection.json', dict(status='promoted', candidates=records,
+                winner=dict(winner, checkpoint=str(directory / 'winner.pt'), candidate_checkpoint=winner['checkpoint'])))
+        return args, archive, pools, bc
+
+    @staticmethod
+    @contextmanager
+    def mock_historical_inputs(pools, bc):
+        by_path = {Path(info['path']): info for levels in pools.values() for info in levels.values()}
+        baseline = course.read_json(batch.CONFIG)
+        stage_starts = {Path(value['stage_start_server']): value['stage_start_sha256']
+                        for value in (baseline[model] for model in course.MODELS)}
+        file_hash = batch.file_hash
+
+        def load_pool(path, **kwargs):
+            # Restoring the published copies still uses the original scenario identities.
+            info = by_path[path]
+            return SimpleNamespace(scenarios=course.read_json(path)['scenarios'],
+                master_seed=info['master_seed'], stage_seed=info['stage_seed'], content_digest=info['content_digest'])
+
+        def hash_input(path):
+            path = Path(path)
+            return stage_starts[path] if path in stage_starts else file_hash(path)
+
+        def terminal(root, manifest, job, pool):
+            path = root / job['id'] / 'terminal_evaluation.json'
+            result = course.read_json(path)
+            if batch.file_hash(result['checkpoint']) != result['checkpoint_sha256']:
+                raise ValueError('Candidate checkpoint SHA256 differs')
+            return result
+
+        easy = pools['validation']['easy']
+        with (patch.dict(batch.provenance.BC, bc), patch.object(batch.provenance, 'DIGEST', easy['content_digest']),
+              patch.object(batch, 'POOL_SHA', easy['sha256']), patch.object(batch, 'file_hash', side_effect=hash_input),
+              patch.object(course, 'load_v2_validation_pool', side_effect=load_pool),
+              patch.object(batch, 'validate_terminal', side_effect=terminal),
+              patch.object(batch, 'gate_bindings', return_value=[]),
+              patch.object(course, 'generate_v2_validation_pool') as generate):
+            yield
+            generate.assert_not_called()
 
     def test_explicit_acc_is_available_across_formal_stages(self):
         for stage in ('easy', 'medium', 'hard'):

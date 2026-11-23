@@ -37,6 +37,8 @@ SEEDS = batch_runner.COURSE_SEEDS
 VALIDATION_SEED = 20260904
 INDEPENDENT_SEED = 20261121
 SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_source.json'
+RESUME_SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_resume_source.json'
+HISTORICAL_HEAD = 'e6bc9be6b1cd95ac5c23b370f373b7eb3050c6df'
 PREDECESSOR = dict(medium='easy', hard='medium')
 PROC_ROOT = Path('/proc')
 
@@ -140,7 +142,7 @@ def seal_copy(source, target, expected_hash):
         raise ValueError(f'Sealed copy differs from expected input: {target}')
 
 
-def prepare_pools(root, source_dir):
+def prepare_pools(root, source_dir, *, read_only=False):
     """Seal both partitions before the first CUDA gate."""
     specs = [resolve_course_job(batch_runner.jobs(EXPERIMENT, f'easy-{m}')[0])[0] for m in MODELS]
     if any(specs[0][key] != specs[1][key] for key in ('scenario_config', 'uav_collision_radius')):
@@ -148,20 +150,20 @@ def prepare_pools(root, source_dir):
     scenario = scenario_config_from_snapshot(specs[0]['scenario_config'])
     radius = specs[0]['uav_collision_radius']
     lock = root / 'pools.json'
-    saved = read_json(lock) if lock.exists() else None
+    saved = read_json(lock) if read_only or lock.exists() else None
     evidence, pools = {}, {}
     for partition, seed in (('validation', VALIDATION_SEED), ('independent', INDEPENDENT_SEED)):
         evidence[partition], pools[partition] = {}, {}
         for stage in V2_TD3_STAGES:
             name = f'v2_validation_{stage}.json'
             path = root / 'pools' / partition / name
-            source = source_dir / name
+            source = source_dir / name if not read_only else None
             if saved is not None and batch_runner.file_hash(path) != saved[partition][stage]['sha256']:
                 raise ValueError(f'Locked pool changed: {path}')
             if saved is None and partition == 'validation' and (stage == 'easy' or source.exists()):
                 expected = batch_runner.POOL_SHA if stage == 'easy' else batch_runner.file_hash(source)
                 seal_copy(source, path, expected)
-            if not path.exists():
+            if not read_only and not path.exists():
                 pool = generate_v2_validation_pool(scenario, stage, master_seed=seed,
                                                    uav_collision_radius=radius)
                 atomic_json(path, pool.to_dict())
@@ -175,7 +177,11 @@ def prepare_pools(root, source_dir):
     if original['sha256'] != batch_runner.POOL_SHA or original['content_digest'] != provenance.DIGEST:
         raise ValueError('Course easy requires the original safe-direct promotion pool.')
     require_disjoint_pools(pools['validation'], pools['independent'])
-    seal_json(lock, evidence)
+    if read_only:
+        if saved != evidence:
+            raise ValueError(f'Historical pool seal differs from the verified pools: {lock}')
+    else:
+        seal_json(lock, evidence)
     return evidence, pools
 
 
@@ -198,10 +204,12 @@ def counts_for_pool(evaluation, pool):
     return {label: labels[label] for label in OUTCOMES}
 
 
-def collect_batch(args, pool, evidence):
+def collect_batch(args, pool, evidence, *, historical_source=None):
     root = args.root
     manifest = read_json(root / 'manifest.json')
     status = read_json(root / 'batch_summary.json')
+    if historical_source is not None:
+        check_historical_easy_inputs(args, evidence, historical_source)
     expected_gate = batch_runner.validate_gate(args, evidence)
     expected_plan = batch_runner.plan(args)
     expected_plan['initialization_timeout'] = manifest['plan']['initialization_timeout']
@@ -233,8 +241,103 @@ def collect_batch(args, pool, evidence):
         records.append(record)
     if pids != set(read_json(root / 'release.json')['pids']) or len(pids) != len(SEEDS):
         raise ValueError('Training release PIDs differ from the completed workers.')
-    batch_runner.check_inputs(evidence)
+    if historical_source is None:
+        batch_runner.check_inputs(evidence)
     return records
+
+
+def check_historical_easy_inputs(args, evidence, source):
+    """Verify e6bc9be inputs against the historical seal, without using live source identity."""
+    paths = evidence['paths']
+    hashes = evidence['hashes']
+    sealed_files = dict(config=batch_runner.CONFIG, experiment_config=batch_runner.GUIDANCE_CONFIG,
+                        source_manifest=SOURCE_MANIFEST)
+    expected_hashes = {key: batch_runner.source_hash(path) for key, path in sealed_files.items()}
+    baseline = read_json(batch_runner.CONFIG)
+    expected_paths = dict(pool=args.validation_pool)
+    expected_hashes['pool'] = args.pool_sha256
+    for model in MODELS:
+        expected_paths[model + '_bc'] = getattr(args, model + '_bc')
+        expected_hashes[model + '_bc'] = provenance.BC[model][1]
+        expected_paths[model + '_stage_start'] = Path(baseline[model]['stage_start_server'])
+        expected_hashes[model + '_stage_start'] = baseline[model]['stage_start_sha256']
+    gate_source = read_json(args.gate_report / 'manifest.json')['inputs']['source']
+    if (evidence['experiment'] != EXPERIMENT or evidence['global_steps_start'] != 0
+            or evidence['source']['HEAD'] != HISTORICAL_HEAD or gate_source['HEAD'] != HISTORICAL_HEAD
+            or evidence['source']['sha256'] != source or hashes != expected_hashes
+            or set(paths) != set(expected_hashes)):
+        raise ValueError(f'Historical easy source or input seal differs: {args.root / "manifest.json"}')
+    for key, path in expected_paths.items():
+        if Path(paths[key]) != path.resolve() or batch_runner.file_hash(path) != hashes[key]:
+            raise ValueError(f'Historical easy input path or SHA256 differs: {path}')
+
+
+def promoted_selection(directory, candidates, winner):
+    if winner is not None:
+        winner = {**winner, 'candidate_checkpoint': winner['checkpoint'],
+                  'checkpoint': str(directory / 'winner.pt')}
+    return dict(candidates=candidates, winner=winner,
+                status='promoted' if winner is not None else 'no_formal_pass')
+
+
+def completed_attempts(directory):
+    return [path for path in sorted(directory.glob('attempt-*'))
+            if (path / 'train/batch_summary.json').exists()
+            and read_json(path / 'train/batch_summary.json')['execution_completed'] is True]
+
+
+def import_easy(args, archive, bc):
+    source = read_json(SOURCE_MANIFEST)['sha256']
+    archive_course = archive / 'course.json'
+    if read_json(archive_course) != dict(experiment=EXPERIMENT, code=source, bc=bc,
+                                         plan=course_plan(archive)):
+        raise ValueError(f'Historical course differs from the e6bc9be seal: {archive_course}')
+    evidence, pools = prepare_pools(archive, None, read_only=True)
+    imported = {}
+    originals = {}
+    for model in MODELS:
+        batch = f'easy-{model}'
+        directory = archive / 'batches' / batch
+        completed = completed_attempts(directory)
+        if len(completed) != 1:
+            raise ValueError(f'Expected one completed historical training attempt: {directory}')
+        attempt = completed[0]
+        training = batch_args(args, batch, attempt / 'train', evidence['validation']['easy'],
+                              None, gate_report=attempt / 'gate')
+        manifest = training.root / 'manifest.json'
+        old_inputs = read_json(manifest)['inputs']
+        candidates = collect_batch(training, pools['validation']['easy'], old_inputs,
+                                   historical_source=source)
+        winner = select_winner(candidates)
+        selection = directory / 'selection.json'
+        old_winner = directory / 'winner.pt'
+        if winner is None or read_json(selection) != promoted_selection(directory, candidates, winner):
+            raise ValueError(f'Historical easy promotion differs from terminal candidate evidence: {selection}')
+        if batch_runner.file_hash(old_winner) != winner['checkpoint_sha256']:
+            raise ValueError(f'Historical easy winner SHA256 differs: {old_winner}')
+        imported[model] = promoted_selection(args.root / 'batches' / batch, candidates, winner)
+        originals[model] = dict(attempt=str(attempt), selection=str(selection),
+            selection_sha256=batch_runner.file_hash(selection), training_manifest_sha256=batch_runner.file_hash(manifest),
+            gate_manifest_sha256=batch_runner.file_hash(training.gate_report / 'manifest.json'),
+            winner=str(old_winner), winner_sha256=winner['checkpoint_sha256'],
+            imported_winner=imported[model]['winner']['checkpoint'])
+    seal_json(args.root / 'resume_source.json', dict(root=str(archive), HEAD=HISTORICAL_HEAD,
+        course_sha256=batch_runner.file_hash(archive_course),
+        pool_seal_sha256=batch_runner.file_hash(archive / 'pools.json'), pools=evidence, easy=originals))
+    local_evidence = {}
+    for partition, levels in evidence.items():
+        local_evidence[partition] = {}
+        for stage, info in levels.items():
+            source_path = Path(info['path'])
+            target = args.root / 'pools' / partition / source_path.name
+            seal_copy(source_path, target, info['sha256'])
+            local_evidence[partition][stage] = {**info, 'path': str(target)}
+    seal_json(args.root / 'pools.json', local_evidence)
+    for model, selection in imported.items():
+        target = Path(selection['winner']['checkpoint'])
+        seal_copy(Path(originals[model]['winner']), target, originals[model]['winner_sha256'])
+        seal_json(target.parent / 'selection.json', selection)
+    return local_evidence, pools, imported
 
 
 def require_stopped_phase(phase, batch):
@@ -332,8 +435,7 @@ def run_batch(args, batch, pool_info, pool, parent):
     directory = args.root / 'batches' / batch
     directory.mkdir(parents=True, exist_ok=True)
     attempts = sorted(directory.glob('attempt-*'))
-    completed = [path for path in attempts if (path / 'train/batch_summary.json').exists()
-                 and read_json(path / 'train/batch_summary.json')['execution_completed'] is True]
+    completed = completed_attempts(directory)
     if len(completed) > 1:
         raise ValueError(f'Multiple completed training attempts for {batch}.')
     attempt = completed[0] if completed else directory / f'attempt-{len(attempts)+1:06d}'
@@ -352,13 +454,11 @@ def run_batch(args, batch, pool_info, pool, parent):
         print(f'{batch}: verifying completed batch {training.root}', flush=True)
     candidates = collect_batch(training, pool, evidence)
     winner = select_winner(candidates)
+    selection = promoted_selection(directory, candidates, winner)
     if winner is not None:
-        published = directory / 'winner.pt'
-        seal_copy(Path(winner['checkpoint']), published, winner['checkpoint_sha256'])
-        winner = {**winner, 'candidate_checkpoint': winner['checkpoint'], 'checkpoint': str(published)}
-    seal_json(directory / 'selection.json', dict(candidates=candidates, winner=winner,
-        status='promoted' if winner is not None else 'no_formal_pass'))
-    return candidates, winner
+        seal_copy(Path(winner['checkpoint']), directory / 'winner.pt', winner['checkpoint_sha256'])
+    seal_json(directory / 'selection.json', selection)
+    return candidates, selection['winner']
 
 
 def evaluate_winners(root, winners, evidence, pools):
@@ -445,7 +545,16 @@ def write_table(path, columns, rows):
     temporary.replace(path)
 
 
+def resume_root(root, archive):
+    if archive is not None:
+        root, archive = root.resolve(), archive.resolve()
+        if root.is_relative_to(archive) or archive.is_relative_to(root):
+            raise ValueError('The continuation and historical result directories must be separate.')
+    return archive
+
+
 def run_course(args):
+    resume_root(args.root, getattr(args, 'resume_from', None))
     # The server-only lock also keeps interrupted attempts and published results immutable.
     import fcntl
     args.root.mkdir(parents=True, exist_ok=True)
@@ -455,15 +564,23 @@ def run_course(args):
 
 
 def _run_locked(args):
+    archive = resume_root(args.root, getattr(args, 'resume_from', None))
     identity = batch_runner.identity(EXPERIMENT)
-    if read_json(args.source_manifest)['sha256'] != identity['sha256']:
+    reviewed = read_json(args.source_manifest)['sha256']
+    if archive is not None and reviewed != read_json(RESUME_SOURCE_MANIFEST)['sha256']:
+        raise ValueError('Continuation requires the reviewed post-fix course source manifest.')
+    if reviewed != identity['sha256']:
         raise ValueError('Actual source files differ from the reviewed course manifest.')
     bc = {m: batch_runner.file_hash(args.input_root / provenance.BC[m][0]) for m in MODELS}
     if bc != {m: provenance.BC[m][1] for m in MODELS}:
         raise ValueError('Original BC best SHA256 mismatch.')
     seal_json(args.root / 'course.json', dict(experiment=EXPERIMENT,
-        code=identity['sha256'], bc=bc, plan=course_plan(args.root)))
-    evidence, pools = prepare_pools(args.root, args.validation_pool_dir)
+        code=identity['sha256'], bc=bc, plan=course_plan(args.root, archive)))
+    if archive is None:
+        evidence, pools = prepare_pools(args.root, args.validation_pool_dir)
+        imported = {}
+    else:
+        evidence, pools, imported = import_easy(args, archive, bc)
     frozen_path = args.root / 'independent_inputs.json'
     if frozen_path.exists() or (args.root / 'independent').exists():
         return finish_independent(args.root, evidence, pools)
@@ -474,8 +591,11 @@ def _run_locked(args):
                 rows.extend(dict(model=model, stage=stage, seed=seed, status='blocked_by_no_formal_pass')
                             for seed in SEEDS)
                 continue
-            records, winner = run_batch(args, f'{stage}-{model}', evidence['validation'][stage],
-                                        pools['validation'][stage], winners.get(model))
+            if stage == 'easy' and model in imported:
+                records, winner = imported[model]['candidates'], imported[model]['winner']
+            else:
+                records, winner = run_batch(args, f'{stage}-{model}', evidence['validation'][stage],
+                                            pools['validation'][stage], winners.get(model))
             if winner is None:
                 stopped[model] = stage
                 winners.pop(model, None)
@@ -519,7 +639,7 @@ def finish_independent(root, evidence, pools):
     return 0
 
 
-def course_plan(root):
+def course_plan(root, archive=None):
     batches = {}
     for batch in batch_runner.COURSE_BATCHES:
         entries = []
@@ -530,9 +650,13 @@ def course_plan(root):
                 else f'{job["model"]} {PREDECESSOR[stage]} winner'),
                 effective_bc_schedule=v2_bc_schedule_metadata(stage, schedule=spec['bc_schedule'])))
         batches[batch] = entries
-    return dict(root=str(root), experiment=EXPERIMENT, batches=batches,
+    plan = dict(root=str(root), experiment=EXPERIMENT, batches=batches,
                 validation_seed=VALIDATION_SEED, independent_seed=INDEPENDENT_SEED,
                 scene_count_per_level=100, concurrent_workers=4)
+    if archive is not None:
+        plan.update(resume_from=str(archive), reuse_batches=[f'easy-{model}' for model in MODELS],
+                    first_training_batch='medium-ann')
+    return plan
 
 
 def course_status(root):
@@ -568,15 +692,23 @@ def main(argv=None):
     parser.add_argument('--root', type=Path, required=True)
     parser.add_argument('--input-root', type=Path, default=Path('/home/zj/projects/my_project'))
     parser.add_argument('--validation-pool-dir', type=Path)
-    parser.add_argument('--source-manifest', type=Path, default=SOURCE_MANIFEST)
+    parser.add_argument('--resume-from', type=Path, help='Read completed e6bc9be easy results and pools here.')
+    parser.add_argument('--source-manifest', type=Path)
     parser.add_argument('--timeout', type=float, default=1800.)
     parser.add_argument('--gate-timeout', type=float, default=300.)
     args = parser.parse_args(argv)
     args.root = args.root.resolve()
+    try:
+        args.resume_from = resume_root(args.root, args.resume_from)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.resume_from is not None and args.validation_pool_dir is not None:
+        parser.error('--resume-from uses the six pools sealed by the historical course.')
+    args.source_manifest = args.source_manifest or RESUME_SOURCE_MANIFEST
     if args.status:
         print(json.dumps(course_status(args.root), indent=2))
     elif not args.run:
-        print(json.dumps(course_plan(args.root), indent=2))
+        print(json.dumps(course_plan(args.root, args.resume_from), indent=2))
     else:
         if Path(sys.executable).resolve() != Path(provenance.PYTHON).resolve():
             parser.error('Use the declared server Python.')
