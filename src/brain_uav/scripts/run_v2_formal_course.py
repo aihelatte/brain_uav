@@ -39,13 +39,17 @@ INDEPENDENT_SEED = 20261121
 SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_source.json'
 MEDIUM_ANN_SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_resume_source.json'
 RESUME_SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_snapshot_resume_source.json'
+HARD_ANN_ACC_SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_hard_ann_acc_source.json'
+SNAPSHOT_RESUME_HEAD = '3ffc6e1ca76c1a0cff12efcb51e103d0c174e118'
+HARD_ANN_ACC_REUSED = ('easy-ann', 'easy-snn', 'medium-ann', 'medium-snn', 'hard-snn')
+COURSE_MAX_STEPS = 500_000
 MEDIUM_ANN_HEAD = '144e5183628a28a29126e886fe16918aadd33c2d'
 HISTORICAL_HEAD = 'e6bc9be6b1cd95ac5c23b370f373b7eb3050c6df'
 PREDECESSOR = dict(medium='easy', hard='medium')
 PROC_ROOT = Path('/proc')
 
 
-def resolve_course_job(job):
+def resolve_course_job(job, *, course_profile=None):
     model, stage, seed = job['model'], job['stage'], job['seed']
     easy_seed = 7 if seed == 41 else seed
     reference = next(j for j in batch_runner.jobs(batch_runner.GUIDANCE_EXPERIMENT)
@@ -59,7 +63,8 @@ def resolve_course_job(job):
     else:
         config = V2FormalTrainingConfig(
             stage=stage, seed=seed, actor_lr=_resolve_v2_actor_lr(stage, model, None),
-            spike_regularization=config.spike_regularization, acc_eta=config.acc_eta,
+            max_steps=COURSE_MAX_STEPS if course_profile else None,
+            spike_regularization=config.spike_regularization, acc_eta=job['acc_eta'],
             terminal_geo_radius=config.terminal_geo_radius,
             terminal_geo_far_weight=config.terminal_geo_far_weight,
         )
@@ -72,7 +77,7 @@ def resolve_course_job(job):
     return spec, config
 
 
-def parent_steps(stage, model, path, expected_hash, hashes):
+def parent_steps(stage, model, path, expected_hash, hashes, *, course_profile=None):
     if stage == 'easy':
         return 0
     if hashes['parent'] != expected_hash:
@@ -84,7 +89,9 @@ def parent_steps(stage, model, path, expected_hash, hashes):
     job = next((candidate for candidate in candidates if candidate['seed'] == parent_seed), None)
     if job is None:
         raise ValueError('Selected parent seed was not scheduled in this course.')
-    spec, config = resolve_course_job(job)
+    # Both hard ANN continuations inherit a medium checkpoint from a legacy budget.
+    parent_profile = '500k' if course_profile == '500k' else None
+    spec, config = resolve_course_job(job, course_profile=parent_profile)
     if (raw['formal_config'] != config.to_dict() or raw['reward_config'] != spec['reward_config']
             or raw['scenario_config'] != spec['scenario_config']
             or raw['uav_collision_radius'] != spec['uav_collision_radius']
@@ -187,9 +194,21 @@ def prepare_pools(root, source_dir, *, read_only=False):
     return evidence, pools
 
 
-def batch_args(args, batch, root, pool_info, parent, *, gate_only=False, gate_report=None):
+def new_batch_profile(batch, *, after_medium_ann=False, hard_ann_acc=False):
+    if batch == 'hard-ann':
+        if hard_ann_acc:
+            return 'hard-ann-acc'
+        if after_medium_ann:
+            return '500k-historical-parent'
+    return '500k'
+
+
+def batch_args(args, batch, root, pool_info, parent, *, gate_only=False, gate_report=None, historical=False):
     ann_bc, snn_bc = [args.input_root / provenance.BC[model][0] for model in MODELS]
-    return argparse.Namespace(mode='launch', root=root, experiment=EXPERIMENT, batch=batch,
+    profile = None if historical else new_batch_profile(batch,
+        after_medium_ann=getattr(args, 'resume_after_medium_ann', False),
+        hard_ann_acc=getattr(args, 'resume_hard_ann_acc', False))
+    return argparse.Namespace(mode='launch', root=root, experiment=EXPERIMENT, batch=batch, course_profile=profile,
         ann_bc=ann_bc, snn_bc=snn_bc, validation_pool=Path(pool_info['path']),
         source_manifest=args.source_manifest, timeout=args.timeout, gate_timeout=args.gate_timeout,
         launch=True, gate_only=gate_only, gate_report=gate_report, pool_sha256=pool_info['sha256'],
@@ -300,7 +319,9 @@ def verify_historical_batch(args, archive, batch, pool_info, pool, source, paren
     if len(completed) != 1:
         raise ValueError(f'Expected one completed historical training attempt: {directory}')
     attempt = completed[0]
-    training = batch_args(args, batch, attempt / 'train', pool_info, parent, gate_report=attempt / 'gate')
+    training = batch_args(args, batch, attempt / 'train', pool_info, parent, gate_report=attempt / 'gate',
+                          historical=True)
+    training.source_manifest = source[0]
     manifest = training.root / 'manifest.json'
     evidence = read_json(manifest)['inputs']
     candidates = collect_batch(training, pool, evidence, historical_source=source)
@@ -333,16 +354,16 @@ def verify_course_record(root, source_manifest, bc, plan):
         raise ValueError(f'Historical course differs from the reviewed seal: {path}')
 
 
-def import_completed(args, archive, bc, *, after_medium_ann):
+def read_historical_import(args, archive, bc, *, after_medium_ann):
     if after_medium_ann:
         preceding = archive
         origin = Path(read_json(preceding / 'course.json')['plan']['resume_from']).resolve()
         resume_root(args.root, origin)
         resume_root(preceding, origin)
-        verify_course_record(preceding, MEDIUM_ANN_SOURCE_MANIFEST, bc, course_plan(preceding, origin))
+        verify_course_record(preceding, MEDIUM_ANN_SOURCE_MANIFEST, bc, course_plan(preceding, origin, historical=True))
     else:
         origin = archive
-    verify_course_record(origin, SOURCE_MANIFEST, bc, course_plan(origin))
+    verify_course_record(origin, SOURCE_MANIFEST, bc, course_plan(origin, historical=True))
     evidence, pools = prepare_pools(origin, None, read_only=True)
     imported, originals = {}, {}
     for model in MODELS:
@@ -373,15 +394,88 @@ def import_completed(args, archive, bc, *, after_medium_ann):
         imported['medium-ann'], receipt = verify_historical_batch(args, preceding, 'medium-ann',
             prior_pools['validation']['medium'], prior_objects['validation']['medium'],
             (MEDIUM_ANN_SOURCE_MANIFEST, MEDIUM_ANN_HEAD), parent=prior_winners['ann'])
-        for attempt in sorted((preceding / 'batches/medium-snn').glob('attempt-*')):
-            for phase in ('train', 'gate'):
-                require_stopped_phase(attempt / phase, 'medium-snn')
         winner = imported['medium-ann']['winner']
         source['medium-ann'] = dict(receipt, root=str(preceding), HEAD=MEDIUM_ANN_HEAD,
             status=imported['medium-ann']['status'], imported_winner=winner['checkpoint'] if winner else None,
             source_receipt_sha256=batch_runner.file_hash(prior_receipt),
             course_sha256=batch_runner.file_hash(preceding / 'course.json'),
             pool_seal_sha256=batch_runner.file_hash(preceding / 'pools.json'))
+    receipts = {f'easy-{model}': receipt for model, receipt in originals.items()}
+    if after_medium_ann:
+        receipts['medium-ann'] = source['medium-ann']
+    return evidence, pools, imported, source, receipts
+
+
+def read_hard_ann_acc_import(args, archive, bc):
+    recorded_plan = read_json(archive / 'course.json')['plan']
+    previous = Path(recorded_plan['resume_from']).resolve() if 'resume_from' in recorded_plan else None
+    after_medium_ann = recorded_plan.get('first_training_batch') == 'medium-snn'
+    verify_course_record(archive, RESUME_SOURCE_MANIFEST, bc,
+                         course_plan(archive, previous, after_medium_ann=after_medium_ann, historical=True))
+    evidence, pools = prepare_pools(archive, None, read_only=True)
+    prior_imports, prior_receipts, previous_source = {}, {}, None
+    if previous is not None:
+        resume_root(args.root, previous)
+        resume_root(archive, previous)
+        historical_args = argparse.Namespace(**{**vars(args), 'root': archive})
+        original_pools, _, prior_imports, previous_source, prior_receipts = read_historical_import(
+            historical_args, previous, bc, after_medium_ann=after_medium_ann)
+        if evidence != remap_pools(original_pools, archive):
+            raise ValueError(f'Continued course pools differ from the original seal: {archive / "pools.json"}')
+        previous_receipt = archive / 'resume_source.json'
+        if read_json(previous_receipt) != previous_source:
+            raise ValueError(f'Previous continuation source receipt differs: {previous_receipt}')
+
+    imported, receipts, winners = {}, {}, {}
+    for batch in HARD_ANN_ACC_REUSED:
+        stage, model = batch.split('-')
+        directory = archive / 'batches' / batch
+        selection_path = directory / 'selection.json'
+        if batch in prior_imports:
+            original = prior_imports[batch]
+            if read_json(selection_path) != original:
+                raise ValueError(f'Previously imported {batch} selection differs: {selection_path}')
+            winner = original['winner']
+            if winner is None or batch_runner.file_hash(winner['checkpoint']) != winner['checkpoint_sha256']:
+                raise ValueError(f'Historical {batch} requires an intact formal winner: {directory}')
+            imported[batch] = {**original, 'winner': {**winner,
+                'checkpoint': str(args.root / 'batches' / batch / 'winner.pt')}}
+            receipt = dict(upstream=prior_receipts[batch])
+        else:
+            imported[batch], receipt = verify_historical_batch(args, archive, batch, evidence['validation'][stage],
+                pools['validation'][stage], (RESUME_SOURCE_MANIFEST, SNAPSHOT_RESUME_HEAD),
+                parent=winners.get(model))
+            winner = imported[batch]['winner']
+            if winner is None:
+                raise ValueError(f'Historical {batch} requires a formal winner: {selection_path}')
+            winner = {**winner, 'checkpoint': str(directory / 'winner.pt')}
+        winners[model] = winner
+        receipts[batch] = dict(receipt, selection=str(selection_path),
+            selection_sha256=batch_runner.file_hash(selection_path), winner=winner['checkpoint'],
+            winner_sha256=winner['checkpoint_sha256'])
+
+    check_batch_stopped(archive / 'batches/hard-ann', 'hard-ann')
+    source = dict(root=str(archive), HEAD=SNAPSHOT_RESUME_HEAD, course_sha256=batch_runner.file_hash(archive / 'course.json'),
+        pool_seal_sha256=batch_runner.file_hash(archive / 'pools.json'), pools=evidence, batches=receipts)
+    if previous_source is not None:
+        source.update(upstream=previous_source,
+                      source_receipt_sha256=batch_runner.file_hash(previous_receipt))
+    return evidence, pools, imported, source, receipts
+
+
+def import_completed(args, archive, bc, *, after_medium_ann, hard_ann_acc=False):
+    if hard_ann_acc:
+        evidence, pools, imported, source, receipts = read_hard_ann_acc_import(args, archive, bc)
+        raw = args.root / 'historical'
+        seal_copy(archive / 'pools.json', raw / 'pools.json', source['pool_seal_sha256'])
+        for batch, receipt in receipts.items():
+            seal_copy(Path(receipt['selection']), raw / 'batches' / batch / 'selection.json',
+                      receipt['selection_sha256'])
+    else:
+        evidence, pools, imported, source, receipts = read_historical_import(args, archive, bc,
+                                                                            after_medium_ann=after_medium_ann)
+        if after_medium_ann:
+            check_batch_stopped(archive / 'batches/medium-snn', 'medium-snn')
     seal_json(args.root / 'resume_source.json', source)
     local_evidence = remap_pools(evidence, args.root)
     for partition, levels in evidence.items():
@@ -390,7 +484,7 @@ def import_completed(args, archive, bc, *, after_medium_ann):
     seal_json(args.root / 'pools.json', local_evidence)
     for batch, selection in imported.items():
         directory = args.root / 'batches' / batch
-        receipt = source[batch] if batch == 'medium-ann' else originals[batch.split('-')[1]]
+        receipt = receipts[batch]
         if selection['winner'] is not None:
             seal_copy(Path(receipt['winner']), directory / 'winner.pt', receipt['winner_sha256'])
         elif (directory / 'winner.pt').exists():
@@ -490,6 +584,12 @@ def require_stopped_phase(phase, batch):
             f'MPS pipe={pipe_paths}, MPS logs={logs}, worker logs={phase}/*.log') from exc
 
 
+def check_batch_stopped(directory, batch):
+    for attempt in sorted(directory.glob('attempt-*'), reverse=True):
+        for phase in ('train', 'gate'):
+            require_stopped_phase(attempt / phase, batch)
+
+
 def run_batch(args, batch, pool_info, pool, parent):
     directory = args.root / 'batches' / batch
     directory.mkdir(parents=True, exist_ok=True)
@@ -501,9 +601,7 @@ def run_batch(args, batch, pool_info, pool, parent):
     training = batch_args(args, batch, attempt / 'train', pool_info, parent, gate_report=attempt / 'gate')
     evidence = batch_runner.inputs(training)
     if not completed:
-        for previous in reversed(attempts):
-            for phase in ('train', 'gate'):
-                require_stopped_phase(previous / phase, batch)
+        check_batch_stopped(directory, batch)
         attempt.mkdir(exist_ok=False)
         print(f'{batch}: CUDA gate {attempt / "gate"}', flush=True)
         batch_runner.launch(batch_args(args, batch, attempt / 'gate', pool_info, parent, gate_only=True))
@@ -613,7 +711,15 @@ def resume_root(root, archive):
 
 
 def run_course(args):
-    resume_root(args.root, getattr(args, 'resume_from', None))
+    archive = getattr(args, 'resume_from', None)
+    ancestors = set()
+    while archive is not None:
+        archive = resume_root(args.root, archive)
+        if archive in ancestors:
+            raise ValueError(f'Cyclic historical course source: {archive}')
+        ancestors.add(archive)
+        previous = read_json(archive / 'course.json')['plan'].get('resume_from')
+        archive = Path(previous) if previous is not None else None
     # The server-only lock also keeps interrupted attempts and published results immutable.
     import fcntl
     args.root.mkdir(parents=True, exist_ok=True)
@@ -626,8 +732,9 @@ def _run_locked(args):
     archive = resume_root(args.root, getattr(args, 'resume_from', None))
     identity = batch_runner.identity(EXPERIMENT)
     after_medium_ann = getattr(args, 'resume_after_medium_ann', False)
+    hard_ann_acc = getattr(args, 'resume_hard_ann_acc', False)
     reviewed = read_json(args.source_manifest)['sha256']
-    if archive is not None and reviewed != read_json(RESUME_SOURCE_MANIFEST)['sha256']:
+    if archive is not None and reviewed != read_json(HARD_ANN_ACC_SOURCE_MANIFEST)['sha256']:
         raise ValueError('Continuation requires the reviewed post-fix course source manifest.')
     if reviewed != identity['sha256']:
         raise ValueError('Actual source files differ from the reviewed course manifest.')
@@ -635,12 +742,13 @@ def _run_locked(args):
     if bc != {m: provenance.BC[m][1] for m in MODELS}:
         raise ValueError('Original BC best SHA256 mismatch.')
     seal_json(args.root / 'course.json', dict(experiment=EXPERIMENT,
-        code=identity['sha256'], bc=bc, plan=course_plan(args.root, archive, after_medium_ann=after_medium_ann)))
+        code=identity['sha256'], bc=bc, plan=course_plan(args.root, archive, after_medium_ann=after_medium_ann, hard_ann_acc=hard_ann_acc)))
     if archive is None:
         evidence, pools = prepare_pools(args.root, args.validation_pool_dir)
         imported = {}
     else:
-        evidence, pools, imported = import_completed(args, archive, bc, after_medium_ann=after_medium_ann)
+        evidence, pools, imported = import_completed(args, archive, bc, after_medium_ann=after_medium_ann,
+                                                     hard_ann_acc=hard_ann_acc)
     frozen_path = args.root / 'independent_inputs.json'
     if frozen_path.exists() or (args.root / 'independent').exists():
         return finish_independent(args.root, evidence, pools)
@@ -700,13 +808,22 @@ def finish_independent(root, evidence, pools):
     return 0
 
 
-def course_plan(root, archive=None, *, after_medium_ann=False):
+def course_plan(root, archive=None, *, after_medium_ann=False, hard_ann_acc=False, historical=False):
+    reused = []
+    if archive is not None:
+        reused = list(HARD_ANN_ACC_REUSED) if hard_ann_acc else ['easy-ann', 'easy-snn']
+        if after_medium_ann:
+            reused.append('medium-ann')
     batches = {}
     for batch in batch_runner.COURSE_BATCHES:
         entries = []
-        for job in batch_runner.jobs(EXPERIMENT, batch):
-            spec, config = resolve_course_job(job)
+        profile = None if historical or batch in reused else new_batch_profile(
+            batch, after_medium_ann=after_medium_ann, hard_ann_acc=hard_ann_acc)
+        for job in batch_runner.jobs(EXPERIMENT, batch, course_profile=profile):
+            spec, config = resolve_course_job(job, course_profile=profile)
             stage = config.stage
+            if not historical:
+                spec['noise_decay_steps'] = int(config.max_steps * config.noise_schedule.decay_fraction)
             entries.append(dict(spec, initialization=(f'{job["model"]} original BC best' if stage == 'easy'
                 else f'{job["model"]} {PREDECESSOR[stage]} winner'),
                 effective_bc_schedule=v2_bc_schedule_metadata(stage, schedule=spec['bc_schedule'])))
@@ -715,11 +832,9 @@ def course_plan(root, archive=None, *, after_medium_ann=False):
                 validation_seed=VALIDATION_SEED, independent_seed=INDEPENDENT_SEED,
                 scene_count_per_level=100, concurrent_workers=4)
     if archive is not None:
-        plan.update(resume_from=str(archive), reuse_batches=[f'easy-{model}' for model in MODELS],
-                    first_training_batch='medium-ann')
-        if after_medium_ann:
-            plan['reuse_batches'].append('medium-ann')
-            plan['first_training_batch'] = 'medium-snn'
+        plan.update(resume_from=str(archive), reuse_batches=reused,
+                    first_training_batch='hard-ann' if hard_ann_acc else
+                    'medium-snn' if after_medium_ann else 'medium-ann')
     return plan
 
 
@@ -757,7 +872,10 @@ def main(argv=None):
     parser.add_argument('--input-root', type=Path, default=Path('/home/zj/projects/my_project'))
     parser.add_argument('--validation-pool-dir', type=Path)
     parser.add_argument('--resume-from', type=Path, help='Read sealed results and pools from the previous course.')
-    parser.add_argument('--resume-after-medium-ann', action='store_true',
+    resume_mode = parser.add_mutually_exclusive_group()
+    resume_mode.add_argument('--resume-hard-ann-acc', action='store_true',
+                             help='Import five completed batches from the 3ffc6e1 course, then train hard ANN with ACC.')
+    resume_mode.add_argument('--resume-after-medium-ann', action='store_true',
                         help='Use the 144e518 continuation as the source and start at medium-snn.')
     parser.add_argument('--source-manifest', type=Path)
     parser.add_argument('--timeout', type=float, default=1800.)
@@ -768,15 +886,18 @@ def main(argv=None):
         args.resume_from = resume_root(args.root, args.resume_from)
     except ValueError as error:
         parser.error(str(error))
+    if args.resume_hard_ann_acc and args.resume_from is None:
+        parser.error('--resume-hard-ann-acc requires --resume-from pointing to the 3ffc6e1 course.')
     if args.resume_after_medium_ann and args.resume_from is None:
         parser.error('--resume-after-medium-ann requires --resume-from pointing to the 144e518 course.')
     if args.resume_from is not None and args.validation_pool_dir is not None:
         parser.error('--resume-from uses the six pools sealed by the historical course.')
-    args.source_manifest = args.source_manifest or RESUME_SOURCE_MANIFEST
+    args.source_manifest = args.source_manifest or HARD_ANN_ACC_SOURCE_MANIFEST
     if args.status:
         print(json.dumps(course_status(args.root), indent=2))
     elif not args.run:
-        print(json.dumps(course_plan(args.root, args.resume_from, after_medium_ann=args.resume_after_medium_ann), indent=2))
+        print(json.dumps(course_plan(args.root, args.resume_from, after_medium_ann=args.resume_after_medium_ann,
+                                     hard_ann_acc=args.resume_hard_ann_acc), indent=2))
     else:
         if Path(sys.executable).resolve() != Path(provenance.PYTHON).resolve():
             parser.error('Use the declared server Python.')

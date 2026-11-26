@@ -5,12 +5,12 @@
 | 阶段 | 预算 | ANN actor / critic LR | SNN actor / critic LR | 训练场景混合 | BC 日程 | 失败采样偏置 |
 |---|---:|---|---|---|---|---:|
 | easy | 500,000 | 1.55e-4 / 2e-4 | 8.25e-4 / 1e-3 | easy 100% | smooth-mid-strong | 2 |
-| medium | 750,000 | 1.55e-4 / 2.5e-4 | 9.5e-4 / 2.5e-4 | medium 80%、easy 20% | default | 1 |
-| hard | 1,000,000 | 1.125e-4 / 2.125e-4 | 1.125e-4 / 2.125e-4 | hard 70%、medium 20%、easy 10% | default | 1 |
+| medium | 500,000 | 1.55e-4 / 2.5e-4 | 9.5e-4 / 2.5e-4 | medium 80%、easy 20% | default | 1 |
+| hard | 500,000 | 1.125e-4 / 2.125e-4 | 1.125e-4 / 2.125e-4 | hard 70%、medium 20%、easy 10% | default | 1 |
 
-easy 从 `safe-direct-20261119` 解析。medium 的模型专用 actor LR 由 `train_v2_td3.py` 解析。medium 的 critic LR、hard 的两个 LR、后两级预算及场景混合取 `v2_curriculum.py` 默认值。medium、hard 用正式课程 CLI 的默认 BC 日程和 150k 观测快照。BC 权重按阶段步数重置，easy 在 0/75k/150k/200k/250k/300k/335k/370k 的权重为 500/150/75/60/30/20/14/10。medium、hard 在 0/75k/150k/250k/300k 为 500/150/30/15/5。
+easy 从 `safe-direct-20261119` 解析。medium 的模型专用 actor LR 由 `train_v2_td3.py` 解析。medium 的 critic LR、hard 的两个 LR 及后两级场景混合取 `v2_curriculum.py` 默认值。正式课程入口统一为新训练设置 500,000 步上限。历史归档仍按各自封存的上限核验。medium、hard 用正式课程 CLI 的默认 BC 日程和 150k 观测快照。BC 权重按阶段步数重置，easy 在 0/75k/150k/200k/250k/300k/335k/370k 的权重为 500/150/75/60/30/20/14/10。medium、hard 在 0/75k/150k/250k/300k 为 500/150/30/15/5。
 
-三个阶段均为 ANN min、SNN ACC η=.01，γ=.99、τ=.005、policy delay 2、warmup 1280 步、actor 冻结 25k 步。探索噪声 .020→.005，目标噪声 .015→.006，clip .030→.012，均在各阶段预算的前一半衰减。正式候选至少训练 125k 步，连续四个 15 完整回合窗口各最多一次失败，并在对应固定 100 场中最多失败五场。保留 `default_v2_cuda_graph_compilation()`、GPUCompute、CPU 去重、批次非阻塞和椭球净空缓存。上界方向性预警 120 米，水平 60 米。直飞几何检查使用 40 米净空及参考动作下一步安全检查，近段至 400 米、系数 3000，远段系数 1500，两段分别求均值。评估由模型独立选动作。
+从头启动课程时三个阶段均为 ANN min、SNN ACC η=.01，γ=.99、τ=.005、policy delay 2、warmup 1280 步、actor 冻结 25k 步。探索噪声 .020→.005，目标噪声 .015→.006，clip .030→.012，均在各阶段前 250,000 步衰减，计划以 `noise_decay_steps` 记录。正式候选至少训练 125k 步，连续四个 15 完整回合窗口各最多一次失败，并在对应固定 100 场中最多失败五场。保留 `default_v2_cuda_graph_compilation()`、GPUCompute、CPU 去重、批次非阻塞和椭球净空缓存。上界方向性预警 120 米，水平 60 米。直飞几何检查使用 40 米净空及参考动作下一步安全检查，近段至 400 米、系数 3000，远段系数 1500，两段分别求均值。评估由模型独立选动作。
 
 ## 拉取
 
@@ -73,7 +73,7 @@ cd "$checkout" && run_course
 
 ## 从 `v2_course_e6bc9be` 续跑
 
-续跑入口使用 `--resume-from`。旧目录固定为 `/home/zj/diagnostics/outputs/v2_course_e6bc9be`，新结果目录示例为 `/home/zj/diagnostics/outputs/v2_course_e6bc9be_resume_<时间戳>`。`144e518` 的原续跑版本由 `scripts/v2_formal_course_resume_source.json` 封存。本 checkout 新训练使用 `scripts/v2_formal_course_snapshot_resume_source.json`。历史 `scripts/v2_formal_course_source.json` 保留用于核对原课程，原 checkout 可沿用它。
+续跑入口使用 `--resume-from`。旧目录固定为 `/home/zj/diagnostics/outputs/v2_course_e6bc9be`，新结果目录示例为 `/home/zj/diagnostics/outputs/v2_course_e6bc9be_resume_<时间戳>`。`144e518` 的原续跑版本由 `scripts/v2_formal_course_resume_source.json` 封存。本 checkout 新训练使用 `scripts/v2_formal_course_hard_ann_acc_source.json`。历史 `scripts/v2_formal_course_source.json` 保留用于核对原课程，原 checkout 可沿用它。
 
 启动前按 `e6bc9be` 的 `course.json`、原门控和训练清单、逐 seed 终态及回合记录复核两批 easy，重新核对晋级排名以及 `winner.pt` 和对应候选的 SHA256。`resume_source.json` 保存旧课程、旧池清单、原门控及训练清单、原选优记录和两个胜者的来源。新目录按原字节复制胜者和六份场景池。场景池核对字节哈希、内容摘要、种子与场景契约，沿用晋级和独立场景互斥检查。续跑读旧目录中的封存产物，并使用原 BC 和 `stage_start.json` 作为核验输入。
 
@@ -125,7 +125,7 @@ cd "$checkout" && resume_course
 
 将 `prior` 设为实际使用 `144e518` 的续跑结果目录，即包含 `batches/medium-ann/selection.json` 的课程根目录。入口从该目录的 `course.json` 找到原 `e6bc9be` 课程，两个旧目录都只读。它核对三批共 12 个候选、旧门控及输入身份、场景池与选优记录。`medium-ann` 如有胜者，会复制到新目录供 hard ANN 使用。原结果若为 `no_formal_pass`，ANN 保持止步于 medium，SNN 继续。首个新批次为 `medium-snn`，使用 SNN easy 胜者，重新执行 CUDA 门控及 seed 7、11、23、41。原 `medium-snn` 如果有遗留进程，须先由既有只读检查确认已退出。
 
-新 `course.json` 和新门控使用 `scripts/v2_formal_course_snapshot_resume_source.json`。`resume_source.json` 同时记录两个旧阶段来源，包括 `medium-ann` 的原 `selection.json` 摘要与晋级状态。周期快照文件名仍用计划步数，内容和周期评估里的 `scheduled_stage_steps` 用于对齐索引，`stage_steps` 记录实际采集或评估步数，评估的 `global_steps` 同样对应实际步数。旧版可读快照仍可使用当前加载器。
+`3ffc6e1` 当时用 `scripts/v2_formal_course_snapshot_resume_source.json` 封存。本 checkout 生成的新 `course.json` 和门控使用 `scripts/v2_formal_course_hard_ann_acc_source.json`。`resume_source.json` 同时记录两个旧阶段来源，包括 `medium-ann` 的原 `selection.json` 摘要与晋级状态。周期快照文件名仍用计划步数，内容和周期评估里的 `scheduled_stage_steps` 用于对齐索引，`stage_steps` 记录实际采集或评估步数，评估的 `global_steps` 同样对应实际步数。旧版可读快照仍可使用当前加载器。
 
 审查并推送后，把 `REVIEWED_COMMIT` 和 `prior` 填成实际值。中断后在同一个 checkout 和 `root` 上重跑 `resume_course`。
 
@@ -150,6 +150,47 @@ resume_course() {
   return "$rc"
 }
 test -s "$prior/batches/medium-ann/selection.json" &&
+  git clone --single-branch --branch multi-nfz-training https://github.com/aihelatte/brain_uav.git "$checkout" &&
+  cd "$checkout" && git checkout --detach "$REVIEWED_COMMIT" &&
+  PYTHONPATH=src "${runner[@]}" "${resume_args[@]}" &&
+  resume_course
+```
+
+查看进度用 `PYTHONPATH=src "${runner[@]}" --root "$root" --status`。
+
+## 从 `3ffc6e1` 续跑 hard ANN ACC
+
+使用 `--resume-from "$prior" --resume-hard-ann-acc`。先按各历史源码清单核验 `easy-ann`、`easy-snn`、`medium-ann`、`medium-snn` 和 `hard-snn`，复核各批选优、输入和 checkpoint 哈希。新目录复制六份原场景池和历史胜者权重。原字节的 `pools.json` 和五份 `selection.json` 副本保存在 `historical/` 下。运行用的池和选优清单将胜者及池路径指向新目录，`resume_source.json` 保留历史路径、摘要和上游来源。
+
+只重新运行 `hard-ann` 的四 worker 门控和 seed 7、11、23、41。父权重使用经核验的历史 `medium-ann` 胜者，仍按该历史阶段的 750,000 步和 ANN min 配置校验。新 hard ANN 用 ACC η=0.01、500,000 步上限和 250,000 步噪声衰减。actor / critic LR 为 1.125e-4 / 2.125e-4，训练混合为 hard 70%、medium 20%、easy 10%。保留默认 BC 日程、150k 观测快照、120m/60m 方向性预警、40m/400m 安全直飞、现有 CUDA graph/compile 设置和 125k 正式早停最低门槛。原 `hard-ann` 的 gate/train 如有未清理进程，先做原有只读检查。新训练从新目录的 `attempt-000001` 开始。
+
+hard ANN 有正式胜者时，自动使用该权重和导入的 hard SNN 权重做 600 场独立评估，并生成 `independent.csv` 与 `course_summary.json`。四个新候选均未通过时，仍生成 24 行的 `training.csv` 和记录 `stopped_at={"ann": "hard"}` 的汇总。
+
+审查并推送后填写 `REVIEWED_COMMIT` 和 `prior`。中断后恢复同一 checkout、root 和函数定义，再执行 `resume_course`。
+
+```bash
+REVIEWED_COMMIT=''
+prior=''
+stamp=$(date +%Y%m%d_%H%M%S_%N)
+root="/home/zj/diagnostics/outputs/v2_course_hard_ann_acc_$stamp"
+checkout="/home/zj/diagnostics/my_project_formal_course_hard_ann_acc_$stamp"
+runner=(/home/zj/envs/uav_torch/bin/python -u -B -m brain_uav.scripts.run_v2_formal_course)
+resume_args=(--root "$root" --resume-from "$prior" --resume-hard-ann-acc)
+resume_course() {
+  local start rc
+  start=$(date +%s)
+  printf 'Total result directory: %s\n' "$root"
+  if PYTHONPATH=src "${runner[@]}" "${resume_args[@]}" --run 2>&1 | tee -a "$root.driver.log"; then
+    rc=${PIPESTATUS[0]}
+  else
+    rc=${PIPESTATUS[0]}
+  fi
+  printf 'exit_code=%s\nprocess_wall_seconds=%s\n' "$rc" "$(( $(date +%s)-start ))" | tee -a "$root.driver.log"
+  return "$rc"
+}
+test -n "$REVIEWED_COMMIT" && test -n "$prior" &&
+  test -s "$prior/batches/medium-ann/selection.json" &&
+  test -s "$prior/batches/hard-snn/selection.json" &&
   git clone --single-branch --branch multi-nfz-training https://github.com/aihelatte/brain_uav.git "$checkout" &&
   cd "$checkout" && git checkout --detach "$REVIEWED_COMMIT" &&
   PYTHONPATH=src "${runner[@]}" "${resume_args[@]}" &&
