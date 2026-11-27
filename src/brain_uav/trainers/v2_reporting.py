@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass
 import csv
+import gzip
 import json
 from math import ceil, isfinite
 from pathlib import Path
@@ -106,7 +107,10 @@ class _JsonlWriter:
         self.path = path
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            self._handle: TextIO | None = path.open('x', encoding='utf-8')
+            self._handle: TextIO | None = (
+                gzip.open(path, 'xt', encoding='utf-8', compresslevel=3)
+                if path.suffix == '.gz' else path.open('x', encoding='utf-8')
+            )
         except Exception as exc:
             raise RuntimeError(f'Failed to open V2 report JSONL: {path}') from exc
 
@@ -536,6 +540,13 @@ def _plot_training_windows(path: Path, rows: Sequence[Mapping[str, Any]], *,
             plt.close(fig)
 
 
+V2_TRAJECTORY_ARCHIVE_MODES = ('none', 'failures', 'full')
+_TRAJECTORY_ARCHIVE_FIELDS = (
+    'episode', 'curriculum_level', 'stage_steps', 'global_steps', 'outcome',
+    'episode_length', 'episode_return',
+)
+
+
 class V2ExperimentReporter:
     """Synchronous, optional report sink for one formal V2 stage."""
 
@@ -544,6 +555,8 @@ class V2ExperimentReporter:
                  uav_collision_radius: float, max_steps: int,
                  required_qualified_windows: int = 4,
                  progress_interval_seconds: float = 600.0,
+                 render_trajectories: bool = True,
+                 trajectory_archive_mode: str = 'none',
                  clock: Callable[[], float] = monotonic) -> None:
         if stage not in ('easy', 'medium', 'hard'):
             raise ValueError('stage must be easy, medium, or hard.')
@@ -553,6 +566,10 @@ class V2ExperimentReporter:
             raise TypeError('scenario and rewards must use project config classes.')
         if type(required_qualified_windows) is not int or required_qualified_windows <= 0:
             raise ValueError('required_qualified_windows must be a positive integer.')
+        if type(render_trajectories) is not bool:
+            raise TypeError('render_trajectories must be a bool.')
+        if trajectory_archive_mode not in V2_TRAJECTORY_ARCHIVE_MODES:
+            raise ValueError('trajectory_archive_mode must be none, failures or full.')
         interval = float(progress_interval_seconds)
         if not isfinite(interval) or interval <= 0.0:
             raise ValueError('progress_interval_seconds must be finite and positive.')
@@ -566,6 +583,8 @@ class V2ExperimentReporter:
         self.scenario = scenario
         self.rewards = rewards
         self.uav_collision_radius = float(uav_collision_radius)
+        self.render_trajectories = render_trajectories
+        self.trajectory_archive_mode = trajectory_archive_mode
         self._clock = clock
         self._interval = interval
         self._required_qualified_windows = required_qualified_windows
@@ -577,6 +596,11 @@ class V2ExperimentReporter:
         self._last_console = self._stage_started
         self._episodes = _JsonlWriter(root / 'episodes.jsonl')
         self._windows = _JsonlWriter(root / 'windows.jsonl')
+        self._archive = (
+            _JsonlWriter(root / 'trajectories.jsonl.gz')
+            if trajectory_archive_mode != 'none' else None
+        )
+        self._archived_goal_bucket = -1
         self._window_rows: list[dict[str, Any]] = []
         self._pending_episodes: list[dict[str, Any]] = []
         self._selector = V2TrainingTrajectorySelector(max_steps=max_steps)
@@ -600,6 +624,8 @@ class V2ExperimentReporter:
             'uav_collision_radius': self.uav_collision_radius,
             'report_directory': str(self.output_dir), **dict(metadata),
         }
+        if self._archive is not None:
+            startup['trajectory_archive_mode'] = self.trajectory_archive_mode
         _write_json(self.output_dir / 'stage_start.json', startup)
         initialization = metadata.get('initialization_source', {})
         source = (
@@ -614,7 +640,8 @@ class V2ExperimentReporter:
               f"initialization={initialization.get('path')} "
               f"checkpoint={metadata.get('checkpoint_output')} "
               f"episodes={self.output_dir / 'episodes.jsonl'} "
-              f"images={self.output_dir / 'trajectories'}", flush=True)
+              f"images={self.output_dir / 'trajectories' if self.render_trajectories else 'disabled'}",
+              flush=True)
 
     def maybe_report_progress(self, *, stage_steps: int, completed_episodes: int,
                               current_episode_steps: int, actor_active: bool) -> bool:
@@ -651,6 +678,8 @@ class V2ExperimentReporter:
         persisted['stage_elapsed_seconds'] = now - self._stage_started
         self._episodes.append(persisted)
         self._pending_episodes.append(persisted)
+        if self._archive is not None:
+            self._archive_episode(record, scenario_payload, trajectory, actions, terminal_state)
         prefix = f"[V2 {self.model_type.upper()} {self.stage}]"
         status = str(record.get('actor_update_status', 'not_updated'))
         if status == 'frozen':
@@ -668,6 +697,8 @@ class V2ExperimentReporter:
             f"|{persisted['episode_elapsed_seconds']:7.1f}s",
             flush=True,
         )
+        if not self.render_trajectories:
+            return
         selection = self._selector.select(
             episode=int(record['episode']), stage_steps=int(record['stage_steps']),
             outcome=str(record['outcome']))
@@ -690,6 +721,23 @@ class V2ExperimentReporter:
                  'episode_length': record['episode_length'], 'stage': self.stage,
                  'global_steps': record['global_steps'], 'model_type': self.model_type,
                  'source': 'training', 'selection_reasons': reasons})
+
+    def _archive_episode(self, record, scenario_payload, trajectory, actions, terminal_state):
+        if self.trajectory_archive_mode == 'failures' and record['outcome'] == 'goal':
+            bucket = (int(record['stage_steps']) - 1) // 50_000
+            if bucket == self._archived_goal_bucket:
+                return
+            self._archived_goal_bucket = bucket
+        self._archive.append({
+            **{key: record[key] for key in _TRAJECTORY_ARCHIVE_FIELDS},
+            'stage': self.stage,
+            'window_index': len(self._window_rows) + 1,
+            'scenario_payload': {key: value for key, value in scenario_payload.items() if key != 'metadata'},
+            'trajectory': [[round(float(value), 4) for value in point] for point in trajectory],
+            'actions': [[round(float(value), 4) for value in action] for action in actions],
+            'terminal_state': [round(float(value), 4) for value in terminal_state],
+        })
+
     def _reported_window(self, row: Mapping[str, Any], *, partial: bool) -> dict[str, Any]:
         episodes = list(self._pending_episodes)
         result = dict(row)
@@ -776,7 +824,7 @@ class V2ExperimentReporter:
         persisted['global_steps'] = self._pending_validation_global_steps
         persisted['sequence_index'] = self._validation_completed - 1
         self._validation_writer.append(persisted)
-        reasons = self._validation_selector.select(str(record['outcome']))
+        reasons = self._validation_selector.select(str(record['outcome'])) if self.render_trajectories else ()
         if reasons:
             stem = (f"scenario_{self._validation_completed:04d}_"
                     f"{record['scenario_id']}_{record['outcome']}")
@@ -913,11 +961,15 @@ class V2ExperimentReporter:
     def close(self) -> None:
         if self._closed:
             return
-        self.abort_validation()
-        self._episodes.close()
-        self._windows.close()
-        if self._periodic_validation_writer is not None:
-            self._periodic_validation_writer.close()
+        try:
+            self.abort_validation()
+            self._episodes.close()
+            self._windows.close()
+            if self._periodic_validation_writer is not None:
+                self._periodic_validation_writer.close()
+        finally:
+            if self._archive is not None:
+                self._archive.close()
         self._closed = True
 
 

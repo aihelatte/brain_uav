@@ -39,7 +39,9 @@ INDEPENDENT_SEED = 20261121
 SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_source.json'
 MEDIUM_ANN_SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_resume_source.json'
 RESUME_SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_snapshot_resume_source.json'
-HARD_ANN_ACC_SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_formal_course_hard_ann_acc_source.json'
+# The continuation still reads the original historical seals above. New
+# launches on this checkout use its own reviewed source manifest.
+HARD_ANN_ACC_SOURCE_MANIFEST = batch_runner.REPO / 'scripts/v2_training_pipeline_source.json'
 SNAPSHOT_RESUME_HEAD = '3ffc6e1ca76c1a0cff12efcb51e103d0c174e118'
 HARD_ANN_ACC_REUSED = ('easy-ann', 'easy-snn', 'medium-ann', 'medium-snn', 'hard-snn')
 COURSE_MAX_STEPS = 500_000
@@ -49,9 +51,11 @@ PREDECESSOR = dict(medium='easy', hard='medium')
 PROC_ROOT = Path('/proc')
 
 
-def resolve_course_job(job, *, course_profile=None):
+def resolve_course_job(job, *, course_profile=None, pipeline=None):
     model, stage, seed = job['model'], job['stage'], job['seed']
     easy_seed = 7 if seed == 41 else seed
+    if pipeline is not None and easy_seed not in (7, 11, 23):
+        easy_seed = 7
     reference = next(j for j in batch_runner.jobs(batch_runner.GUIDANCE_EXPERIMENT)
                      if j['model'] == model and j['seed'] == easy_seed)
     spec, config = batch_runner.resolved(reference, batch_runner.GUIDANCE_EXPERIMENT)
@@ -74,16 +78,33 @@ def resolve_course_job(job, *, course_profile=None):
         periodic = 150_000  # Observational cadence of the formal curriculum CLI.
     spec.update(job=job, experiment=EXPERIMENT, formal_config=config.to_dict(),
                 training_config_source=source, periodic_snapshot_interval_steps=periodic)
+    if pipeline is not None:
+        from brain_uav.scripts.train_v2_td3 import default_v2_cuda_graph_compilation
+        from brain_uav.trainers.v2_reporting import V2_TRAJECTORY_ARCHIVE_MODES
+
+        device, archive = pipeline['device'], pipeline['trajectory_archive']
+        if device not in ('cpu', 'cuda') or archive not in V2_TRAJECTORY_ARCHIVE_MODES:
+            raise ValueError('Invalid V2 pipeline device or trajectory archive mode.')
+        config = replace(config, max_steps=pipeline['max_steps'])
+        spec.update(formal_config=config.to_dict(), device=device, render_trajectories=False,
+            trajectory_archive_mode=archive, periodic_snapshot_interval_steps=150_000,
+            gpu_td3_compute=device == 'cuda', non_blocking_batch_transfer=device == 'cuda',
+            compilation=default_v2_cuda_graph_compilation(model=model, resolved_device=device) if device == 'cuda' else {})
     return spec, config
 
 
-def parent_steps(stage, model, path, expected_hash, hashes, *, course_profile=None):
+def parent_steps(stage, model, path, expected_hash, hashes, *, course_profile=None, pipeline=None):
     if stage == 'easy':
         return 0
     if hashes['parent'] != expected_hash:
         raise ValueError('Selected parent checkpoint SHA256 mismatch.')
     raw = load_v2_formal_checkpoint(path, expected_model_type=model, next_stage=stage,
                                     require_passed=True)
+    if pipeline is not None:
+        # Explicit parents may come from a different budget or seed. The
+        # checkpoint loader and stage initialization still enforce predecessor,
+        # acceptance, architecture, scenario, rewards and collision radius.
+        return raw['training_result']['global_steps_end']
     parent_seed = raw['formal_config']['seed']
     candidates = batch_runner.jobs(EXPERIMENT, f'{PREDECESSOR[stage]}-{model}')
     job = next((candidate for candidate in candidates if candidate['seed'] == parent_seed), None)
@@ -100,17 +121,18 @@ def parent_steps(stage, model, path, expected_hash, hashes, *, course_profile=No
     return raw['training_result']['global_steps_end']
 
 
-def episode_window(path, terminal_steps):
-    history = last_complete_episodes(path, terminal_steps, by_end=True)
+def episode_window(path, terminal_steps, *, allow_empty=False):
+    history = last_complete_episodes(path, terminal_steps, by_end=True, allow_empty=allow_empty)
     history['from_step_exclusive'] = history.pop('from_step')
     return history
 
 
-def select_winner(records):
-    if len(records) != len(SEEDS) or {row['seed'] for row in records} != set(SEEDS) or any(
+def select_winner(records, seeds=SEEDS):
+    if not seeds or len(records) != len(seeds) or len(set(seeds)) != len(seeds) or {row['seed'] for row in records} != set(seeds) or any(
             row['execution_completed'] is not True or type(row['formal_passed']) is not bool
             for row in records):
-        raise ValueError('Promotion requires four completed candidates.')
+        raise ValueError('Promotion requires four completed candidates.' if seeds == SEEDS
+                         else 'Promotion requires every scheduled candidate to complete.')
 
     def rank(row):
         window = row['last_50k']
@@ -231,10 +253,11 @@ def collect_batch(args, pool, evidence, *, historical_source=None):
     status = read_json(root / 'batch_summary.json')
     if historical_source is not None:
         check_historical_inputs(args, evidence, *historical_source)
-    expected_gate = batch_runner.validate_gate(args, evidence)
+    cpu = (getattr(args, 'pipeline', None) or {}).get('device') == 'cpu'
+    expected_gate = None if cpu else batch_runner.validate_gate(args, evidence)
     expected_plan = batch_runner.plan(args)
     expected_plan['initialization_timeout'] = manifest['plan']['initialization_timeout']
-    if (status['execution_completed'] is not True or status['mps_cleanup']['stopped'] is not True
+    if (status['execution_completed'] is not True or (not cpu and status['mps_cleanup']['stopped'] is not True)
             or manifest['plan'] != expected_plan
             or manifest['gate_evidence'] != expected_gate
             or manifest['inputs']['paths'] != evidence['paths']
@@ -245,22 +268,26 @@ def collect_batch(args, pool, evidence, *, historical_source=None):
         raise ValueError('Training batch inputs, completion or gate evidence differ.')
     records = []
     pids = set()
-    for job in batch_runner.batch_jobs(args):
+    jobs = batch_runner.batch_jobs(args)
+    for job in jobs:
         validated = batch_runner.validate_terminal(root, manifest, job, pool)
         directory = root / job['id']
         ready = read_json(directory / 'ready.json')
         pids.add(ready['pid'])
         steps = validated['actual_steps']
+        allow_empty = (getattr(args, 'pipeline', None) is not None
+                       and not validated['formal_passed'] and steps < pool.scenario_config['max_steps'])
         record = dict(model=job['model'], stage=job['stage'], seed=job['seed'], steps=steps,
             execution_completed=True, formal_passed=validated['formal_passed'],
             checkpoint=validated['checkpoint'], checkpoint_sha256=validated['checkpoint_sha256'],
             initialization=ready['initialization'], terminal_evaluation=str(directory / 'terminal_evaluation.json'),
-            last_50k=episode_window(directory / 'metrics_reports' / 'episodes.jsonl', steps),
+            last_50k=episode_window(directory / 'metrics_reports' / 'episodes.jsonl', steps,
+                                    allow_empty=allow_empty),
             **counts_for_pool(validated['evaluation'], pool))
         if status['formal_passed'][job['id']] != record['formal_passed']:
             raise ValueError('Worker acceptance differs from batch summary.')
         records.append(record)
-    if pids != set(read_json(root / 'release.json')['pids']) or len(pids) != len(SEEDS):
+    if not cpu and (pids != set(read_json(root / 'release.json')['pids']) or len(pids) != len(jobs)):
         raise ValueError('Training release PIDs differ from the completed workers.')
     if historical_source is None:
         batch_runner.check_inputs(evidence)
@@ -618,18 +645,18 @@ def run_batch(args, batch, pool_info, pool, parent):
     return candidates, selection['winner']
 
 
-def evaluate_winners(root, winners, evidence, pools):
+def evaluate_winners(root, winners, evidence, pools, *, promotion_stage='hard', device='cuda'):
     from brain_uav.scripts.diagnose_v2_policy import load_diagnostic_inputs
     require_disjoint_pools(pools['validation'], pools['independent'])
     rows = []
-    for model in MODELS:
+    for model in (name for name in MODELS if name in winners):
         winner = winners[model]
         path = Path(winner['checkpoint'])
         if batch_runner.file_hash(path) != winner['checkpoint_sha256']:
-            raise ValueError(f'{model} hard winner changed before independent evaluation.')
-        hard_pool = evidence['validation']['hard']
-        if batch_runner.file_hash(hard_pool['path']) != hard_pool['sha256']:
-            raise ValueError('Hard promotion pool changed after locking.')
+            raise ValueError(f'{model} {promotion_stage} winner changed before independent evaluation.')
+        promotion_pool = evidence['validation'][promotion_stage]
+        if batch_runner.file_hash(promotion_pool['path']) != promotion_pool['sha256']:
+            raise ValueError('Winner promotion pool changed after locking.')
         frozen = None
         for stage in V2_TD3_STAGES:
             info = evidence['independent'][stage]
@@ -654,12 +681,12 @@ def evaluate_winners(root, winners, evidence, pools):
                     raise ValueError(f'Independent evaluation cache invalid: {output} (seal {digest_path}): {exc}') from exc
             else:
                 if frozen is None:
-                    frozen = load_diagnostic_inputs(model=model, checkpoint=path, validation_pool=hard_pool['path'],
-                                                    device='cuda')
+                    frozen = load_diagnostic_inputs(model=model, checkpoint=path, validation_pool=promotion_pool['path'],
+                                                    device=device)
                     if (frozen['checkpoint_hash'] != winner['checkpoint_sha256']
-                            or frozen['pool_hash'] != hard_pool['sha256']
+                            or frozen['pool_hash'] != promotion_pool['sha256']
                             or frozen['checkpoint_payload']['passed_validation'] is not True):
-                        raise ValueError('Independent evaluation did not load the selected hard policy.')
+                        raise ValueError(f'Independent evaluation did not load the selected {promotion_stage} policy.')
                 value = evaluate_v2_fixed_validation(frozen['actor'], pool, frozen['rewards'],
                     device=frozen['device'], cpu_deduplication=True).to_dict()
                 counts = independent_counts(value, pool)

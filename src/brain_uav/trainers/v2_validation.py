@@ -578,7 +578,7 @@ def evaluate_v2_diagnostic_scenarios(actor, records, scenario, collision_radius,
 
 def _evaluate_v2_scenarios(actor, records, scenario, collision_radius, rewards, *,
                            curriculum_level, max_failures, device, reporter,
-                           cpu_deduplication, measure_distance=False):
+                           cpu_deduplication, measure_distance=False, scenario_sink=None):
     if type(cpu_deduplication) is not bool:
         raise TypeError('cpu_deduplication must be a bool.')
     if not isinstance(actor, (V2ANNPolicyActor, V2SNNPolicyActor)):
@@ -621,6 +621,7 @@ def _evaluate_v2_scenarios(actor, records, scenario, collision_radius, rewards, 
     )
     was_training = actor.training
     actor.eval()
+    capture_trajectory = scenario_sink is not None or (reporter is not None and reporter.render_trajectories)
     counts = {name: 0 for name in ('goal', 'ground', 'boundary', 'collision', 'timeout')}
     details: list[dict[str, Any]] = []
     if reporter is not None:
@@ -643,7 +644,7 @@ def _evaluate_v2_scenarios(actor, records, scenario, collision_radius, rewards, 
                 with torch.inference_mode():
                     action = actor(batch)[0].detach().cpu().numpy().astype(np.float32)
                 observation, reward, terminated, truncated, info = env.step(action)
-                if reporter is not None:
+                if capture_trajectory:
                     actions.append(env.prev_action.copy().tolist())
                 episode_return += float(reward)
                 episode_length += 1
@@ -667,13 +668,14 @@ def _evaluate_v2_scenarios(actor, records, scenario, collision_radius, rewards, 
                 points = np.asarray(env.trajectory, dtype=np.float64)
                 detail['flight_distance_m'] = float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
             details.append(detail)
-            if reporter is not None:
-                reporter.record_validation_scenario(
+            sink = reporter.record_validation_scenario if reporter is not None else scenario_sink
+            if sink is not None:
+                sink(
                     detail,
                     scenario_payload=record['payload'],
-                    trajectory=[point.tolist() for point in env.trajectory],
+                    trajectory=[point.tolist() for point in env.trajectory] if capture_trajectory else [],
                     actions=actions,
-                    terminal_state=env.state.copy().tolist(),
+                    terminal_state=env.state.copy().tolist() if capture_trajectory else [],
                 )
     except Exception:
         if reporter is not None:

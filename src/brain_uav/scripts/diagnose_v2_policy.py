@@ -80,10 +80,10 @@ def load_diagnostic_checkpoint(checkpoint, **expected):
     return load_v2_formal_checkpoint(raw, require_passed=False, **expected)
 
 
-def load_diagnostic_inputs(*, model: str, checkpoint: str | Path,
+def load_diagnostic_inputs(*, model: str | None, checkpoint: str | Path,
                            validation_pool: str | Path, device: str) -> dict[str, Any]:
     """Use strict loaders and bind the original pool, without building an engine."""
-    if model not in ('ann', 'snn') or device not in ('cpu', 'cuda'):
+    if model not in (None, 'ann', 'snn') or device not in ('cpu', 'cuda'):
         raise ValueError('model must be ann/snn and device must be cpu/cuda.')
     if device == 'cuda' and not torch.cuda.is_available():
         raise RuntimeError('CUDA requested but torch.cuda.is_available() is False.')
@@ -94,6 +94,7 @@ def load_diagnostic_inputs(*, model: str, checkpoint: str | Path,
     payload = load_diagnostic_checkpoint(
         checkpoint_path, expected_model_type=model,
     )
+    model = payload.get('model_type', 'ann') if model is None else model
     scenario = scenario_config_from_snapshot(payload['scenario_config'])
     rewards = RewardConfig(**payload['reward_config'])
     radius = float(payload['uav_collision_radius'])

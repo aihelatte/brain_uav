@@ -93,7 +93,7 @@ def _check(engine,config,pool,prepared,checkpoint,model,report,*,bc_schedule='sm
     obs,_=profile._numeric_diagnostic_observation_batches(warm,device=torch.device('cpu'))
     batch=V2ReplayBatch(obs,torch.zeros(64,2),torch.linspace(-2,2,64).reshape(-1,1),deepcopy(obs),
         torch.arange(64).remainder(2).float().reshape(-1,1),torch.zeros(64,1),torch.zeros(64,1),torch.ones(64,1))
-    noise=torch.randn(64,2,generator=torch.Generator().manual_seed(config.seed)).cuda()
+    noise=torch.randn(64,2,generator=torch.Generator().manual_seed(config.seed % (1 << 64))).cuda()
     if config.terminal_geo_far_weight:
         report['guidance_fixture'] = 'alternating unsafe, near and far masks through actor updates'
     checks=[];public=0;physical=0;old_beta=None;load_invalidated=False

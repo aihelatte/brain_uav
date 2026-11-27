@@ -42,7 +42,7 @@ from brain_uav.trainers.v2_validation import (
     load_v2_validation_pool,
     scenario_config_snapshot,
 )
-from brain_uav.trainers.v2_reporting import V2ExperimentReporter
+from brain_uav.trainers.v2_reporting import V2ExperimentReporter, V2_TRAJECTORY_ARCHIVE_MODES
 
 
 def _resolve_v2_actor_lr(stage: str, model: str, actor_lr: float | None) -> float | None:
@@ -521,6 +521,8 @@ def run_v2_td3_stage(
     spike_regularization: V2SpikeRegularizationConfig | None = None,
     prepared_initialization: V2PreparedStageInitialization | None = None,
     reporting: bool = True,
+    render_trajectories: bool = True,
+    trajectory_archive_mode: str = 'none',
     compile_critic_encoder: bool = False,
     compile_target_encoders: bool = False,
     compile_actors: bool = False,
@@ -588,6 +590,12 @@ def run_v2_td3_stage(
         raise ValueError('snn_time_window must be a positive integer.')
     if type(reporting) is not bool:
         raise ValueError('reporting must be bool.')
+    if type(render_trajectories) is not bool:
+        raise ValueError('render_trajectories must be bool.')
+    if trajectory_archive_mode not in V2_TRAJECTORY_ARCHIVE_MODES:
+        raise ValueError('trajectory_archive_mode must be none, failures or full.')
+    if not reporting and trajectory_archive_mode != 'none':
+        raise ValueError('Trajectory archiving requires reporting.')
     if model == 'snn':
         require_v2_spikingjelly()
     config = V2FormalTrainingConfig(
@@ -742,6 +750,8 @@ def run_v2_td3_stage(
             uav_collision_radius=effective_uav_collision_radius,
             max_steps=config.max_steps,
             required_qualified_windows=config.consecutive_qualified_windows,
+            render_trajectories=render_trajectories,
+            trajectory_archive_mode=trajectory_archive_mode,
         )
         if reporting
         else None
@@ -893,10 +903,10 @@ def run_v2_td3_stage(
             cpu_deduplication if periodic_validation_sink is not None else None),
         'compilation_warmup': 'not_applicable',
     })
-    if reporter is not None:
-        reporter.start_stage({**stage_report_payload,
-                              'execution_configuration': execution_configuration})
     try:
+        if reporter is not None:
+            reporter.start_stage({**stage_report_payload,
+                                  'execution_configuration': execution_configuration})
         result = trainer.run()
         compilation_metadata['local_optimizations'] = components.engine.local_optimization_metadata()
         execution_configuration['non_blocking_batch_transfer']['actual_execution']=compilation_metadata['local_optimizations'].get('non_blocking_batch_transfer')

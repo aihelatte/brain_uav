@@ -61,14 +61,15 @@ def read_json(path):
 def outcome(row):
     if row['outcome'] == 'boundary':
         return 'upper_boundary' if any(
-            v['axis'] == 'z' and v['direction'] == 'positive' for v in row['boundary_violations']
+            v == 'z_max' or (isinstance(v, dict) and v['axis'] == 'z' and v['direction'] == 'positive')
+            for v in row['boundary_violations']
         ) else 'other_boundary'
     if row['outcome'] not in ('goal', 'collision', 'ground', 'timeout'):
         raise ValueError('Unexpected terminal outcome.')
     return row['outcome']
 
 
-def last_complete_episodes(path, actual_steps, *, by_end=False):
+def last_complete_episodes(path, actual_steps, *, by_end=False, allow_empty=False):
     cutoff = actual_steps - 50000 if by_end else max(0, actual_steps - 50000)
     previous = success = count = 0
     with path.open(encoding='utf-8') as stream:
@@ -84,7 +85,7 @@ def last_complete_episodes(path, actual_steps, *, by_end=False):
                 count += 1
                 success += label == 'goal'
             previous = end
-    if previous == 0:
+    if previous == 0 and not allow_empty:
         raise ValueError('Missing complete training episode history.')
     return dict(from_step=cutoff, through_step=actual_steps, count=count, successes=success,
                 success_rate=success / count if count else None)
