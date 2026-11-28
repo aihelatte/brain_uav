@@ -86,6 +86,21 @@ def resolve_course_job(job, *, course_profile=None, pipeline=None):
         if device not in ('cpu', 'cuda') or archive not in V2_TRAJECTORY_ARCHIVE_MODES:
             raise ValueError('Invalid V2 pipeline device or trajectory archive mode.')
         config = replace(config, max_steps=pipeline['max_steps'])
+        spec['reward_config'] = dict(
+            spec['reward_config'],
+            ground_directional_warning_enabled=True,
+            ground_directional_warning_height=60.0,
+            ground_directional_penalty_weight=180.0,
+            ground_soft_penalty_cap=300.0,
+            boundary_directional_warning_enabled=True,
+            boundary_directional_warning_distance=60.0,
+            boundary_directional_penalty_weight=90.0,
+            upper_boundary_directional_warning_distance=150.0,
+            upper_boundary_directional_penalty_weight=200.0,
+            boundary_soft_penalty_cap=300.0,
+        )
+        if stage == 'hard':
+            spec['bc_schedule'] = 'smooth-mid-strong'
         spec.update(formal_config=config.to_dict(), device=device, render_trajectories=False,
             trajectory_archive_mode=archive, periodic_snapshot_interval_steps=150_000,
             gpu_td3_compute=device == 'cuda', non_blocking_batch_transfer=device == 'cuda',

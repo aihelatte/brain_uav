@@ -12,7 +12,9 @@ from unittest import mock
 
 import numpy as np
 
-from brain_uav.config import RewardConfig, ScenarioConfig
+from brain_uav.config import (
+    RewardConfig, ScenarioConfig, reward_config_from_snapshot, reward_config_snapshot,
+)
 from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
 from brain_uav.envs.static_no_fly_env_runtime import StaticNoFlyTrajectoryEnv
 from brain_uav.geometry import NoFlyZone, Sphere
@@ -37,6 +39,58 @@ class TestV2RewardOptions(unittest.TestCase):
                                        uav_collision_radius=0.5)
         env.enable_reward_diagnostics()
         return env
+
+    def test_ground_directional_warning_uses_altitude_and_downward_speed(self):
+        scenario = ScenarioConfig(world_z_min=0.0, ground_warning_height=12.0)
+        env = V2StaticNoFlyTrajectoryEnv(scenario, RewardConfig(ground_directional_warning_enabled=True))
+        half_speed_gamma = math.asin(math.sin(.6) / 2)
+        for z, gamma, expected in ((30, -.6, 45), (30, -half_speed_gamma, 22.5),
+                                    (30, 0, 0), (30, .6, 0), (60, -.6, 0),
+                                    (61, -.6, 0), (0, -.6, 300), (4, 0, 45)):
+            with self.subTest(z=z, gamma=gamma):
+                env.state = np.array([0., 0., z, gamma, 0.])
+                self.assertAlmostEqual(env._ground_warning_penalty(env.state[:3]), expected)
+        env.rewards.ground_directional_warning_enabled = False
+        for z, expected in ((0, 180.0), (4, 45.0), (8, 0.0), (30, 0.0)):
+            env.state = np.array([0., 0., z, -.6, 0.])
+            self.assertEqual(env._ground_warning_penalty(env.state[:3]), expected)
+        shifted = V2StaticNoFlyTrajectoryEnv(ScenarioConfig(world_z_min=2.0),
+            RewardConfig(ground_directional_warning_enabled=True))
+        shifted.state = np.array([0., 0., 32., -.6, 0.])
+        self.assertAlmostEqual(shifted._ground_warning_penalty(shifted.state[:3]), 45.0)
+
+    def test_vertical_warning_snapshot_compatibility_and_validation(self):
+        vertical_fields = (
+            'ground_directional_warning_enabled', 'ground_directional_warning_height',
+            'ground_directional_penalty_weight', 'upper_boundary_directional_penalty_weight',
+        )
+        previous = {name: value for name, value in asdict(RewardConfig()).items()
+                    if name not in (*vertical_fields, 'upper_boundary_directional_warning_distance')}
+        self.assertEqual(reward_config_from_snapshot(previous), RewardConfig())
+        self.assertEqual(reward_config_snapshot(RewardConfig()), previous)
+        enabled = RewardConfig(ground_directional_warning_enabled=True,
+                               upper_boundary_directional_penalty_weight=200.0)
+        snapshot = reward_config_snapshot(enabled)
+        self.assertEqual(set(snapshot) - set(previous), set(vertical_fields))
+        self.assertEqual(reward_config_from_snapshot(snapshot), enabled)
+        disabled = RewardConfig(ground_directional_warning_height=75.0)
+        self.assertEqual(reward_config_from_snapshot(reward_config_snapshot(disabled)), disabled)
+        for value in (0, 1, 'true', None):
+            with self.subTest(value=value), self.assertRaisesRegex(TypeError, vertical_fields[0]):
+                reward_config_from_snapshot({**previous, vertical_fields[0]: value})
+        for name in vertical_fields[1:]:
+            for value in (True, '60', -1, math.nan, math.inf, 10**1000):
+                with self.subTest(name=name, value=repr(value)[:20]), self.assertRaisesRegex(ValueError, name):
+                    reward_config_from_snapshot({**previous, name: value})
+        with self.assertRaises(ValueError):
+            RewardConfig(ground_directional_warning_height=0)
+        for height, scenario in ((8.0, ScenarioConfig(ground_warning_height=12.0)),
+                                 (10.0, ScenarioConfig(world_z_min=10.0))):
+            with self.subTest(height=height), self.assertRaises(ValueError):
+                RewardConfig(ground_directional_warning_enabled=True,
+                             ground_directional_warning_height=height).validate_scenario(scenario)
+        RewardConfig(ground_directional_penalty_weight=0,
+                     upper_boundary_directional_penalty_weight=0)
 
     def test_disabled_options_preserve_captured_baseline_parts(self):
         env = V2StaticNoFlyTrajectoryEnv(_config(max_steps=30), RewardConfig())
@@ -191,10 +245,10 @@ class TestV2RewardArtifacts(unittest.TestCase):
                 for name in NEW_FIELDS:
                     old['reward_config'].pop(name, None)
                 normalized = loader(old)
-                self.assertEqual(normalized['reward_config'], asdict(RewardConfig()))
+                self.assertEqual(normalized['reward_config'], reward_config_snapshot(RewardConfig()))
                 self.assertNotIn('descent_three_band_enabled', old['reward_config'])
                 changed = deepcopy(source)
-                changed['reward_config'] = asdict(RewardConfig(
+                changed['reward_config'] = reward_config_snapshot(RewardConfig(
                     breakthrough_clearance_gate_enabled=True, descent_three_band_enabled=True))
                 self.assertEqual(loader(changed)['reward_config'], changed['reward_config'])
                 mixed = deepcopy(old)
@@ -315,7 +369,7 @@ class TestV2RewardArtifacts(unittest.TestCase):
             run_policy_diagnostic(model='ann', checkpoint=checkpoint, validation_pool=pool,
                                   output_dir=directory / 'diagnostic', max_scenes=1)
             manifest = json.loads((directory / 'diagnostic' / 'manifest.json').read_text())
-            self.assertEqual(manifest['reward_config'], asdict(RewardConfig()))
+            self.assertEqual(manifest['reward_config'], reward_config_snapshot(RewardConfig()))
 
 
 if __name__ == '__main__':

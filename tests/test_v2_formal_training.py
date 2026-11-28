@@ -198,8 +198,11 @@ class TestV2FormalTraining(unittest.TestCase):
                 metadata = v2_bc_schedule_metadata(stage, schedule=schedule)
                 metadata['values'][2] = 0.
                 self.assertEqual(v2_bc_schedule_metadata(stage, schedule=schedule), expected)
-        with self.assertRaisesRegex(ValueError, 'easy or medium'):
-            v2_bc_schedule_metadata('hard', schedule=schedule)
+        if schedule == 'smooth-mid-strong':
+            self.assertEqual(v2_bc_schedule_metadata('hard', schedule=schedule), expected)
+        else:
+            with self.assertRaisesRegex(ValueError, 'easy or medium'):
+                v2_bc_schedule_metadata('hard', schedule=schedule)
         with self.assertRaisesRegex(ValueError, 'conflict'):
             v2_bc_schedule_metadata('medium', schedule=schedule, final_drop_step=400000)
 

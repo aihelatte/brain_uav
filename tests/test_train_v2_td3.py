@@ -40,20 +40,19 @@ class TestTrainV2TD3CLI(unittest.TestCase):
         from contextlib import redirect_stdout
         from io import StringIO
         for model in ('ann', 'snn'):
-            with self.subTest(model=model), redirect_stdout(StringIO()), mock.patch(
-                'brain_uav.scripts.train_v2_td3.run_v2_td3_stage', return_value={'passed': True}
-            ) as runner:
-                train_main(['--stage','easy','--model',model,'--device','cpu',
-                    '--init-checkpoint','bc.pt','--output','out.pt','--metrics-out','metrics.json',
-                    '--validation-pool','pool.json','--bc-schedule','smooth-mid-strong'])
-            self.assertEqual(runner.call_args.kwargs['bc_schedule'], 'smooth-mid-strong')
-        for stage, extra, error in (('hard', {}, 'easy or medium'),
-                                    ('easy', {'bc_final_drop_step':400000}, 'conflict'),
-                                    ('medium', {'bc_final_drop_step':400000}, 'conflict')):
-            with self.subTest(stage=stage), self.assertRaisesRegex(ValueError, error):
+            for stage, parent in (('easy', 'bc.pt'), ('hard', 'medium.pt')):
+                with self.subTest(model=model, stage=stage), redirect_stdout(StringIO()), mock.patch(
+                    'brain_uav.scripts.train_v2_td3.run_v2_td3_stage', return_value={'passed': True}
+                ) as runner:
+                    train_main(['--stage',stage,'--model',model,'--device','cpu',
+                        '--init-checkpoint',parent,'--output','out.pt','--metrics-out','metrics.json',
+                        '--validation-pool','pool.json','--bc-schedule','smooth-mid-strong'])
+                self.assertEqual(runner.call_args.kwargs['bc_schedule'], 'smooth-mid-strong')
+        for stage in ('easy', 'medium', 'hard'):
+            with self.subTest(stage=stage), self.assertRaisesRegex(ValueError, 'conflict'):
                 run_v2_td3_stage(stage=stage, init_checkpoint=Path('unused.pt'),
                     output=Path('out.pt'), metrics_out=Path('metrics.json'), validation_pool=Path('pool.json'),
-                    bc_schedule='smooth-mid-strong', **extra)
+                    bc_schedule='smooth-mid-strong', bc_final_drop_step=400000)
 
     def test_smooth_mid_cli_forwards_explicit_actor_lr_for_ann_and_snn(self):
         from contextlib import redirect_stdout

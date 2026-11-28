@@ -163,6 +163,111 @@ class PipelineToolsTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             course.select_winner([candidate], seeds=[53, 79])
 
+    def test_pipeline_plan_only_changes_vertical_rewards_and_hard_bc(self):
+        from brain_uav.scripts import run_v2_pipeline as pipeline
+
+        course = pipeline.course
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()) as output:
+            root = Path(directory) / 'new'
+            pipeline.main(['--models', 'ann,snn', '--stages', 'easy,medium,hard', '--seeds', '7,11,23,41',
+                           '--output-root', str(root), '--plan'])
+            self.assertFalse(root.exists())
+        plan = json.loads(output.getvalue())
+        vertical = dict(
+            ground_directional_warning_enabled=True, ground_directional_warning_height=60.0,
+            ground_directional_penalty_weight=180.0, ground_soft_penalty_cap=300.0,
+            boundary_directional_warning_enabled=True, boundary_directional_warning_distance=60.0,
+            boundary_directional_penalty_weight=90.0, upper_boundary_directional_warning_distance=150.0,
+            upper_boundary_directional_penalty_weight=200.0, boundary_soft_penalty_cap=300.0,
+        )
+        self.assertEqual(len(plan['batches']), 6)
+        reward_configs = []
+        for batch, (jobs,) in plan['batches'].items():
+            stage, model = batch.split('-')
+            self.assertEqual([spec['job']['seed'] for spec in jobs], [7, 11, 23, 41])
+            for spec in jobs:
+                with self.subTest(batch=batch, seed=spec['job']['seed']):
+                    old, _ = course.resolve_course_job(spec['job'], course_profile='500k')
+                    self.assertEqual(old['reward_config']['upper_boundary_directional_warning_distance'], 120.0)
+                    self.assertEqual(old['reward_config']['boundary_soft_penalty_cap'], 240.0)
+                    self.assertFalse({'ground_directional_warning_enabled', 'upper_boundary_directional_penalty_weight'}
+                                     & old['reward_config'].keys())
+                    self.assertEqual(old['bc_schedule'], 'smooth-mid-strong' if stage == 'easy' else 'default')
+                    self.assertEqual(spec['reward_config'], {**old['reward_config'], **vertical})
+                    reward_configs.append(spec['reward_config'])
+                    self.assertEqual(spec['bc_schedule'], 'default' if stage == 'medium' else 'smooth-mid-strong')
+                    self.assertEqual(spec['formal_config'], old['formal_config'])
+                    self.assertEqual(spec['job']['method'], 'min' if model == 'ann' else 'acc')
+                    self.assertEqual(spec['formal_config'].get('acc_eta'), None if model == 'ann' else .01)
+        self.assertTrue(all(rewards == reward_configs[0] for rewards in reward_configs))
+
+    def test_pipeline_vertical_rewards_survive_real_stage_checkpoint_handoffs(self):
+        import torch
+
+        from brain_uav.config import reward_config_from_snapshot
+        from brain_uav.scripts import run_v2_formal_course as course
+        from brain_uav.scripts.train_v2_bc import train_v2_behavior_cloning
+        from brain_uav.trainers import v2_formal_training as formal
+        from brain_uav.trainers.v2_validation import scenario_config_from_snapshot
+        from test_v2_bc import make_scenario_payload, write_cluster
+
+        def unblocked_scene(index, zone_count):
+            payload = make_scenario_payload(index, zone_count)
+            payload['metadata']['requested_direct_path_blocker'] = False
+            return payload
+
+        threads = torch.get_num_threads()
+        torch.set_num_threads(1)
+        self.addCleanup(torch.set_num_threads, threads)
+        options = dict(course_profile='500k',
+                       pipeline=dict(seeds=[7], device='cpu', max_steps=500_000, trajectory_archive='full'))
+        with tempfile.TemporaryDirectory() as directory, redirect_stdout(StringIO()):
+            root = Path(directory)
+            batch = course.batch_runner
+            for model in ('ann', 'snn'):
+                parent = None
+                for stage in ('easy', 'medium', 'hard'):
+                    job, = batch.jobs(course.EXPERIMENT, f'{stage}-{model}', **options)
+                    spec, config = batch.resolved(job, course.EXPERIMENT, **options)
+                    scenario = scenario_config_from_snapshot(spec['scenario_config'])
+                    rewards = reward_config_from_snapshot(spec['reward_config'])
+                    if stage == 'easy':
+                        with patch('test_v2_bc.make_scenario_payload', side_effect=unblocked_scene):
+                            cluster = write_cluster(root / f'{model}-cluster', scenario_config=scenario, zone_counts=(0,) * 4)
+                        bc_dir = root / model
+                        train_v2_behavior_cloning(trajectory_cluster=cluster, output_dir=bc_dir, epochs=1,
+                            batch_size=2, validation_fraction=.25, device='cpu', model=model,
+                            actor_hidden_dim=192, actor_projection_dim=32)
+                        parent = bc_dir / f'bc_v2_{model}_best.pt'
+                    components = formal.build_v2_stage_engine(scenario, config, init_checkpoint=parent,
+                        rewards=rewards, model_type=model, device='cpu')
+                    self.assertEqual(components.engine.target_q_aggregation, 'min')
+                    acc = getattr(components.engine, 'formal_acc', None)
+                    self.assertEqual(None if acc is None else acc.controller.eta, None if model == 'ann' else .01)
+                    if stage == 'hard':
+                        self.assertEqual(formal.v2_bc_lambda(300_000, schedule=spec['bc_schedule']), 20.0)
+                        self.assertEqual(formal.v2_bc_lambda(499_999, schedule=spec['bc_schedule']), 10.0)
+                        periodic = formal.build_v2_periodic_snapshot(components.engine, config, stage_steps=150_000,
+                            scenario=scenario, rewards=rewards, uav_collision_radius=0.0, seed_manifest={'base_seed': 7},
+                            initialization_source=components.initialization_source, bc_schedule=spec['bc_schedule'])
+                        self.assertEqual(formal.load_v2_periodic_snapshot(periodic)['reward_config'], spec['reward_config'])
+                        with self.assertRaisesRegex(ValueError, 'Previous stage RewardConfig is incompatible'):
+                            formal.prepare_v2_stage_initialization(config, init_checkpoint=parent,
+                                scenario=scenario, rewards=RewardConfig(), model_type=model)
+                    result = formal.V2FormalTrainingResult.empty(stage, global_steps_start=0)
+                    result.status, result.passed_validation = 'passed', True
+                    result.validation_records.append({'passed': True})
+                    payload = formal.build_v2_formal_checkpoint(components.engine, result, config,
+                        scenario=scenario, rewards=rewards, uav_collision_radius=0.0, seed_manifest={'base_seed': 7},
+                        validation_pool_metadata=dict(path='fixture', format_version=1, curriculum_level=stage,
+                            master_seed=123, stage_seed=234, scenario_count=100, content_digest='fixture'),
+                        initialization_source=components.initialization_source, bc_schedule=spec['bc_schedule'])
+                    parent = root / model / f'{stage}.pt'
+                    formal.save_v2_formal_checkpoint(parent, payload)
+                    restored = formal.load_v2_formal_checkpoint(parent, require_passed=True, expected_model_type=model)
+                    self.assertEqual(restored['reward_config'], spec['reward_config'])
+                    self.assertEqual(restored['bc_schedule'].get('name', 'default'), spec['bc_schedule'])
+
     def test_pipeline_cpu_runs_real_worker_and_publishes_flat_reports(self):
         import torch
 
@@ -226,6 +331,8 @@ class PipelineToolsTest(unittest.TestCase):
                                '--source-manifest', str(source_manifest)])
             self.assertIs(stage.call_args.kwargs['render_trajectories'], False)
             self.assertEqual(stage.call_args.kwargs['trajectory_archive_mode'], 'full')
+            self.assertTrue(stage.call_args.kwargs['rewards'].ground_directional_warning_enabled)
+            self.assertEqual(stage.call_args.kwargs['rewards'].upper_boundary_directional_penalty_weight, 200.0)
             seed = training / 'runs' / 'easy-ann' / 'seed53'
             for name in ('model_failed.pt', 'trajectories.jsonl.gz', 'episodes.jsonl', 'windows.jsonl',
                          'stage_start.json', 'stage_end.json', 'terminal_evaluation.json', 'metrics.json', 'ready.json'):

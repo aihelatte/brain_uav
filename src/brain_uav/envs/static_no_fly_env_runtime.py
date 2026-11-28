@@ -1018,13 +1018,17 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
         penalties = []
         for index, (distance, outward_speed, denominator) in enumerate(faces):
             directional_distance = self.rewards.boundary_directional_warning_distance
-            if index == len(faces) - 1 and self.rewards.upper_boundary_directional_warning_distance is not None:
-                directional_distance = self.rewards.upper_boundary_directional_warning_distance
+            directional_weight = self.rewards.boundary_directional_penalty_weight
+            if index == len(faces) - 1:
+                if self.rewards.upper_boundary_directional_warning_distance is not None:
+                    directional_distance = self.rewards.upper_boundary_directional_warning_distance
+                if self.rewards.upper_boundary_directional_penalty_weight is not None:
+                    directional_weight = self.rewards.upper_boundary_directional_penalty_weight
             old_ratio = min(1.0, max(0.0, (warning_distance - distance) / warning_distance))
             h = min(1.0, max(0.0, 1.0 - distance / directional_distance))
             u = min(1.0, max(0.0, outward_speed / denominator))
             penalties.append(self.rewards.boundary_soft_penalty_weight * old_ratio**2
-                             + self.rewards.boundary_directional_penalty_weight * h**2 * u)
+                             + directional_weight * h**2 * u)
         return min(self.rewards.boundary_soft_penalty_cap, max(penalties))
 
     def _legacy_boundary_warning_penalty(self, pos: np.ndarray) -> float:
@@ -1043,12 +1047,27 @@ class StaticNoFlyTrajectoryEnv(gym.Env):
 
     def _ground_warning_penalty(self, pos: np.ndarray) -> float:
         warning_height = min(self.scenario.ground_warning_height, 8.0)
-        effective_span = max(warning_height - self.scenario.world_z_min, 1e-6)
-        if float(pos[2]) >= warning_height:
-            return 0.0
-        ratio = float(np.clip((warning_height - float(pos[2])) / effective_span, 0.0, 1.0))
-        penalty = self.rewards.ground_soft_penalty_weight * (ratio**2)
-        return min(penalty, self.rewards.ground_soft_penalty_cap)
+        z = float(pos[2])
+        if z >= warning_height:
+            if not self.rewards.ground_directional_warning_enabled:
+                return 0.0
+            old_penalty = 0.0
+        else:
+            effective_span = max(warning_height - self.scenario.world_z_min, 1e-6)
+            ratio = float(np.clip((warning_height - z) / effective_span, 0.0, 1.0))
+            old_penalty = self.rewards.ground_soft_penalty_weight * (ratio**2)
+        cap = self.rewards.ground_soft_penalty_cap
+        if not self.rewards.ground_directional_warning_enabled:
+            return min(old_penalty, cap)
+        distance = z - self.scenario.world_z_min
+        if distance >= self.rewards.ground_directional_warning_height:
+            return min(old_penalty, cap)
+        vz = self.scenario.speed * math.sin(float(self.state[3]))
+        denominator = max(self.scenario.speed * math.sin(self.scenario.gamma_max), 1e-6)
+        h = min(1.0, max(0.0, 1.0 - distance / self.rewards.ground_directional_warning_height))
+        u = min(1.0, max(0.0, -vz / denominator))
+        directional = self.rewards.ground_directional_penalty_weight * h**2 * u
+        return min(cap, old_penalty + directional)
 
     def _descent_trend_penalty(self, prev_state: np.ndarray, new_state: np.ndarray) -> float:
         delta_z = float(new_state[2] - prev_state[2])

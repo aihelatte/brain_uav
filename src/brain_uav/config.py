@@ -142,14 +142,22 @@ class RewardConfig:
     boundary_directional_warning_distance: float = 60.0
     boundary_directional_penalty_weight: float = 90.0
     upper_boundary_directional_warning_distance: float | None = None
+    ground_directional_warning_enabled: bool = False
+    ground_directional_warning_height: float = 60.0
+    ground_directional_penalty_weight: float = 180.0
+    upper_boundary_directional_penalty_weight: float | None = None
 
     def __post_init__(self) -> None:
         for name in ('breakthrough_clearance_gate_enabled', 'descent_three_band_enabled',
-                     'boundary_directional_warning_enabled'):
+                     'boundary_directional_warning_enabled', 'ground_directional_warning_enabled'):
             if type(getattr(self, name)) is not bool:
                 raise TypeError(f'{name} must be a bool.')
-        for name in ('descent_low_height', 'descent_high_height', 'descent_transition_factor',
-                     'boundary_directional_warning_distance', 'boundary_directional_penalty_weight'):
+        numeric_fields = ('descent_low_height', 'descent_high_height', 'descent_transition_factor',
+                          'boundary_directional_warning_distance', 'boundary_directional_penalty_weight',
+                          'ground_directional_warning_height', 'ground_directional_penalty_weight')
+        if self.upper_boundary_directional_penalty_weight is not None:
+            numeric_fields += ('upper_boundary_directional_penalty_weight',)
+        for name in numeric_fields:
             value = getattr(self, name)
             if type(value) not in (int, float):
                 raise ValueError(f'{name} must be a finite number.')
@@ -171,6 +179,13 @@ class RewardConfig:
             raise ValueError('Upper directional boundary warning distance must be finite and positive.')
         if self.boundary_directional_penalty_weight < 0:
             raise ValueError('boundary_directional_penalty_weight must be nonnegative.')
+        if self.ground_directional_warning_height <= 0:
+            raise ValueError('ground_directional_warning_height must be positive.')
+        if self.ground_directional_penalty_weight < 0:
+            raise ValueError('ground_directional_penalty_weight must be nonnegative.')
+        upper_weight = self.upper_boundary_directional_penalty_weight
+        if upper_weight is not None and upper_weight < 0:
+            raise ValueError('upper_boundary_directional_penalty_weight must be nonnegative.')
         try:
             ratio = float(self.zone_secondary_penalty_ratio)
         except (TypeError, ValueError, OverflowError) as exc:
@@ -189,6 +204,11 @@ class RewardConfig:
                 or self.boundary_directional_warning_distance) > scenario.boundary_warning_distance
         ):
             raise ValueError('Directional boundary warning requires a distance above boundary_warning_distance.')
+        if self.ground_directional_warning_enabled and not (
+            self.ground_directional_warning_height > min(scenario.ground_warning_height, 8.0)
+            and self.ground_directional_warning_height > scenario.world_z_min
+        ):
+            raise ValueError('ground_directional_warning_height must exceed the soft warning height and world_z_min.')
         if self.descent_three_band_enabled and not (
             isfinite(scenario.world_z_min)
             and scenario.world_z_min < self.descent_low_height < self.descent_high_height
@@ -200,15 +220,25 @@ def reward_config_snapshot(config: RewardConfig) -> dict:
     values = asdict(config)
     if config.upper_boundary_directional_warning_distance is None:
         values.pop('upper_boundary_directional_warning_distance')
+    if config.upper_boundary_directional_penalty_weight is None:
+        values.pop('upper_boundary_directional_penalty_weight')
+    if not config.ground_directional_warning_enabled:
+        values.pop('ground_directional_warning_enabled')
+        if config.ground_directional_warning_height == 60.0:
+            values.pop('ground_directional_warning_height')
+        if config.ground_directional_penalty_weight == 180.0:
+            values.pop('ground_directional_penalty_weight')
     return values
 
 
 def reward_config_from_snapshot(snapshot: dict) -> RewardConfig:
-    """Only optional P1/P2/P3 reward fields may be absent in old artifacts."""
+    """Fill optional reward fields introduced after the original snapshot format."""
     added = ('breakthrough_clearance_gate_enabled', 'descent_three_band_enabled',
              'descent_low_height', 'descent_high_height', 'descent_transition_factor',
              'boundary_directional_warning_enabled', 'boundary_directional_warning_distance',
-             'boundary_directional_penalty_weight', 'upper_boundary_directional_warning_distance')
+             'boundary_directional_penalty_weight', 'upper_boundary_directional_warning_distance',
+             'ground_directional_warning_enabled', 'ground_directional_warning_height',
+             'ground_directional_penalty_weight', 'upper_boundary_directional_penalty_weight')
     names = {item.name for item in fields(RewardConfig)}
     if not isinstance(snapshot, dict) or set(snapshot) - names or (names - set(snapshot)) - set(added):
         raise ValueError('RewardConfig snapshot has missing or unknown fields.')

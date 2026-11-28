@@ -12,7 +12,9 @@ from unittest import mock
 import numpy as np
 import torch
 
-from brain_uav.config import RewardConfig, ScenarioConfig, reward_config_from_snapshot
+from brain_uav.config import (
+    RewardConfig, ScenarioConfig, reward_config_from_snapshot, reward_config_snapshot,
+)
 from brain_uav.envs import V2StaticNoFlyTrajectoryEnv
 from brain_uav.trainers.v2_reporting import V2ExperimentReporter
 from test_v2_static_no_fly_env import _scenario
@@ -68,6 +70,21 @@ class TestBoundaryDirectional(unittest.TestCase):
         self.assertAlmostEqual(env.last_reward_components['boundary_directional'], 0, delta=1e-12)
         self.assertAlmostEqual(math.fsum(env.last_reward_components.values()), reward)
         self.assertAlmostEqual(self.penalty(env, [1400, 0, 100], 0, 0), 240)
+
+    def test_stronger_upper_warning_keeps_horizontal_weight(self):
+        env = self.env(upper_boundary_directional_warning_distance=150.0,
+                       upper_boundary_directional_penalty_weight=200.0,
+                       boundary_soft_penalty_cap=300.0)
+        for z, gamma, expected in ((450, .6, 0), (510, .6, 32), (525, .6, 50),
+                                    (525, 0, 0), (525, -.6, 0),
+                                    (600, .6, 300), (600, 0, 180)):
+            with self.subTest(z=z, gamma=gamma):
+                self.assertAlmostEqual(self.penalty(env, [0, 0, z], gamma), expected)
+        for xyz, psi in (([1282.5, 0, 100], 0), ([-1282.5, 0, 100], math.pi),
+                         ([0, 1282.5, 100], math.pi / 2), ([0, -1282.5, 100], -math.pi / 2)):
+            self.assertAlmostEqual(self.penalty(env, xyz, 0, psi), 22.5)
+        env.rewards.upper_boundary_directional_penalty_weight = 0.0
+        self.assertEqual(self.penalty(env, [0, 0, 525]), 0.0)
 
     def test_disabled_parity_and_diagnostics_do_not_leak(self):
         env = self.env(False)
@@ -254,20 +271,20 @@ class TestBoundaryRecordsAndArtifacts(unittest.TestCase):
                 older = deepcopy(old)
                 for field in NEW_FIELDS:
                     older['reward_config'].pop(field)
-                self.assertEqual(loader(older)['reward_config'], asdict(RewardConfig()))
-                current = {**source, 'reward_config': asdict(rewards)}
-                self.assertEqual(loader(current)['reward_config'], asdict(rewards))
+                self.assertEqual(loader(older)['reward_config'], reward_config_snapshot(RewardConfig()))
+                current = {**source, 'reward_config': reward_config_snapshot(rewards)}
+                self.assertEqual(loader(current)['reward_config'], reward_config_snapshot(rewards))
                 for changes in ({P3_FIELDS[0]: 1}, {P3_FIELDS[1]: math.nan}, {'unknown': 0}):
-                    bad = {**current, 'reward_config': {**asdict(rewards), **changes}}
+                    bad = {**current, 'reward_config': {**current['reward_config'], **changes}}
                     with self.assertRaises((ValueError, TypeError)):
                         loader(bad)
             legacy = {**original, 'reward_config': {k: v for k, v in original['reward_config'].items() if k not in P3_FIELDS}}
             torch.save(legacy, checkpoint)
             inputs = load_diagnostic_inputs(model='ann', checkpoint=checkpoint, validation_pool=pool, device='cpu')
             self.assertFalse(inputs['checkpoint_payload']['reward_config'][P3_FIELDS[0]])
-            torch.save({**original, 'reward_config': asdict(rewards)}, checkpoint)
+            torch.save({**original, 'reward_config': reward_config_snapshot(rewards)}, checkpoint)
             inputs = load_diagnostic_inputs(model='ann', checkpoint=checkpoint, validation_pool=pool, device='cpu')
-            self.assertEqual(inputs['checkpoint_payload']['reward_config'], asdict(rewards))
+            self.assertEqual(inputs['checkpoint_payload']['reward_config'], reward_config_snapshot(rewards))
             with self.assertRaises(ValueError):
                 formal.prepare_v2_stage_initialization(formal.V2FormalTrainingConfig(stage='medium'), init_checkpoint=checkpoint)
             bc = directory / 'bc.pt'
